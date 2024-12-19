@@ -1,58 +1,24 @@
-import pyxdf
 import numpy as np
-from scipy.signal import butter, filtfilt
+import pickle
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
 from sklearn.model_selection import KFold
 from sklearn.metrics import accuracy_score
-import pickle
-
-# Butterworth bandpass filter
-def butter_bandpass_filter(data, lowcut, highcut, fs, order=4):
-    nyquist = 0.5 * fs
-    low = lowcut / nyquist
-    high = highcut / nyquist
-    b, a = butter(order, [low, high], btype='band')
-    return filtfilt(b, a, data, axis=0)
-
-# Common Average Reference (CAR)
-def apply_car_filter(data):
-    avg = np.mean(data, axis=0)
-    return data - avg
-
-# Load XDF data
-def load_xdf(file_path):
-    streams, _ = pyxdf.load_xdf(file_path)
-    eeg_stream = next((s for s in streams if s['info']['type'][0] == 'EEG'), None)
-    marker_stream = next((s for s in streams if s['info']['type'][0] == 'Markers'), None)
-
-    if eeg_stream is None or marker_stream is None:
-        raise ValueError("Both EEG and Marker streams must be present in the XDF file.")
-
-    print("EEG and Marker streams successfully loaded.")
-    return eeg_stream, marker_stream
-
-# Extract segments of EEG data based on markers
-def extract_segments(eeg_data, eeg_timestamps, marker_timestamps, marker_values, window_size, fs):
-    segments = []
-    labels = []
-    samples_per_window = int(window_size * fs)
-
-    for marker_time, marker_value in zip(marker_timestamps, marker_values):
-        if marker_value not in [100, 200]:
-            continue
-
-        # Find the start index for the marker
-        start_idx = np.searchsorted(eeg_timestamps, marker_time)
-        end_idx = start_idx + samples_per_window
-
-        if end_idx < len(eeg_data):
-            segment = eeg_data[start_idx:end_idx]
-            segments.append(segment)
-            labels.append(marker_value)
-
-    return np.array(segments), np.array(labels)
+from Utils.preprocessing import butter_bandpass_filter, apply_car_filter
+from Utils.stream_utils import load_xdf, extract_segments
+import config
 
 def train_model(segments, labels, n_splits=5):
+    """
+    Train an LDA model with k-fold cross-validation and return the trained model.
+
+    Parameters:
+        segments (np.ndarray): EEG data segments.
+        labels (np.ndarray): Corresponding labels for the segments.
+        n_splits (int): Number of splits for cross-validation.
+
+    Returns:
+        lda: Trained LDA model.
+    """
     kf = KFold(n_splits=n_splits, shuffle=False)  # No randomization to preserve time structure
     lda = LDA()
     accuracies = []
@@ -86,15 +52,12 @@ def train_model(segments, labels, n_splits=5):
     return lda
 
 def main():
-    # Define parameters
-    file_path = '/home/arman-admin/Documents/CurrentStudy/sub-P001/ses-S001/eeg/sub-P001_ses-S001_task-Default_run-001_eeg.xdf'
-    lowcut = 0.1  # Hz
-    highcut = 30  # Hz
-    fs = 512  # Sampling frequency
-    window_size = 1  # seconds
-
+    """
+    Main function to generate an LDA decoder from EEG data.
+    """
     # Load data
-    eeg_stream, marker_stream = load_xdf(file_path)
+    print("Loading XDF data...")
+    eeg_stream, marker_stream = load_xdf(config.DATA_FILE_PATH)
 
     # Extract EEG and marker data
     eeg_data = np.array(eeg_stream['time_series'])
@@ -104,14 +67,16 @@ def main():
 
     # Apply pre-processing
     print("Applying Butterworth bandpass filter...")
-    eeg_data = butter_bandpass_filter(eeg_data, lowcut, highcut, fs)
+    eeg_data = butter_bandpass_filter(eeg_data, config.LOWCUT, config.HIGHCUT, config.FS)
 
     print("Applying Common Average Reference (CAR) filter...")
     eeg_data = apply_car_filter(eeg_data)
 
     # Extract segments based on markers
     print("Extracting EEG segments based on markers...")
-    segments, labels = extract_segments(eeg_data, eeg_timestamps, marker_timestamps, marker_values, window_size, fs)
+    segments, labels = extract_segments(
+        eeg_data, eeg_timestamps, marker_timestamps, marker_values, config.WINDOW_SIZE, config.FS
+    )
 
     # Print segment distribution
     unique_labels, counts = np.unique(labels, return_counts=True)
@@ -120,13 +85,12 @@ def main():
         print(f"Class {label}: {count} segments")
 
     # Train LDA model
-    lda_model = train_model(segments, labels, n_splits=5)
+    lda_model = train_model(segments, labels, n_splits=config.N_SPLITS)
 
     # Save the trained model
-    model_path = 'lda_eeg_model.pkl'
-    with open(model_path, 'wb') as f:
+    with open(config.MODEL_PATH, 'wb') as f:
         pickle.dump(lda_model, f)
-    print(f"Model saved to {model_path}")
+    print(f"Model saved to {config.MODEL_PATH}")
 
 if __name__ == "__main__":
     main()
