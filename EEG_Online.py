@@ -2,6 +2,10 @@ import pygame
 import socket
 import time
 import pickle
+import datetime
+import os
+import csv
+import pandas as pd
 from pylsl import StreamInlet, resolve_stream
 import numpy as np
 from Utils.preprocessing import butter_bandpass_filter, apply_car_filter
@@ -9,6 +13,8 @@ from Utils.visualization import draw_arrow_fill, draw_ball_fill, draw_fixation_c
 from Utils.experiment_utils import generate_trial_sequence, display_multiple_messages_with_udp
 from Utils.networking import send_udp_message
 import config
+from sklearn.metrics import confusion_matrix
+
 
 # Initialize Pygame with dimensions from config
 pygame.init()
@@ -31,6 +37,16 @@ try:
 except FileNotFoundError:
     print(f"Error: Model file '{config.MODEL_PATH}' not found.")
     exit(1)
+
+
+# Ensure the Data directory exists
+data_folder = os.path.join('/home/arman-admin/Projects/Harmony', 'Data')
+os.makedirs(data_folder, exist_ok=True)
+
+predictions_list = []
+ground_truth_list = []
+
+
 
 # Show feedback
 def show_feedback(duration=5, mode=0, inlet=None):
@@ -121,6 +137,11 @@ def show_feedback(duration=5, mode=0, inlet=None):
     else:
         final_class = 100 if mode == 0 else 200
 
+    # After calculating `final_class` in show_feedback:
+    predictions_list.append(final_class)
+    ground_truth_list.append(correct_label)  # Add the true label
+
+    
     return final_class
 
 # Classify EEG
@@ -224,5 +245,32 @@ while running and current_trial < len(trial_sequence):
 
     current_trial += 1  # Move to the next trial
     clock.tick(60)  # Keep the frame rate consistent
+
+
+
+# Calculate confusion matrix
+cm = confusion_matrix(ground_truth_list, predictions_list, labels=[200, 100])
+
+# Add labels for clarity
+labels = ['Correct Right Arm Move (200)', 'Correct Rest (100)']
+timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+
+# After collecting predictions and ground truths:
+if predictions_list and ground_truth_list:  # Ensure the lists are not empty
+    cm = confusion_matrix(ground_truth_list, predictions_list, labels=[200, 100])
+
+    # Convert confusion matrix to a DataFrame with labeled rows and columns
+    cm_df = pd.DataFrame(
+        cm,
+        index=['Actual 200 (Correct Move)', 'Actual 100 (Correct Rest)'],
+        columns=['Predicted 200 (Move)', 'Predicted 100 (Rest)']
+    )
+
+    # Save the confusion matrix to a CSV file
+    cm_file_path = os.path.join(data_folder, f'confusion_matrix_{timestamp}.csv')
+    cm_df.to_csv(cm_file_path)
+    print(f"Confusion matrix saved to {cm_file_path}")
+else:
+    print("No predictions or ground truths available to calculate confusion matrix.")
 
 pygame.quit()
