@@ -1,10 +1,14 @@
 import pygame
 import socket
+import sys
 import time
 from Utils.visualization import draw_arrow_fill, draw_ball_fill, draw_fixation_cross
 from Utils.experiment_utils import generate_trial_sequence, display_multiple_messages_with_udp
 from Utils.networking import send_udp_message
 import config
+from pylsl import StreamInlet, resolve_stream
+
+
 
 # Initialize Pygame with dimensions from config
 pygame.init()
@@ -16,8 +20,12 @@ screen_width = config.SCREEN_WIDTH
 screen_height = config.SCREEN_HEIGHT
 
 # Initialize UDP sockets
-udp_socket_main = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-udp_socket_extra = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp_socket_marker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp_socket_robot = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+fes_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+
+FES_toggle = config.FES_toggle
 
 # Utility function to show feedback
 def show_feedback(duration=5, mode=0):
@@ -74,6 +82,11 @@ def show_feedback(duration=5, mode=0):
     return True
 
 # Main Game Loop
+# Attempt to resolve the stream
+print("Looking for EEG data stream...")
+streams = resolve_stream('type', 'EEG')
+inlet = StreamInlet(streams[0])
+print("EEG data stream detected. Starting experiment...")
 trial_sequence = generate_trial_sequence(config.TOTAL_TRIALS, config.MAX_REPEATS)
 current_trial = 0
 running = True
@@ -111,12 +124,13 @@ while running and current_trial < len(trial_sequence):
 
     # Send UDP triggers
     if mode == 0:
-        send_udp_message(udp_socket_main, config.UDP_MAIN["IP"], config.UDP_MAIN["PORT"], "200")
+        send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], "200")
+        send_udp_message(fes_socket, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_GO") if FES_toggle == 1 else print("FES is disabled. Skipping interaction.")
     else:
-        send_udp_message(udp_socket_main, config.UDP_MAIN["IP"], config.UDP_MAIN["PORT"], "100")
+        send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], "100")
 
     # Show feedback
-    if not show_feedback(duration=5, mode=mode):
+    if not show_feedback(duration=config.TIME_MI, mode=mode):
         break
 
     # Post-feedback message
@@ -124,18 +138,18 @@ while running and current_trial < len(trial_sequence):
         messages = ["Robot Move"]
         udp_messages = ["x", "g"]
         colors = [config.green]
-        duration = 13
+        duration = config.TIME_ROB
     else:
         messages = ["Robot Stationary"]
         udp_messages = None
         colors = [config.white]
-        duration = 2
+        duration = config.TIME_STATIONARY
 
     offsets = [0]
     display_multiple_messages_with_udp(
         messages=messages, colors=colors, offsets=offsets,
         duration=duration, udp_messages=udp_messages,
-        udp_socket=udp_socket_extra, udp_ip=config.UDP_EXTRA["IP"], udp_port=config.UDP_EXTRA["PORT"]
+        udp_socket=udp_socket_robot, udp_ip=config.UDP_ROBOT["IP"], udp_port=config.UDP_ROBOT["PORT"]
     )
 
     current_trial += 1

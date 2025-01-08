@@ -1,0 +1,21 @@
+{
+    "FES_frequency": 30,
+    "FES_enabled": 1,
+    "channels": {
+        "red": {
+            "current_mA": 4.0,
+            "pulse_width": 250.0,
+            "duration": 5
+        },
+        "blue": {
+            "current_mA": 0.0,
+            "pulse_width": 250.0,
+            "duration": 5
+        },
+        "black": {
+            "current_mA": 0.0,
+            "pulse_width": 250.0,
+            "duration": 5
+        }
+    }
+}

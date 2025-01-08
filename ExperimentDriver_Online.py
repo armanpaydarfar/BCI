@@ -1,6 +1,7 @@
 import pygame
 import socket
 import time
+import sys
 import pickle
 import datetime
 import os
@@ -8,7 +9,7 @@ import csv
 import pandas as pd
 from pylsl import StreamInlet, resolve_stream
 import numpy as np
-from Utils.preprocessing import butter_bandpass_filter, apply_car_filter
+from Utils.preprocessing import butter_bandpass_filter, apply_car_filter, apply_notch_filter, flatten_single_segment
 from Utils.visualization import draw_arrow_fill, draw_ball_fill, draw_fixation_cross
 from Utils.experiment_utils import generate_trial_sequence, display_multiple_messages_with_udp
 from Utils.networking import send_udp_message
@@ -26,8 +27,12 @@ screen_width = config.SCREEN_WIDTH
 screen_height = config.SCREEN_HEIGHT
 
 # UDP Settings
-udp_socket_main = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-udp_socket_extra = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp_socket_marker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp_socket_robot = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp_socket_fes = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+FES_toggle = config.FES_toggle
+
 
 # Load the LDA model
 try:
@@ -57,13 +62,13 @@ def show_feedback(duration=5, mode=0, inlet=None):
     start_time = time.time()
     collected_data = []  # Store incoming EEG data
     step_size = 0.1  # Sliding window step size (seconds)
-    window_size = 1.0  # Sliding window size (seconds)
-
+    window_size = config.CLASSIFY_WINDOW / 1000  # Sliding window size (ms -> seconds)
     # Send UDP triggers at the start and flush buffer
     if mode == 0:  # Red Arrow Mode
-        send_udp_message(udp_socket_main, config.UDP_MAIN["IP"], config.UDP_MAIN["PORT"], "200")
+        send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], "200")
+        send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_GO") if FES_toggle == 1 else print("FES is disabled. Skipping interaction.")
     else:  # Blue Ball Mode
-        send_udp_message(udp_socket_main, config.UDP_MAIN["IP"], config.UDP_MAIN["PORT"], "100")
+        send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], "100")
 
     inlet.flush()  # Ensure fresh data collection
 
@@ -78,7 +83,7 @@ def show_feedback(duration=5, mode=0, inlet=None):
         progress = elapsed_time / duration
 
         # Collect EEG data continuously
-        new_data, _ = inlet.pull_chunk(timeout=0.01, max_samples=int(0.01 * config.FS))
+        new_data, _ = inlet.pull_chunk(timeout=0.01, max_samples=int(0.05 * config.FS))
         if new_data:
             collected_data.extend(new_data)
 
@@ -110,19 +115,7 @@ def show_feedback(duration=5, mode=0, inlet=None):
 
         clock.tick(60)  # Limit frame rate to 60 FPS
 
-    # Classification Logic
-    predictions = []  # Store predictions for sliding window
-    total_samples = len(collected_data)
-
-    if total_samples >= int(window_size * config.FS):
-        # Use sliding window to classify
-        for start_idx in range(0, total_samples - int(window_size * config.FS), int(step_size * config.FS)):
-            eeg_window = np.array(collected_data[start_idx:start_idx + int(window_size * config.FS)])
-            prediction = classify_eeg(eeg_window)  # Pass EEG window directly
-            predictions.append(prediction)
-    else:
-        print("Warning: Not enough data collected for classification!")
-
+    predictions = classify_eeg(collected_data,step_size, model)
     # Calculate performance
     correct_label = 200 if mode == 0 else 100
     accuracy = predictions.count(correct_label) / len(predictions) if predictions else 0.0
@@ -145,23 +138,63 @@ def show_feedback(duration=5, mode=0, inlet=None):
     return final_class
 
 # Classify EEG
-def classify_eeg(eeg_window):
+
+
+def classify_eeg(collected_data, step_size, model):
     """
-    Classify EEG data using the trained model.
+    Classify EEG data using a trained model with a sliding window approach.
 
     Parameters:
-        eeg_window (np.ndarray): EEG data window for classification. Shape: (samples, channels).
+        collected_data (list): Collected EEG data in a list format (time x channels).
+        step_size (float): Step size in seconds for the sliding window.
+        model (object): Trained classification model.
 
     Returns:
-        int: Predicted class (e.g., 200 for 'Right Arm Move', 100 for 'Rest').
+        list: Predicted classes for each sliding window.
     """
-    eeg_window = butter_bandpass_filter(eeg_window, 0.1, 30, config.FS)  # Apply bandpass filter
-    eeg_window = apply_car_filter(eeg_window)                           # Apply CAR filter
-    features = eeg_window.flatten().reshape(1, -1)                      # Flatten to match model dimensions
-    return model.predict(features)[0]
+    # Convert the collected data into a NumPy array
+    eeg_data = np.array(collected_data)
+    total_samples = eeg_data.shape[0]  # Total number of samples in the collected data
+    # Ensure EEG data has the correct shape (time x channels)
+    eeg_data = eeg_data[:, :config.CAP_TYPE]  # Retain only the number of expected channels
+
+    # Apply pre-processing to the entire EEG dataset
+    eeg_data = apply_notch_filter(eeg_data, config.FS)  # Remove line noise with notch filter
+    eeg_data = butter_bandpass_filter(eeg_data, config.LOWCUT, config.HIGHCUT, config.FS)  # Apply bandpass filter
+    eeg_data = apply_car_filter(eeg_data)  # Apply common average referencing (CAR) filter
+
+    # Initialize a list to store predictions
+    predictions = []
+
+    # Calculate the number of samples in the classification window
+    classify_window_samples = int(config.CLASSIFY_WINDOW / 1000 * config.FS)
+    step_size_samples = int(step_size * config.FS)
+
+    if total_samples >= classify_window_samples:
+        # Perform sliding window classification
+        for start_idx in range(0, total_samples - classify_window_samples + 1, step_size_samples):
+            # Extract the current window of EEG data
+            eeg_window = eeg_data[start_idx:start_idx + classify_window_samples]  # Shape: (window_samples, channels)
+
+            # Flatten the window into a feature vector for classification
+            features = flatten_single_segment(eeg_window)  # Shape: (1, channels * window_samples)
+
+            # Predict the class using the trained model
+            prediction = model.predict(features)[0]
+
+            # Append the prediction to the list
+            predictions.append(prediction)
+    else:
+        print("Warning: Not enough data collected for classification!")
+
+    return predictions
 
 # Main Game Loop
-inlet = StreamInlet(resolve_stream('type', 'EEG')[0])
+# Attempt to resolve the stream
+print("Looking for EEG data stream...")
+streams = resolve_stream('type', 'EEG')
+inlet = StreamInlet(streams[0])
+print("EEG data stream detected. Starting experiment...")
 trial_sequence = generate_trial_sequence(total_trials=config.TOTAL_TRIALS, max_repeats=config.MAX_REPEATS)
 current_trial = 0  # Track the current trial index
 
@@ -201,7 +234,7 @@ while running and current_trial < len(trial_sequence):
         mode = trial_sequence[current_trial]  # Use pseudo-randomized sequence
 
     # Show feedback and classification
-    prediction = show_feedback(duration=5, mode=mode, inlet=inlet)
+    prediction = show_feedback(duration=config.TIME_MI, mode=mode, inlet=inlet)
 
     # Prepare messages and UDP logic based on the prediction
     if mode == 0:  # Red Arrow Mode (Right Arm Move)
@@ -210,26 +243,26 @@ while running and current_trial < len(trial_sequence):
             colors = [config.green, config.green]
             offsets = [-100, 100]
             udp_messages = ["x", "g"]
-            duration = 13
+            duration = config.TIME_ROB
         else:  # Incorrect prediction
             messages = ["Incorrect", "Robot Stationary"]
             colors = [config.red, config.white]
             offsets = [-100, 100]
             udp_messages = None
-            duration = 2
+            duration = config.TIME_STATIONARY
     else:  # Blue Ball Mode (Rest)
         if prediction == 100:  # Correct prediction
             messages = ["Correct", "Robot Stationary"]
             colors = [config.green, config.green]
             offsets = [-100, 100]
             udp_messages = None
-            duration = 2
+            duration = config.TIME_STATIONARY
         else:  # Incorrect prediction
             messages = ["Incorrect", "Robot Stationary"]
             colors = [config.red, config.white]
             offsets = [-100, 100]
             udp_messages = None
-            duration = 2
+            duration = config.TIME_STATIONARY
 
     # Display the feedback messages and send UDP messages
     display_multiple_messages_with_udp(
@@ -238,9 +271,9 @@ while running and current_trial < len(trial_sequence):
         offsets=offsets,
         duration=duration,
         udp_messages=udp_messages,
-        udp_socket=udp_socket_extra,
-        udp_ip=config.UDP_EXTRA["IP"],
-        udp_port=config.UDP_EXTRA["PORT"]
+        udp_socket=udp_socket_robot,
+        udp_ip=config.UDP_ROBOT["IP"],
+        udp_port=config.UDP_ROBOT["PORT"]
     )
 
     current_trial += 1  # Move to the next trial

@@ -3,8 +3,8 @@ import pickle
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
 from sklearn.model_selection import KFold
 from sklearn.metrics import accuracy_score
-from Utils.preprocessing import butter_bandpass_filter, apply_car_filter
-from Utils.stream_utils import load_xdf, extract_segments
+from Utils.preprocessing import butter_bandpass_filter, apply_car_filter, extract_segments, apply_notch_filter, flatten_segments
+from Utils.stream_utils import load_xdf
 import config
 
 def train_model(segments, labels, n_splits=5):
@@ -22,19 +22,17 @@ def train_model(segments, labels, n_splits=5):
     kf = KFold(n_splits=n_splits, shuffle=False)  # No randomization to preserve time structure
     lda = LDA()
     accuracies = []
-
     print("Starting K-Fold Cross Validation...")
     for train_index, test_index in kf.split(segments):
         X_train, X_test = segments[train_index], segments[test_index]
-        y_train, y_test = labels[train_index], labels[test_index]
-
+        Y_train, Y_test = labels[train_index], labels[test_index]
         # Flatten each segment for the LDA input
-        X_train_flat = X_train.reshape(X_train.shape[0], -1)
-        X_test_flat = X_test.reshape(X_test.shape[0], -1)
+        #X_train_flat = X_train.reshape(X_train.shape[0], -1)
+        #X_test_flat = X_test.reshape(X_test.shape[0], -1)
 
-        lda.fit(X_train_flat, y_train)
-        y_pred = lda.predict(X_test_flat)
-        accuracy = accuracy_score(y_test, y_pred)
+        lda.fit(X_train, Y_train)
+        Y_pred = lda.predict(X_test)
+        accuracy = accuracy_score(Y_test, Y_pred)
         accuracies.append(accuracy)
         print(f"Fold Accuracy: {accuracy:.4f}")
 
@@ -66,6 +64,11 @@ def main():
     marker_values = np.array([int(m[0]) for m in marker_stream['time_series']])
 
     # Apply pre-processing
+
+    print("Applying Notch filter...")
+    eeg_data = apply_notch_filter(eeg_data, config.FS)
+
+
     print("Applying Butterworth bandpass filter...")
     eeg_data = butter_bandpass_filter(eeg_data, config.LOWCUT, config.HIGHCUT, config.FS)
 
@@ -75,9 +78,13 @@ def main():
     # Extract segments based on markers
     print("Extracting EEG segments based on markers...")
     segments, labels = extract_segments(
-        eeg_data, eeg_timestamps, marker_timestamps, marker_values, config.WINDOW_SIZE, config.FS
+        eeg_data, eeg_timestamps, marker_timestamps, marker_values,config.CLASSIFY_WINDOW, config.FS
     )
+    print(f"segment shape: {segments.shape}")
+    segments = flatten_segments(segments)
+    print(f"Flattening . . . new shape -> {segments.shape}")
 
+ 
     # Print segment distribution
     unique_labels, counts = np.unique(labels, return_counts=True)
     print("Segment distribution:")

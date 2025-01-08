@@ -28,21 +28,3 @@ def load_xdf(file_path):
     print("EEG and Marker streams successfully loaded.")
     return eeg_stream, marker_stream
 
-def extract_segments(eeg_data, eeg_timestamps, marker_timestamps, marker_values, window_size, fs):
-    segments = []
-    labels = []
-    samples_per_window = int(window_size * fs)
-
-    for marker_time, marker_value in zip(marker_timestamps, marker_values):
-        if marker_value not in [100, 200]:
-            continue
-
-        start_idx = np.searchsorted(eeg_timestamps, marker_time)
-        end_idx = start_idx + samples_per_window
-
-        if end_idx < len(eeg_data):
-            segment = eeg_data[start_idx:end_idx]
-            segments.append(segment)
-            labels.append(marker_value)
-
-    return np.array(segments), np.array(labels)

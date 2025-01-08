@@ -22,16 +22,20 @@ def get_eeg_inlet():
     print("EEG stream connected.")
     return inlet
 
-def get_current_eeg_timestamp(inlet):
+def get_current_eeg_timestamp(inlet,udp_recieved_time = 0):
     """
     Pull the most recent sample and timestamp aligned with the current time.
     """
     inlet.flush()  # Flush the buffer to discard old samples
     sample, timestamp = inlet.pull_sample(timeout=1.0)  # Wait for a fresh sample
+    temp_timestamp = local_clock()
+
     if timestamp is not None:
         # Compare the LSL stream timestamp with the local system clock
-        stream_offset = local_clock() - timestamp
+        stream_offset = temp_timestamp - udp_recieved_time
         print(f"Current EEG timestamp: {timestamp}, Stream Offset: {stream_offset:.4f} seconds")
+        #print(f"local clock indicated: {temp_timestamp}")
+        #print(f"difference between local clock and pulled timestamp: {temp_timestamp - timestamp} s")
         return timestamp
     else:
         print("No new EEG timestamp available.")
@@ -65,12 +69,13 @@ def handle_udp_requests(eeg_inlet, udp_port=12345):
 
     while True:
         data, addr = sock.recvfrom(1024)  # Receive up to 1024 bytes
+        udp_recieved_time = local_clock()
         try:
             message = data.decode('utf-8').strip()
             print(f"Received UDP message: {message} from {addr}")
             marker_value = int(message)
             if marker_value in possible_marker_values:
-                timestamp = get_current_eeg_timestamp(eeg_inlet)
+                timestamp = get_current_eeg_timestamp(eeg_inlet, udp_recieved_time)
                 if timestamp is not None:
                     send_marker(marker_value, timestamp)
                 else:

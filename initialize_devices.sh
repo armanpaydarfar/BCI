@@ -12,6 +12,11 @@ open_terminal() {
   gnome-terminal -- bash -c "source $CONDA_SCRIPT && conda activate mne && $cmd; exec bash"
 }
 
+# Function to check if FES_toggle is enabled
+check_fes_toggle() {
+  python3 -c "import config; print(config.FES_toggle)" 2>/dev/null
+}
+
 read -p "Is Harmony already initialized? (default yes) (y/n): " harmony_initialized
 read -p "Do you want to start mne-lsl viewer? (default no) (y/n): " start_mne
 
@@ -32,6 +37,7 @@ open_terminal "LabRecorder"
 # Step 4: Optionally start mne-lsl viewer
 if [[ "$start_mne" == "y" ]]; then
   echo "Starting mne-lsl viewer..."
+  sleep 30
   open_terminal "mne-lsl viewer"
 else
   echo "Skipping mne-lsl viewer."
@@ -49,5 +55,13 @@ else
   echo "Skipping Harmony initialization as it is already running."
 fi
 
-echo "Initialization complete. Check the opened terminals for individual processes."
+# Step 6: Conditionally run STMsetup.py
+fes_toggle=$(check_fes_toggle)
+if [[ "$fes_toggle" == "1" ]]; then
+  echo "FES_toggle is enabled. Running STMsetup.py..."
+  open_terminal "python3 $SCRIPT_DIR/STMsetup.py"
+else
+  echo "FES_toggle is disabled. Skipping STMsetup.py."
+fi
 
+echo "Initialization complete. Check the opened terminals for individual processes."
