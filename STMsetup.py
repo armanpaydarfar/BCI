@@ -77,91 +77,111 @@ def RH_LH_stsRed():
 	print(FES1_freq)
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=stsTime:
+		cycle_time = time.time()
 		FES1.pulse('red',RH_stsRed_i.get(), int(RH_stsRed_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - cycle_time)))
+		#time.sleep(1/FES1_freq)
 
 def RH_LH_stsBlack():
 	RH_LH_freqChange()
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=stsTime:
+		cycle_time = time.time()
 		FES1.pulse('black',LH_stsBlack_i.get(), int(LH_stsBlack_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)
-
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 def RH_LH_stsBlue():
 	RH_LH_freqChange()
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=stsTime:
+		cycle_time = time.time()
 		FES1.pulse('blue',RH_stsBlue_i.get(), int(RH_stsBlue_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)
-
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 def RH_LH_stsWhite():
 	RH_LH_freqChange()
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=stsTime:
+		cycle_time = time.time()
 		FES1.pulse('white',LH_stsWhite_i.get(), int(LH_stsWhite_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 
 def RH_LH_stsRedBlue():
 	RH_LH_freqChange()
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=stsTime:
+		cycle_time = time.time()
 		FES1.pulse('red',RH_stsRed_i.get(), int(RH_stsRed_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
 		FES1.pulse('blue',RH_stsBlue_i.get(), int(RH_stsBlue_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 
 def RH_LH_stsBlackWhite():
 	RH_LH_freqChange()
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=stsTime:
+		cycle_time = time.time()
 		FES1.pulse('black',LH_stsBlack_i.get(), int(LH_stsBlack_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
 		FES1.pulse('white',LH_stsWhite_i.get(), int(LH_stsWhite_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)
-
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 ## Motor
 
 def RH_LH_mtsRed():
 	RH_LH_freqChange()
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=mtsTime:
+		cycle_time = time.time()
 		FES1.pulse('red',RH_mtsRed_i.get(), int(RH_mtsRed_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)
-
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 def RH_LH_mtsBlack():
 	RH_LH_freqChange()
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=mtsTime:
+		cycle_time = time.time()
 		FES1.pulse('black',LH_mtsBlack_i.get(), int(LH_mtsBlack_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 
 def RH_LH_mtsBlue():
 	RH_LH_freqChange()
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=mtsTime:
+		cycle_time = time.time()
 		FES1.pulse('blue',RH_mtsBlue_i.get(), int(RH_mtsBlue_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 
 def RH_LH_mtsWhite():
 	RH_LH_freqChange()
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=mtsTime:
+		cycle_time = time.time()
 		FES1.pulse('white',LH_mtsWhite_i.get(), int(LH_mtsWhite_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 
 def RH_LH_mtsRedBlue():
 	RH_LH_freqChange()
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=mtsTime:
+		cycle_time = time.time()
 		FES1.pulse('red',RH_mtsRed_i.get(), int(RH_mtsRed_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
 		FES1.pulse('blue',RH_mtsBlue_i.get(), int(RH_mtsBlue_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 
 def RH_LH_mtsBlackWhite():
 	RH_LH_freqChange()
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=mtsTime:
+		cycle_time = time.time()
 		FES1.pulse('black',LH_mtsBlack_i.get(), int(LH_mtsBlack_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
 		FES1.pulse('white',LH_mtsWhite_i.get(), int(LH_mtsWhite_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 
 # Full Sequence STS/MTS
 
@@ -169,35 +189,46 @@ def RH_LH_redBlueseq():
 	RH_LH_freqChange()
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=stsTime:
+		cycle_time = time.time()
 		FES1.pulse('red',RH_stsRed_i.get(), int(RH_stsRed_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=stsTime:
+		cycle_time = time.time()
 		FES1.pulse('red',RH_stsRed_i.get(), int(RH_stsRed_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
 		FES1.pulse('blue',RH_stsBlue_i.get(), int(RH_stsBlue_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)		
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=mtsTime:
+		cycle_time = time.time()
 		FES1.pulse('red',RH_mtsRed_i.get(), int(RH_mtsRed_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
 		FES1.pulse('blue',RH_mtsBlue_i.get(), int(RH_mtsBlue_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)
-
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 def RH_LH_blackWhiteseq():
 	RH_LH_freqChange()
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=stsTime:
+		cycle_time = time.time()
 		FES1.pulse('black',LH_stsBlack_i.get(), int(LH_stsBlack_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=stsTime:
+		cycle_time = time.time()
 		FES1.pulse('black',LH_stsBlack_i.get(), int(LH_stsBlack_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
 		FES1.pulse('white',LH_stsWhite_i.get(), int(LH_stsWhite_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)	
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 	prevTime=time.time() 
 	while (time.time() - prevTime)<=mtsTime:
+		cycle_time = time.time()
 		FES1.pulse('black',LH_mtsBlack_i.get(), int(LH_mtsBlack_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
 		FES1.pulse('white',LH_mtsWhite_i.get(), int(LH_mtsWhite_p.get())) # 3 250+int(((t_passed - t_init)/STS_duration[0])*250)
-		time.sleep(1/FES1_freq)
+		time.sleep(max(0, (1 / FES1_freq) - (time.time() - prevTime)))
+		#time.sleep(1/FES1_freq)
 
 def endSetup():
     # Prepare the configuration dictionary

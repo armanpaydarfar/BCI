@@ -1,6 +1,9 @@
 from scipy.signal import butter, filtfilt, iirnotch
 import numpy as np
 import config
+from sklearn.linear_model import LinearRegression
+
+
 
 def apply_notch_filter(eeg_data, sampling_rate, line_freq=60, quality_factor=30, harmonics=2):
     """
@@ -167,7 +170,7 @@ def flatten_single_segment(segment):
     """
     # Ensure the input array has the correct dimensionality
     if segment.ndim != 2:
-        raise ValueError("Input data must be a 3D array (time, channels).")
+        raise ValueError("Input data must be a 2D array (time, channels).")
 
     # Flatten the 2D array into 1D
     flattened = segment.flatten()  # Shape: (time * channels,)
@@ -176,6 +179,47 @@ def flatten_single_segment(segment):
     flattened_row = flattened.reshape(1, -1)  # Shape: (1, time * channels)
 
     return flattened_row
+
+
+
+def extract_and_flatten_segment(eeg_data, start_time, fs, window_size_ms, offset_ms=0):
+    """
+    Extract and flatten a single EEG segment from raw data.
+
+    Parameters:
+        eeg_data (np.ndarray): 2D array of EEG data (samples x channels).
+        start_time (float): Start time of the segment in seconds.
+        fs (float): Sampling rate of the EEG data (Hz).
+        window_size_ms (int): Time window for the segment in milliseconds.
+        offset_ms (int): Time offset after the start_time in milliseconds (default: 0).
+
+    Returns:
+        np.ndarray: Flattened segment of shape (1, time * channels).
+    """
+    # Convert time parameters from milliseconds to samples
+    window_size_samples = int((window_size_ms / 1000) * fs)
+    offset_samples = int((offset_ms / 1000) * fs)
+
+    # Calculate start and end indices
+    start_idx = int(start_time * fs) + offset_samples
+    end_idx = start_idx + window_size_samples
+
+    # Ensure indices are within data bounds
+    if start_idx < 0 or end_idx > eeg_data.shape[0]:
+        raise ValueError(f"Segment indices out of bounds: start_idx={start_idx}, end_idx={end_idx}")
+
+    # Extract the segment
+    segment = eeg_data[start_idx:end_idx, :]
+
+    # Ensure the segment has the correct size
+    if segment.shape[0] != window_size_samples:
+        raise ValueError(f"Segment size mismatch: expected {window_size_samples} samples, got {segment.shape[0]}")
+
+    # Flatten the segment into a row vector
+    flattened_segment = segment.flatten().reshape(1, -1)  # Shape: (1, time * channels)
+
+    return flattened_segment
+
 
 
 def separate_classes(segments, labels, class_1=100, class_2=200):
@@ -211,3 +255,118 @@ def separate_classes(segments, labels, class_1=100, class_2=200):
         {"data": class_1_data, "labels": class_1_labels},
         {"data": class_2_data, "labels": class_2_labels},
     )
+
+
+
+
+def remove_eog_artifacts(eeg_data, eog_data):
+    """
+    Remove EOG artifacts from EEG data using a regression-based approach.
+
+    Parameters:
+        eeg_data (np.ndarray): 2D array of EEG data (samples x channels).
+        eog_data (np.ndarray): 2D array of EOG data (samples x EOG_channels).
+
+    Returns:
+        np.ndarray: Cleaned EEG data with EOG artifacts regressed out.
+    """
+    # Ensure EOG data is 2D
+    if eog_data.ndim == 1:
+        eog_data = eog_data[:, np.newaxis]  # Convert to (samples x 1)
+
+    # Initialize a cleaned EEG array
+    eeg_cleaned = np.zeros_like(eeg_data)
+
+    # Perform regression for each EEG channel
+    for channel_idx in range(eeg_data.shape[1]):
+        # Extract the current EEG channel
+        eeg_channel = eeg_data[:, channel_idx]
+
+        # Fit a linear regression model
+        regressor = LinearRegression()
+        regressor.fit(eog_data, eeg_channel)
+
+        # Predict the EOG contribution to the EEG channel
+        eog_prediction = regressor.predict(eog_data)
+
+        # Subtract the EOG contribution to clean the EEG channel
+        eeg_cleaned[:, channel_idx] = eeg_channel - eog_prediction
+
+    return eeg_cleaned
+
+
+def parse_eeg_and_eog(eeg_stream, channel_names):
+    """
+    Parse EEG and EOG data from the given EEG stream based on configuration.
+
+    Parameters:
+        eeg_stream (dict): EEG stream containing 'time_series' and 'time_stamps'.
+        channel_names (list): List of channel names corresponding to the data columns.
+
+    Returns:
+        tuple:
+            - np.ndarray: EEG data from specified channels.
+            - np.ndarray or None: EOG data from specified channels (if EOG_TOGGLE is enabled).
+    """
+
+    # Extract EEG data from the stream
+    eeg_data = np.array(eeg_stream['time_series'])  # Shape: (N_samples, N_channels)
+
+    # Handle "ALL" keyword for EEG channels
+    if config.EEG_CHANNEL_NAMES == ['ALL']:
+        eeg_selected = eeg_data[:, :config.CAP_TYPE]  # Assume the first 32 channels are EEG (value stored in config.CAP_TYPE)
+    else:
+        # Identify indices for EEG channels based on configuration
+        eeg_indices = [channel_names.index(ch) for ch in config.EEG_CHANNEL_NAMES if ch in channel_names]
+        if not eeg_indices:
+            raise ValueError("No matching EEG channels found in the provided stream.")
+
+        # Extract EEG data
+        eeg_selected = eeg_data[:, eeg_indices]
+
+    # Handle EOG data based on toggle
+    if config.EOG_TOGGLE:
+        # Identify indices for EOG channels based on configuration
+        eog_indices = [channel_names.index(ch) for ch in config.EOG_CHANNEL_NAMES if ch in channel_names]
+        if not eog_indices:
+            print("Warning: No matching EOG channels found in the provided stream.")
+            eog_selected = None
+        else:
+            # Extract EOG data
+            eog_selected = eeg_data[:, eog_indices]
+    else:
+        eog_selected = None
+
+    return eeg_selected, eog_selected
+
+
+def extract_psd_features(eeg_data, fs=512, bands=[(0.5, 4), (4, 8), (8, 13), (13, 30), (30, 50)]):
+    """
+    Extract power spectral density (PSD) features for predefined frequency bands.
+
+    Parameters:
+        eeg_data (np.ndarray): 3D array of EEG data (n_samples x window_samples x n_channels).
+        fs (int): Sampling frequency of the EEG data in Hz.
+        bands (list): List of tuples defining frequency bands (low_freq, high_freq).
+
+    Returns:
+        np.ndarray: Feature matrix of shape (n_samples, n_bands * n_channels).
+    """
+    n_samples, window_samples, n_channels = eeg_data.shape
+    psd_features = []
+
+    for sample_idx in range(n_samples):
+        sample_features = []
+        for band in bands:
+            band_power = []
+            for channel in range(n_channels):
+                # Compute PSD using Welch's method
+                freqs, psd = welch(eeg_data[sample_idx, :, channel], fs=fs, nperseg=128)
+                
+                # Integrate power within the frequency band
+                band_power.append(np.sum(psd[(freqs >= band[0]) & (freqs <= band[1])]))
+            
+            sample_features.extend(band_power)
+        psd_features.append(sample_features)
+    
+    return np.array(psd_features)

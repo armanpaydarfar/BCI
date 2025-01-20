@@ -5,6 +5,7 @@ import sys
 import os
 from pathlib import Path
 import config
+import select
 
 dirP = os.path.abspath(os.getcwd())
 sys.path.append(dirP + '/STM_interface/1_packages/rehamoveLibrary')
@@ -36,10 +37,21 @@ def trigger_fes(channel_name, duration):
 
     print(f"Triggering FES on {channel_name} for {duration} seconds.")
     start_time = time.time()
-    while time.time() - start_time < duration:
-        FES_device.pulse(channel_name, current, pulse_width)
-        time.sleep(1 / FES_frequency)
 
+    while time.time() - start_time < duration:
+        # Check for UDP messages without blocking
+        cycle_time = time.time()
+        readable, _, _ = select.select([sock], [], [], 0)  # polling appreach with 0s timeout - minimal latency
+        if readable:
+            data, addr = sock.recvfrom(1024)
+            trigger = str(data.decode()).strip()
+            if trigger == "FES_STOP":
+                print("Received FES_STOP. Stopping stimulation.")
+                break
+
+        FES_device.pulse(channel_name, current, pulse_width)
+        time.sleep(max(0, (1 / FES_frequency) - (time.time() - cycle_time)))
+        #time.sleep(1/FES_frequency)
     print(f"Stimulation on {channel_name} completed. Returning to listening mode.")
 
 while True:

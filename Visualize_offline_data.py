@@ -6,12 +6,12 @@ import mne
 from matplotlib.cm import ScalarMappable # Add colorbar explicitly
 from matplotlib.colors import Normalize  # Add colorbar explicitly
 import matplotlib.pyplot as plt
-from Utils.preprocessing import apply_car_filter, apply_notch_filter, butter_bandpass_filter, extract_segments, flatten_segments, separate_classes, compute_grand_average
+from Utils.preprocessing import apply_car_filter, apply_notch_filter, butter_bandpass_filter, extract_segments, remove_eog_artifacts, separate_classes, compute_grand_average, parse_eeg_and_eog
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import welch
 import config
-
+from Utils.stream_utils import get_channel_names_from_xdf
 
 sampling_rate = config.FS  # Update this to the actual EEG sampling rate
 
@@ -28,25 +28,6 @@ def import_montage(montage_name):
     else:
         raise FileNotFoundError(f"Montage file not found at: {montage_path}")
     return montage
-
-
-def get_channel_names_from_xdf(eeg_stream):
-    """
-    Extract channel names from an EEG stream in a pyxdf file.
-
-    Parameters:
-        eeg_stream (dict): EEG stream from the loaded pyxdf file.
-
-    Returns:
-        list: A list of channel names.
-    """
-    if 'desc' in eeg_stream['info'] and 'channels' in eeg_stream['info']['desc'][0]:
-        channel_desc = eeg_stream['info']['desc'][0]['channels'][0]['channel']
-        channel_names = [channel['label'][0] for channel in channel_desc]
-        return channel_names
-    else:
-        raise ValueError("Channel names not found in EEG stream metadata.")
-
 
 
 
@@ -180,19 +161,33 @@ def plot_topo(grand_average, montage):
     Plot a topographic map using the grand average values.
 
     Parameters:
-        grand_average (np.ndarray): Grand average data of shape (n_channels,).
+        grand_average (np.ndarray): Grand average data of shape (n_selected_channels,).
         montage (mne.channels.DigMontage): The loaded montage object.
     """
+
+    # Get channel names from configuration
+    grand_average_ch_names = config.EEG_CHANNEL_NAMES
     # Get channel positions
     ch_positions = montage.get_positions()["ch_pos"]
-
-    # Ensure the number of channels matches the grand average
-    if len(ch_positions) != len(grand_average):
-        raise ValueError("Number of channels in the montage does not match the grand average.")
+    montage_ch_names = list(ch_positions.keys())
+    # Initialize an array for the updated grand average
+    updated_grand_average = np.zeros(len(montage_ch_names))
+    # Handle the "ALL" case
+    if grand_average_ch_names == ["ALL"]:
+        grand_average_ch_names = get_channel_names_from_xdf(eeg_stream)
+    # Map grand_average values to montage channels
+    for idx, ch_name in enumerate(montage_ch_names):
+        ch_name = ch_name.upper() # uppercase so schemes match
+        if ch_name in grand_average_ch_names:
+            try:
+                ga_idx = grand_average_ch_names.index(ch_name)
+                updated_grand_average[idx] = grand_average[ga_idx]
+            except ValueError:
+                updated_grand_average[idx] = 0.0  # Channel not in grand_average, set to 0
 
     # Prepare data for the topomap
-    pos = np.array([ch_positions[ch_name][:2] for ch_name in montage.ch_names])  # Extract (x, y) positions
-    data = grand_average  # Grand average values for each channel
+    pos = np.array([ch_positions[ch_name][:2] for ch_name in montage_ch_names])  # Extract (x, y) positions
+    data = updated_grand_average  # Grand average values for each channel
     # Plot the topomap
     fig, ax = plt.subplots(figsize=(8, 8))
     im, _ = mne.viz.plot_topomap(
@@ -200,12 +195,10 @@ def plot_topo(grand_average, montage):
         pos,
         axes=ax,
         show=False,
-        names=montage.ch_names,
+        names=montage_ch_names,
         contours=0,  # Disable contour lines
         cmap='coolwarm'
     )
-
-
 
     # Create a ScalarMappable to manually add a colorbar
     norm = Normalize(vmin=data.min(), vmax=data.max())
@@ -218,6 +211,7 @@ def plot_topo(grand_average, montage):
     fig.subplots_adjust(left=0.2, right=0.6, top=0.85, bottom=0.15)
     ax.set_title("Topographic Map (Grand Average)", fontsize=16)
     plt.show()
+
 
 def display_eeg_channel_names(eeg_stream):
     """
@@ -292,15 +286,17 @@ montage = import_montage('CA-209-dig.fif')
 
 
 # Extract EEG data and timestamps
-eeg_data = np.array(eeg_stream['time_series'])  # Shape: (N_samples, N_channels)
+#eeg_data = np.array(eeg_stream['time_series'])  # Shape: (N_samples, N_channels)
 eeg_timestamps = np.array(eeg_stream['time_stamps'])  # Shape: (N_samples,)
 
+eeg_data, eog_data = parse_eeg_and_eog(eeg_stream, channel_names)
+
+eeg_data = remove_eog_artifacts(eeg_data, eog_data) if config.EOG_TOGGLE == 1 else eeg_data
 
 #apply filtering schemes before segmenting dataset
 eeg_data = apply_notch_filter(eeg_data, sampling_rate)
-eeg_data = butter_bandpass_filter(eeg_data, 8, 30, sampling_rate, 4)
+eeg_data = butter_bandpass_filter(eeg_data, config.LOWCUT, config.HIGHCUT, sampling_rate, 4)
 eeg_data = apply_car_filter(eeg_data)
-
 
 
 # Extract marker data and timestamps

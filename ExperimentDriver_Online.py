@@ -9,10 +9,11 @@ import csv
 import pandas as pd
 from pylsl import StreamInlet, resolve_stream
 import numpy as np
-from Utils.preprocessing import butter_bandpass_filter, apply_car_filter, apply_notch_filter, flatten_single_segment
+from Utils.preprocessing import butter_bandpass_filter, apply_car_filter, apply_notch_filter, flatten_single_segment, extract_and_flatten_segment, parse_eeg_and_eog, remove_eog_artifacts
 from Utils.visualization import draw_arrow_fill, draw_ball_fill, draw_fixation_cross
 from Utils.experiment_utils import generate_trial_sequence, display_multiple_messages_with_udp
 from Utils.networking import send_udp_message
+from Utils.stream_utils import get_channel_names_from_lsl
 import config
 from sklearn.metrics import confusion_matrix
 
@@ -52,6 +53,144 @@ predictions_list = []
 ground_truth_list = []
 
 
+
+def show_feedback(duration=5, mode=0, inlet=None):
+    """
+    Displays feedback animation, collects EEG data, and performs real-time classification
+    using a sliding window approach with early stopping based on posterior probabilities.
+    """
+    start_time = time.time()
+    collected_data = []  # Store incoming EEG data
+    sliding_window = []  # Sliding window for real-time classification
+    step_size = 0.1  # Sliding window step size (seconds)
+    window_size = config.CLASSIFY_WINDOW / 1000  # Sliding window size (ms -> seconds)
+    window_size_samples = int(window_size * config.FS)
+    step_size_samples = int(step_size * config.FS)
+
+    all_probabilities = []  # Store probabilities for each classification
+    predictions = []  # Store predicted labels for each classification
+    min_predictions = config.MIN_PREDICTIONS  # Minimum number of classifications required
+    channel_names = get_channel_names_from_lsl()
+
+    # Send UDP triggers at the start and flush buffer
+    if mode == 0:  # Red Arrow Mode
+        send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], "200")
+        send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_GO") if FES_toggle == 1 else print("FES is disabled. Skipping interaction.")
+    else:  # Blue Ball Mode
+        send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], "100")
+
+    inlet.flush()  # Ensure fresh data collection
+
+    # Fonts for messages
+    small_font = pygame.font.SysFont(None, 48)
+    large_font = pygame.font.SysFont(None, 72)
+
+    # Animation and Data Collection Loop
+    clock = pygame.time.Clock()
+
+    running_avg_confidence = 0.1 # Start with an initial placeholder value for visual feedback; updated with real probabilities when available.
+    accumulated_confidence = 0.0  # Accumulate confidence before min_predictions
+
+    while time.time() - start_time < duration:
+        elapsed_time = time.time() - start_time
+        progress = elapsed_time / duration
+
+        # Collect EEG data continuously
+        new_data, _ = inlet.pull_chunk(timeout=0.01, max_samples=int(0.05 * config.FS))
+        if new_data:
+            collected_data.extend(new_data)
+            sliding_window.extend(new_data)
+
+        # If sliding window has enough data, classify
+        if len(sliding_window) >= window_size_samples:
+            # Extract the last `window_size_samples` for classification
+            # Ensure sliding_window is a NumPy array
+            sliding_window_np = np.array(sliding_window)
+            # Extract EEG and EOG data
+            sliding_data, sliding_eog = parse_eeg_and_eog({'time_series': sliding_window_np}, channel_names)
+            # Remove EOG artifacts if enabled
+            window_data = remove_eog_artifacts(sliding_data[-window_size_samples:], sliding_eog[-window_size_samples:]) if config.EOG_TOGGLE == 1 else sliding_data[-window_size_samples:]
+            # preprocess data before prediction
+            window_data = apply_notch_filter(window_data, config.FS)
+            window_data = butter_bandpass_filter(window_data, config.LOWCUT, config.HIGHCUT, fs=config.FS)
+            window_data = apply_car_filter(window_data)
+
+            # Pass the 3D array to flatten_single_segment
+            features = extract_and_flatten_segment(window_data, start_time=0, fs=config.FS, window_size_ms=config.CLASSIFY_WINDOW, offset_ms=config.CLASSIFICATION_OFFSET)
+
+            probabilities = model.predict_proba(features)[0]  # Get probabilities for each class
+            predicted_label = model.classes_[np.argmax(probabilities)]  # Get predicted label
+
+            predictions.append(predicted_label)
+            all_probabilities.append(probabilities)
+
+            # Calculate running average confidence for the target class
+            correct_class_idx = np.where(model.classes_ == (200 if mode == 0 else 100))[0][0]
+            accumulated_confidence += probabilities[correct_class_idx]
+            running_avg_confidence = accumulated_confidence / len(all_probabilities)
+            # Slide the window forward
+            sliding_window = sliding_window[step_size_samples:]
+            # Early stopping logic
+            if len(predictions) >= min_predictions:
+                if running_avg_confidence >= config.ACCURACY_THRESHOLD:
+                    print(f"Early stopping triggered! Confidence: {running_avg_confidence:.2f}")
+                    send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP") if FES_toggle == 1 else print("FES is disabled. Skipping interaction.")
+                    break
+
+        # Draw the animation and display appropriate text
+        screen.fill(config.black)
+
+        if mode == 0:  # Red Arrow Mode
+            # Adjust arrow fill based on probability
+            draw_arrow_fill(running_avg_confidence, screen_width, screen_height)
+            draw_ball_fill(0, screen_width, screen_height)
+            message = small_font.render("Imagine Right Arm Movement", True, config.white)
+        else:  # Blue Ball Mode
+            # Adjust ball fill based on probability
+            draw_ball_fill(running_avg_confidence, screen_width, screen_height)
+            draw_arrow_fill(0, screen_width, screen_height)
+            message = large_font.render("Rest", True, config.white)
+
+        # Center the text
+        screen.blit(
+            message,
+            (screen_width // 2 - message.get_width() // 2,
+             screen_height // 2)
+        )
+
+        pygame.display.flip()
+
+        # Check for quit events
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                return None
+
+        clock.tick(60)  # Limit frame rate to 60 FPS
+
+    # Calculate final statistics
+    correct_label = 200 if mode == 0 else 100
+    correct_class_idx = np.where(model.classes_ == correct_label)[0][0]
+
+    # Calculate final average confidence
+    avg_confidence = np.mean([probs[correct_class_idx] for probs in all_probabilities]) if all_probabilities else 0.0
+    print(f"Feedback Mode: {'Red Arrow (Right Arm Move)' if mode == 0 else 'Blue Ball (Rest)'}")
+    print(f"Number of Classifications: {len(predictions)}")
+    print(f"Final Average Confidence for Correct Class: {avg_confidence:.2f}")
+
+    # Determine the final decision
+    if avg_confidence >= config.ACCURACY_THRESHOLD:
+        final_class = correct_label
+    else:
+        final_class = 100 if mode == 0 else 200  # Opposite class
+
+    predictions_list.append(final_class)
+    ground_truth_list.append(correct_label)  # Add the true label
+
+    return final_class
+
+
+'''
 
 # Show feedback
 def show_feedback(duration=5, mode=0, inlet=None):
@@ -116,6 +255,7 @@ def show_feedback(duration=5, mode=0, inlet=None):
         clock.tick(60)  # Limit frame rate to 60 FPS
 
     predictions = classify_eeg(collected_data,step_size, model)
+    print(predictions)
     # Calculate performance
     correct_label = 200 if mode == 0 else 100
     accuracy = predictions.count(correct_label) / len(predictions) if predictions else 0.0
@@ -136,6 +276,7 @@ def show_feedback(duration=5, mode=0, inlet=None):
 
     
     return final_class
+'''
 
 # Classify EEG
 
@@ -177,11 +318,10 @@ def classify_eeg(collected_data, step_size, model):
             eeg_window = eeg_data[start_idx:start_idx + classify_window_samples]  # Shape: (window_samples, channels)
 
             # Flatten the window into a feature vector for classification
-            features = flatten_single_segment(eeg_window)  # Shape: (1, channels * window_samples)
+            features = extract_and_flatten_segment(eeg_window, start_time = 0, fs = config.FS,window_size_ms = config.CLASSIFY_WINDOW, offset_ms = config.CLASSIFICATION_OFFSET)  # Shape: (1, channels * window_samples)
 
             # Predict the class using the trained model
             prediction = model.predict(features)[0]
-
             # Append the prediction to the list
             predictions.append(prediction)
     else:
@@ -198,8 +338,13 @@ print("EEG data stream detected. Starting experiment...")
 trial_sequence = generate_trial_sequence(total_trials=config.TOTAL_TRIALS, max_repeats=config.MAX_REPEATS)
 current_trial = 0  # Track the current trial index
 
+channel_names = get_channel_names_from_lsl()
+print(f"channel names in stream {channel_names}")
+
 running = True
 clock = pygame.time.Clock()
+
+
 
 while running and current_trial < len(trial_sequence):
     # Initial fixation cross

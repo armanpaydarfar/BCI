@@ -3,7 +3,7 @@
     "FES_enabled": 1,
     "channels": {
         "red": {
-            "current_mA": 4.0,
+            "current_mA": 5.0,
             "pulse_width": 250.0,
             "duration": 5
         },

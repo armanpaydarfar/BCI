@@ -3,9 +3,10 @@ import pickle
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
 from sklearn.model_selection import KFold
 from sklearn.metrics import accuracy_score
-from Utils.preprocessing import butter_bandpass_filter, apply_car_filter, extract_segments, apply_notch_filter, flatten_segments
+from Utils.preprocessing import butter_bandpass_filter, apply_car_filter, extract_segments, apply_notch_filter, flatten_segments, remove_eog_artifacts, parse_eeg_and_eog, extract_psd_features
 from Utils.stream_utils import load_xdf
 import config
+from Utils.stream_utils import get_channel_names_from_xdf
 
 def train_model(segments, labels, n_splits=5):
     """
@@ -62,12 +63,16 @@ def main():
     eeg_timestamps = np.array(eeg_stream['time_stamps'])
     marker_timestamps = np.array(marker_stream['time_stamps'])
     marker_values = np.array([int(m[0]) for m in marker_stream['time_series']])
+    channel_names = get_channel_names_from_xdf(eeg_stream)
 
     # Apply pre-processing
 
+    eeg_data, eog_data = parse_eeg_and_eog(eeg_stream, channel_names)
+
+    eeg_data = remove_eog_artifacts(eeg_data, eog_data) if config.EOG_TOGGLE == 1 else eeg_data
+
     print("Applying Notch filter...")
     eeg_data = apply_notch_filter(eeg_data, config.FS)
-
 
     print("Applying Butterworth bandpass filter...")
     eeg_data = butter_bandpass_filter(eeg_data, config.LOWCUT, config.HIGHCUT, config.FS)
@@ -80,11 +85,11 @@ def main():
     segments, labels = extract_segments(
         eeg_data, eeg_timestamps, marker_timestamps, marker_values,config.CLASSIFY_WINDOW, config.FS
     )
+
     print(f"segment shape: {segments.shape}")
     segments = flatten_segments(segments)
     print(f"Flattening . . . new shape -> {segments.shape}")
 
- 
     # Print segment distribution
     unique_labels, counts = np.unique(labels, return_counts=True)
     print("Segment distribution:")

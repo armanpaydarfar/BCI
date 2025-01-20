@@ -20,8 +20,18 @@ UDP_FES = {
 # EEG Settings
 CAP_TYPE = 32
 LOWCUT = 8  # Hz
-HIGHCUT = 30  # Hz
+HIGHCUT = 12  # Hz
 FS = 512  # Sampling frequency (Hz)
+
+EEG_CHANNEL_NAMES = ['F7', 'F3', 'FZ', 'F4', 'F8', 'FC5', 'FC1', 'FC2', 'FC6', 'C3', 'CZ', 'C4', 
+                     'CP5', 'CP1', 'CP2', 'CP6', 'P7', 'P3', 'PZ', 'P4', 'P8', 'POZ'] # List of EEG channel names to use
+'''
+EEG_CHANNEL_NAMES = ['ALL']
+'''
+EOG_CHANNEL_NAMES = ['AUX1'] # List of EOG channel names to use
+EOG_TOGGLE = 1  # Toggle to enable or disable EOG processing (1 = enabled, 0 = disabled)
+
+
 
 # Experiment Parameters
 TOTAL_TRIALS = 30  # Total number of trials
@@ -34,9 +44,11 @@ TIME_STATIONARY = 2 # time for stationary feedback after no movement/failed move
 
 # Classification Parameters
 CLASSIFY_WINDOW = 1000  # Duration of EEG data window for classification (milliseconds)
-ACCURACY_THRESHOLD = 0.51  # Accuracy threshold to determine "Correct"
-
-
+ACCURACY_THRESHOLD = 0.5  # Accuracy threshold to determine "Correct"
+MIN_PREDICTIONS = 15 # Min number of predictions during Online experiment before the decoder can end early
+CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
+#CLASSIFICATION_SCHEME_OPT = "TIMESERIES"
+CLASSIFICATION_SCHEME_OPT = "FREQUENCY"
 
 # FES Parameters
 FES_toggle = 1
