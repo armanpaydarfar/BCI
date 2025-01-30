@@ -2,10 +2,9 @@ import socket
 from pylsl import StreamInfo, StreamOutlet, StreamInlet, resolve_stream, local_clock
 import threading
 import time
-
+import config
 # Define marker values to be sent
-possible_marker_values = [0, 100, 200]
-
+possible_marker_values = [int(value) for value in config.TRIGGERS.values()]
 print(f"Possible marker values: {possible_marker_values}")
 
 # Create LSL stream for markers

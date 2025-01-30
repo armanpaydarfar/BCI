@@ -40,12 +40,13 @@ N_SPLITS = 5  # Number of splits for KFold cross-validation
 TIME_MI = 5 # time for motor imagery and rest
 TIME_ROB = 13 # time allocated for robot to move
 TIME_STATIONARY = 2 # time for stationary feedback after no movement/failed movement trial
-
+TIMING = True
 
 # Classification Parameters
 CLASSIFY_WINDOW = 1000  # Duration of EEG data window for classification (milliseconds)
 ACCURACY_THRESHOLD = 0.5  # Accuracy threshold to determine "Correct"
-MIN_PREDICTIONS = 15 # Min number of predictions during Online experiment before the decoder can end early
+RELAXATION_RATIO = 1
+MIN_PREDICTIONS = 25 # Min number of predictions during Online experiment before the decoder can end early
 CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
 #CLASSIFICATION_SCHEME_OPT = "TIMESERIES"
 CLASSIFICATION_SCHEME_OPT = "FREQUENCY"
@@ -53,6 +54,8 @@ CLASSIFICATION_SCHEME_OPT = "FREQUENCY"
 # FES Parameters
 FES_toggle = 1
 FES_CHANNEL = "red"
+FES_TIMING_OFFSET = 4 
+# above for motor FES, cut out X seconds before the full duration of movement. This should represent when the robot will naturally reach the end of motion (in successful case)
 
 # Screen Dimensions
 SCREEN_WIDTH = 1800
@@ -68,3 +71,16 @@ blue = (0, 0, 255)
 red = (255, 0, 0)
 green = (0, 255, 0)
 
+# software triggers
+TRIGGERS = {
+    "MI_BEGIN": "200",
+    "MI_END": "220",
+    "MI_EARLYSTOP": "240",
+    "ROBOT_BEGIN": "300",
+    "ROBOT_END": "320",
+    "ROBOT_EARLYSTOP": "340",
+    "REST_BEGIN": "100",
+    "REST_END": "120",
+    "REST_EARLYSTOP": "140"
+    
+}

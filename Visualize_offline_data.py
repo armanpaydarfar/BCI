@@ -84,7 +84,7 @@ def compute_and_plot_psd(eeg_segmented, sampling_rate, channel_name, channel_nam
 
 def plot_markers_vs_time(marker_timestamps, marker_data):
     """
-    Plot markers versus time with different colors for different marker values.
+    Plot markers versus time with different colors for different marker value ranges.
 
     Parameters:
         marker_timestamps (np.ndarray): Array of marker timestamps.
@@ -94,18 +94,24 @@ def plot_markers_vs_time(marker_timestamps, marker_data):
     marker_timestamps = np.array(marker_timestamps)
     marker_data = np.array(marker_data)
     
-    # Separate markers based on their values
-    marker_100_times = marker_timestamps[marker_data == 100]
-    marker_200_times = marker_timestamps[marker_data == 200]
+    # Separate markers based on their value ranges
+    marker_100_times = marker_timestamps[(marker_data >= 100) & (marker_data < 200)]
+    marker_200_times = marker_timestamps[(marker_data >= 200) & (marker_data < 300)]
+    marker_300_times = marker_timestamps[(marker_data >= 300) & (marker_data < 400)]
+
+    marker_100_values = marker_data[(marker_data >= 100) & (marker_data < 200)]
+    marker_200_values = marker_data[(marker_data >= 200) & (marker_data < 300)]
+    marker_300_values = marker_data[(marker_data >= 300) & (marker_data < 400)]
 
     plt.figure(figsize=(10, 6))
-    plt.scatter(marker_100_times, [100] * len(marker_100_times), color='blue', label='Marker 100', alpha=0.7)
-    plt.scatter(marker_200_times, [200] * len(marker_200_times), color='red', label='Marker 200', alpha=0.7)
-    
+    plt.scatter(marker_100_times, marker_100_values, color='blue', label='100s Markers', alpha=0.7)
+    plt.scatter(marker_200_times, marker_200_values, color='red', label='200s Markers', alpha=0.7)
+    plt.scatter(marker_300_times, marker_300_values, color='green', label='300s Markers', alpha=0.7)
+
     plt.xlabel('Time (s)', fontsize=12)
     plt.ylabel('Marker Values', fontsize=12)
     plt.title('Markers vs Time', fontsize=14)
-    plt.ylim(0, 250)  # Set the y-axis range
+    plt.ylim(0, max(marker_data) + 50)  # Set the y-axis range dynamically
     plt.grid(True, linestyle='--', alpha=0.6)
     plt.legend()
     plt.tight_layout()
@@ -413,7 +419,6 @@ print("topo plot 200 Shape:", GA_timeseries_200.shape)
 plot_topo(Topo_GA_100, montage)
 
 plot_topo(Topo_GA_200, montage)
-
 
 plot_markers_vs_time(marker_timestamps, marker_data)
 

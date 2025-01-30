@@ -1,7 +1,31 @@
 import pygame
+import numpy as np
+import random
+
+
+class LeakyIntegrator:
+    def __init__(self, alpha=0.95):
+        """
+        Initializes the leaky integrator.
+        
+        :param alpha: Leak factor (0 < alpha < 1), where higher values retain past values longer.
+        """
+        self.alpha = alpha
+        self.accumulated_probability = 0.0  # Initial probability
+
+    def update(self, new_probability):
+        """
+        Updates the accumulated probability using a leaky integration method.
+
+        :param new_probability: The new probability input from the classifier.
+        :return: The updated accumulated probability.
+        """
+        self.accumulated_probability = self.alpha * self.accumulated_probability + (1 - self.alpha) * new_probability
+        return self.accumulated_probability
+
+
 
 def generate_trial_sequence(total_trials=30, max_repeats=3):
-    import random
     trials = [0] * (total_trials // 2) + [1] * (total_trials // 2)
     random.shuffle(trials)
     fixed_trials = []
@@ -12,6 +36,8 @@ def generate_trial_sequence(total_trials=30, max_repeats=3):
             trial = alternatives[0]
         fixed_trials.append(trial)
     return fixed_trials
+
+
 
 def display_multiple_messages_with_udp(messages, colors, offsets, duration=13, udp_messages=None, udp_socket=None, udp_ip=None, udp_port=None):
     font = pygame.font.SysFont(None, 72)

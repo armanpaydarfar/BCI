@@ -3,19 +3,25 @@
     "FES_enabled": 1,
     "channels": {
         "red": {
-            "current_mA": 5.0,
             "pulse_width": 250.0,
-            "duration": 5
+            "Sensory_current_mA": 2.5,
+            "Motor_current_mA": 3.5,
+            "duration_sense": 5,
+            "duration_Motor": 9
         },
         "blue": {
-            "current_mA": 0.0,
             "pulse_width": 250.0,
-            "duration": 5
+            "Sensory_current_mA": 0.0,
+            "Motor_current_mA": 0.0,
+            "duration_sense": 5,
+            "duration_Motor": 9
         },
         "black": {
-            "current_mA": 0.0,
             "pulse_width": 250.0,
-            "duration": 5
+            "Sensory_current_mA": 0.0,
+            "Motor_current_mA": 0.0,
+            "duration_sense": 5,
+            "duration_Motor": 9
         }
     }
 }

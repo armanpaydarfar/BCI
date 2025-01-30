@@ -25,14 +25,15 @@ UDP_PORT = config.UDP_FES["PORT"]       # Use the same port as in your EEG scrip
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((UDP_IP, UDP_PORT))
 
-def trigger_fes(channel_name, duration):
+def trigger_fes(channel_name, mode = 'SENSORY'):
     """Trigger FES for a specific channel and duration."""
     channel_config = fes_config["channels"].get(channel_name, {})
     if not channel_config:
         print(f"No configuration found for channel: {channel_name}")
         return
 
-    current = channel_config["current_mA"]
+    current = channel_config["Sensory_current_mA"] if mode == 'SENSORY' else channel_config["Motor_current_mA"] #utilize sensory threshold or motor threshold depending on mode
+    duration = channel_config["duration_sense"] if mode == 'SENSORY' else channel_config["duration_Motor"] # utilize MI/rest duration or robot movement duration
     pulse_width = int(channel_config["pulse_width"])  # Ensure pulse_width is an integer
 
     print(f"Triggering FES on {channel_name} for {duration} seconds.")
@@ -62,10 +63,12 @@ while True:
     if trigger == "ping":  # Respond to ping
         print("Received ping. Listener is active.")
         sock.sendto(b"pong", addr)  # Reply with a pong
-    elif trigger == "FES_GO":  # Red arrow trigger
+    elif trigger == "FES_SENS_GO":  # Red arrow trigger
         channel = config.FES_CHANNEL
-        duration = fes_config["channels"][channel]["duration"]
-        trigger_fes(channel, duration)
+        trigger_fes(channel, mode = 'SENSORY')
+    elif trigger == "FES_MOTOR_GO":
+        channel = config.FES_CHANNEL
+        trigger_fes(channel, mode = "MOTOR")
     else:
         print(f"Received unrecognized trigger: {trigger}")
 
