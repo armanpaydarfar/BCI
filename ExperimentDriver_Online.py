@@ -87,12 +87,71 @@ def display_fixation_period(duration=3):
 
         clock.tick(60)  # Maintain 60 FPS
 
+# Interpolation function to compute fill amount between SHAPE_MIN and SHAPE_MAX
+def interpolate_fill(value):
+    return max(0, min(1, (value - config.SHAPE_MIN) / (config.SHAPE_MAX - config.SHAPE_MIN)))
+
+def calculate_fill_levels(running_avg_confidence, mode):
+    """
+    Determines the fill levels for both MI (arrow) and Rest (ball) based on accumulated probability.
+
+    Parameters:
+        running_avg_confidence (float): The leaky-integrated probability estimate.
+        mode (int): 0 for MI trial (fill square), 1 for Rest trial (fill ball).
+
+    Returns:
+        tuple: (fill_arrow, fill_ball) - Values between 0 and 1 indicating fill levels.
+    """
+    # Ensure probability stays within configured bounds
+    prob = max(0, min(1, running_avg_confidence))
+    prob_inverse = 1 - prob  # Inverse probability for the other shape
 
 
+    # Determine fill levels
+    fill_mi = interpolate_fill(prob) if prob >= config.SHAPE_MIN else 0  # MI shape fills when prob > SHAPE_MIN
+    fill_rest = interpolate_fill(prob_inverse) if prob_inverse >= config.SHAPE_MIN else 0  # Rest shape fills when 1-prob > SHAPE_MIN
+
+    # Swap roles if in Rest mode
+    if mode == 1:
+        return fill_rest, fill_mi  # Flip values for Rest condition
+    return fill_mi, fill_rest  # Default for MI mode
 
 
+def handle_fes_activation(mode, running_avg_confidence, fes_active):
+    """
+    Manages the activation of sensory FES based on the running average probability.
 
-def classify_real_time(inlet, window_size_samples, step_size_samples, all_probabilities, predictions, data_buffer, mode):
+    Parameters:
+        mode (int): 0 for MI (Motor Imagery), 1 for Rest.
+        running_avg_confidence (float): Current probability estimate.
+        fes_active (bool): Current state of FES (True if active, False if inactive).
+
+    Returns:
+        bool: Updated FES state after processing.
+    """
+    # Determine if FES should be active:
+    # - If mode is MI (0) and confidence > 50% → Turn on FES
+    # - If mode is Rest (1) and confidence < 50% → Turn on FES
+    fes_should_be_active = (mode == 0 and running_avg_confidence > 0.5) or \
+                           (mode == 1 and running_avg_confidence < 0.5)
+
+    # If FES should be ON but is currently OFF → Activate
+    if fes_should_be_active and not fes_active:
+        send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_SENS_GO") if FES_toggle == 1 else print("FES is disabled.")
+        print("Sensory FES activated.")
+        return True  # FES is now active
+
+    # If FES should be OFF but is currently ON → Deactivate
+    elif not fes_should_be_active and fes_active:
+        send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP") if FES_toggle == 1 else print("FES is disabled.")
+        print("Sensory FES stopped.")
+        return False  # FES is now inactive
+
+    # No change in state, return the existing value
+    return fes_active
+
+
+def classify_real_time(inlet, window_size_samples, step_size_samples, all_probabilities, predictions, data_buffer, mode, leaky_integrator):
     """
     Reads EEG data, applies preprocessing, extracts features, and classifies using a trained model.
     Maintains a sliding window approach with step_size shifting.
@@ -115,7 +174,7 @@ def classify_real_time(inlet, window_size_samples, step_size_samples, all_probab
         # Ensure there are enough samples before proceeding
         if len(data_buffer) < window_size_samples:
             #print(f"Warning: Not enough samples for classification ({len(data_buffer)} samples). Skipping.")
-            return 0.0, predictions, all_probabilities, data_buffer  # Return 0.0 for no confidence update
+            return leaky_integrator.accumulated_probability, predictions, all_probabilities, data_buffer  # Return 0.0 for no confidence update
 
         # Keep only the latest `window_size_samples` for classification
         sliding_window_np = np.array(data_buffer[-window_size_samples:])
@@ -137,7 +196,7 @@ def classify_real_time(inlet, window_size_samples, step_size_samples, all_probab
 
         predictions.append(predicted_label)
         all_probabilities.append(probabilities)
-
+        
         # **Dynamically determine the correct class based on mode**
         correct_label = 200 if mode == 0 else 100  # 200 = Right Arm MI, 100 = Rest
         correct_class_idx = np.where(model.classes_ == correct_label)[0][0]
@@ -150,7 +209,7 @@ def classify_real_time(inlet, window_size_samples, step_size_samples, all_probab
 
         return current_confidence, predictions, all_probabilities, data_buffer
 
-    return 0.0, predictions, all_probabilities, data_buffer  # Default return when no data
+    return leaky_integrator.accumulated_probability, predictions, all_probabilities, data_buffer  # Default return when no data
 
 def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode, udp_socket, udp_ip, udp_port,
                                data_buffer, leaky_integrator):
@@ -210,7 +269,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
 
         # Perform classification
         current_confidence, predictions, all_probabilities, data_buffer = classify_real_time(
-            inlet, window_size_samples, step_size_samples, [], [], data_buffer, mode
+            inlet, window_size_samples, step_size_samples, [], [], data_buffer, mode,leaky_integrator
         )
 
         # If a prediction was made, increase the counter
@@ -260,11 +319,11 @@ def show_feedback(duration=5, mode=0, inlet=None):
     window_size = config.CLASSIFY_WINDOW / 1000  # Convert ms to seconds
     window_size_samples = int(window_size * config.FS)
     step_size_samples = int(step_size * config.FS)
-
+    FES_active = False
     all_probabilities = []
     predictions = []
     data_buffer = []  # Buffer for EEG data
-    leaky_integrator = LeakyIntegrator(alpha=0.9)  # Confidence smoothing
+    leaky_integrator = LeakyIntegrator(alpha=0.95)  # Confidence smoothing
     min_predictions = config.MIN_PREDICTIONS
     # Define the correct class based on mode
     correct_class = 200 if mode == 0 else 100  # 200 = Right Arm MI, 100 = Rest
@@ -273,23 +332,47 @@ def show_feedback(duration=5, mode=0, inlet=None):
     if mode == 0:  # Red Arrow Mode (Motor Imagery)
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_BEGIN"])
         send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_SENS_GO") if FES_toggle == 1 else print("FES is disabled.")
+        FES_active = True if FES_toggle == 1 else print("FES tracking N/A")
     else:  # Blue Ball Mode (Rest)
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["REST_BEGIN"])
 
     inlet.flush()
 
     clock = pygame.time.Clock()
-    running_avg_confidence = 0.0  # Initial placeholder
+    running_avg_confidence = 0.5  # Initial placeholder
+    
 
     while time.time() - start_time < duration:
         # Perform classification
         current_confidence, predictions, all_probabilities, data_buffer = classify_real_time(
-            inlet, window_size_samples, step_size_samples, all_probabilities, predictions, data_buffer, mode
+            inlet, window_size_samples, step_size_samples, all_probabilities, predictions, data_buffer, mode, leaky_integrator
         )
-
+        
         # Update leaky integrator confidence
         running_avg_confidence = leaky_integrator.update(current_confidence)
-
+        FES_toggle == 1 and (FES_active := handle_fes_activation(mode, running_avg_confidence, FES_active))
+        # Draw animation
+        screen.fill(config.black)
+        draw_time_balls(2000, next_trial_mode, screen_width, screen_height, ball_radius=30)
+        if mode == 0:
+            MI_fill, Rest_fill = calculate_fill_levels(running_avg_confidence, mode)
+            draw_arrow_fill(MI_fill, screen_width, screen_height)
+            draw_fixation_cross(screen_width, screen_height)
+            draw_ball_fill(Rest_fill, screen_width, screen_height)
+            message = pygame.font.SysFont(None, 48).render("Imagine Right Arm Movement", True, config.white)
+        else:
+            MI_fill, Rest_fill = calculate_fill_levels(running_avg_confidence, mode)
+            draw_ball_fill(Rest_fill, screen_width, screen_height)
+            draw_fixation_cross(screen_width, screen_height)
+            draw_arrow_fill(MI_fill, screen_width, screen_height)
+            message = pygame.font.SysFont(None, 72).render("Rest", True, config.white)
+        
+        #print(f"MI fill: {MI_fill:.2f}")
+        #print(f"REST fill: {Rest_fill:.2f}")
+        #print(f"current Confidence: {running_avg_confidence:.2f}")
+        
+        screen.blit(message, (screen_width // 2 - message.get_width() // 2, screen_height // 2 + 150))
+        pygame.display.flip()
         # Early stopping
         if len(predictions) >= min_predictions and running_avg_confidence >= config.ACCURACY_THRESHOLD:
             print(f"Early stopping triggered! Confidence: {running_avg_confidence:.2f}")
@@ -300,23 +383,6 @@ def show_feedback(duration=5, mode=0, inlet=None):
                 send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["REST_EARLYSTOP"])
 
             break
-
-        # Draw animation
-        screen.fill(config.black)
-        draw_time_balls(2000, next_trial_mode, screen_width, screen_height, ball_radius=30)
-        if mode == 0:
-            draw_arrow_fill(running_avg_confidence, screen_width, screen_height)
-            draw_fixation_cross(screen_width, screen_height)
-            draw_ball_fill(0, screen_width, screen_height)
-            message = pygame.font.SysFont(None, 48).render("Imagine Right Arm Movement", True, config.white)
-        else:
-            draw_ball_fill(running_avg_confidence, screen_width, screen_height)
-            draw_fixation_cross(screen_width, screen_height)
-            draw_arrow_fill(0, screen_width, screen_height)
-            message = pygame.font.SysFont(None, 72).render("Rest", True, config.white)
-
-        screen.blit(message, (screen_width // 2 - message.get_width() // 2, screen_height // 2 + 150))
-        pygame.display.flip()
 
         # Check for quit events
         for event in pygame.event.get():
@@ -329,7 +395,8 @@ def show_feedback(duration=5, mode=0, inlet=None):
     # Final Decision: Return correct or incorrect class based on confidence
     final_class = correct_class if running_avg_confidence >= config.ACCURACY_THRESHOLD else incorrect_class
 
-    print(f"Final decision: {final_class} (Confidence for correct class: {running_avg_confidence:.2f})")
+    print(f"Final decision: {final_class}, Confidence for correct({correct_class}) class: {running_avg_confidence:.2f}) at sample size {len(predictions)}")
+    send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP") if FES_toggle == 1 and FES_active ==True else print("FES disable not needed")
 
     return final_class, leaky_integrator, data_buffer
 

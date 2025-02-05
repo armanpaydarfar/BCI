@@ -1,8 +1,7 @@
 import pygame
 import config
 
-import pygame
-import config
+
 def draw_time_balls(elapsed_time, next_trial_mode, screen_width, screen_height, ball_radius=30, mode="single"):
     """
     Draw a time indicator ball. Supports two modes:
@@ -75,13 +74,20 @@ def draw_arrow_fill(progress, screen_width, screen_height, show_threshold=True):
 
     # Draw success threshold line if enabled
     if show_threshold:
-        threshold_x = bar_x - bar_length // 2 + int(config.ACCURACY_THRESHOLD * bar_length)
+        # Scale accuracy threshold within the shape boundaries
+        scaled_threshold = (config.ACCURACY_THRESHOLD - config.SHAPE_MIN) / (config.SHAPE_MAX - config.SHAPE_MIN)
+        scaled_threshold = max(0, min(1, scaled_threshold))  # Keep within [0,1] range
+
+        # Compute threshold bar position using scaled threshold
+        threshold_x = bar_x - bar_length // 2 + int(scaled_threshold * bar_length)
+
         for i in range(0, bar_width, 10):
             pygame.draw.line(
                 pygame.display.get_surface(), (255, 0, 0),
                 (threshold_x, bar_y - bar_width // 2 + i),
                 (threshold_x, bar_y - bar_width // 2 + i + 5), 2
             )
+
 
 def draw_ball_fill(progress, screen_width, screen_height, show_threshold=True):
     ball_radius = 120
@@ -99,12 +105,18 @@ def draw_ball_fill(progress, screen_width, screen_height, show_threshold=True):
 
     # Draw success threshold line if enabled
     if show_threshold:
-        threshold_y = ball_y + ball_radius - int(config.ACCURACY_THRESHOLD * (ball_radius * 2))
-        for i in range(0, ball_radius * 2, 10):
-            pygame.draw.line(pygame.display.get_surface(), (0, 0, 255), 
-                             (ball_x - ball_radius + i, threshold_y), 
-                             (ball_x - ball_radius + i + 5, threshold_y), 2)
+        # Scale accuracy threshold within the shape boundaries
+        scaled_threshold = (config.ACCURACY_THRESHOLD - config.SHAPE_MIN) / (config.SHAPE_MAX - config.SHAPE_MIN)
+        scaled_threshold = max(0, min(1, scaled_threshold))  # Keep within [0,1] range
 
+        # Compute threshold position using scaled threshold
+        threshold_y = ball_y + ball_radius - int(scaled_threshold * (ball_radius * 2))
+
+        for i in range(0, ball_radius * 2, 10):
+            pygame.draw.line(
+                pygame.display.get_surface(), (0, 0, 255), 
+                (ball_x - ball_radius + i, threshold_y), 
+                (ball_x - ball_radius + i + 5, threshold_y), 2)
 
 def draw_fixation_cross(screen_width, screen_height):
     cross_length = 40

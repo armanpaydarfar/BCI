@@ -41,12 +41,15 @@ TIME_MI = 5 # time for motor imagery and rest
 TIME_ROB = 13 # time allocated for robot to move
 TIME_STATIONARY = 2 # time for stationary feedback after no movement/failed movement trial
 TIMING = True
+SHAPE_MAX = 0.9 #maximum fill 
+SHAPE_MIN = 0.5 #minimum fill 
+
 
 # Classification Parameters
 CLASSIFY_WINDOW = 1000  # Duration of EEG data window for classification (milliseconds)
-ACCURACY_THRESHOLD = 0.5  # Accuracy threshold to determine "Correct"
-RELAXATION_RATIO = 1
-MIN_PREDICTIONS = 25 # Min number of predictions during Online experiment before the decoder can end early
+ACCURACY_THRESHOLD = 0.7  # Accuracy threshold to determine "Correct"
+RELAXATION_RATIO = 0.8
+MIN_PREDICTIONS = 45 # Min number of predictions during Online experiment before the decoder can end early
 CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
 #CLASSIFICATION_SCHEME_OPT = "TIMESERIES"
 CLASSIFICATION_SCHEME_OPT = "FREQUENCY"
@@ -79,6 +82,7 @@ TRIGGERS = {
     "ROBOT_BEGIN": "300",
     "ROBOT_END": "320",
     "ROBOT_EARLYSTOP": "340",
+    "ROBOT_CONFIRM_STOP": "345",
     "REST_BEGIN": "100",
     "REST_END": "120",
     "REST_EARLYSTOP": "140"

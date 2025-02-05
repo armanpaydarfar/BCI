@@ -11,7 +11,7 @@ class LeakyIntegrator:
         :param alpha: Leak factor (0 < alpha < 1), where higher values retain past values longer.
         """
         self.alpha = alpha
-        self.accumulated_probability = 0.0  # Initial probability
+        self.accumulated_probability = 0.5  # Initial probability
 
     def update(self, new_probability):
         """
