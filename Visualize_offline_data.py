@@ -158,6 +158,7 @@ def plot_channel_timeseries(grand_avg_data, channel_name, channel_names, samplin
     plt.ylabel('Amplitude (μV)', fontsize=14)
     plt.title(f'Grand Averaged Timeseries for {channel_name}', fontsize=16)
     plt.grid(True, linestyle='--', alpha=0.6)
+    plt.ylim(-10,10)
     plt.legend(fontsize=12)
     plt.tight_layout()
     plt.show()
@@ -213,7 +214,7 @@ def plot_topo(grand_average, montage):
 
     # Add the colorbar to the figure
     cbar = fig.colorbar(sm, ax=ax, orientation="vertical", fraction=0.046, pad=0.04)
-    cbar.set_label("Grand Average (uV)", fontsize=12)
+    cbar.set_label("Grand Average Power(uV^2)", fontsize=12)
     fig.subplots_adjust(left=0.2, right=0.6, top=0.85, bottom=0.15)
     ax.set_title("Topographic Map (Grand Average)", fontsize=16)
     plt.show()
@@ -236,10 +237,10 @@ def display_eeg_channel_names(eeg_stream):
         print("Channel names not found in EEG stream metadata.")
 
 # Directory containing XDF files
-xdf_dir = '/home/arman-admin/Documents/CurrentStudy/sub-P001/ses-S001/eeg'
+xdf_dir = '/home/arman-admin/Documents/CurrentStudy/sub-PILOT007/ses-S001/eeg'
 
 # Specify the XDF file
-xdf_files = ['sub-P001_ses-S001_task-Default_run-001_eeg.xdf']
+xdf_files = ['sub-PILOT007_ses-S001_task-Default_run-001OFFLINE_eeg.xdf']
 
 #xdf_files = config.DATA_FILE_PATH
 
@@ -292,18 +293,18 @@ montage = import_montage('CA-209-dig.fif')
 
 
 # Extract EEG data and timestamps
-#eeg_data = np.array(eeg_stream['time_series'])  # Shape: (N_samples, N_channels)
 eeg_timestamps = np.array(eeg_stream['time_stamps'])  # Shape: (N_samples,)
 
-eeg_data, eog_data = parse_eeg_and_eog(eeg_stream, channel_names)
+#eeg_data, eog_data = parse_eeg_and_eog(eeg_stream, channel_names)
+eeg_data = np.array(eeg_stream['time_series'])  # Shape: (N_samples, N_channels)
 
 eeg_data = remove_eog_artifacts(eeg_data, eog_data) if config.EOG_TOGGLE == 1 else eeg_data
 
 #apply filtering schemes before segmenting dataset
 eeg_data = apply_notch_filter(eeg_data, sampling_rate)
-eeg_data = butter_bandpass_filter(eeg_data, config.LOWCUT, config.HIGHCUT, sampling_rate, 4)
-eeg_data = apply_car_filter(eeg_data)
-
+eeg_data = butter_bandpass_filter(eeg_data, 8, 16, sampling_rate, 2)
+#eeg_data = apply_car_filter(eeg_data)
+#eeg_data = mne.preprocessing.compute_current_source_density(eeg_data, stiffness = 2)
 
 # Extract marker data and timestamps
 marker_data = np.array([int(value[0]) for value in marker_stream['time_series']])  # Flatten marker values
@@ -325,10 +326,11 @@ segmented = segment_data(
 '''
 # Extract segments based on markers
 print("Extracting EEG segments for timeseries view...")
-timeseries_view_offset = -200
+timeseries_view_offset = -500
 segments, labels = extract_segments(
-    eeg_data, eeg_timestamps, marker_timestamps, marker_data,window_size_ms=1000, fs= config.FS, offset_ms=timeseries_view_offset
+    eeg_data, eeg_timestamps, marker_timestamps, marker_data,window_size_ms=5000, fs= config.FS, offset_ms=timeseries_view_offset
 )
+#print(f"segment raw{segments.shape}")
 #segments = flatten_segments(segments)
 class_1, class_2 = separate_classes(segments, labels)
 
@@ -363,18 +365,20 @@ print("GA trials 100 Shape:", GA_timeseries_100.shape)
 print("GA trials 200 Shape:", GA_timeseries_200.shape)
 
 
-
+trial_num = 30
+#grand_avg_data=data_100[:,:,trial_num]
+#grand_avg_data=data_200[:,:,trial_num]
 plot_channel_timeseries(
-    grand_avg_data=GA_timeseries_100,          # Grand averaged data for marker 100
-    channel_name='FZ',                    # Plot for the channel 'Cz'
+    grand_avg_data=data_100[:,:,trial_num],          # Grand averaged data for marker 100
+    channel_name='CP2',                    # Plot for the channel 'Cz'
     channel_names=channel_names,          # List of channel names
     sampling_rate=sampling_rate,                    # EEG sampling rate in Hz
     time_offset=timeseries_view_offset                # 200 ms pre-marker time
 )
 
 plot_channel_timeseries(
-    grand_avg_data=GA_timeseries_200,          # Grand averaged data for marker 100
-    channel_name='FZ',                    # Plot for the channel 'Cz'
+    grand_avg_data=data_200[:,:,trial_num],          # Grand averaged data for marker 100
+    channel_name='CP2',                    # Plot for the channel 'Cz'
     channel_names=channel_names,          # List of channel names
     sampling_rate=sampling_rate,                    # EEG sampling rate in Hz
     time_offset=timeseries_view_offset                # 200 ms pre-marker time
@@ -383,9 +387,10 @@ plot_channel_timeseries(
 
 
 # Extract segments based on markers
+'''
 print("Extracting EEG segments for topo plots...")
 segments, labels = extract_segments(
-    eeg_data, eeg_timestamps, marker_timestamps, marker_data,window_size_ms=500, fs = config.FS, offset_ms=200
+    eeg_data, eeg_timestamps, marker_timestamps, marker_data,window_size_ms=1000, fs = config.FS, offset_ms=1000
 )
 #segments = flatten_segments(segments)
 class_1, class_2 = separate_classes(segments, labels)
@@ -394,25 +399,25 @@ class_1, class_2 = separate_classes(segments, labels)
 # Assuming 'segmented' is the returned dictionary from the seperate_classes function
 data_100 = class_1["data"]  # Access data for marker 100
 data_200 = class_2["data"]  # Access data for marker 200
-
+'''
 
 # Compute grand average in the range 100 ms to 500 ms
 Topo_GA_100 = compute_grand_average(
-    data=data_100,
+    data=data_100**2,
     sampling_rate=sampling_rate,
     mode="trials_and_timepoints"  # Or "trials"
 )
 
 # Compute grand average in the range 100 ms to 500 ms
 Topo_GA_200 = compute_grand_average(
-    data=data_200,
+    data=data_200**2,
     sampling_rate=sampling_rate,
     mode="trials_and_timepoints"  # Or "trials"
 )
 
 
-print("topo plot 100 Shape:", GA_timeseries_100.shape)
-print("topo plot 200 Shape:", GA_timeseries_200.shape)
+print("topo plot 100 Shape:", Topo_GA_100.shape)
+print("topo plot 200 Shape:", Topo_GA_200.shape)
 
 
 
@@ -426,7 +431,7 @@ plot_markers_vs_time(marker_timestamps, marker_data)
 compute_and_plot_psd(
     eeg_segmented=data_100,  # Replace with your segmented data for marker 100
     sampling_rate=sampling_rate,                    # Replace with your actual sampling rate
-    channel_name="FZ",                    # Replace with your desired channel (e.g., "Cz")
+    channel_name="FC2",                    # Replace with your desired channel (e.g., "Cz")
     channel_names=channel_names,          # Replace with the list of all channel names from your dataset
     nperseg=128                           # Replace with your desired segment length for Welch's method
 )
@@ -435,7 +440,7 @@ compute_and_plot_psd(
 compute_and_plot_psd(
     eeg_segmented=data_200,  # Replace with your segmented data for marker 100
     sampling_rate=sampling_rate,                    # Replace with your actual sampling rate
-    channel_name="FZ",                    # Replace with your desired channel (e.g., "Cz")
+    channel_name="FC2",                    # Replace with your desired channel (e.g., "Cz")
     channel_names=channel_names,          # Replace with the list of all channel names from your dataset
     nperseg=128                           # Replace with your desired segment length for Welch's method
 )

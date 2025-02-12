@@ -323,7 +323,7 @@ def show_feedback(duration=5, mode=0, inlet=None):
     all_probabilities = []
     predictions = []
     data_buffer = []  # Buffer for EEG data
-    leaky_integrator = LeakyIntegrator(alpha=0.95)  # Confidence smoothing
+    leaky_integrator = LeakyIntegrator(alpha=0.96)  # Confidence smoothing
     min_predictions = config.MIN_PREDICTIONS
     # Define the correct class based on mode
     correct_class = 200 if mode == 0 else 100  # 200 = Right Arm MI, 100 = Rest
