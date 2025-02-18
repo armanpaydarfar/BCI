@@ -47,9 +47,9 @@ SHAPE_MIN = 0.5 #minimum fill
 
 # Classification Parameters
 CLASSIFY_WINDOW = 500  # Duration of EEG data window for classification (milliseconds)
-ACCURACY_THRESHOLD = 0.55  # Accuracy threshold to determine "Correct"
-RELAXATION_RATIO = 0.8
-MIN_PREDICTIONS = 45 # Min number of predictions during Online experiment before the decoder can end early
+ACCURACY_THRESHOLD = 0.53  # Accuracy threshold to determine "Correct"
+RELAXATION_RATIO = 0.75
+MIN_PREDICTIONS = 20 # Min number of predictions during Online experiment before the decoder can end early
 CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
 #CLASSIFICATION_SCHEME_OPT = "TIMESERIES"
 CLASSIFICATION_SCHEME_OPT = "FREQUENCY"
@@ -57,7 +57,7 @@ SURFACE_LAPLACIAN_TOGGLE = 1 #apply the surface laplacian spatial filter
 
 
 # FES Parameters
-FES_toggle = 1
+FES_toggle = 0
 FES_CHANNEL = "red"
 FES_TIMING_OFFSET = 4 
 # above for motor FES, cut out X seconds before the full duration of movement. This should represent when the robot will naturally reach the end of motion (in successful case)
@@ -65,6 +65,11 @@ FES_TIMING_OFFSET = 4
 # Screen Dimensions
 SCREEN_WIDTH = 3840
 SCREEN_HEIGHT = 2160
+
+#SCREEN_WIDTH = 1200
+#SCREEN_HEIGHT = 800
+
+
 
 # LDA Model Path
 MODEL_PATH = "/home/arman-admin/Projects/Harmony/Reiman_eeg_model.pkl"

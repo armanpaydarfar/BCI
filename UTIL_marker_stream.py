@@ -1,7 +1,7 @@
 import socket
 import threading
 import time
-import queue  # ✅ Import queue for ordered processing
+import queue  # Import queue for ordered processing
 from pylsl import StreamInfo, StreamOutlet, StreamInlet, resolve_stream, local_clock
 import config  # Import configuration file
 
@@ -13,7 +13,7 @@ print(f"Possible marker values: {possible_marker_values}")
 info = StreamInfo('MarkerStream', 'Markers', 2, 0, 'float32', 'marker_stream_id')  # Sending marker and timestamp as a 2-element sample
 outlet = StreamOutlet(info)
 
-# ✅ Queue to store UDP messages in FIFO order
+# Queue to store UDP messages in FIFO order
 message_queue = queue.Queue()
 
 def get_eeg_inlet():
@@ -79,7 +79,7 @@ def udp_listener(udp_port):
                 print(f"Received ACK message: {message} from {addr}")
                 continue  # Skip further processing
 
-            # ✅ Add UDP message to the processing queue
+            # Add UDP message to the processing queue
             message_queue.put((message, udp_received_time, addr))
 
         except ValueError:
@@ -111,7 +111,7 @@ def process_udp_messages(eeg_inlet):
         except ValueError:
             print(f"Invalid UDP message format: {message}")
 
-        message_queue.task_done()  # ✅ Mark task as done
+        message_queue.task_done()  # Mark task as done
 
 def handle_udp_requests(eeg_inlet):
     """
@@ -123,11 +123,11 @@ def handle_udp_requests(eeg_inlet):
     local_port = config.UDP_MARKER["PORT"]  # Get local UDP port
     robot_port = config.UDP_ROBOT["PORT"]  # Get robot UDP port
 
-    # ✅ Start UDP listener threads (Only Collects Messages)
+    # Start UDP listener threads (Only Collects Messages)
     threading.Thread(target=udp_listener, args=(local_port,), daemon=True).start()
     threading.Thread(target=udp_listener, args=(robot_port,), daemon=True).start()
     
-    # ✅ Start Single Processing Thread to Ensure Ordered Execution
+    # Start Single Processing Thread to Ensure Ordered Execution
     threading.Thread(target=process_udp_messages, args=(eeg_inlet,), daemon=True).start()
 
     print(f"UDP servers started for local (port {local_port}) and robot (port {robot_port}).")

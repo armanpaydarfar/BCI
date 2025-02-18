@@ -8,8 +8,8 @@ from pyriemann.estimation import Shrinkage
 from pyriemann.classification import MDM
 from pyriemann.estimation import Covariances
 import config
-
-
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
 from Utils.stream_utils import load_xdf, get_channel_names_from_xdf
 
 # ✅ Load trigger mappings from config
@@ -53,11 +53,9 @@ def segment_epochs(epochs, window_size=config.CLASSIFY_WINDOW, step_size=0.1):
 
     return np.array(segmented_data), np.array(segmented_labels)
 
-
-
-def train_riemannian_model(cov_matrices, labels, n_splits=5, shrinkage_param=0.1):
+def train_riemannian_model(cov_matrices, labels, n_splits=10, shrinkage_param=0.1):
     """
-    Train an MDM classifier with k-fold cross-validation using Riemannian geometry.
+    Train an MDM classifier with k-fold cross-validation using Riemannian geometry and plot probability histograms.
 
     Parameters:
         cov_matrices (np.ndarray): Covariance matrices.
@@ -68,27 +66,56 @@ def train_riemannian_model(cov_matrices, labels, n_splits=5, shrinkage_param=0.1
     Returns:
         mdm: Trained MDM model.
     """
-    kf = KFold(n_splits=n_splits, shuffle=True)
+    kf = KFold(n_splits=n_splits, shuffle=False)
     mdm = MDM()
 
     accuracies = []
-    print("Starting K-Fold Cross Validation with Riemannian MDM...")
+    all_probabilities = {label: [] for label in np.unique(labels)}  # Store probabilities per class
+
+    print("\n🔍 Starting K-Fold Cross Validation with Riemannian MDM...\n")
 
     # ✅ Apply Shrinkage-based regularization
     shrinkage = Shrinkage(shrinkage=shrinkage_param)
     cov_matrices = shrinkage.fit_transform(cov_matrices)  # Apply shrinkage to all covariance matrices
 
-    for train_index, test_index in kf.split(cov_matrices):
+    for fold_idx, (train_index, test_index) in enumerate(kf.split(cov_matrices), start=1):
         X_train, X_test = cov_matrices[train_index], cov_matrices[test_index]
         Y_train, Y_test = labels[train_index], labels[test_index]
 
+        # ✅ Train and evaluate model
         mdm.fit(X_train, Y_train)
         Y_pred = mdm.predict(X_test)
+        Y_predProb = mdm.predict_proba(X_test)  # Get probabilities
+
         accuracy = accuracy_score(Y_test, Y_pred)
         accuracies.append(accuracy)
-        print(f"Fold Accuracy: {accuracy:.4f}")
 
-    print(f"✅ Average Accuracy: {np.mean(accuracies):.4f}")
+        print(f"\n📌 **Fold {fold_idx} Accuracy: {accuracy:.4f}**")
+
+        # ✅ Store probabilities per class
+        for idx, true_label in enumerate(Y_test):
+            all_probabilities[true_label].append(Y_predProb[idx, np.where(mdm.classes_ == true_label)[0][0]])
+
+    # ✅ Convert probability lists to numpy arrays
+    for label in all_probabilities:
+        all_probabilities[label] = np.array(all_probabilities[label])
+
+    # ✅ Plot probability distributions per class
+    plt.figure(figsize=(10, 5))
+    bins = np.linspace(0, 1, 20)  # Set bins for histogram
+
+    for label, probs in all_probabilities.items():
+        plt.hist(probs, bins=bins, alpha=0.6, label=f"Class {label}")
+
+    plt.xlabel("Predicted Probability")
+    plt.ylabel("Frequency")
+    plt.title("Probability Distribution Across Classes")
+    plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.show()
+
+    # ✅ Print overall average accuracy
+    print(f"\n🚀 **Final Average Accuracy:** {np.mean(accuracies):.4f}")
 
     # ✅ Retrain the model on all data
     mdm.fit(cov_matrices, labels)
@@ -100,6 +127,8 @@ def main():
     """
     Main function to generate a Riemannian-based EEG decoder.
     """
+    mne.set_log_level("WARNING")  # Options: "ERROR", "WARNING", "INFO", "DEBUG"
+
     print("Loading XDF data...")
     eeg_stream, marker_stream = load_xdf(config.DATA_FILE_PATH)
 
@@ -139,7 +168,7 @@ def main():
 
     # Convert data from Volts to microvolts (µV)
     # ✅ Convert raw data from Volts to microvolts (µV) IMMEDIATELY AFTER LOADING
-    raw._data /= 1e6  # Convert V → µV
+    #raw._data /= 1e6  # Convert V → µV
 
     # ✅ Update channel metadata in MNE so the scaling is correctly reflected
 
@@ -167,17 +196,25 @@ def main():
     raw.set_montage(montage)
 
     # ✅ Apply Notch & Bandpass Filtering
-    raw.notch_filter(60, fir_design="firwin")
-    raw.filter(config.LOWCUT, config.HIGHCUT, fir_design="firwin")
+    # Apply Notch Filtering (Remove Powerline Noise)
+    raw.notch_filter(60, method="iir")  
 
+    # Apply Bandpass Filtering Using IIR (Instead of FIR)
+    raw.filter(
+        l_freq=config.LOWCUT, 
+        h_freq=config.HIGHCUT, 
+        method="iir"  # ✅ Ensure consistency with online filtering
+    )
     # ✅ Apply Common Average Reference (CAR)
     #raw.set_eeg_reference("average")
 
     # ✅ Apply Surface Laplacian (CSD) if enabled
+
     if config.SURFACE_LAPLACIAN_TOGGLE:
         raw = mne.preprocessing.compute_current_source_density(raw)
-
-    # ✅ Dynamic Epoching Based on Start & End Markers
+    
+    scaler = StandardScaler()
+    raw._data = scaler.fit_transform(raw.get_data())    # ✅ Dynamic Epoching Based on Start & End Markers
     events = []
     event_id_map = {}
 
@@ -216,19 +253,20 @@ def main():
     # ✅ Create MNE Epochs (Fixes `tmax=None` issue)
     epochs = mne.Epochs(
         raw, events, event_id=event_id_map, tmin=-baseline_duration, tmax=tmax,
-        baseline=(-baseline_duration, 0), detrend=1, preload=True
+        baseline=(None, 0), detrend=1, preload=True
     )
 
 
     # ✅ Define Rejection Criteria (Artifact Removal)
-    reject_threshold = 0.2  # Example threshold
+    '''
+    reject_threshold = 20000  # Example threshold
     max_per_epoch = np.max(np.abs(epochs.get_data()), axis=(1, 2))
     bad_epochs = np.where(max_per_epoch > reject_threshold)[0]
     epochs.drop(bad_epochs)
-
+    
     print(f"🚀 Dropped {len(bad_epochs)} bad epochs exceeding {reject_threshold} mV/m².")
-
-    # ✅ Slice Epochs into Smaller Training Windows (e.g., 0.5s)
+    '''
+   # ✅ Slice Epochs into Smaller Training Windows (e.g., 0.5s)
     print(f"🚀 Segmenting epochs into {config.CLASSIFY_WINDOW}ms training windows...")
     segments, labels = segment_epochs(epochs, window_size=config.CLASSIFY_WINDOW, step_size=0.1)
 
@@ -236,11 +274,33 @@ def main():
 
     # ✅ Compute Covariance Matrices (for Riemannian Classifier)
     print("🧩 Computing Covariance Matrices...")
+
+    cov_matrices = []
+    info = epochs.info  # Use the same info as the original epochs
+    
+    # ✅ Compute Covariance Matrices (for Riemannian Classifier)
+    print("🧩 Computing Covariance Matrices...")
     cov_matrices = np.array([np.cov(segment) for segment in segments])
 
+    '''
+    for segment in segments:
+        # Convert segment into an MNE EpochsArray (shape needs to be (n_epochs, n_channels, n_samples))
+        segment = mne.EpochsArray(segment[np.newaxis, :, :], info)  # Ensure correct shape
+
+        # Compute covariance matrix using OAS regularization
+        cov = mne.compute_covariance(segment, method="oas")
+
+        # Extract covariance matrix and store
+        cov_matrices.append(cov["data"])
+    '''
+    # Convert list to numpy array (shape: (n_epochs, n_channels, n_channels))
+    cov_matrices = np.array(cov_matrices)
+    print(f"✅ Computed {len(cov_matrices)} covariance matrices with shape: {cov_matrices.shape}")
+
     # ✅ Train Riemannian MDM Model
+    #print(cov_matrices)
     print("🚀 Training Riemannian Classifier...")
-    Reimans_model = train_riemannian_model(cov_matrices, labels, n_splits=config.N_SPLITS)
+    Reimans_model = train_riemannian_model(cov_matrices, labels)
 
     # ✅ Save the trained model
     with open(config.MODEL_PATH, 'wb') as f:

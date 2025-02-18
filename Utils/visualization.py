@@ -15,6 +15,7 @@ def draw_time_balls(elapsed_time, next_trial_mode, screen_width, screen_height, 
     :param ball_radius: Radius of the ball(s).
     :param mode: "single" (default) for one ball, "stack" for a three-ball countdown.
     """
+    #next_trial_mode = 2
     # Set color based on next trial mode
     if next_trial_mode == 0:  # Right-hand motor imagery
         ball_color = (255, 0, 0)  # Red
@@ -22,7 +23,8 @@ def draw_time_balls(elapsed_time, next_trial_mode, screen_width, screen_height, 
         ball_color = (0, 0, 255)  # Blue
     else:
         ball_color = (255, 255, 255)  # Default white (if mode is undefined)
-
+    ball_color = (255, 255, 255)  # Default white (if mode is undefined)
+    
     if mode == "single":
         # Single ball centered horizontally, positioned below the fixation cross
         ball_x = screen_width // 2

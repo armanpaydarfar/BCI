@@ -9,14 +9,52 @@ import csv
 import pandas as pd
 from pylsl import StreamInlet, resolve_stream
 import numpy as np
-from Utils.preprocessing import butter_bandpass_filter, apply_car_filter, apply_notch_filter, flatten_single_segment, extract_and_flatten_segment, parse_eeg_and_eog, remove_eog_artifacts
-from Utils.visualization import draw_arrow_fill, draw_ball_fill, draw_fixation_cross, draw_time_balls
-from Utils.experiment_utils import generate_trial_sequence, display_multiple_messages_with_udp, LeakyIntegrator
-from Utils.networking import send_udp_message
-from Utils.stream_utils import get_channel_names_from_lsl
-import config
-from sklearn.metrics import confusion_matrix
+from pyriemann.estimation import Shrinkage
+from pyriemann.estimation import Shrinkage
+from pyriemann.classification import MDM
+from pyriemann.estimation import Covariances
+from sklearn.preprocessing import StandardScaler
 
+# ✅ MNE for real-time EEG processing
+import mne
+mne.set_log_level("WARNING")  # Options: "ERROR", "WARNING", "INFO", "DEBUG"
+# ✅ Preprocessing functions (updated for MNE integration)
+from Utils.preprocessing import (
+    butter_bandpass_filter,
+    apply_car_filter,
+    apply_notch_filter,
+    flatten_single_segment,
+    extract_and_flatten_segment,
+    parse_eeg_and_eog,
+    remove_eog_artifacts,
+)
+
+# ✅ Visualization utilities
+from Utils.visualization import (
+    draw_arrow_fill,
+    draw_ball_fill,
+    draw_fixation_cross,
+    draw_time_balls,
+)
+
+# ✅ Experiment utilities
+from Utils.experiment_utils import (
+    generate_trial_sequence,
+    display_multiple_messages_with_udp,
+    LeakyIntegrator,
+)
+
+# ✅ Networking utilities
+from Utils.networking import send_udp_message
+
+# ✅ Stream utilities (LSL channel names)
+from Utils.stream_utils import get_channel_names_from_lsl
+
+# ✅ Configuration parameters
+import config
+
+# ✅ Performance evaluation (classification metrics)
+from sklearn.metrics import confusion_matrix
 
 # Initialize Pygame with dimensions from config
 pygame.init()
@@ -150,10 +188,38 @@ def handle_fes_activation(mode, running_avg_confidence, fes_active):
     # No change in state, return the existing value
     return fes_active
 
-
-def classify_real_time(inlet, window_size_samples, step_size_samples, all_probabilities, predictions, data_buffer, mode, leaky_integrator):
+def collect_baseline_during_countdown(inlet, countdown_start, countdown_duration, baseline_buffer):
     """
-    Reads EEG data, applies preprocessing, extracts features, and classifies using a trained model.
+    Monitors countdown time and collects baseline EEG data during the last 0.5s.
+
+    Parameters:
+    - inlet: LSL EEG stream inlet.
+    - countdown_start: Start time of countdown (pygame ticks).
+    - countdown_duration: Total countdown duration in milliseconds.
+    - baseline_buffer: List to store baseline EEG data.
+
+    Returns:
+    - Updated baseline_buffer containing collected baseline samples.
+    """
+    current_time = pygame.time.get_ticks()
+    remaining_time = countdown_duration - (current_time - countdown_start)
+
+    if remaining_time <= 500 and not baseline_buffer:  # ✅ When 0.5s remain, flush and start collecting
+        print("⏳ Less than 0.5s left in countdown. Flushing buffer and collecting baseline data...")
+        inlet.flush()  # ✅ Remove old EEG data
+
+    if remaining_time <= 500:  # ✅ Collect EEG data continuously
+        new_data, _ = inlet.pull_chunk(timeout=0.1, max_samples=config.FS // 2)  # 0.5s worth of samples
+        if new_data:
+            baseline_buffer.extend(new_data)
+
+    return baseline_buffer
+
+
+def classify_real_time(inlet, window_size_samples, step_size_samples, all_probabilities, predictions, 
+                        data_buffer, mode, leaky_integrator, baseline_mean=None):
+    """
+    Reads EEG data, applies preprocessing using MNE, extracts features, and classifies using a trained model.
     Maintains a sliding window approach with step_size shifting.
 
     Returns:
@@ -168,51 +234,108 @@ def classify_real_time(inlet, window_size_samples, step_size_samples, all_probab
         new_data_np = np.array(new_data)
         data_buffer.extend(new_data_np)  # Append new data to buffer
 
-        # Debugging: Print buffer size
-        #print(f"Data buffer size: {len(data_buffer)}, Required: {window_size_samples}")
-
-        # Ensure there are enough samples before proceeding
+        # ✅ Ensure sufficient data before classification
         if len(data_buffer) < window_size_samples:
-            #print(f"Warning: Not enough samples for classification ({len(data_buffer)} samples). Skipping.")
-            return leaky_integrator.accumulated_probability, predictions, all_probabilities, data_buffer  # Return 0.0 for no confidence update
+            return leaky_integrator.accumulated_probability, predictions, all_probabilities, data_buffer  
 
-        # Keep only the latest `window_size_samples` for classification
-        sliding_window_np = np.array(data_buffer[-window_size_samples:])
+        # ✅ Keep only the latest `window_size_samples` for classification
+        sliding_window_np = np.array(data_buffer[-window_size_samples:]).T  # Transpose to (channels, samples)
 
-        # Process EEG and EOG data
-        sliding_data, sliding_eog = parse_eeg_and_eog({'time_series': sliding_window_np}, channel_names)
+        # ✅ Convert to MNE RawArray
+        sfreq = config.FS
+        info = mne.create_info(ch_names=channel_names, sfreq=sfreq, ch_types="eeg")
+        raw = mne.io.RawArray(sliding_window_np, info)
 
-        # Preprocessing
-        window_data = remove_eog_artifacts(sliding_data, sliding_eog) if config.EOG_TOGGLE == 1 else sliding_data
-        window_data = apply_notch_filter(window_data, config.FS)
-        window_data = butter_bandpass_filter(window_data, config.LOWCUT, config.HIGHCUT, fs=config.FS)
-        window_data = apply_car_filter(window_data)
+        # ✅ Drop AUX Channels (These are NOT EEG)
+        aux_channels = {"AUX1", "AUX2", "AUX3", "AUX7", "AUX8", "AUX9", "TRIGGER"}
+        existing_aux = [ch for ch in aux_channels if ch in raw.ch_names]
+        if existing_aux:
+            raw.drop_channels(existing_aux)
 
-        # Extract features and classify
-        features = extract_and_flatten_segment(window_data, start_time=0, fs=config.FS, window_size_ms=config.CLASSIFY_WINDOW, offset_ms=config.CLASSIFICATION_OFFSET)
+        # ✅ Standardize Channel Naming to Match 10-20 Montage
+        rename_dict = {
+            "FP1": "Fp1", "FPZ": "Fpz", "FP2": "Fp2",
+            "FZ": "Fz", "CZ": "Cz", "PZ": "Pz", "POZ": "POz", "OZ": "Oz"
+        }
+        raw.rename_channels(rename_dict)
 
-        probabilities = model.predict_proba(features)[0]
+        # ✅ Remove Mastoid Channels if Present
+        mastoid_channels = ["M1", "M2"]
+        existing_mastoids = [ch for ch in mastoid_channels if ch in raw.ch_names]
+        if existing_mastoids:
+            raw.drop_channels(existing_mastoids)
+
+        # ✅ Ensure Data Matches Standard 10-20 Montage
+        montage = mne.channels.make_standard_montage("standard_1020")
+        raw.set_montage(montage, match_case=True, on_missing="warn")
+
+        # ✅ Convert Data to Microvolts (µV)
+        #raw._data /= 1e6  # Convert Volts → µV
+        for ch in raw.info['chs']:
+            ch['unit'] = 201  # MNE Code for µV
+
+        # ✅ Apply Notch and Bandpass Filtering (IIR to avoid FIR length issues)
+        raw.notch_filter(60, method="iir")  
+        raw.filter(
+            l_freq=config.LOWCUT,
+            h_freq=config.HIGHCUT,
+            method="iir"  # ✅ Use IIR filter to avoid large FIR filter lengths
+        )
+
+        # ✅ Apply Surface Laplacian (CSD) with Error Handling
+
+        #raw.set_eeg_reference('average')
+        if config.SURFACE_LAPLACIAN_TOGGLE:
+            raw = mne.preprocessing.compute_current_source_density(raw)
+
+        #print(raw)
+        # ✅ Apply Baseline Correction (Subtract Precomputed Baseline Mean)
+        raw._data -= baseline_mean  # Apply baseline correction
+        #print(raw)
+        #✅ Apply Z-score Normalization using StandardScaler (Same as in Training)
+        
+        scaler = StandardScaler()
+        raw._data = scaler.fit_transform(raw.get_data()) 
+        #print(raw)
+        # ✅ Compute the Covariance Matrix (For Riemannian Classifier)
+        info = raw.info  # Get the raw's info object
+
+        # ✅ Compute Covariance Matrix using MNE
+        #cov = mne.compute_covariance(mne.EpochsArray(raw.get_data()[np.newaxis, :, :], info), method="oas")
+        cov_matrix = np.cov(raw.get_data())
+        #print(cov_matrix)
+        cov_matrix = np.expand_dims(cov_matrix, axis=0)  # Reshape to (1, channels, channels)
+        # ✅ Apply Shrinkage Regularization
+        shrinkage = Shrinkage(shrinkage=0.1)  
+        cov_matrix = shrinkage.fit_transform(cov_matrix)  # Regularized covariance matrix
+
+        # ✅ Now pass the properly formatted covariance matrix to the classifier
+        probabilities = model.predict_proba(cov_matrix)[0]
+
         predicted_label = model.classes_[np.argmax(probabilities)]
 
         predictions.append(predicted_label)
         all_probabilities.append(probabilities)
-        
-        # **Dynamically determine the correct class based on mode**
+
+        # ✅ Dynamically determine the correct class based on mode
         correct_label = 200 if mode == 0 else 100  # 200 = Right Arm MI, 100 = Rest
         correct_class_idx = np.where(model.classes_ == correct_label)[0][0]
         current_confidence = probabilities[correct_class_idx]  # Single window confidence
 
-        # Slide the buffer forward by step_size_samples
+        # ✅ Slide the buffer forward by `step_size_samples`
         data_buffer = data_buffer[step_size_samples:]
-
-        #print(f"Predicted label: {predicted_label}, Current Confidence for ({correct_label}): {current_confidence:.3f}")
 
         return current_confidence, predictions, all_probabilities, data_buffer
 
     return leaky_integrator.accumulated_probability, predictions, all_probabilities, data_buffer  # Default return when no data
 
+
+
+
+
+
 def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode, udp_socket, udp_ip, udp_port,
-                               data_buffer, leaky_integrator):
+                               data_buffer, leaky_integrator, baseline_mean):
     """
     Holds visual messages on the screen while running real-time EEG classification in the background.
     If classification confidence drops below a threshold, sends an "s" message to stop the robot.
@@ -269,7 +392,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
 
         # Perform classification
         current_confidence, predictions, all_probabilities, data_buffer = classify_real_time(
-            inlet, window_size_samples, step_size_samples, [], [], data_buffer, mode,leaky_integrator
+            inlet, window_size_samples, step_size_samples, [], [], data_buffer, mode,leaky_integrator, baseline_mean
         )
 
         # If a prediction was made, increase the counter
@@ -309,7 +432,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
 
 
 
-def show_feedback(duration=5, mode=0, inlet=None):
+def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
     """
     Displays feedback animation, collects EEG data, and performs real-time classification
     using a sliding window approach with early stopping based on posterior probabilities.
@@ -319,15 +442,75 @@ def show_feedback(duration=5, mode=0, inlet=None):
     window_size = config.CLASSIFY_WINDOW / 1000  # Convert ms to seconds
     window_size_samples = int(window_size * config.FS)
     step_size_samples = int(step_size * config.FS)
+
     FES_active = False
     all_probabilities = []
     predictions = []
     data_buffer = []  # Buffer for EEG data
-    leaky_integrator = LeakyIntegrator(alpha=0.96)  # Confidence smoothing
+    leaky_integrator = LeakyIntegrator(alpha=0.92)  # Confidence smoothing
     min_predictions = config.MIN_PREDICTIONS
+
     # Define the correct class based on mode
     correct_class = 200 if mode == 0 else 100  # 200 = Right Arm MI, 100 = Rest
     incorrect_class = 100 if mode == 0 else 200  # The opposite class
+
+    # ✅ Preprocess the baseline dataset before feedback starts
+    if baseline_data is not None:
+        print("🔍 Processing Baseline Data...")
+
+        # Convert to MNE RawArray
+        sfreq = config.FS
+        info = mne.create_info(ch_names=channel_names, sfreq=sfreq, ch_types="eeg")
+        raw_baseline = mne.io.RawArray(baseline_data.T, info)
+
+        # Drop AUX and Mastoid channels
+        aux_channels = {"AUX1", "AUX2", "AUX3", "AUX7", "AUX8", "AUX9", "TRIGGER"}
+        mastoid_channels = ["M1", "M2"]
+        raw_baseline.drop_channels([ch for ch in aux_channels if ch in raw_baseline.ch_names])
+        #raw_baseline.drop_channels([ch for ch in mastoid_channels if ch in raw_baseline.ch_names])
+        
+        if "M1" in raw.ch_names and "M2" in raw.ch_names:
+            raw.drop_channels(["M1", "M2"])
+            print("✅ Removed Mastoid Channels: M1, M2")
+        else:
+            print("ℹ️ No Mastoid Channels Found in Data")
+
+
+        
+        # Ensure standard 10-20 montage
+        montage = mne.channels.make_standard_montage("standard_1020")
+        raw_baseline.rename_channels({
+            "FP1": "Fp1", "FPZ": "Fpz", "FP2": "Fp2",
+            "FZ": "Fz", "CZ": "Cz", "PZ": "Pz", "POZ": "POz", "OZ": "Oz"
+        })
+        raw_baseline.set_montage(montage, match_case=True, on_missing="warn")
+
+        # Convert to µV
+        #raw_baseline._data /= 1e6  
+        for ch in raw_baseline.info['chs']:
+            ch['unit'] = 201  # µV
+
+        # Apply preprocessing: Notch filter, Bandpass, CAR, CSD
+        raw.notch_filter(60, method="iir")  
+        raw_baseline.filter(
+            l_freq=config.LOWCUT,
+            h_freq=config.HIGHCUT,
+            method="iir"  # ✅ Use IIR filter to avoid large FIR filter lengths
+        )
+        #raw_baseline.set_eeg_reference('average')
+
+
+        if config.SURFACE_LAPLACIAN_TOGGLE:
+            raw_baseline = mne.preprocessing.compute_current_source_density(raw)
+
+
+        
+        # Compute baseline mean across time
+        baseline_mean = np.mean(raw_baseline.get_data(), axis=1, keepdims=True)  # Shape: (n_channels, 1)
+        print(f"✅ Computed Baseline Mean: Shape {baseline_mean.shape}")
+
+    else:
+        baseline_mean = None  # No baseline correction applied
     # Send UDP triggers
     if mode == 0:  # Red Arrow Mode (Motor Imagery)
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_BEGIN"])
@@ -340,17 +523,17 @@ def show_feedback(duration=5, mode=0, inlet=None):
 
     clock = pygame.time.Clock()
     running_avg_confidence = 0.5  # Initial placeholder
-    
 
     while time.time() - start_time < duration:
         # Perform classification
         current_confidence, predictions, all_probabilities, data_buffer = classify_real_time(
-            inlet, window_size_samples, step_size_samples, all_probabilities, predictions, data_buffer, mode, leaky_integrator
+            inlet, window_size_samples, step_size_samples, all_probabilities, predictions, data_buffer, mode, leaky_integrator, baseline_mean
         )
-        
+
         # Update leaky integrator confidence
         running_avg_confidence = leaky_integrator.update(current_confidence)
         FES_toggle == 1 and (FES_active := handle_fes_activation(mode, running_avg_confidence, FES_active))
+
         # Draw animation
         screen.fill(config.black)
         draw_time_balls(2000, next_trial_mode, screen_width, screen_height, ball_radius=30)
@@ -366,39 +549,30 @@ def show_feedback(duration=5, mode=0, inlet=None):
             draw_fixation_cross(screen_width, screen_height)
             draw_arrow_fill(MI_fill, screen_width, screen_height)
             message = pygame.font.SysFont(None, 72).render("Rest", True, config.white)
-        
-        #print(f"MI fill: {MI_fill:.2f}")
-        #print(f"REST fill: {Rest_fill:.2f}")
-        #print(f"current Confidence: {running_avg_confidence:.2f}")
-        
+
         screen.blit(message, (screen_width // 2 - message.get_width() // 2, screen_height // 2 + 150))
         pygame.display.flip()
+
         # Early stopping
         if len(predictions) >= min_predictions and running_avg_confidence >= config.ACCURACY_THRESHOLD:
             print(f"Early stopping triggered! Confidence: {running_avg_confidence:.2f}")
-            if mode ==0:
+            if mode == 0:
                 send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP") if FES_toggle == 1 else print("FES is disabled.")
                 send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_EARLYSTOP"])
             else:
                 send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["REST_EARLYSTOP"])
-
             break
-
-        # Check for quit events
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit()
-                return None
 
         clock.tick(60)  # Limit frame rate
 
     # Final Decision: Return correct or incorrect class based on confidence
     final_class = correct_class if running_avg_confidence >= config.ACCURACY_THRESHOLD else incorrect_class
-
     print(f"Final decision: {final_class}, Confidence for correct({correct_class}) class: {running_avg_confidence:.2f}) at sample size {len(predictions)}")
-    send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP") if FES_toggle == 1 and FES_active ==True else print("FES disable not needed")
 
-    return final_class, leaky_integrator, data_buffer
+    send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP") if FES_toggle == 1 and FES_active else print("FES disable not needed")
+
+    return final_class, leaky_integrator, data_buffer, baseline_mean
+
 
 
 # Main Game Loop
@@ -407,12 +581,51 @@ print("Looking for EEG data stream...")
 streams = resolve_stream('type', 'EEG')
 inlet = StreamInlet(streams[0])
 print("EEG data stream detected. Starting experiment...")
+
+# Generate trial sequence
 trial_sequence = generate_trial_sequence(total_trials=config.TOTAL_TRIALS, max_repeats=config.MAX_REPEATS)
 current_trial = 0  # Track the current trial index
 
+# Fetch channel names from LSL
 channel_names = get_channel_names_from_lsl()
-print(f"channel names in stream {channel_names}")
+print(f"Channel names in stream: {channel_names}")
 
+# ✅ Load standard 10-20 montage
+montage = mne.channels.make_standard_montage("standard_1020")
+
+# ✅ Case-sensitive renaming dictionary (for consistency with montage)
+rename_dict = {
+    "FP1": "Fp1", "FPZ": "Fpz", "FP2": "Fp2",
+    "FZ": "Fz", "CZ": "Cz", "PZ": "Pz", "POZ": "POz", "OZ": "Oz"
+}
+
+# ✅ Drop non-EEG channels
+non_eeg_channels = {"AUX1", "AUX2", "AUX3", "AUX7", "AUX8", "AUX9", "TRIGGER"}
+valid_eeg_channels = [ch for ch in channel_names if ch not in non_eeg_channels]
+
+# ✅ Ensure valid EEG channels are indexed correctly
+valid_indices = [channel_names.index(ch) for ch in valid_eeg_channels]
+
+# ✅ Set up the MNE Raw object for real-time processing
+sfreq = config.FS
+info = mne.create_info(ch_names=valid_eeg_channels, sfreq=sfreq, ch_types="eeg")
+
+# ✅ Create an empty buffer (will be updated with real-time data)
+raw = mne.io.RawArray(np.zeros((len(valid_eeg_channels), 1)), info)
+
+# ✅ Apply montage to match offline pipeline
+raw.rename_channels(rename_dict)
+raw.set_montage(montage, match_case=True, on_missing="warn")
+
+# ✅ Convert data from Volts to microvolts (µV) immediately
+raw._data /= 1e6  # Convert from Volts → µV
+for ch in raw.info['chs']:
+    ch['unit'] = 201  # 201 corresponds to µV in MNE’s standard units
+
+print(f"✅ Applied standard 10-20 montage. Final EEG channels: {raw.ch_names}")
+# ✅ Store this fixed montage for use in classification
+
+# Start experiment loop
 running = True
 clock = pygame.time.Clock()
 display_fixation_period(duration=3)
@@ -430,6 +643,7 @@ while running and current_trial < len(trial_sequence):
     waiting_for_press = True
     countdown_start = None  # Reset countdown timer
     countdown_duration = 3000  # 3 seconds in milliseconds
+    baseline_buffer = []  # ✅ Store EEG samples for baseline calculation
 
     while waiting_for_press:
         for event in pygame.event.get():
@@ -437,31 +651,32 @@ while running and current_trial < len(trial_sequence):
                 running = False
                 waiting_for_press = False
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_RIGHT:  # Right arrow key for red arrow
+                if event.key == pygame.K_RIGHT:  
                     backdoor_mode = 0
-                elif event.key == pygame.K_DOWN:  # Down arrow key for rest
+                elif event.key == pygame.K_DOWN:  
                     backdoor_mode = 1
-                elif event.key == pygame.K_SPACE:  # Space bar can also act as a trigger
+                elif event.key == pygame.K_SPACE:  
                     print("Space bar pressed, proceeding...")
                 waiting_for_press = False
 
-        # Timing-based execution logic
         if config.TIMING:
             if countdown_start is None:
-                countdown_start = pygame.time.get_ticks()  # Start countdown
+                countdown_start = pygame.time.get_ticks()  # ✅ Start countdown
 
             elapsed_time = pygame.time.get_ticks() - countdown_start
 
-            # Draw timing balls during countdown
-            next_trial_mode = trial_sequence[current_trial]  # Get the mode for the next trial
+            # ✅ Call function to collect baseline when time is running out
+            baseline_buffer = collect_baseline_during_countdown(inlet, countdown_start, countdown_duration, baseline_buffer)
+
+            next_trial_mode = trial_sequence[current_trial]  
             draw_time_balls(elapsed_time, next_trial_mode, screen_width, screen_height, ball_radius=30)
-            
-            pygame.display.flip()  # Update the display with time balls
+            pygame.display.flip()  
 
             if elapsed_time >= countdown_duration:
-                print("Countdown complete, proceeding automatically.")
+                print("✅ Countdown complete, computing baseline mean...")
                 pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_SPACE))
                 waiting_for_press = False
+
 
     if not running:
         break
@@ -472,8 +687,13 @@ while running and current_trial < len(trial_sequence):
     else:
         mode = trial_sequence[current_trial]  # Use pseudo-randomized sequence
 
+
+
+    # ✅ Compute baseline mean after countdown ends
+    baseline_data = np.array(baseline_buffer)
+
     # Show feedback and classification
-    prediction, leaky_integrator, data_buffer = show_feedback(duration=config.TIME_MI, mode=mode, inlet=inlet)
+    prediction, leaky_integrator, data_buffer, baseline_mean = show_feedback(duration=config.TIME_MI, mode=mode, inlet=inlet, baseline_data = baseline_data)
     send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_END"]) if mode == 0 else send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["REST_END"])
 
 
@@ -540,7 +760,8 @@ while running and current_trial < len(trial_sequence):
             udp_ip=config.UDP_ROBOT["IP"], 
             udp_port=config.UDP_ROBOT["PORT"],
             data_buffer=data_buffer,  # Pass accumulated EEG data
-            leaky_integrator=leaky_integrator  # Pass the leaky integrator instance
+            leaky_integrator=leaky_integrator,  # Pass the leaky integrator instance
+            baseline_mean = baseline_mean
         )
                          
     display_fixation_period(duration=3)
