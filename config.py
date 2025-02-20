@@ -41,15 +41,15 @@ TIME_MI = 5 # time for motor imagery and rest
 TIME_ROB = 13 # time allocated for robot to move
 TIME_STATIONARY = 2 # time for stationary feedback after no movement/failed movement trial
 TIMING = True
-SHAPE_MAX = 0.7 #maximum fill 
+SHAPE_MAX = 0.9 #maximum fill 
 SHAPE_MIN = 0.5 #minimum fill 
 
 
 # Classification Parameters
 CLASSIFY_WINDOW = 500  # Duration of EEG data window for classification (milliseconds)
-ACCURACY_THRESHOLD = 0.53  # Accuracy threshold to determine "Correct"
+ACCURACY_THRESHOLD = 0.7  # Accuracy threshold to determine "Correct"
 RELAXATION_RATIO = 0.75
-MIN_PREDICTIONS = 20 # Min number of predictions during Online experiment before the decoder can end early
+MIN_PREDICTIONS = 50 # Min number of predictions during Online experiment before the decoder can end early
 CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
 #CLASSIFICATION_SCHEME_OPT = "TIMESERIES"
 CLASSIFICATION_SCHEME_OPT = "FREQUENCY"
@@ -63,17 +63,29 @@ FES_TIMING_OFFSET = 4
 # above for motor FES, cut out X seconds before the full duration of movement. This should represent when the robot will naturally reach the end of motion (in successful case)
 
 # Screen Dimensions
-SCREEN_WIDTH = 3840
-SCREEN_HEIGHT = 2160
+#SCREEN_WIDTH = 3840
+#SCREEN_HEIGHT = 2160
 
-#SCREEN_WIDTH = 1200
-#SCREEN_HEIGHT = 800
+SCREEN_WIDTH = 1200
+SCREEN_HEIGHT = 800
 
 
+# Relevant Directories
+WORKING_DIR = "/home/arman-admin/Projects/Harmony/"
+DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
 
-# LDA Model Path
 MODEL_PATH = "/home/arman-admin/Projects/Harmony/Reiman_eeg_model.pkl"
 DATA_FILE_PATH = "/home/arman-admin/Documents/CurrentStudy/sub-PILOT007/ses-S001/eeg/sub-PILOT007_ses-S001_task-Default_run-001OFFLINE_eeg.xdf"
+
+TRAINING_SUBJECT = "PILOT007"
+
+
+#TRAINING_SESSION = "001OFFLINE"
+
+
+USE_PREVIOUS_ONLINE_STATS = False # for z-score normalization of data coming in - this defines the starting point, False = use the stats from the training session, true = use previous online stats
+
+
 # Colors
 black = (0, 0, 0)
 white = (255, 255, 255)

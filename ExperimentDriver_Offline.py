@@ -51,7 +51,7 @@ def display_fixation_period(duration=3):
         # Draw blank shapes (assuming placeholders)
         draw_ball_fill(0, screen_width, screen_height, show_threshold=False)  # Empty fill
         draw_arrow_fill(0, screen_width, screen_height, show_threshold=False)  # Empty fill
-        draw_time_balls(0,None,screen_width,screen_height)
+        draw_time_balls(0,screen_width,screen_height, ball_radius= 40)
         pygame.display.flip()  # Update display
 
         # Check for quit events
@@ -84,12 +84,13 @@ def show_feedback(duration=5, mode=0):
 
         # Clear screen
         screen.fill(config.black)
-        draw_time_balls(2000, next_trial_mode, screen_width, screen_height, ball_radius=30)
         if mode == 0:
             # Draw the arrow filling
             draw_arrow_fill(progress, screen_width, screen_height, show_threshold=False)
             draw_ball_fill(0, screen_width, screen_height, show_threshold=False)
             draw_fixation_cross(screen_width, screen_height)
+            draw_time_balls(2, screen_width, screen_height, ball_radius=40)
+
             # Render and center message with smaller font
             message = small_font.render("Imagine Right Arm Movement", True, config.white)
         else:
@@ -97,6 +98,8 @@ def show_feedback(duration=5, mode=0):
             draw_ball_fill(progress, screen_width, screen_height, show_threshold=False)
             draw_arrow_fill(0, screen_width, screen_height, show_threshold=False)
             draw_fixation_cross(screen_width, screen_height)
+            draw_time_balls(3, screen_width, screen_height, ball_radius=40)
+
 
             # Render and center message with larger font
             message = large_font.render("Rest", True, config.white)
@@ -134,7 +137,7 @@ while running and current_trial < len(trial_sequence):
     draw_fixation_cross(screen_width, screen_height)
     draw_arrow_fill(0, screen_width, screen_height, show_threshold=False)  # Replace arrow with bar
     draw_ball_fill(0, screen_width, screen_height, show_threshold=False)
-    draw_time_balls(0,0,screen_width,screen_height)
+    draw_time_balls(0,screen_width,screen_height, ball_radius = 40)
     pygame.display.flip()
 
     # Backdoor logic
@@ -165,7 +168,7 @@ while running and current_trial < len(trial_sequence):
 
             # Draw timing balls during countdown
             next_trial_mode = trial_sequence[current_trial]  # Get the mode for the next trial
-            draw_time_balls(elapsed_time, next_trial_mode, screen_width, screen_height, ball_radius=30)
+            draw_time_balls(1, screen_width, screen_height, ball_radius=40)
             
             pygame.display.flip()  # Update the display with time balls
 

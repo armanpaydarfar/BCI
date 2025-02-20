@@ -5,6 +5,8 @@ import matplotlib.pyplot as plt
 import mne
 from scipy.signal import welch
 import config
+from scipy.stats import zscore
+
 
 # Custom utility functions
 from Utils.preprocessing import apply_notch_filter, butter_bandpass_filter, extract_segments, separate_classes, compute_grand_average
@@ -16,8 +18,8 @@ from Utils.stream_utils import get_channel_names_from_xdf
 subject = "P002"
 session = "S001OFFLINE"
 
-xdf_dir = "/home/arman-admin/Documents/CurrentStudy/sub-P002/ses-S001/eeg"
-xdf_file_path = os.path.join(xdf_dir, "sub-P002_ses-S001_task-Default_run-001OFFLINE_eeg.xdf")
+xdf_dir = "/home/arman-admin/Documents/CurrentStudy/sub-PILOT007/ses-S002OFFLINE/eeg"
+xdf_file_path = os.path.join(xdf_dir, "sub-PILOT007_ses-S002OFFLINE_task-Default_run-001_eeg.xdf")
 
 print(f"Loading XDF file: {xdf_file_path}")
 streams, header = pyxdf.load_xdf(xdf_file_path)
@@ -118,8 +120,11 @@ print("\n Rechecking Channel Positions After Montage Application:")
 for ch in raw.info["chs"]:
     print(f"{ch['ch_name']}: {ch['loc'][:3]}")
 '''
-highband = 12
+highband = 30
 lowband = 8
+
+time_start = -0.5
+time_end = 5
 
 # Preprocessing
 raw.notch_filter(60)  # Notch filter at 50Hz
@@ -156,22 +161,26 @@ marker_labels = {
 }
 # Create Epochs with rejection
 epochs = mne.Epochs(
-    raw, events, event_id=event_dict, tmin=-0.5, tmax=5.0, baseline = (None,0), detrend=1, preload=True
+    raw, events, event_id=event_dict, tmin=time_start, tmax=time_end, baseline = None, detrend=1, preload=True
 )
-# Define a rejection threshold (adjust as needed)5
-reject_threshold = 0.03 # 150 mV/m²
+#baseline =(None,time_start+0.5)
 
-# Get absolute max per epoch
+# Define a rejection threshold (adjust as needed)5
+
+
+# Compute max per epoch
 max_per_epoch = np.max(np.abs(epochs.get_data()), axis=(1, 2))  
 
-# Identify bad epochs
-bad_epochs = np.where(max_per_epoch > reject_threshold)[0]  
+# Compute z-scores
+z_scores = zscore(max_per_epoch)
+
+# Define a rejection criterion (e.g., 3 standard deviations)
+reject_z_threshold = 3.0  
+bad_epochs = np.where(np.abs(z_scores) > reject_z_threshold)[0]  
 
 # Drop the bad epochs
 epochs.drop(bad_epochs)
-
-print(f"Dropped {len(bad_epochs)} bad epochs exceeding {reject_threshold} mV/m².")
-
+print(f"Dropped {len(bad_epochs)} bad epochs based on z-score method.")
 
 # **Define time windows (instead of discrete time points)**
 num_windows = 5  # Change this for finer resolution
@@ -185,10 +194,13 @@ print("Squaring all epochs for signal power computation...")
 epochs_power = epochs.copy()
 
 # Find baseline indices
-baseline_indices = epochs.time_as_index([-0.5, 0])  # Baseline window (-0.5 to 0 sec)
+'''
+'''
+baseline_indices = epochs.time_as_index([time_start, time_start+0.5])  # Baseline window (-0.5 to 0 sec)
 idx_start, idx_end = baseline_indices
 
 # Compute baseline mean **before squaring**
+
 baseline_mean = np.mean(epochs_power._data[:, :, idx_start:idx_end], axis=2, keepdims=True)
 
 # Subtract baseline mean from original signal
@@ -207,7 +219,7 @@ for event_id in ["100", "200", "300"]:
 scaling_factor = 1e6  # Convert from mV²/m⁴ to µV²/mm⁴
 for key in evoked_power.keys():
     evoked_power[key].data *= scaling_factor
-    print(f"🔎 Post-Scaling Power Data (Marker {key}): "
+    print(f"Post-Scaling Power Data (Marker {key}): "
           f"min={evoked_power[key].data.min()}, max={evoked_power[key].data.max()}")
 
 # **Step 4: Compute mean power over each time window**
@@ -257,8 +269,8 @@ for event_id in evoked_power.keys():
 plt.show()
 
 # **Step 6: Compute and Plot PSD**
-#raw.compute_psd(fmax=50).plot()
-epochs.compute_psd(fmax= 50).plot()
+raw.compute_psd(fmax=50).plot()
+#epochs.compute_psd(fmax= 50).plot()
 # **Step 7: Plot Event Markers Over Time**
 fig, ax = plt.subplots(figsize=(10, 5))
 sc = ax.scatter(marker_timestamps, marker_data, c=marker_data, cmap='coolwarm', alpha=0.7)
@@ -278,7 +290,7 @@ plt.show()
 ##################################################################################
 
 # Define Time Windows for ERD/ERS
-baseline = (-0.5, 0)  # Pre-event window
+baseline = (time_start, time_start+0.5)  # Pre-event window
 window_size = 0.5  # Window duration in seconds
 time_windows = np.arange(0, 5, window_size)  # Start times
 
@@ -288,16 +300,16 @@ tfr_data = {}
 for marker in ["100", "200", "300"]:
     if marker in event_dict:
         tfr = epochs[marker].compute_tfr(
-            method="multitaper", freqs=np.linspace(8, 12, 5), n_cycles=2.5, 
+            method="multitaper", freqs=np.linspace(lowband, highband, highband - lowband),tmin = time_start, tmax= time_end, n_cycles=2.5, 
             use_fft=True, return_itc=False
         )
 
         # Apply baseline correction
         print(f"Before baseline correction: {np.mean(tfr.data):.6f}")  # Debugging
         tfr.apply_baseline(baseline=baseline, mode="percent")  
-        print(f"Computed ERD/ERS for marker {marker}. 🔍 After baseline correction: {np.mean(tfr.data):.6f}")
+        print(f"Computed ERD/ERS for marker {marker}. After baseline correction: {np.mean(tfr.data):.6f}")
 
-        # ✅ Convert to AverageTFR and store
+        # Convert to AverageTFR and store
         tfr_data[marker] = tfr.average()
 
 # Adjust ERD/ERS values to be centered at 0%

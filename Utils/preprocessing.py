@@ -1,4 +1,4 @@
-from scipy.signal import butter, filtfilt, iirnotch
+from scipy.signal import butter, filtfilt, iirnotch, lfilter
 import numpy as np
 import config
 from sklearn.linear_model import LinearRegression
@@ -29,12 +29,19 @@ def apply_notch_filter(eeg_data, sampling_rate, line_freq=60, quality_factor=30,
     return filtered_data
 
 
-def butter_bandpass_filter(data, lowcut, highcut, fs, order=4):
-    nyquist = 0.5 * fs
-    low = lowcut / nyquist
-    high = highcut / nyquist
+# Bandpass Filter Design Function
+def butter_bandpass(lowcut, highcut, fs, order=4):
+    nyq = 0.5 * fs  # Nyquist frequency
+    low = lowcut / nyq
+    high = highcut / nyq
     b, a = butter(order, [low, high], btype='band')
-    return filtfilt(b, a, data, axis=0)
+    return b, a
+
+# Function to Apply Filter with State Tracking
+def filter_with_state(data, b, a, zi):
+    filtered_data, zf = lfilter(b, a, data, zi=zi)  # Apply filter with prior state
+    return filtered_data, zf  # Return filtered signal & final state
+
 
 def apply_car_filter(data):
     avg = np.mean(data, axis=0)

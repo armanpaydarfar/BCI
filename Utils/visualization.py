@@ -1,55 +1,56 @@
 import pygame
 import config
+import pygame
 
 
-def draw_time_balls(elapsed_time, next_trial_mode, screen_width, screen_height, ball_radius=30, mode="single"):
+def draw_time_balls(ball_state, screen_width, screen_height, ball_radius=30, mode="single"):
     """
-    Draw a time indicator ball. Supports two modes:
-    - "single" (default): Displays a single ball that is either filled or outlined.
-    - "stack": Displays three vertically stacked balls as a countdown.
+    Draw a time indicator ball with 4 possible states:
+    - 0 = Empty (Outlined Ball)
+    - 1 = White Ball (Baseline/Neutral)
+    - 2 = Red Ball (Motor Imagery)
+    - 3 = Blue Ball (Rest)
 
-    :param elapsed_time: Time elapsed during the countdown (in milliseconds).
-    :param next_trial_mode: The mode of the next trial (0 for MI, 1 for rest).
+    :param ball_state: The current state of the ball (0-3).
     :param screen_width: Width of the screen.
     :param screen_height: Height of the screen.
     :param ball_radius: Radius of the ball(s).
     :param mode: "single" (default) for one ball, "stack" for a three-ball countdown.
     """
-    #next_trial_mode = 2
-    # Set color based on next trial mode
-    if next_trial_mode == 0:  # Right-hand motor imagery
-        ball_color = (255, 0, 0)  # Red
-    elif next_trial_mode == 1:  # Rest
-        ball_color = (0, 0, 255)  # Blue
-    else:
-        ball_color = (255, 255, 255)  # Default white (if mode is undefined)
-    ball_color = (255, 255, 255)  # Default white (if mode is undefined)
+
+    # Define ball colors based on state
+    color_map = {
+        1: (255, 255, 255),  # White (Baseline)
+        2: (255, 0, 0),  # Red (MI)
+        3: (0, 0, 255)  # Blue (Rest)
+    }
     
+    ball_color = color_map.get(ball_state, (255, 255, 255))  # Default to white
+
     if mode == "single":
         # Single ball centered horizontally, positioned below the fixation cross
         ball_x = screen_width // 2
         ball_y = screen_height // 2 - ball_radius * 4  # Position below fixation cross
 
-        # Fill the ball at beginning of 3 second countdown
-        if elapsed_time > 100:  
-            pygame.draw.circle(pygame.display.get_surface(), ball_color, (ball_x, ball_y), ball_radius)
-        else:  # Outline before the trial starts
+        if ball_state == 0:
+            # Draw an outlined ball (empty state)
             pygame.draw.circle(pygame.display.get_surface(), (255, 255, 255), (ball_x, ball_y), ball_radius, 2)
+        else:
+            # Draw a filled ball
+            pygame.draw.circle(pygame.display.get_surface(), ball_color, (ball_x, ball_y), ball_radius)
 
     elif mode == "stack":
         # Three vertically stacked balls for countdown
-        stack_x = screen_width // 2 - ball_radius * 14  # Positioned to the left of the main shape
+        stack_x = screen_width // 2 - ball_radius * 14  # Positioned to the left
         stack_y_start = screen_height // 2 - ball_radius * 2  # Center vertically
         spacing = ball_radius * 3  # Space between balls
 
-        # Draw the balls in a countdown format
         for i in range(3):
             ball_y = stack_y_start + i * spacing
-            if elapsed_time >= i * 1000:  # Fill at 0, 1, and 2 seconds
-                pygame.draw.circle(pygame.display.get_surface(), ball_color, (stack_x, ball_y), ball_radius)
-            else:  # Empty outline
+            if ball_state == 0:
                 pygame.draw.circle(pygame.display.get_surface(), (255, 255, 255), (stack_x, ball_y), ball_radius, 2)
-
+            else:
+                pygame.draw.circle(pygame.display.get_surface(), ball_color, (stack_x, ball_y), ball_radius)
 
 
 def draw_arrow_fill(progress, screen_width, screen_height, show_threshold=True):

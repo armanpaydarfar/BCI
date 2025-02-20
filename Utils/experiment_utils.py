@@ -1,6 +1,51 @@
 import pygame
 import numpy as np
 import random
+import pickle
+from collections import deque
+import os
+
+class RollingScaler:
+    def __init__(self, window_size=100, save_path=None):
+        """
+        A rolling Z-score normalizer that updates mean and std dynamically.
+        
+        - `window_size`: The max number of windows to store.
+        - `save_path`: Optional path to save/load rolling stats between sessions.
+        """
+        self.window_size = window_size
+        self.buffer = deque(maxlen=window_size)
+        self.save_path = save_path  # File to save/load rolling mean & std
+
+    def update(self, new_data):
+        """Store new EEG data in the rolling window buffer."""
+        self.buffer.append(new_data)
+
+    def transform(self, new_data):
+        """Apply z-score normalization using a single mean/std across all stored EEG values."""
+        if len(self.buffer) == 0:
+            mean = np.mean(new_data)  # Compute single mean over all values
+            std = np.std(new_data) + 1e-8  # Compute single std over all values
+        else:
+            past_data = np.concatenate(self.buffer, axis=1).flatten()  # Flatten to (total_values,)
+            mean = np.mean(past_data)  # Compute single mean across all data
+            std = np.std(past_data)  # Compute single std across all data
+
+        return (new_data - mean) / std
+
+
+    def save(self):
+        """Save the latest rolling buffer for continuity across runs."""
+        if self.save_path:
+            with open(self.save_path, 'wb') as f:
+                pickle.dump(list(self.buffer), f)  # Convert deque to list before saving
+
+    def load(self):
+        """Load previously saved rolling buffer if available."""
+        if self.save_path and os.path.exists(self.save_path):
+            with open(self.save_path, 'rb') as f:
+                self.buffer = deque(pickle.load(f), maxlen=self.window_size)
+                print(f"✅ Loaded rolling stats from: {self.save_path}")
 
 
 class LeakyIntegrator:
