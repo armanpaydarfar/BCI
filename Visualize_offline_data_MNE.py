@@ -9,20 +9,59 @@ from scipy.stats import zscore
 
 
 # Custom utility functions
-from Utils.preprocessing import apply_notch_filter, butter_bandpass_filter, extract_segments, separate_classes, compute_grand_average
+from Utils.preprocessing import apply_notch_filter, extract_segments, separate_classes, compute_grand_average
 from Utils.stream_utils import get_channel_names_from_xdf
 
+subject = "PILOT007"
+session = "001OFFLINE"
 
-# ----- Load XDF Data -----
+# Construct the EEG directory path dynamically
+xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
 
-subject = "P002"
-session = "S001OFFLINE"
+# Ensure the directory exists
+if not os.path.exists(xdf_dir):
+    raise FileNotFoundError(f"❌ EEG directory not found: {xdf_dir}")
 
-xdf_dir = "/home/arman-admin/Documents/CurrentStudy/sub-PILOT007/ses-S002OFFLINE/eeg"
-xdf_file_path = os.path.join(xdf_dir, "sub-PILOT007_ses-S002OFFLINE_task-Default_run-001_eeg.xdf")
+# Find all .xdf files in the EEG folder
+xdf_files = [os.path.join(xdf_dir, f) for f in os.listdir(xdf_dir) if f.endswith(".xdf")]
 
-print(f"Loading XDF file: {xdf_file_path}")
-streams, header = pyxdf.load_xdf(xdf_file_path)
+if not xdf_files:
+    raise FileNotFoundError(f"❌ No XDF files found in: {xdf_dir}")
+
+print(f"📂 Found {len(xdf_files)} XDF files in: {xdf_dir}")
+
+# Display available files with an index
+for idx, file in enumerate(xdf_files, start=1):
+    print(f" [{idx}] {os.path.basename(file)}")
+
+# Prompt user for selection
+print("\nPress ENTER to merge **all** files, or enter the number(s) of the file(s) to load (comma-separated, e.g., 1,3): ")
+user_input = input("➡️  Selection: ").strip()
+
+# Determine which files to load
+selected_files = []
+
+if user_input:  # If user enters a choice
+    try:
+        selected_indices = [int(i) - 1 for i in user_input.split(",")]
+        selected_files = [xdf_files[i] for i in selected_indices if 0 <= i < len(xdf_files)]
+    except ValueError:
+        print("❌ Invalid input. Loading all files instead.")
+        selected_files = xdf_files  # Default to all files
+else:
+    selected_files = xdf_files  # Default to all files
+
+# Load and concatenate selected XDF files
+all_streams = []
+all_headers = []
+
+for xdf_file_path in selected_files:
+    print(f"📥 Loading XDF file: {xdf_file_path}")
+    streams, header = pyxdf.load_xdf(xdf_file_path)
+    all_streams.extend(streams)  # Merge streams
+    all_headers.append(header)   # Store headers for reference
+
+print(f"✅ Successfully loaded and merged {len(all_streams)} streams from {len(selected_files)} XDF file(s).")
 
 # Find EEG and Marker streams
 eeg_stream = next((s for s in streams if s["info"]["type"][0] == "EEG"), None)
@@ -120,7 +159,7 @@ print("\n Rechecking Channel Positions After Montage Application:")
 for ch in raw.info["chs"]:
     print(f"{ch['ch_name']}: {ch['loc'][:3]}")
 '''
-highband = 30
+highband = 12
 lowband = 8
 
 time_start = -0.5

@@ -104,6 +104,53 @@ rolling_scaler_path = None
 rolling_scaler = RollingScaler(window_size=100, save_path=None)
 
 
+SESSION_TIMESTAMP = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+
+
+
+
+def append_trial_probabilities_to_csv(trial_probabilities, mode, subject, model_dir):
+    """
+    Appends trial probability data to a uniquely named CSV file for each run.
+
+    :param trial_probabilities: (N, 2) NumPy array containing P(MI) and P(Rest) for each classification step.
+    :param correct_class: Integer, correct label for the trial (200 for MI, 100 for Rest).
+    :param subject: String, subject identifier.
+    :param model_dir: String, path to the subject's model directory.
+    """
+    # Ensure the directory exists
+    os.makedirs(model_dir, exist_ok=True)
+
+    # Define the CSV file path with a timestamp
+    results_file_path = os.path.join(model_dir, f'classification_probabilities_{SESSION_TIMESTAMP}.csv')
+    correct_class = 200 if mode == 0 else 100  # 200 = MI (Right Arm Move), 100 = Rest
+    # Ensure trial_probabilities is properly structured
+    trial_probabilities = np.array(trial_probabilities)  # Convert to NumPy array if not already
+    if trial_probabilities.shape[1] != 2:
+        print(f"❌ Error: Unexpected shape {trial_probabilities.shape}. Expected (N,2). Skipping save.")
+        return
+
+    # Create the correct class column
+    correct_class_column = np.full((trial_probabilities.shape[0], 1), correct_class)
+
+    # Combine probabilities and labels (shape: N, 3)
+    final_trial_data = np.hstack([trial_probabilities, correct_class_column])
+
+    # Convert to DataFrame
+    df = pd.DataFrame(final_trial_data, columns=["P(REST)", "P(MI)", "Correct Class"])
+
+    # Check if the file exists to determine whether to write a header
+    file_exists = os.path.isfile(results_file_path)
+
+    # Append data to the CSV file
+    df.to_csv(results_file_path, mode='a', header=not file_exists, index=False)
+
+    print(f"✅ Probabilities saved to {results_file_path}")
+
+
+
+
+
 def display_fixation_period(duration=3):
     """
     Displays a blank screen with fixation cross for a given duration.
@@ -463,6 +510,8 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
     leaky_integrator = LeakyIntegrator(alpha=0.95)  # Confidence smoothing
     min_predictions = config.MIN_PREDICTIONS
 
+
+    classification_results = []
     # Define the correct class based on mode
     # Define the correct class based on mode
     correct_class = 200 if mode == 0 else 100  # 200 = Right Arm MI, 100 = Rest
@@ -531,7 +580,6 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
 
     clock = pygame.time.Clock()
     running_avg_confidence = 0.5  # Initial placeholder
-
     while time.time() - start_time < duration:
         # Perform classification
         current_confidence, predictions, all_probabilities, data_buffer = classify_real_time(
@@ -580,7 +628,9 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
 
     send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP") if FES_toggle == 1 and FES_active else print("FES disable not needed")
 
-    return final_class, leaky_integrator, data_buffer, baseline_mean
+ 
+
+    return final_class, leaky_integrator, data_buffer, baseline_mean, all_probabilities
 
 
 
@@ -633,7 +683,7 @@ for ch in raw.info['chs']:
 
 print(f"Applied standard 10-20 montage. Final EEG channels: {raw.ch_names}")
 # Store this fixed montage for use in classification
-
+all_results = []
 
 # Start experiment loop
 running = True
@@ -703,12 +753,16 @@ while running and current_trial < len(trial_sequence):
     baseline_data = np.array(baseline_buffer)
 
     # Show feedback and classification
-    prediction, leaky_integrator, data_buffer, baseline_mean = show_feedback(duration=config.TIME_MI, mode=mode, inlet=inlet, baseline_data = baseline_data)
+    prediction, leaky_integrator, data_buffer, baseline_mean, trial_probs = show_feedback(duration=config.TIME_MI, mode=mode, inlet=inlet, baseline_data = baseline_data)
     send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_END"]) if mode == 0 else send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["REST_END"])
 
 
+    
+
+    append_trial_probabilities_to_csv(trial_probs, mode, config.TRAINING_SUBJECT, subject_model_dir)
     predictions_list.append(prediction)
     ground_truth_list.append(200) if mode ==0 else ground_truth_list.append(100)
+    
     # Prepare messages and UDP logic based on the prediction
     if mode == 0:  # Red Arrow Mode (Right Arm Move)
         if prediction == 200:  # Correct prediction
@@ -811,5 +865,6 @@ if predictions_list and ground_truth_list:
     print(f" Confusion matrix saved to: {cm_file_path}")
 else:
     print(" No predictions or ground truths available to calculate confusion matrix.")
+
 
 pygame.quit()
