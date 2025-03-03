@@ -3,6 +3,54 @@ import numpy as np
 import config
 from sklearn.linear_model import LinearRegression
 
+def concatenate_streams(eeg_streams, marker_streams):
+    """
+    Concatenates multiple EEG and marker streams into a single dataset.
+    Ensures metadata (e.g., 'info') is preserved.
+    """
+    merged_eeg = {"time_series": [], "time_stamps": [], "info": eeg_streams[0].get("info", {})}
+    merged_markers = {"time_series": [], "time_stamps": []}
+
+    time_offset = 0
+    for i, (eeg, markers) in enumerate(zip(eeg_streams, marker_streams)):
+        if i == 0:
+            merged_eeg["time_series"] = eeg["time_series"]
+            merged_eeg["time_stamps"] = eeg["time_stamps"]
+            merged_markers["time_series"] = markers["time_series"]
+            merged_markers["time_stamps"] = markers["time_stamps"]
+        else:
+            time_offset = merged_eeg["time_stamps"][-1] - eeg["time_stamps"][0] + np.mean(np.diff(eeg["time_stamps"]))
+            merged_eeg["time_series"] = np.vstack([merged_eeg["time_series"], eeg["time_series"]])
+            merged_eeg["time_stamps"] = np.concatenate([merged_eeg["time_stamps"], eeg["time_stamps"] + time_offset])
+            merged_markers["time_series"] = np.vstack([merged_markers["time_series"], markers["time_series"]])
+            merged_markers["time_stamps"] = np.concatenate([merged_markers["time_stamps"], markers["time_stamps"] + time_offset])
+
+    return merged_eeg, merged_markers
+
+
+def select_motor_channels(raw, keep_prefixes=("CP", "P", "C")):
+    """
+    Filters the MNE raw object to keep only CP (centroparietal), P (parietal), and C (central) channels.
+
+    Parameters:
+    - raw (mne.io.Raw): The MNE Raw object containing EEG data.
+    - keep_prefixes (tuple): Channel name prefixes to keep (default: ("CP", "P", "C")).
+
+    Returns:
+    - raw (mne.io.Raw): The modified MNE Raw object with only the selected channels.
+    """
+
+    # Get all channel names from the MNE Raw object
+    channel_names = raw.info["ch_names"]
+
+    # Find indices of channels that start with CP, P, or C
+    selected_channels = [ch for ch in channel_names if ch.startswith(keep_prefixes)]
+
+    # Select only these channels
+    raw.pick_channels(selected_channels)
+
+    return raw  # Return modified Raw object
+
 
 
 def apply_notch_filter(eeg_data, sampling_rate, line_freq=60, quality_factor=30, harmonics=2):

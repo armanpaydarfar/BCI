@@ -5,7 +5,7 @@
         "red": {
             "pulse_width": 250.0,
             "Sensory_current_mA": 4.0,
-            "Motor_current_mA": 5.0,
+            "Motor_current_mA": 6.0,
             "duration_sense": 5,
             "duration_Motor": 9
         },

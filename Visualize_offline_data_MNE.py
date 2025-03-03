@@ -6,14 +6,12 @@ import mne
 from scipy.signal import welch
 import config
 from scipy.stats import zscore
-
-
 # Custom utility functions
-from Utils.preprocessing import apply_notch_filter, extract_segments, separate_classes, compute_grand_average
-from Utils.stream_utils import get_channel_names_from_xdf
+from Utils.preprocessing import apply_notch_filter, extract_segments, separate_classes, compute_grand_average,concatenate_streams
+from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "PILOT007"
-session = "001OFFLINE"
+subject = "DELAND"
+session = "S001OFFLINE"
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
@@ -55,23 +53,20 @@ else:
 all_streams = []
 all_headers = []
 
-for xdf_file_path in selected_files:
-    print(f"📥 Loading XDF file: {xdf_file_path}")
-    streams, header = pyxdf.load_xdf(xdf_file_path)
-    all_streams.extend(streams)  # Merge streams
-    all_headers.append(header)   # Store headers for reference
+# Load multiple XDF files (concatenating EEG streams if needed)
+eeg_streams, marker_streams = [], []
+for xdf_file in xdf_files:
+    eeg_s, marker_s = load_xdf(xdf_file)
+    eeg_streams.append(eeg_s)
+    marker_streams.append(marker_s)
 
 print(f"✅ Successfully loaded and merged {len(all_streams)} streams from {len(selected_files)} XDF file(s).")
 
 # Find EEG and Marker streams
-eeg_stream = next((s for s in streams if s["info"]["type"][0] == "EEG"), None)
-marker_stream = next((s for s in streams if s["info"]["type"][0] == "Markers"), None)
-
-if eeg_stream is None or marker_stream is None:
-    raise ValueError(" EEG or Marker stream not found in the XDF file.")
-
-print(f"EEG Stream: {eeg_stream['info']['name'][0]}")
-print(f"Marker Stream: {marker_stream['info']['name'][0]}")
+# Merge multiple runs (if necessary)
+eeg_stream, marker_stream = (
+    (eeg_streams[0], marker_streams[0]) if len(eeg_streams) == 1 else concatenate_streams(eeg_streams, marker_streams)
+)
 
 # Extract EEG timestamps and data
 eeg_timestamps = np.array(eeg_stream["time_stamps"])  # (N_samples,)
@@ -162,7 +157,8 @@ for ch in raw.info["chs"]:
 highband = 12
 lowband = 8
 
-time_start = -0.5
+time_start = -1
+baseline_period = 1
 time_end = 5
 
 # Preprocessing
@@ -214,12 +210,15 @@ max_per_epoch = np.max(np.abs(epochs.get_data()), axis=(1, 2))
 z_scores = zscore(max_per_epoch)
 
 # Define a rejection criterion (e.g., 3 standard deviations)
-reject_z_threshold = 3.0  
+reject_z_threshold = 3.0 
 bad_epochs = np.where(np.abs(z_scores) > reject_z_threshold)[0]  
 
 # Drop the bad epochs
 epochs.drop(bad_epochs)
 print(f"Dropped {len(bad_epochs)} bad epochs based on z-score method.")
+for marker in ["100", "200"]:
+    print(f"Marker {marker}: {len(epochs[marker])} epochs")
+
 
 # **Define time windows (instead of discrete time points)**
 num_windows = 5  # Change this for finer resolution
@@ -233,9 +232,9 @@ print("Squaring all epochs for signal power computation...")
 epochs_power = epochs.copy()
 
 # Find baseline indices
-'''
-'''
-baseline_indices = epochs.time_as_index([time_start, time_start+0.5])  # Baseline window (-0.5 to 0 sec)
+
+
+baseline_indices = epochs_power.time_as_index([time_start, time_start+baseline_period])  # Baseline window (-0.5 to 0 sec)
 idx_start, idx_end = baseline_indices
 
 # Compute baseline mean **before squaring**
@@ -249,7 +248,7 @@ epochs_power._data = np.square(epochs_power._data)  # Square EEG signal
 
 # **Step 2: Compute grand-average power per event type**
 evoked_power = {}
-for event_id in ["100", "200", "300"]:
+for event_id in ["100", "200"]:
     if event_id in event_dict:
         evoked_power[event_id] = epochs_power[event_id].average()
         print(f"Computed grand average power for marker {event_id}.")
@@ -308,8 +307,20 @@ for event_id in evoked_power.keys():
 plt.show()
 
 # **Step 6: Compute and Plot PSD**
-raw.compute_psd(fmax=50).plot()
-#epochs.compute_psd(fmax= 50).plot()
+#raw.compute_psd(fmax=50).plot()
+# Select epochs based on marker values
+epochs_marker1 = epochs['100']  # Replace '100' with the actual event ID for the first marker
+epochs_marker2 = epochs['200']  # Replace '200' with the actual event ID for the second marker
+
+# Compute and plot PSD for the first marker
+psd_marker1 = epochs_marker1.compute_psd(fmax=50)
+psd_marker1.plot()  # Modify title based on event ID
+plt.title("PSD for rest")  # Set title separately
+# Compute and plot PSD for the second marker
+psd_marker2 = epochs_marker2.compute_psd(fmax=50)
+psd_marker2.plot()  # Modify title based on event ID
+plt.title("PSD for MI")  # Set title separately
+
 # **Step 7: Plot Event Markers Over Time**
 fig, ax = plt.subplots(figsize=(10, 5))
 sc = ax.scatter(marker_timestamps, marker_data, c=marker_data, cmap='coolwarm', alpha=0.7)
@@ -329,14 +340,14 @@ plt.show()
 ##################################################################################
 
 # Define Time Windows for ERD/ERS
-baseline = (time_start, time_start+0.5)  # Pre-event window
+baseline = (time_start, time_start+baseline_period)  # Pre-event window
 window_size = 0.5  # Window duration in seconds
 time_windows = np.arange(0, 5, window_size)  # Start times
 
 # Compute ERD/ERS Using MNE's Updated API
 tfr_data = {}
 
-for marker in ["100", "200", "300"]:
+for marker in ["100", "200"]:
     if marker in event_dict:
         tfr = epochs[marker].compute_tfr(
             method="multitaper", freqs=np.linspace(lowband, highband, highband - lowband),tmin = time_start, tmax= time_end, n_cycles=2.5, 
@@ -345,17 +356,18 @@ for marker in ["100", "200", "300"]:
 
         # Apply baseline correction
         print(f"Before baseline correction: {np.mean(tfr.data):.6f}")  # Debugging
-        tfr.apply_baseline(baseline=baseline, mode="percent")  
-        print(f"Computed ERD/ERS for marker {marker}. After baseline correction: {np.mean(tfr.data):.6f}")
-
+        tfr.apply_baseline(baseline=baseline, mode="logratio")  
         # Convert to AverageTFR and store
         tfr_data[marker] = tfr.average()
+        
+
 
 # Adjust ERD/ERS values to be centered at 0%
+'''
 for marker, tfr_avg in tfr_data.items():
     tfr_avg.data *= 100  # Convert to percentage
     tfr_avg.data -= 100  # Shift to center at 0%
-
+'''
 # Compute dynamic vmin/vmax across all markers
 all_erd_values = np.concatenate([tfr_avg.data.flatten() for tfr_avg in tfr_data.values()])
 vmin, vmax = np.percentile(all_erd_values, [2, 98])  # Use percentiles to avoid extreme outliers
@@ -394,7 +406,7 @@ for marker, tfr_avg in tfr_data.items():
             sm = plt.cm.ScalarMappable(norm=norm, cmap="viridis")  # Create a proper color mapping
             sm.set_array([])  # Required for colorbar to display properly
             cbar = fig.colorbar(sm, ax=axes, orientation="horizontal", fraction=0.05, pad=0.1)
-            cbar.set_label("ERD/ERS (%)", fontsize=12)
+            cbar.set_label("ERD/ERS (logratio)", fontsize=12)
 
 
     # Set figure title using the marker label
@@ -402,9 +414,81 @@ for marker, tfr_avg in tfr_data.items():
     fig.suptitle(f"ERD/ERS Over Time Windows - {marker_label}", fontsize=14)
     figures[marker] = fig
 
-
-
 plt.show()
+
+
+
+
+##################################################################################
+#ERD or ERS analysis below
+##################################################################################
+##################################################################################
+
+
+
+# Define motor cortex channels for ERD/ERS averaging
+motor_cortex_channels = ["P3"]  # Adjust as needed
+selected_ch_indices = [epochs.ch_names.index(ch) for ch in motor_cortex_channels if ch in epochs.ch_names]
+
+# Time Windows for ERD/ERS
+baseline = (time_start, time_start+baseline_period)  # Pre-event baseline
+window_size = 0.5  # Window duration in seconds
+time_windows = np.arange(0, 5, window_size)  # Start times for windows
+
+# Compute ERD/ERS
+tfr_data = {}
+
+for marker in ["100", "200"]:
+    if marker in event_dict:
+        tfr = epochs[marker].compute_tfr(
+            method="multitaper",
+            freqs=np.linspace(lowband, highband, highband - lowband),
+            tmin=time_start, tmax=time_end,
+            n_cycles=2.5, use_fft=True, return_itc=False
+        )
+        # Apply baseline correction
+        tfr.apply_baseline(baseline=baseline, mode="logratio")
+        tfr_data[marker] = tfr
+
+# Plot ERD/ERS Averaged Over Motor Cortex Channels
+fig, axes = plt.subplots(1, len(tfr_data), figsize=(12, 6), sharex=True, sharey=True)
+
+for col, (marker, tfr) in enumerate(tfr_data.items()):
+    times = tfr.times  # Extract time points
+
+    # Compute mean & std across selected motor cortex channels
+    erd_ers_mean = np.mean(tfr.data[selected_ch_indices], axis=(0, 1, 2))  # Mean over channels, epochs, freqs
+    erd_ers_std = np.std(tfr.data[selected_ch_indices], axis=(0, 1, 2))    # STD over channels, epochs, freqs
+
+    ax = axes[col] if len(tfr_data) > 1 else axes
+    ax.plot(times, erd_ers_mean, label=f"Avg ERD/ERS ({', '.join(motor_cortex_channels)})", color='b')
+
+    # Plot shaded region for variability (mean ± std)
+    ax.fill_between(times, erd_ers_mean - erd_ers_std, erd_ers_mean + erd_ers_std, color='b', alpha=0.3, label="±1 STD")
+
+    # Highlight the baseline window
+    ax.axvspan(baseline[0], baseline[1], color="gray", alpha=0.2, label="Baseline")
+
+    # Formatting
+    ax.axhline(0, linestyle="--", color="black", linewidth=1)  # Zero line
+    ax.set_title(f"{marker_labels.get(marker, f'Marker {marker}')} -  ERD/ERS")
+    ax.set_ylabel("ERD/ERS (logratio)")
+    ax.set_xlabel("Time (s)")
+    ax.legend()
+
+# Dynamically get channel names being averaged
+channel_labels = ", ".join(motor_cortex_channels)
+
+# Update plot title to show exact channels
+plt.suptitle(f"ERD/ERS Over Selected Channels: {channel_labels}", fontsize=14)
+plt.tight_layout()
+plt.show()
+
+
+
+
+
+
 
 #########################
 #TESTING

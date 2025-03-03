@@ -30,6 +30,7 @@ from Utils.preprocessing import (
     extract_and_flatten_segment,
     parse_eeg_and_eog,
     remove_eog_artifacts,
+    select_motor_channels,
 )
 
 # Visualization utilities
@@ -90,6 +91,19 @@ except FileNotFoundError:
     exit(1)
 
 
+# Load precomputed mean and std
+'''
+scaler_mean_path = os.path.join(subject_model_dir, f"sub-{config.TRAINING_SUBJECT}_mean.npy")
+scaler_std_path = os.path.join(subject_model_dir, f"sub-{config.TRAINING_SUBJECT}_std.npy")
+
+if os.path.exists(scaler_mean_path) and os.path.exists(scaler_std_path):
+    scaler_mean = np.load(scaler_mean_path)
+    scaler_std = np.load(scaler_std_path)
+    print("✅ Loaded precomputed mean and std for real-time normalization.")
+else:
+    print("❌ Error: Precomputed mean and std files not found.")
+    exit(1)
+'''
 predictions_list = []
 ground_truth_list = []
 fs = config.FS
@@ -97,12 +111,14 @@ b, a = butter_bandpass(config.LOWCUT, config.HIGHCUT, fs, order=4)
 global filter_states
 filter_states = {}
 
+'''
 # rolling normalization initialization: 
 global rolling_scalar
 # Initialize Rolling Scaler with 100 window memory
+
 rolling_scaler_path = None
 rolling_scaler = RollingScaler(window_size=100, save_path=None)
-
+'''
 
 SESSION_TIMESTAMP = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
@@ -261,11 +277,11 @@ def collect_baseline_during_countdown(inlet, countdown_start, countdown_duration
     current_time = pygame.time.get_ticks()
     remaining_time = countdown_duration - (current_time - countdown_start)
 
-    if remaining_time <= 500 and not baseline_buffer:  # When 0.5s remain, flush and start collecting
+    if remaining_time <= 1000 and not baseline_buffer:  # When 0.5s remain, flush and start collecting
         print("⏳ Less than 0.5s left in countdown. Flushing buffer and collecting baseline data...")
         inlet.flush()  # Remove old EEG data
 
-    if remaining_time <= 500:  # Collect EEG data continuously
+    if remaining_time <= 1000:  # Collect EEG data continuously
         new_data, _ = inlet.pull_chunk(timeout=0.1, max_samples=config.FS // 2)  # 0.5s worth of samples
         if new_data:
             baseline_buffer.extend(new_data)
@@ -286,15 +302,15 @@ def classify_real_time(inlet, window_size_samples, step_size_samples, all_probab
     - updated data_buffer (preserves past EEG samples)
     """
     new_data, _ = inlet.pull_chunk(timeout=0.1, max_samples=int(step_size_samples))
-    global filter_states
-    global rolling_scaler
+    #global filter_states
+    #global rolling_scaler
 
     if new_data:
         new_data_np = np.array(new_data)
         data_buffer.extend(new_data_np)  # Append new data to buffer
 
-        # Ensure sufficient data before classification
-        if len(data_buffer) < window_size_samples:
+        # wait until the buffer has collected over 1s of data to begin classifying
+        if len(data_buffer) < config.FS:
             return leaky_integrator.accumulated_probability, predictions, all_probabilities, data_buffer  
 
         # Keep only the latest `window_size_samples` for classification
@@ -304,7 +320,6 @@ def classify_real_time(inlet, window_size_samples, step_size_samples, all_probab
         sfreq = config.FS
         info = mne.create_info(ch_names=channel_names, sfreq=sfreq, ch_types="eeg")
         raw = mne.io.RawArray(sliding_window_np, info)
-
         # Drop AUX Channels (These are NOT EEG)
         aux_channels = {"AUX1", "AUX2", "AUX3", "AUX7", "AUX8", "AUX9", "TRIGGER"}
         existing_aux = [ch for ch in aux_channels if ch in raw.ch_names]
@@ -335,37 +350,56 @@ def classify_real_time(inlet, window_size_samples, step_size_samples, all_probab
 
         # Apply Notch and Bandpass Filtering (IIR to avoid FIR length issues)
         raw.notch_filter(60, method="iir")  
+
+        '''
          # **Apply Stateful Bandpass Filtering Using Scipy**
         for ch_idx, ch_name in enumerate(raw.ch_names):
             if ch_idx not in filter_states:
                 filter_states[ch_idx] = lfilter_zi(b, a) * raw._data[ch_idx][0]  # Initialize state
             raw._data[ch_idx], filter_states[ch_idx] = filter_with_state(raw._data[ch_idx], b, a, filter_states[ch_idx])
+        '''
+        
+        raw.filter(l_freq=config.LOWCUT, h_freq=config.HIGHCUT, method="iir")  # Bandpass filter (8-16Hz)
+
         # Apply Surface Laplacian (CSD) with Error Handling
 
         #raw.set_eeg_reference('average')
         if config.SURFACE_LAPLACIAN_TOGGLE:
             raw = mne.preprocessing.compute_current_source_density(raw)
 
-        #print(raw)
+        #print(raw.get_data())
+        if config.SELECT_MOTOR_CHANNELS:
+            raw = select_motor_channels(raw)
         # Apply Baseline Correction (Subtract Precomputed Baseline Mean)
         raw._data -= baseline_mean  # Apply baseline correction
         #print(raw)
- 
+
+        '''
         # Update rolling mean & std memory with new data
         rolling_scaler.update(raw.get_data())
         raw._data = rolling_scaler.transform(raw.get_data())
+        '''
 
-        #print(raw._data)
+        '''
+        #normalize data if needed
+        raw._data = (raw.get_data() - scaler_mean[:, None]) / scaler_std[:, None]
+        #print(raw._data.shape)
+        '''
         # Compute the Covariance Matrix (For Riemannian Classifier)
         info = raw.info  # Get the raw's info object
 
         # Compute Covariance Matrix using MNE
         #cov = mne.compute_covariance(mne.EpochsArray(raw.get_data()[np.newaxis, :, :], info), method="oas")
-        cov_matrix = np.cov(raw.get_data())
+        #cov_matrix = np.cov(raw.get_data())
+        # Extract EEG data (shape: n_channels x n_samples)
+        eeg_data = raw.get_data()
+
+        # Compute the normalized covariance matrix
+        cov_matrix = (eeg_data @ eeg_data.T) / np.trace(eeg_data @ eeg_data.T)
         #print(cov_matrix)
         cov_matrix = np.expand_dims(cov_matrix, axis=0)  # Reshape to (1, channels, channels)
         # Apply Shrinkage Regularization
-        shrinkage = Shrinkage(shrinkage=0.1)  
+        shrinkage = Shrinkage(shrinkage=config.SHRINKAGE_PARAM)  
         cov_matrix = shrinkage.fit_transform(cov_matrix)  # Regularized covariance matrix
 
         # Now pass the properly formatted covariance matrix to the classifier
@@ -507,7 +541,7 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
     all_probabilities = []
     predictions = []
     data_buffer = []  # Buffer for EEG data
-    leaky_integrator = LeakyIntegrator(alpha=0.95)  # Confidence smoothing
+    leaky_integrator = LeakyIntegrator(alpha=config.INTEGRATOR_ALPHA)  # Confidence smoothing
     min_predictions = config.MIN_PREDICTIONS
 
 
@@ -516,7 +550,6 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
     # Define the correct class based on mode
     correct_class = 200 if mode == 0 else 100  # 200 = Right Arm MI, 100 = Rest
     incorrect_class = 100 if mode == 0 else 200  # The opposite class
-
     # Preprocess the baseline dataset before feedback starts
     if baseline_data is not None:
         print(" Processing Baseline Data...")
@@ -530,9 +563,7 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
         aux_channels = {"AUX1", "AUX2", "AUX3", "AUX7", "AUX8", "AUX9", "TRIGGER"}
         raw_baseline.drop_channels([ch for ch in aux_channels if ch in raw_baseline.ch_names])        
         mastoid_channels = ["M1", "M2"]
-        existing_mastoids = [ch for ch in mastoid_channels if ch in raw.ch_names]
-        if existing_mastoids:
-            raw.drop_channels(existing_mastoids)
+        raw_baseline.drop_channels(mastoid_channels)
 
         # Ensure standard 10-20 montage
         montage = mne.channels.make_standard_montage("standard_1020")
@@ -548,26 +579,34 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
 
         # Apply Notch Filtering to `raw_baseline`
         raw_baseline.notch_filter(60, method="iir")  
-
+        '''
         # Apply Bandpass Filtering with State Preservation
+
         for ch_idx, ch_name in enumerate(raw_baseline.ch_names):
             if ch_idx not in filter_states:
                 filter_states[ch_idx] = lfilter_zi(b, a) * raw_baseline._data[ch_idx][0]  # Initialize state
             raw_baseline._data[ch_idx], filter_states[ch_idx] = filter_with_state(raw_baseline._data[ch_idx], b, a, filter_states[ch_idx])
             #raw_baseline.set_eeg_reference('average')
-
+        '''
+        raw_baseline.filter(l_freq=config.LOWCUT, h_freq=config.HIGHCUT, method="iir")  # Bandpass filter (8-12Hz)
 
         if config.SURFACE_LAPLACIAN_TOGGLE:
-            raw_baseline = mne.preprocessing.compute_current_source_density(raw)
+            raw_baseline = mne.preprocessing.compute_current_source_density(raw_baseline)
 
-
+        if config.SELECT_MOTOR_CHANNELS:
+            raw_baseline = select_motor_channels(raw_baseline)
         
+        #print(raw_baseline)
         # Compute baseline mean across time
         baseline_mean = np.mean(raw_baseline.get_data(), axis=1, keepdims=True)  # Shape: (n_channels, 1)
+        
         #print(f" Computed Baseline Mean: Shape {baseline_mean.shape}")
 
     else:
         baseline_mean = None  # No baseline correction applied
+    
+    
+    
     # Send UDP triggers
     if mode == 0:  # Red Arrow Mode (Motor Imagery)
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_BEGIN"])
@@ -751,7 +790,7 @@ while running and current_trial < len(trial_sequence):
 
     # Compute baseline mean after countdown ends
     baseline_data = np.array(baseline_buffer)
-
+    
     # Show feedback and classification
     prediction, leaky_integrator, data_buffer, baseline_mean, trial_probs = show_feedback(duration=config.TIME_MI, mode=mode, inlet=inlet, baseline_data = baseline_data)
     send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_END"]) if mode == 0 else send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["REST_END"])
