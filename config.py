@@ -39,26 +39,34 @@ TIME_MI = 5 # time for motor imagery and rest
 TIME_ROB = 13 # time allocated for robot to move
 TIME_STATIONARY = 2 # time for stationary feedback after no movement/failed movement trial
 TIMING = True
-SHAPE_MAX = 0.9 #maximum fill 
+SHAPE_MAX = 0.8 #maximum fill 
 SHAPE_MIN = 0.5 #minimum fill 
 
 
 # Classification Parameters
 CLASSIFY_WINDOW = 500  # Duration of EEG data window for classification (milliseconds)
-ACCURACY_THRESHOLD = 0.55  # Accuracy threshold to determine "Correct"
+ACCURACY_THRESHOLD = 0.57  # Accuracy threshold to determine "Correct" (plan to obsolete)
+THRESHOLD_MI = 0.55 #Threshold for MI "correct"
+THRESHOLD_REST = 0.65 #Threshold for REST "Correct"
 RELAXATION_RATIO = 0.5
-MIN_PREDICTIONS = 25 # Min number of predictions during Online experiment before the decoder can end early
+MIN_PREDICTIONS = 20 # Min number of predictions during Online experiment before the decoder can end early
 CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
 #CLASSIFICATION_SCHEME_OPT = "TIMESERIES"
 CLASSIFICATION_SCHEME_OPT = "FREQUENCY"
-SURFACE_LAPLACIAN_TOGGLE = 0 #apply the surface laplacian spatial filter 
+SURFACE_LAPLACIAN_TOGGLE = 0 #apply the surface laplacian spatial filter during online
 SELECT_MOTOR_CHANNELS = 1 # toggle to select motor channels or not (can be used to select other channels too)
 INTEGRATOR_ALPHA = 0.95 # defines how fast the accumulated probability may change as new data comes in
 SHRINKAGE_PARAM = 0.1 # hyperparameter for shrinkage regularization
+LEDOITWOLF = 1 #Set to true to use ledoit wolf shrinkage regularization - otherwise pyreimannian will be used w/ shrinkage param shown above
+
+# adaptive Recentering parameters for config
+RECENTERING = 1 # adaptive recentering toggle
+UPDATE_DURING_MOVE = 0 #this toggle defines whether or not the reimannian adaptive recentering scheme updates when the robot is moving. 0 = no, 1 = yes. The algo will update always during MI
+
 
 
 # FES Parameters
-FES_toggle = 1
+FES_toggle = 0
 FES_CHANNEL = "red"
 FES_TIMING_OFFSET = 4 
 # above for motor FES, cut out X seconds before the full duration of movement. This should represent when the robot will naturally reach the end of motion (in successful case)

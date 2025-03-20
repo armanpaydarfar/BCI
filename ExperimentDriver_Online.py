@@ -15,7 +15,9 @@ from pyriemann.classification import MDM
 from pyriemann.estimation import Covariances
 from sklearn.preprocessing import StandardScaler
 from scipy.signal import butter, lfilter, lfilter_zi
-
+from pyriemann.utils.geodesic import geodesic_riemann
+from pyriemann.utils.base import invsqrtm
+from sklearn.covariance import LedoitWolf
 
 # MNE for real-time EEG processing
 import mne
@@ -110,6 +112,10 @@ fs = config.FS
 b, a = butter_bandpass(config.LOWCUT, config.HIGHCUT, fs, order=4)
 global filter_states
 filter_states = {}
+
+global Prev_T
+global counter 
+counter = 0
 
 '''
 # rolling normalization initialization: 
@@ -290,7 +296,7 @@ def collect_baseline_during_countdown(inlet, countdown_start, countdown_duration
 
 
 def classify_real_time(inlet, window_size_samples, step_size_samples, all_probabilities, predictions, 
-                        data_buffer, mode, leaky_integrator, baseline_mean=None):
+                        data_buffer, mode, leaky_integrator, baseline_mean=None, update_recentering = True):
     """
     Reads EEG data, applies preprocessing using MNE, extracts features, and classifies using a trained model.
     Maintains a sliding window approach with step_size shifting.
@@ -304,7 +310,8 @@ def classify_real_time(inlet, window_size_samples, step_size_samples, all_probab
     new_data, _ = inlet.pull_chunk(timeout=0.1, max_samples=int(step_size_samples))
     #global filter_states
     #global rolling_scaler
-
+    global counter
+    global Prev_T
     if new_data:
         new_data_np = np.array(new_data)
         data_buffer.extend(new_data_np)  # Append new data to buffer
@@ -396,11 +403,41 @@ def classify_real_time(inlet, window_size_samples, step_size_samples, all_probab
 
         # Compute the normalized covariance matrix
         cov_matrix = (eeg_data @ eeg_data.T) / np.trace(eeg_data @ eeg_data.T)
-        #print(cov_matrix)
-        cov_matrix = np.expand_dims(cov_matrix, axis=0)  # Reshape to (1, channels, channels)
+        #print(cov_matrix.shape)
         # Apply Shrinkage Regularization
-        shrinkage = Shrinkage(shrinkage=config.SHRINKAGE_PARAM)  
-        cov_matrix = shrinkage.fit_transform(cov_matrix)  # Regularized covariance matrix
+
+        if config.LEDOITWOLF:
+            # Compute covariance matrices with optimized shrinkage via ledoit wolf
+            cov_matrix_shrinked = np.array([LedoitWolf().fit(cov_matrix).covariance_])
+            cov_matrix = cov_matrix_shrinked
+            #cov_matrix = np.expand_dims(cov_matrix, axis=0)  # Reshape to (1, channels, channels)    
+            #print(cov_matrix.shape)
+
+        else:
+            # regularize w/ pyreimanian, shrinkage value defined in config
+            cov_matrix = np.expand_dims(cov_matrix, axis=0)  # Reshape to (1, channels, channels)
+            shrinkage = Shrinkage(shrinkage=config.SHRINKAGE_PARAM)
+            cov_matrix = shrinkage.fit_transform(cov_matrix)  
+
+        # adaptive recentering 
+        if config.RECENTERING:
+            cov_matrix = np.squeeze(cov_matrix, axis=0)  # Shape: (13, 13)
+            if counter == 0:
+                Prev_T = cov_matrix
+
+            T_test = geodesic_riemann(Prev_T, cov_matrix, 1/(counter+1))
+            
+            if update_recentering:
+                Prev_T = T_test
+                counter = counter +  1
+
+            T_test_invsqrtm = invsqrtm(T_test)
+    
+            cov_matrix = T_test_invsqrtm @ cov_matrix @ T_test_invsqrtm.T
+            cov_matrix = np.expand_dims(cov_matrix, axis=0)  # Reshape to (1, channels, channels)
+
+        
+
 
         # Now pass the properly formatted covariance matrix to the classifier
         probabilities = model.predict_proba(cov_matrix)[0]
@@ -469,6 +506,10 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
     min_predictions_before_stop = config.MIN_PREDICTIONS
     num_predictions = 0  # Counter for predictions made
 
+    # accuracy threshold based on mode
+    accuracy_threshold = config.THRESHOLD_MI if mode == 0 else config.THRESHOLD_REST 
+
+
     clock = pygame.time.Clock()
 
     while time.time() - start_time < duration:
@@ -485,7 +526,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
 
         # Perform classification
         current_confidence, predictions, all_probabilities, data_buffer = classify_real_time(
-            inlet, window_size_samples, step_size_samples, [], [], data_buffer, mode,leaky_integrator, baseline_mean
+            inlet, window_size_samples, step_size_samples, [], [], data_buffer, mode,leaky_integrator, baseline_mean, update_recentering = config.UPDATE_DURING_MOVE
         )
 
         # If a prediction was made, increase the counter
@@ -496,7 +537,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
         running_avg_confidence = leaky_integrator.update(current_confidence)
 
         # **Early stopping condition - stop the robot from moving, display message regarding early stop, and stop FES**
-        if num_predictions >= min_predictions_before_stop and running_avg_confidence < config.RELAXATION_RATIO * config.ACCURACY_THRESHOLD:
+        if num_predictions >= min_predictions_before_stop and running_avg_confidence < config.RELAXATION_RATIO * accuracy_threshold:
             early_stop = True
             print(f"Stopping robot! Confidence: {running_avg_confidence:.2f} after {num_predictions} predictions")
             send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_EARLYSTOP"])
@@ -531,7 +572,7 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
     using a sliding window approach with early stopping based on posterior probabilities.
     """
     start_time = time.time()
-    step_size = 0.05  # Sliding window step size (seconds)
+    step_size = 1 / 16  # Sliding window step size (seconds)
     window_size = config.CLASSIFY_WINDOW / 1000  # Convert ms to seconds
     window_size_samples = int(window_size * config.FS)
     step_size_samples = int(step_size * config.FS)
@@ -550,6 +591,10 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
     # Define the correct class based on mode
     correct_class = 200 if mode == 0 else 100  # 200 = Right Arm MI, 100 = Rest
     incorrect_class = 100 if mode == 0 else 200  # The opposite class
+
+    # accuracy threshold based on mode
+    accuracy_threshold = config.THRESHOLD_MI if mode == 0 else config.THRESHOLD_REST 
+
     # Preprocess the baseline dataset before feedback starts
     if baseline_data is not None:
         print(" Processing Baseline Data...")
@@ -606,7 +651,6 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
         baseline_mean = None  # No baseline correction applied
     
     
-    
     # Send UDP triggers
     if mode == 0:  # Red Arrow Mode (Motor Imagery)
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_BEGIN"])
@@ -651,7 +695,7 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
         clock.tick(30)  # Maintain 30 FPS
 
         # Early stopping
-        if len(predictions) >= min_predictions and running_avg_confidence >= config.ACCURACY_THRESHOLD:
+        if len(predictions) >= min_predictions and running_avg_confidence >= accuracy_threshold:
             print(f"Early stopping triggered! Confidence: {running_avg_confidence:.2f}")
             if mode == 0:
                 send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP") if FES_toggle == 1 else print("FES is disabled.")
@@ -662,7 +706,7 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
 
 
     # Final Decision: Return correct or incorrect class based on confidence
-    final_class = correct_class if running_avg_confidence >= config.ACCURACY_THRESHOLD else incorrect_class
+    final_class = correct_class if running_avg_confidence >= accuracy_threshold else incorrect_class
     print(f"Final decision: {final_class}, Confidence for correct({correct_class}) class: {running_avg_confidence:.2f}) at sample size {len(predictions)}")
 
     send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP") if FES_toggle == 1 and FES_active else print("FES disable not needed")

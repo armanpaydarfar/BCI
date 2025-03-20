@@ -10,8 +10,8 @@ from scipy.stats import zscore
 from Utils.preprocessing import apply_notch_filter, extract_segments, separate_classes, compute_grand_average,concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "DELAND"
-session = "S001OFFLINE"
+subject = "Class_Subj_001"
+session = "S001OFFLINE_NOFES"
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
@@ -75,7 +75,7 @@ channel_names = get_channel_names_from_xdf(eeg_stream)
 marker_data = np.array([int(value[0]) for value in marker_stream['time_series']])
 marker_timestamps = np.array(marker_stream['time_stamps'])
 print("\n EEG Channels from XDF:", channel_names)
-
+#print(marker_stream[0])
 # Load standard 10-20 montage
 montage = mne.channels.make_standard_montage("standard_1020")
 
@@ -154,7 +154,7 @@ print("\n Rechecking Channel Positions After Montage Application:")
 for ch in raw.info["chs"]:
     print(f"{ch['ch_name']}: {ch['loc'][:3]}")
 '''
-highband = 12
+highband = 30
 lowband = 8
 
 time_start = -1
@@ -178,7 +178,9 @@ raw = mne.preprocessing.compute_current_source_density(raw)
 # Debug: Final check
 print("\n Final EEG Channels After Processing:", raw.ch_names)
 
-
+#print(marker_data)
+#print(marker_timestamps)
+#print(eeg_timestamps)
 # Create Events Array for MNE Epoching
 unique_markers = np.unique(marker_data)
 event_dict = {str(marker): marker for marker in unique_markers}
@@ -187,7 +189,10 @@ events = np.column_stack((
     np.zeros(len(marker_data), dtype=int),              # MNE requires a placeholder column
     marker_data                                        # Marker values
 ))
-
+#print(events)
+#print(marker_data)
+#print(marker_timestamps)
+#print(np.searchsorted(eeg_timestamps, marker_timestamps))
 # Define marker labels
 marker_labels = {
     "100": "Rest",
@@ -198,6 +203,8 @@ marker_labels = {
 epochs = mne.Epochs(
     raw, events, event_id=event_dict, tmin=time_start, tmax=time_end, baseline = None, detrend=1, preload=True
 )
+
+
 #baseline =(None,time_start+0.5)
 
 # Define a rejection threshold (adjust as needed)5

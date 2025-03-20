@@ -95,7 +95,7 @@ def train_riemannian_model(cov_matrices, labels, subject_ids="PILOT007", n_split
     Returns:
         dict: Trained models and applied transformations.
     """
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    kf = KFold(n_splits=n_splits, shuffle=False,)
     mdm = MDM()
 
     accuracies = []
@@ -110,6 +110,7 @@ def train_riemannian_model(cov_matrices, labels, subject_ids="PILOT007", n_split
     print(f"🔹 Unique domain labels: {np.unique(subject_ids)}")
 
     # **Step 2: Apply Shrinkage Regularization**
+
     shrinkage = Shrinkage(shrinkage=shrinkage_param)
     cov_matrices = shrinkage.fit_transform(cov_matrices)
 
@@ -118,19 +119,34 @@ def train_riemannian_model(cov_matrices, labels, subject_ids="PILOT007", n_split
         X_train, X_test = cov_matrices[train_index], cov_matrices[test_index]
         Y_train, Y_test = labels[train_index], labels[test_index]
         subjects_train, subjects_test = subject_ids[train_index], subject_ids[test_index]
+        # Print the first covariance matrix before and after TLCenter
+        
+        #print("\n🔍 First Covariance Matrix (Before Centering):")
+        #print(X_train[0])  # Print the first training matrix before transformation
+
 
         # **Step 4: Extract Subject Name Only for `target_domain`**
         target_domain = np.unique([subj.split("/")[0] for subj in subjects_test])[0]  # Extract "PILOT007" only
 
-        print(f"🔹 Fold {fold_idx}: Target domain = {target_domain}")
+        #print(f"🔹 Fold {fold_idx}: Target domain = {target_domain}")
 
         # **Step 5: Apply Re-Centering Transformation (RCT) on the TRAINING SET ONLY**
         rct = TLCenter(target_domain=target_domain)
         X_train_centered = rct.fit_transform(X_train, subjects_train)
-
+        
         # **Step 6: Apply the same RCT transformation to the test set**
         X_test_centered = rct.transform(X_test)
-        print(X_test_centered[0])
+
+        # Debugging: Verify Centered Matrices
+        mean_diag_train = np.mean([np.diag(cov) for cov in X_train_centered])
+        mean_col_train = np.mean([cov.mean(axis=0) for cov in X_train_centered])
+
+        mean_diag_test = np.mean([np.diag(cov) for cov in X_test_centered])
+        mean_col_test = np.mean([cov.mean(axis=0) for cov in X_test_centered])
+
+        #print(f"🔍 Mean Diagonal (Train): {mean_diag_train:.4f}, Mean Columns (Train): {mean_col_train.mean():.4f}")
+        #print(f"🔍 Mean Diagonal (Test): {mean_diag_test:.4f}, Mean Columns (Test): {mean_col_test.mean():.4f}")
+
         # **Step 7: Train and Evaluate the Classifier**
         mdm.fit(X_train_centered, Y_train)
         Y_pred = mdm.predict(X_test_centered)

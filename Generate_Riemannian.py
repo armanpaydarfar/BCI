@@ -5,8 +5,8 @@ import mne
 from sklearn.model_selection import KFold
 from sklearn.metrics import accuracy_score
 from pyriemann.estimation import Shrinkage
-from pyriemann.classification import MDM
-from pyriemann.estimation import Covariances
+from pyriemann.classification import MDM, FgMDM
+from pyriemann.estimation import Covariances, XdawnCovariances
 import config
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
@@ -15,6 +15,11 @@ from scipy.signal import butter, lfilter, lfilter_zi
 from Utils.preprocessing import butter_bandpass, concatenate_streams, select_motor_channels
 import glob  # Required for multi-file loading
 from scipy.stats import zscore
+from pyriemann.utils.mean import mean_riemann
+from scipy.linalg import sqrtm
+import seaborn as sns
+from sklearn.covariance import LedoitWolf
+from pyriemann.preprocessing import Whitening
 
 # Load trigger mappings from config
 TRIGGERS = config.TRIGGERS
@@ -26,6 +31,36 @@ EPOCHS_START_END = {
 }
 
 
+
+
+def plot_posterior_probabilities(posterior_probs):
+    """
+    Plots the histogram of posterior probabilities for each class.
+
+    Parameters:
+        posterior_probs (dict): Dictionary containing posterior probabilities for each class.
+    """
+    plt.figure(figsize=(10, 6))
+    bins = np.linspace(0, 1, 20)  # Set bins for histogram
+
+    # Convert numerical labels to "Rest" and "MI"
+    label_map = {100: "Rest", 200: "MI"}  # Ensures proper text labels
+    renamed_probs = {label_map[label]: probs for label, probs in posterior_probs.items()}
+
+    for label, probs in renamed_probs.items():
+        probs = np.array(probs).flatten()
+        sns.histplot(probs, bins=bins, alpha=0.6, label=f"{label} Probability", kde=True)
+
+    plt.xlabel("Predicted Probability")
+    plt.ylabel("Frequency")
+    plt.title("Posterior Probability Distribution Across Classes")
+    plt.legend(title="True Class")
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.show()
+
+
+
+
 # Stateful Filtering Function
 def apply_stateful_filter(raw, b, a):
     filter_states = {}  # Initialize state tracking dictionary
@@ -35,7 +70,27 @@ def apply_stateful_filter(raw, b, a):
         raw._data[ch_idx], filter_states[ch_idx] = lfilter(b, a, raw._data[ch_idx], zi=filter_states[ch_idx])
     return raw
 
+def center_cov_matrices_riemannian(cov_matrices):
+    """
+    Center a set of covariance matrices around the identity matrix using the Riemannian mean.
 
+    Parameters:
+        cov_matrices (np.ndarray): Array of shape (n_matrices, n_channels, n_channels)
+
+    Returns:
+        np.ndarray: Centered covariance matrices
+    """
+    # Compute the Riemannian mean of the covariance matrices
+    mean_cov = mean_riemann(cov_matrices, maxiter = 5000)
+
+    # Compute the inverse square root of the mean covariance
+    eigvals, eigvecs = np.linalg.eigh(mean_cov)
+    inv_sqrt_mean_cov = eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T
+
+    # Apply whitening transformation to center around the identity
+    centered_matrices = np.array([inv_sqrt_mean_cov @ C @ inv_sqrt_mean_cov for C in cov_matrices])
+
+    return centered_matrices
 
 def segment_epochs(epochs, window_size=config.CLASSIFY_WINDOW, step_size=0.1):
     """
@@ -70,30 +125,61 @@ def segment_epochs(epochs, window_size=config.CLASSIFY_WINDOW, step_size=0.1):
 
 def train_riemannian_model(cov_matrices, labels, n_splits=8, shrinkage_param=config.SHRINKAGE_PARAM):
     """
-    Train an MDM classifier with k-fold cross-validation using Riemannian geometry and plot probability histograms.
+    Train an MDM classifier with k-fold cross-validation using Riemannian geometry 
+    and plot posterior probability histograms.
 
     Parameters:
-        cov_matrices (np.ndarray): Covariance matrices.
+        cov_matrices (np.ndarray): Covariance matrices of shape (n_samples, n_channels, n_channels).
         labels (np.ndarray): Corresponding labels for the segments.
         n_splits (int): Number of splits for cross-validation.
         shrinkage_param (float): Regularization strength for Shrinkage.
 
     Returns:
-        mdm: Trained MDM model.
+        mdm (MDM): Trained MDM model.
     """
+
+    print("\n🚀 Starting K-Fold Cross Validation with Riemannian MDM...\n")
+
+
+    
+    # Compute the reference matrix (Riemannian mean)
+    '''
+    reference_matrix = mean_riemann(cov_matrices, maxiter=1000)
+
+    # Center covariance matrices
+    
+    cov_matrices = np.array([np.linalg.inv(reference_matrix) @ cov @ np.linalg.inv(reference_matrix)
+                              for cov in cov_matrices])
+    
+    '''
+
+    #cov_matrices = center_cov_matrices_riemannian(cov_matrices)
+    #cov_matrices = center_cov_matrices(cov_matrices, reference_matrix)
+    # Apply Shrinkage-based regularization
+
+    if config.LEDOITWOLF:
+        # Compute covariance matrices with optimized shrinkage
+        cov_matrices_shrinked = np.array([LedoitWolf().fit(cov).covariance_ for cov in cov_matrices])
+        cov_matrices = cov_matrices_shrinked    
+    else:
+        shrinkage = Shrinkage(shrinkage=shrinkage_param)
+        cov_matrices = shrinkage.fit_transform(cov_matrices)  
+
+    
+    # Apply Riemannian whitening
+    if config.RECENTERING:
+        whitener = Whitening(metric="riemann")  # Use Riemannian mean for whitening
+        cov_matrices = whitener.fit_transform(cov_matrices)
+    
+    #print(mean_riemann(cov_matrices))
+    
+    
+    # Initialize cross-validation
     kf = KFold(n_splits=n_splits, shuffle=False)
     mdm = MDM()
-
     accuracies = []
-    all_probabilities = {label: [] for label in np.unique(labels)}  # Store probabilities per class
+    posterior_probs = {label: [] for label in np.unique(labels)}  # Store probabilities per class
 
-    print("\n Starting K-Fold Cross Validation with Riemannian MDM...\n")
-
-    # Apply Shrinkage-based regularization
-    
-    shrinkage = Shrinkage(shrinkage=shrinkage_param)
-    cov_matrices = shrinkage.fit_transform(cov_matrices)  # Apply shrinkage to all covariance matrices
-    
     for fold_idx, (train_index, test_index) in enumerate(kf.split(cov_matrices), start=1):
         X_train, X_test = cov_matrices[train_index], cov_matrices[test_index]
         Y_train, Y_test = labels[train_index], labels[test_index]
@@ -101,60 +187,32 @@ def train_riemannian_model(cov_matrices, labels, n_splits=8, shrinkage_param=con
         # Train and evaluate model
         mdm.fit(X_train, Y_train)
         Y_pred = mdm.predict(X_test)
-        Y_predProb = mdm.predict_proba(X_test)  # Get probabilities
+        Y_predProb = mdm.predict_proba(X_test)  # Get class probabilities
 
         accuracy = accuracy_score(Y_test, Y_pred)
         accuracies.append(accuracy)
-
-        print(f"\n **Fold {fold_idx} Accuracy: {accuracy:.4f}**")
+        print(f"\n ✅ Fold {fold_idx} Accuracy: {accuracy:.4f}")
 
         # Store probabilities per class
         for idx, true_label in enumerate(Y_test):
-            all_probabilities[true_label].append(Y_predProb[idx, np.where(mdm.classes_ == true_label)[0][0]])
+            class_idx = np.where(mdm.classes_ == true_label)[0][0]
+            posterior_probs[true_label].append(Y_predProb[idx, class_idx])
 
     # Convert probability lists to numpy arrays
-    for label in all_probabilities:
-        all_probabilities[label] = np.array(all_probabilities[label])
-        #print(label)
-        #print(all_probabilities[label])
-    # Plot probability distributions per class
-    plt.figure(figsize=(10, 5))
-    bins = np.linspace(0, 1, 20)  # Set bins for histogram
+    for label in posterior_probs:
+        posterior_probs[label] = np.array(posterior_probs[label])
 
-    for label, probs in all_probabilities.items():
-        plt.hist(probs, bins=bins, alpha=0.6, label=f"True Class {label}")
+    # Plot probability histograms
+    plot_posterior_probabilities(posterior_probs)
 
-    plt.xlabel("Predicted Probability")
-    plt.ylabel("Frequency")
-    plt.title("Probability Distribution Across Classes")
-    plt.legend()
-    plt.grid(True, linestyle="--", alpha=0.6)
-    plt.show()
-
-
-    # Assuming `accuracies` is already populated from k-fold cross-validation
-    k_folds = len(accuracies)  # Number of folds
-
-    # Plot k-fold cross-validation results
-    plt.figure(figsize=(8, 5))
-    plt.plot(range(1, k_folds + 1), accuracies, marker='o', linestyle='-', color='b', label='Accuracy per Fold')
-    plt.axhline(np.mean(accuracies), color='r', linestyle='--', label=f'Mean Accuracy: {np.mean(accuracies):.4f}')
-    plt.xlabel("Fold Number")
-    plt.ylabel("Accuracy")
-    plt.title("K-Fold Cross-Validation Accuracy")
-    plt.xticks(range(1, k_folds + 1))
-    plt.legend()
-    plt.grid(True, linestyle="--", alpha=0.6)
-    plt.show()
-
-    # Print overall average accuracy
-    print(f"\n🚀 **Final Average Accuracy:** {np.mean(accuracies):.4f}")
+    # Print overall accuracy
+    avg_accuracy = np.mean(accuracies)
+    print(f"\n🚀 **Final Average Accuracy:** {avg_accuracy:.4f}")
 
     # Retrain the model on all data
     mdm.fit(cov_matrices, labels)
 
     return mdm
-
 
 def main():
     """
@@ -331,6 +389,7 @@ def main():
     # Convert to MNE format and sort
     events = np.array(events)
     events = events[np.argsort(events[:, 0])]  # Sort by time index
+    #print(events)
 
     # Create MNE Epochs (without baseline correction)
     epochs = mne.Epochs(
@@ -360,7 +419,7 @@ def main():
 
    # Slice Epochs into Smaller Training Windows (e.g., 0.5s)
     print(f"Segmenting epochs into {config.CLASSIFY_WINDOW}ms training windows...")
-    segments, labels = segment_epochs(epochs, window_size=config.CLASSIFY_WINDOW, step_size=0.1)
+    segments, labels = segment_epochs(epochs, window_size=config.CLASSIFY_WINDOW, step_size=1/16)
 
     print(f"🔹 Segmented Data Shape: {segments.shape}")  # Debugging output
 
