@@ -10,7 +10,7 @@ from scipy.stats import zscore
 from Utils.preprocessing import apply_notch_filter, extract_segments, separate_classes, compute_grand_average,concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "Class_Subj_001"
+subject = "CLASS_SUBJ_833"
 session = "S001OFFLINE_NOFES"
 
 # Construct the EEG directory path dynamically
@@ -67,13 +67,15 @@ print(f"✅ Successfully loaded and merged {len(all_streams)} streams from {len(
 eeg_stream, marker_stream = (
     (eeg_streams[0], marker_streams[0]) if len(eeg_streams) == 1 else concatenate_streams(eeg_streams, marker_streams)
 )
-
 # Extract EEG timestamps and data
 eeg_timestamps = np.array(eeg_stream["time_stamps"])  # (N_samples,)
 eeg_data = np.array(eeg_stream["time_series"]).T  # Shape: (n_channels, n_samples)
 channel_names = get_channel_names_from_xdf(eeg_stream)
 marker_data = np.array([int(value[0]) for value in marker_stream['time_series']])
-marker_timestamps = np.array(marker_stream['time_stamps'])
+#marker_timestamps = np.array(marker_stream['time_stamps'])
+marker_timestamps = np.array([float(value[1]) for value in marker_stream['time_series']])
+#print(marker_stream['time_series'])
+#print(marker_timestamps)
 print("\n EEG Channels from XDF:", channel_names)
 #print(marker_stream[0])
 # Load standard 10-20 montage

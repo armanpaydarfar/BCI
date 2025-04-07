@@ -258,8 +258,9 @@ def main():
     eeg_data = np.array(eeg_stream['time_series']).T  # (n_channels, n_samples)
     channel_names = get_channel_names_from_xdf(eeg_stream)
 
-    marker_timestamps = np.array(marker_stream['time_stamps'])
+    #marker_timestamps = np.array(marker_stream['time_stamps'])
     marker_values = np.array([int(m[0]) for m in marker_stream['time_series']])
+    marker_timestamps = np.array([float(value[1]) for value in marker_stream['time_series']])
 
 
     # Load standard 10-20 montage

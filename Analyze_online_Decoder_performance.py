@@ -1,97 +1,147 @@
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import numpy as np
-from sklearn.metrics import confusion_matrix, roc_curve, auc
+import config  # Import thresholds and paths from config
+from sklearn.metrics import confusion_matrix
+import os
+import glob
+from datetime import datetime
 
-def find_optimal_thresholds(y_true, y_scores, pos_label):
-    """
-    Finds the optimal threshold for classification using the ROC curve.
+def plot_posterior_probabilities(posterior_probs):
+    plt.figure(figsize=(10, 6))
+    bins = np.linspace(0, 1, 20)
 
-    Parameters:
-        y_true (array-like): True class labels (100 for Rest, 200 for MI).
-        y_scores (array-like): Predicted probabilities for MI or Rest.
-        pos_label (int): The label to treat as the positive class (100 or 200).
+    for label, probs in posterior_probs.items():
+        probs = np.array(probs).flatten()
+        sns.histplot(probs, bins=bins, alpha=0.6, label=f"{label} Probability", kde=True)
 
-    Returns:
-        float: Optimal threshold for the given class.
-    """
-    fpr, tpr, thresholds = roc_curve(y_true, y_scores, pos_label=pos_label)
-    roc_auc = auc(fpr, tpr)
-
-    # Find optimal threshold using Youden’s J statistic
-    youden_j = tpr - fpr
-    optimal_idx = np.argmax(youden_j)
-    optimal_threshold = thresholds[optimal_idx]
-
-    # Plot ROC Curve
-    plt.figure(figsize=(8, 6))
-    plt.plot(fpr, tpr, label=f"ROC Curve (AUC = {roc_auc:.2f})", linewidth=2)
-    plt.scatter(fpr[optimal_idx], tpr[optimal_idx], color='red', label=f"Optimal Threshold = {optimal_threshold:.2f}")
-    plt.plot([0, 1], [0, 1], 'k--')  # Diagonal line for random guessing
-    plt.xlabel("False Positive Rate (1 - Specificity)")
-    plt.ylabel("True Positive Rate (Sensitivity)")
-    plt.title(f"ROC Curve for Class {pos_label}")
-    plt.legend()
-    plt.grid(True)
+    plt.xlabel("Predicted Probability")
+    plt.ylabel("Frequency")
+    plt.title("Online - Posterior Probability Distribution Across Classes")
+    plt.legend(title="True Class/Domain")
+    plt.grid(True, linestyle="--", alpha=0.6)
     plt.show()
 
-    return optimal_threshold
-
 def analyze_posterior_probabilities(probability_file):
-    """
-    Imports the probability CSV, computes the confusion matrix,
-    and performs ROC analysis to find separate optimal thresholds for MI and Rest.
-
-    Parameters:
-        probability_file (str): Path to the CSV file containing posterior probabilities.
-    """
-    # Load probability data
     df = pd.read_csv(probability_file, delimiter=",")
     df.columns = ["P(REST)", "P(MI)", "Correct Class"]
-
-    # Map true labels to descriptive names
     df["Class Label"] = df["Correct Class"].map({200: "MI", 100: "Rest"})
 
-    # Always compute optimal thresholds dynamically
-    print("Performing ROC analysis to find optimal thresholds...")
-    t_mi = find_optimal_thresholds(df["Correct Class"], df["P(MI)"], pos_label=200)
-    t_rest = find_optimal_thresholds(df["Correct Class"], df["P(REST)"], pos_label=100)
+    threshold_mi = config.THRESHOLD_MI
+    threshold_rest = config.THRESHOLD_REST
 
-    print(f"\nComputed Optimal Thresholds for this run:")
-    print(f"MI Threshold (T_MI): {t_mi:.2f}")
-    print(f"Rest Threshold (T_Rest): {t_rest:.2f}")
+    print(f"Using Config Thresholds: MI={threshold_mi}, Rest={threshold_rest}")
 
-    # Dual-threshold classification:
     def classify(row):
-        if row["P(MI)"] > t_mi:
-            return 200  # MI
-        elif row["P(REST)"] > t_rest:
-            return 100  # Rest
+        if row["P(MI)"] > threshold_mi:
+            return 200
+        elif row["P(REST)"] > threshold_rest:
+            return 100
         else:
-            return -1  # Ambiguous zone (optional handling)
+            return -1
 
     df["Predicted Class"] = df.apply(classify, axis=1)
 
-    # Compute confusion matrix
-    cm = confusion_matrix(df["Correct Class"], df["Predicted Class"], labels=[200, 100, -1])
+    posterior_probs = {
+        "Rest": df[df["Correct Class"] == 100]["P(REST)"],
+        "MI": df[df["Correct Class"] == 200]["P(MI)"]
+    }
 
-    # Plot confusion matrix
-    plt.figure(figsize=(6, 4))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", linewidths=0.5,
-                xticklabels=["Predicted MI (200)", "Predicted Rest (100)", "Ambiguous (-1)"],
-                yticklabels=["Actual MI (200)", "Actual Rest (100)", "Ambiguous (-1)"])
-    plt.title("Confusion Matrix with Dual Thresholds")
-    plt.xlabel("Predicted Class")
-    plt.ylabel("Actual Class")
-    plt.show()
+    plot_posterior_probabilities(posterior_probs)
 
-    # Print confusion matrix
-    print("\nConfusion Matrix with Dual Thresholds:\n", pd.DataFrame(cm,
-        columns=["Predicted MI (200)", "Predicted Rest (100)", "Ambiguous (-1)"],
-        index=["Actual MI (200)", "Actual Rest (100)", "Ambiguous (-1)"]))
+    
 
+    
+
+def aggregate_confusion_matrices(min_total=30):
+    """
+    Aggregates and plots confusion matrices grouped by date (model condition).
+    Skips matrices with fewer than `min_total` total samples.
+
+    Parameters:
+    - subject (str): Participant identifier (e.g., "CLASS_SUBJ_833")
+    - min_total (int): Minimum number of total classifications to include a confusion matrix.
+    """
+    subject = config.TRAINING_SUBJECT
+    models_base_path = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", "models")
+
+    condition_groups = {}
+
+    if not os.path.exists(models_base_path):
+        print(f"[ERROR] Models directory not found: {models_base_path}")
+        return
+
+    for root, dirs, files in os.walk(models_base_path):
+        for file in files:
+            if "confusion_matrix" in file and file.endswith(".csv"):
+                cm_path = os.path.join(root, file)
+                try:
+                    cm = pd.read_csv(cm_path, index_col=0).values
+                except Exception as e:
+                    print(f"Error loading {cm_path}: {e}")
+                    continue
+
+                if cm.sum() < min_total:
+                    print(f"[SKIP] {cm_path} has only {cm.sum()} samples.")
+                    continue
+
+                try:
+                    date_str = file.split("_")[-2]
+                    timestamp = datetime.strptime(date_str, "%Y-%m-%d")
+                    date_key = timestamp.date().isoformat()
+                except Exception as e:
+                    print(f"[ERROR] Couldn't parse date from {file}: {e}")
+                    continue
+
+                if date_key not in condition_groups:
+                    condition_groups[date_key] = []
+                condition_groups[date_key].append(cm)
+
+    for date_key, matrices in condition_groups.items():
+        aggregated = np.sum(matrices, axis=0)[:2, :2]
+        plt.figure(figsize=(6, 5))
+        ax = sns.heatmap(
+            aggregated,
+            annot=True,
+            fmt="d",
+            cmap="Blues",
+            linewidths=0.5,
+            annot_kws={"size": 9},
+            cbar=False,
+            xticklabels=["Predicted 200 (Move)", "Predicted 100 (Rest)"],
+            yticklabels=["Actual 200 (Correct Move)", "Actual 100 (Correct Rest)"]
+        )
+        ax.set_xticklabels(ax.get_xticklabels(), fontsize=8)
+        ax.set_yticklabels(ax.get_yticklabels(), fontsize=8)
+        plt.title(f"Aggregated Confusion Matrix - {date_key}", fontsize=11)
+        plt.xlabel("Predicted Class", fontsize=10)
+        plt.ylabel("True Class", fontsize=10)
+
+        # Calculate stats
+        TP = aggregated[0, 0]
+        FN = aggregated[0, 1]
+        FP = aggregated[1, 0]
+        TN = aggregated[1, 1]
+
+        accuracy = (TP + TN) / (TP + TN + FP + FN)
+        precision = TP / (TP + FP) if (TP + FP) > 0 else 0
+        recall = TP / (TP + FN) if (TP + FN) > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+        stats_text = (f"Accuracy: {accuracy:.2f}  |  "
+                      f"Precision: {precision:.2f}  |  "
+                      f"Recall: {recall:.2f}  |  "
+                      f"F1 Score: {f1:.2f}")
+
+        ax.text(0.5, -0.25, stats_text, ha='center', va='center', transform=ax.transAxes, fontsize=8)        
+        plt.tight_layout(rect=[0, 0.12, 1, 1])
+        plt.show()
 # Example usage
-analyze_posterior_probabilities(
-    "/home/arman-admin/Documents/CurrentStudy/sub-PILOT007/models/03_14 testing (adaptive reimanian)/classification_probabilities_2025-03-14_15-26-50.csv"
-)
+if __name__ == "__main__":
+    analyze_posterior_probabilities(
+        "/home/arman-admin/Documents/CurrentStudy/sub-PILOT007/models/03_14 testing (adaptive reimanian)/classification_probabilities_2025-03-14_15-26-50.csv"
+    )
+
+    # To aggregate and display confusion matrices for a subject:
+    aggregate_confusion_matrices()

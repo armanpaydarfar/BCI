@@ -33,6 +33,7 @@ EOG_TOGGLE = 0  # Toggle to enable or disable EOG processing (1 = enabled, 0 = d
 
 # Experiment Parameters
 TOTAL_TRIALS = 30  # Total number of trials
+TOTAL_TRIALS_ERRP = 45 # Total number of trials for ErrP experiment
 MAX_REPEATS = 3  # Maximum consecutive repeats of the same condition
 N_SPLITS = 5  # Number of splits for KFold cross-validation
 TIME_MI = 5 # time for motor imagery and rest
@@ -86,7 +87,7 @@ DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
 MODEL_PATH = "/home/arman-admin/Projects/Harmony/Reiman_eeg_model.pkl"
 DATA_FILE_PATH = "/home/arman-admin/Documents/CurrentStudy/sub-PILOT007/ses-S001/eeg/sub-PILOT007_ses-S001_task-Default_run-001OFFLINE_eeg.xdf"
 
-TRAINING_SUBJECT = "PILOT007"
+TRAINING_SUBJECT = "PILOT_ERP"
 
 
 #TRAINING_SESSION = "001OFFLINE"
@@ -111,6 +112,14 @@ TRIGGERS = {
     "ROBOT_END": "320",
     "ROBOT_EARLYSTOP": "340",
     "ROBOT_CONFIRM_STOP": "345",
+
+    #Coles
+    "ROBOT_RESTART": "350",
+
+    "ERRP_BEGIN": "400",
+    "ERRP_END": "420",
+    #end coles
+    
     "REST_BEGIN": "100",
     "REST_END": "120",
     "REST_EARLYSTOP": "140"
