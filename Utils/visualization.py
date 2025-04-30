@@ -1,9 +1,8 @@
 import pygame
 import config
-import pygame
 
 
-def draw_time_balls(ball_state, screen_width, screen_height, ball_radius=30, mode="single"):
+def draw_time_balls(ball_state, screen_width, screen_height, ball_radius=60, mode="single"):
     """
     Draw a time indicator ball with 4 possible states:
     - 0 = Empty (Outlined Ball)
@@ -54,9 +53,16 @@ def draw_time_balls(ball_state, screen_width, screen_height, ball_radius=30, mod
 
 
 def draw_arrow_fill(progress, screen_width, screen_height, show_threshold=True):
-    ball_radius = 120  # Base measurement
+    ball_radius = 200  # Base measurement
     bar_width, bar_length = ball_radius * 2, ball_radius * 2
-    bar_x, bar_y = screen_width // 2 + ball_radius * 2, screen_height // 2  # Positioned to the right
+    offset = ball_radius * 2
+    if config.ARM_SIDE == "Left":
+        bar_x = screen_width // 2 - offset
+    else:
+        bar_x = screen_width // 2 + offset
+    
+    bar_y = screen_height // 2
+
 
     bar_outline = [
         (bar_x - bar_length // 2, bar_y - bar_width // 2),
@@ -93,8 +99,13 @@ def draw_arrow_fill(progress, screen_width, screen_height, show_threshold=True):
 
 
 def draw_ball_fill(progress, screen_width, screen_height, show_threshold=True):
-    ball_radius = 120
-    ball_x, ball_y = screen_width // 2 - ball_radius*2, screen_height // 2  # Superimposed with fixation cross
+    ball_radius = 200
+    offset = ball_radius * 2
+    if config.ARM_SIDE == "Left":
+        ball_x = screen_width // 2 + offset
+    else:
+        ball_x = screen_width // 2 - offset
+    ball_y = screen_height // 2
 
     pygame.draw.circle(pygame.display.get_surface(), (255, 255, 255), (ball_x, ball_y), ball_radius, 2)
     water_surface = pygame.Surface((ball_radius * 2, ball_radius * 2), pygame.SRCALPHA)

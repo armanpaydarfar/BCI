@@ -71,21 +71,55 @@ class LeakyIntegrator:
 
 
 def generate_trial_sequence(total_trials=30, max_repeats=3):
-    trials = [0] * (total_trials // 2) + [1] * (total_trials // 2)
-    random.shuffle(trials)
-    fixed_trials = []
-    for trial in trials:
-        if len(fixed_trials) >= max_repeats and all(t == trial for t in fixed_trials[-max_repeats:]):
-            alternatives = [t for t in set([0, 1]) if t != trial]
-            random.shuffle(alternatives)
-            trial = alternatives[0]
-        fixed_trials.append(trial)
-    return fixed_trials
+    """
+    Generate a balanced binary sequence with no more than `max_repeats` consecutive values.
+    Falls back to simple shuffle if constraints cannot be satisfied.
+
+    Parameters:
+        total_trials (int): Total number of trials (must be even).
+        max_repeats (int): Maximum allowed repetitions of the same class.
+
+    Returns:
+        list: A valid binary sequence (0s and 1s).
+    """
+    assert total_trials % 2 == 0, "Total number of trials must be even."
+
+    target_count = total_trials // 2
+    counts = {0: 0, 1: 0}
+    stack = [([], counts.copy())]
+
+    while stack:
+        seq, current_counts = stack.pop()
+
+        if len(seq) == total_trials:
+            return seq
+
+        options = [0, 1]
+        random.shuffle(options)
+
+        for val in options:
+            if len(seq) >= max_repeats and all(x == val for x in seq[-max_repeats:]):
+                continue
+            if current_counts[val] >= target_count:
+                continue
+
+            new_seq = seq + [val]
+            new_counts = current_counts.copy()
+            new_counts[val] += 1
+            stack.append((new_seq, new_counts))
+
+    # Fallback strategy: return a random balanced sequence
+    fallback = [0] * target_count + [1] * target_count
+    random.shuffle(fallback)
+    print("⚠️ [generate_trial_sequence] Warning: Falling back to shuffled sequence due to constraint failure.")
+    return fallback
+
+
 
 
 
 def display_multiple_messages_with_udp(messages, colors, offsets, duration=13, udp_messages=None, udp_socket=None, udp_ip=None, udp_port=None):
-    font = pygame.font.SysFont(None, 72)
+    font = pygame.font.SysFont(None, 96)
     end_time = pygame.time.get_ticks() + duration * 1000
 
     udp_sent = False

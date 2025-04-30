@@ -403,6 +403,10 @@ def main():
         detrend=1, 
         preload=True
     )
+
+    for label in epochs.event_id:
+        print(f"{label}: {len(epochs[label])} epochs")
+
     # Define Rejection Criteria (Artifact Removal)
     # Compute max per epoch
     max_per_epoch = np.max(np.abs(epochs.get_data()), axis=(1, 2))  

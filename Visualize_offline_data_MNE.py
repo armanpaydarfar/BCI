@@ -10,8 +10,8 @@ from scipy.stats import zscore
 from Utils.preprocessing import apply_notch_filter, extract_segments, separate_classes, compute_grand_average,concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "CLASS_SUBJ_833"
-session = "S001OFFLINE_NOFES"
+subject = "CLASS_SUBJ_832"
+session = "S002OFFLINE_FES"
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
@@ -105,7 +105,7 @@ print(f"First Channel Unit (FIFF Code): {first_channel_unit}")
 
 # Convert data from Volts to microvolts (µV)
 # Convert raw data from Volts to microvolts (µV) IMMEDIATELY AFTER LOADING
-raw._data /= 1e6  # Convert V → µV
+#raw._data /= 1e6  # Convert V → µV
 
 # Update channel metadata in MNE so the scaling is correctly reflected
 
@@ -156,7 +156,7 @@ print("\n Rechecking Channel Positions After Montage Application:")
 for ch in raw.info["chs"]:
     print(f"{ch['ch_name']}: {ch['loc'][:3]}")
 '''
-highband = 30
+highband = 12
 lowband = 8
 
 time_start = -1
@@ -191,6 +191,39 @@ events = np.column_stack((
     np.zeros(len(marker_data), dtype=int),              # MNE requires a placeholder column
     marker_data                                        # Marker values
 ))
+
+# Ensure sample index uniqueness by nudging marker 300 forward by 1 sample if needed
+unique_samples = set()
+for i in range(len(events)):
+    sample = events[i, 0]
+    code = events[i, 2]
+
+    if sample in unique_samples:
+        # Conflict detected; check if it's marker 300
+        if code == 300:
+            print(f"Nudging marker 300 at index {i} forward by 1 sample.")
+            events[i, 0] += 1  # Shift it forward by 1
+        else:
+            print(f"Warning: Non-300 event duplicated at sample {sample} – manual check suggested.")
+
+    unique_samples.add(events[i, 0])
+
+
+'''
+# Get sample indices
+sample_indices = events[:, 0]
+
+# Find duplicates by checking for repeated sample indices
+_, idx_counts = np.unique(sample_indices, return_counts=True)
+duplicate_indices = sample_indices[np.where(idx_counts > 1)]
+
+if duplicate_indices.size > 0:
+    print("⚠️ Duplicate sample indices found:")
+    print(duplicate_indices)
+else:
+    print("✅ No duplicate sample indices.")
+
+'''
 #print(events)
 #print(marker_data)
 #print(marker_timestamps)
@@ -199,7 +232,7 @@ events = np.column_stack((
 marker_labels = {
     "100": "Rest",
     "200": "Right Arm MI",
-    "300": "Robot Move"
+    "300":"Robot Move"
 }
 # Create Epochs with rejection
 epochs = mne.Epochs(
@@ -234,6 +267,48 @@ num_windows = 5  # Change this for finer resolution
 window_size = 0.5  # Each window covers 500ms
 time_windows = np.linspace(0.1, 5.0 - window_size, num_windows)  # Avoid end clipping
 
+
+
+# Config
+channel_name = "C3"
+target_marker = 200  # for example, MI trials
+trial_index = 0      # 0 = first trial, 1 = second, etc.
+
+# Get channel index
+channel_index = epochs.ch_names.index(channel_name)
+
+# Select the epochs corresponding to the target marker
+epochs_for_marker = epochs[target_marker]  # or epochs['200'] if using string keys
+
+# Get data: shape (n_trials, n_channels, n_times)
+data = epochs_for_marker.get_data()
+#print(data.shape)
+# Extract signal for the desired trial and channel
+signal = data[trial_index, channel_index, :]
+times = epochs_for_marker.times
+
+# Plot it
+plt.figure(figsize=(10, 4))
+plt.plot(times, signal)
+plt.xlabel("Time (s)")
+plt.ylabel("Amplitude (uV)")
+plt.title(f"Trial #{trial_index+1} - Marker {target_marker}, Channel {channel_name}")
+plt.axvline(0, color='k', linestyle='--', label='Stimulus Onset')
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+
+
+
+
+
+
+
+
+
 # **Step 1: Square all epochs to compute signal power**
 print("Squaring all epochs for signal power computation...")
 
@@ -264,6 +339,7 @@ for event_id in ["100", "200"]:
 
 # **Step 3: Convert to proper display units (mV²/m⁴ → µV²/mm⁴)**
 scaling_factor = 1e6  # Convert from mV²/m⁴ to µV²/mm⁴
+#scaling_factor = 1
 for key in evoked_power.keys():
     evoked_power[key].data *= scaling_factor
     print(f"Post-Scaling Power Data (Marker {key}): "

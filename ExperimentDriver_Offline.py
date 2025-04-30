@@ -51,7 +51,7 @@ def display_fixation_period(duration=3):
         # Draw blank shapes (assuming placeholders)
         draw_ball_fill(0, screen_width, screen_height, show_threshold=False)  # Empty fill
         draw_arrow_fill(0, screen_width, screen_height, show_threshold=False)  # Empty fill
-        draw_time_balls(0,screen_width,screen_height, ball_radius= 40)
+        draw_time_balls(0,screen_width,screen_height)
         pygame.display.flip()  # Update display
 
         # Check for quit events
@@ -89,26 +89,27 @@ def show_feedback(duration=5, mode=0):
             draw_arrow_fill(progress, screen_width, screen_height, show_threshold=False)
             draw_ball_fill(0, screen_width, screen_height, show_threshold=False)
             draw_fixation_cross(screen_width, screen_height)
-            draw_time_balls(2, screen_width, screen_height, ball_radius=40)
+            draw_time_balls(2, screen_width, screen_height)
 
             # Render and center message with smaller font
-            message = small_font.render("Imagine Right Arm Movement", True, config.white)
+            message = pygame.font.SysFont(None, 96).render(f"Move {config.ARM_SIDE.upper()} Arm", True, config.white)
         else:
             # Draw the ball filling
             draw_ball_fill(progress, screen_width, screen_height, show_threshold=False)
             draw_arrow_fill(0, screen_width, screen_height, show_threshold=False)
             draw_fixation_cross(screen_width, screen_height)
-            draw_time_balls(3, screen_width, screen_height, ball_radius=40)
+            draw_time_balls(3, screen_width, screen_height)
 
 
             # Render and center message with larger font
-            message = large_font.render("Rest", True, config.white)
+            message = pygame.font.SysFont(None, 96).render("Rest", True, config.white)
+
 
         # Center the message properly on the screen
         screen.blit(
             message,
             (screen_width // 2 - message.get_width() // 2,
-             screen_height // 2 - message.get_height() // 2 + 200)
+             screen_height // 2 - message.get_height() // 2 + 300)
         )
 
         pygame.display.flip()
@@ -128,6 +129,7 @@ streams = resolve_stream('type', 'EEG')
 inlet = StreamInlet(streams[0])
 print("EEG data stream detected. Starting experiment...")
 trial_sequence = generate_trial_sequence(config.TOTAL_TRIALS, config.MAX_REPEATS)
+print(f"Trial Sequence: {trial_sequence}")
 current_trial = 0
 running = True
 clock = pygame.time.Clock()
@@ -137,7 +139,7 @@ while running and current_trial < len(trial_sequence):
     draw_fixation_cross(screen_width, screen_height)
     draw_arrow_fill(0, screen_width, screen_height, show_threshold=False)  # Replace arrow with bar
     draw_ball_fill(0, screen_width, screen_height, show_threshold=False)
-    draw_time_balls(0,screen_width,screen_height, ball_radius = 40)
+    draw_time_balls(0,screen_width,screen_height)
     pygame.display.flip()
 
     # Backdoor logic
@@ -168,7 +170,7 @@ while running and current_trial < len(trial_sequence):
 
             # Draw timing balls during countdown
             next_trial_mode = trial_sequence[current_trial]  # Get the mode for the next trial
-            draw_time_balls(1, screen_width, screen_height, ball_radius=40)
+            draw_time_balls(1, screen_width, screen_height)
             
             pygame.display.flip()  # Update the display with time balls
 

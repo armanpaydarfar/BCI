@@ -193,7 +193,7 @@ def display_fixation_period(duration=3):
         # Draw blank shapes (assuming placeholders)
         draw_ball_fill(0, screen_width, screen_height)  # Empty fill
         draw_arrow_fill(0, screen_width, screen_height)  # Empty fill
-        draw_time_balls(0,screen_width,screen_height, ball_radius = 40)
+        draw_time_balls(0,screen_width,screen_height)
         pygame.display.flip()  # Update display
 
         # Check for quit events
@@ -680,17 +680,17 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
             draw_arrow_fill(MI_fill, screen_width, screen_height)
             draw_fixation_cross(screen_width, screen_height)
             draw_ball_fill(Rest_fill, screen_width, screen_height)
-            draw_time_balls(2, screen_width, screen_height, ball_radius=40)
-            message = pygame.font.SysFont(None, 48).render("Imagine Right Arm Movement", True, config.white)
+            draw_time_balls(2, screen_width, screen_height)
+            message = pygame.font.SysFont(None, 96).render(f"Move {config.ARM_SIDE.upper()} Arm", True, config.white)
         else:
             MI_fill, Rest_fill = calculate_fill_levels(running_avg_confidence, mode)
             draw_ball_fill(Rest_fill, screen_width, screen_height)
             draw_fixation_cross(screen_width, screen_height)
             draw_arrow_fill(MI_fill, screen_width, screen_height)
-            draw_time_balls(3, screen_width, screen_height, ball_radius=40)
-            message = pygame.font.SysFont(None, 72).render("Rest", True, config.white)
+            draw_time_balls(3, screen_width, screen_height)
+            message = pygame.font.SysFont(None, 96).render("Rest", True, config.white)
 
-        screen.blit(message, (screen_width // 2 - message.get_width() // 2, screen_height // 2 + 150))
+        screen.blit(message, (screen_width // 2 - message.get_width() // 2, screen_height // 2 + 300))
         pygame.display.flip()
         clock.tick(30)  # Maintain 30 FPS
 
@@ -726,6 +726,8 @@ print("EEG data stream detected. Starting experiment...")
 
 # Generate trial sequence
 trial_sequence = generate_trial_sequence(total_trials=config.TOTAL_TRIALS, max_repeats=config.MAX_REPEATS)
+print(f"Trial Sequence: {trial_sequence}")
+
 current_trial = 0  # Track the current trial index
 
 # Fetch channel names from LSL
@@ -778,7 +780,7 @@ while running and current_trial < len(trial_sequence):
     draw_fixation_cross(screen_width, screen_height)
     draw_arrow_fill(0, screen_width, screen_height)  # Show the empty bar
     draw_ball_fill(0, screen_width, screen_height)  # Show the empty ball
-    draw_time_balls(0, screen_width, screen_height, ball_radius=40)
+    draw_time_balls(0, screen_width, screen_height)
     pygame.display.flip()
 
     # Wait for key press or countdown to determine backdoor
@@ -812,7 +814,7 @@ while running and current_trial < len(trial_sequence):
             baseline_buffer = collect_baseline_during_countdown(inlet, countdown_start, countdown_duration, baseline_buffer)
 
             next_trial_mode = trial_sequence[current_trial]  
-            draw_time_balls(1, screen_width, screen_height, ball_radius=40)
+            draw_time_balls(1, screen_width, screen_height)
             pygame.display.flip()  
 
             if elapsed_time >= countdown_duration:
