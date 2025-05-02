@@ -854,7 +854,7 @@ while running and current_trial < len(trial_sequence):
             messages = ["Correct", "Robot Move"]
             colors = [config.green, config.green]
             offsets = [-100, 100]
-            udp_messages = ["x", "g"]
+            udp_messages = [config.ROBOT_TRAJECTORY, "g"]
             duration = 0.01  # Short duration for initial command
             should_hold_and_classify = True  # Set flag for classification
             send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_MOTOR_GO") if FES_toggle == 1 else print("FES is disabled.")

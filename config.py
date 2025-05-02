@@ -32,7 +32,7 @@ EOG_CHANNEL_NAMES = ['AUX1'] # List of EOG channel names to use
 EOG_TOGGLE = 0  # Toggle to enable or disable EOG processing (1 = enabled, 0 = disabled)
 
 # Experiment Parameters
-ARM_SIDE = "Right"
+ARM_SIDE = "Left"
 TOTAL_TRIALS = 30  # Total number of trials
 TOTAL_TRIALS_ERRP = 45 # Total number of trials for ErrP experiment
 MAX_REPEATS = 3  # Maximum consecutive repeats of the same condition
@@ -43,7 +43,7 @@ TIME_STATIONARY = 2 # time for stationary feedback after no movement/failed move
 TIMING = True
 SHAPE_MAX = 0.8 #maximum fill 
 SHAPE_MIN = 0.5 #minimum fill 
-
+ROBOT_TRAJECTORY = "a"
 
 # Classification Parameters
 CLASSIFY_WINDOW = 500  # Duration of EEG data window for classification (milliseconds)
