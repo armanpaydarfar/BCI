@@ -10,8 +10,8 @@ from scipy.stats import zscore
 from Utils.preprocessing import apply_notch_filter, extract_segments, separate_classes, compute_grand_average,concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "CLASS_SUBJ_832"
-session = "S002OFFLINE_FES"
+subject = "CLASS_SUBJ_831"
+session = "S002OFFLINE_NOFES"
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
@@ -156,7 +156,7 @@ print("\n Rechecking Channel Positions After Montage Application:")
 for ch in raw.info["chs"]:
     print(f"{ch['ch_name']}: {ch['loc'][:3]}")
 '''
-highband = 12
+highband = 30
 lowband = 8
 
 time_start = -1

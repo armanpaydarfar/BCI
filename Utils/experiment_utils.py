@@ -115,10 +115,11 @@ def generate_trial_sequence(total_trials=30, max_repeats=3):
     return fallback
 
 
-
-
-
-def display_multiple_messages_with_udp(messages, colors, offsets, duration=13, udp_messages=None, udp_socket=None, udp_ip=None, udp_port=None):
+def display_multiple_messages_with_udp(
+    messages, colors, offsets, duration=13,
+    udp_messages=None, udp_socket=None, udp_ip=None, udp_port=None,
+    logger=None
+):
     font = pygame.font.SysFont(None, 96)
     end_time = pygame.time.get_ticks() + duration * 1000
 
@@ -133,13 +134,20 @@ def display_multiple_messages_with_udp(messages, colors, offsets, duration=13, u
                  pygame.display.get_surface().get_height() // 2 - message.get_height() // 2 + offsets[i])
             )
         pygame.display.flip()
+
         if udp_messages and not udp_sent:
             for msg in udp_messages:
                 udp_socket.sendto(msg.encode('utf-8'), (udp_ip, udp_port))
-                print(f"Sent UDP message to {udp_ip}:{udp_port}: {msg}")
+                msg_str = f"Sent UDP message to {udp_ip}:{udp_port}: {msg}"
+                if logger is not None:
+                    logger.log_event(msg_str)
+                else:
+                    print(msg_str)
             udp_sent = True
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
                 exit()
+
         pygame.time.Clock().tick(60)
