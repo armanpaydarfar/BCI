@@ -52,6 +52,7 @@ THRESHOLD_MI = 0.55 #Threshold for MI "correct"
 THRESHOLD_REST = 0.55 #Threshold for REST "Correct"
 RELAXATION_RATIO = 0.5
 MIN_PREDICTIONS = 20 # Min number of predictions during Online experiment before the decoder can end early
+STEP_SIZE = 1/16
 CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
 #CLASSIFICATION_SCHEME_OPT = "TIMESERIES"
 CLASSIFICATION_SCHEME_OPT = "FREQUENCY"
@@ -74,11 +75,11 @@ FES_TIMING_OFFSET = 4
 # above for motor FES, cut out X seconds before the full duration of movement. This should represent when the robot will naturally reach the end of motion (in successful case)
 
 # Screen Dimensions
-#SCREEN_WIDTH = 3840
-#SCREEN_HEIGHT = 2160
+SCREEN_WIDTH = 3840
+SCREEN_HEIGHT = 2160
 
-SCREEN_WIDTH = 1200
-SCREEN_HEIGHT = 800
+#SCREEN_WIDTH = 1200
+#SCREEN_HEIGHT = 800
 
 
 # Relevant Directories
@@ -109,20 +110,24 @@ TRIGGERS = {
     "MI_BEGIN": "200",
     "MI_END": "220",
     "MI_EARLYSTOP": "240",
+    "MI_PROBS": "2000",
+
     "ROBOT_BEGIN": "300",
     "ROBOT_END": "320",
     "ROBOT_EARLYSTOP": "340",
     "ROBOT_CONFIRM_STOP": "345",
-
-    #Coles
+    "ROBOT_PROBS": "3000",
+    
     "ROBOT_RESTART": "350",
 
     "ERRP_BEGIN": "400",
     "ERRP_END": "420",
-    #end coles
+    
     
     "REST_BEGIN": "100",
     "REST_END": "120",
-    "REST_EARLYSTOP": "140"
-    
+    "REST_EARLYSTOP": "140",
+    "REST_PROBS": "1000"
+
+
 }

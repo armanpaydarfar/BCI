@@ -141,7 +141,6 @@ def show_feedback(duration=5, mode=0):
     logger.log_event("Feedback display complete.")
     return True
 
-
 # Main Game Loop
 # Attempt to resolve the stream
 logger.log_event("Attempting to resolve EEG stream...")

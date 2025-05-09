@@ -34,10 +34,7 @@ logging.basicConfig(
 # SETUP STREAM AND QUEUE
 # ─────────────────────────────────────────────────────────
 
-possible_marker_values = [int(value) for value in config.TRIGGERS.values()]
-logging.info(f"Possible marker values: {possible_marker_values}")
-
-info = StreamInfo('MarkerStream', 'Markers', 2, 0, 'float32', 'marker_stream_id')
+info = StreamInfo('MarkerStream', 'Markers', 4, 0, 'float32', 'marker_stream_id')
 outlet = StreamOutlet(info)
 
 message_queue = queue.Queue()
@@ -59,19 +56,18 @@ def get_current_eeg_timestamp(inlet, udp_received_time=0):
     temp_timestamp = local_clock()
 
     if timestamp is not None:
-        stream_offset = temp_timestamp - udp_received_time
-        logging.info(f"Current EEG timestamp: {timestamp}, Stream Offset: {stream_offset:.4f} seconds")
+        stream_offset_sec = temp_timestamp - udp_received_time
+        stream_offset_ms = stream_offset_sec * 1000  # Convert to milliseconds
+        logging.info(f"Current EEG timestamp: {timestamp}, Stream Offset: {stream_offset_ms:.2f} ms")
         return timestamp
     else:
         logging.warning("No new EEG timestamp available.")
         return None
 
-def send_marker(value, timestamp):
-    if value in possible_marker_values:
-        outlet.push_sample([float(value), timestamp])
-        logging.info(f"Sent marker: {value} at timestamp: {timestamp}")
-    else:
-        logging.warning(f"Invalid marker value: {value}. Allowed values are {possible_marker_values}.")
+
+def send_marker(marker, timestamp, prob_mi=-1.0, prob_rest=-1.0):
+    outlet.push_sample([float(marker), timestamp, prob_mi, prob_rest])
+    logging.info(f"Sent marker: {marker} at timestamp: {timestamp} | P(MI): {prob_mi:.3f}, P(REST): {prob_rest:.3f}")
 
 def udp_listener(udp_port):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -93,26 +89,44 @@ def udp_listener(udp_port):
         except ValueError:
             logging.warning(f"Invalid UDP message: {data}")
 
+
 def process_udp_messages(eeg_inlet):
     while True:
         message, udp_received_time, addr = message_queue.get()
         logging.info(f"Processing UDP message: {message} from {addr}")
 
         try:
-            marker_value = int(message)
-            if marker_value in possible_marker_values:
+            parts = message.strip().split(',')
+
+            if len(parts) == 1:
+                # Case 1: Just a marker
+                marker_value = int(parts[0])
                 timestamp = get_current_eeg_timestamp(eeg_inlet, udp_received_time)
                 if timestamp is not None:
                     send_marker(marker_value, timestamp)
                 else:
                     logging.warning("Failed to retrieve EEG timestamp. Marker not sent.")
+
+            elif len(parts) == 3:
+                # Case 2: Marker + P(MI) + P(REST)
+                marker_value = int(parts[0])
+                prob_mi = float(parts[1])
+                prob_rest = float(parts[2])
+                timestamp = get_current_eeg_timestamp(eeg_inlet, udp_received_time)
+                if timestamp is not None:
+                    send_marker(marker_value, timestamp, prob_mi, prob_rest)
+                else:
+                    logging.warning("Failed to retrieve EEG timestamp. Marker not sent.")
+
             else:
-                logging.warning(f"Invalid marker value received via UDP: {marker_value}")
-        
-        except ValueError:
-            logging.warning(f"Invalid UDP message format: {message}")
+                logging.warning(f"Unexpected UDP message format: {message}")
+
+        except Exception as e:
+            logging.warning(f"Failed to parse UDP message: {message} | Error: {e}")
 
         message_queue.task_done()
+
+
 
 def handle_udp_requests(eeg_inlet):
     local_port = config.UDP_MARKER["PORT"]

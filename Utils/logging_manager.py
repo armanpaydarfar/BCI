@@ -38,8 +38,9 @@ class LoggerManager:
             writer.writerow([
                 "Trial", "Timestamp", "P(MI)", "P(REST)",
                 "True Label", "Predicted Label", "Early Cutout",
-                "MI Threshold", "REST Threshold"
+                "MI Threshold", "REST Threshold", "Phase"
             ])
+
 
         self.trial_summary_path = self.log_dir / "trial_summary.csv"
         with open(self.trial_summary_path, mode='w', newline='') as f:
@@ -54,14 +55,15 @@ class LoggerManager:
         getattr(logging, level)(message)
 
     def log_decoder_output(self, trial, timestamp, prob_mi, prob_rest, true_label, predicted_label,
-                        early_cutout, mi_threshold, rest_threshold):
+                        early_cutout, mi_threshold, rest_threshold, phase):
         with open(self.decoder_csv_path, mode='a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
                 trial, timestamp, prob_mi, prob_rest,
                 true_label, predicted_label, early_cutout,
-                mi_threshold, rest_threshold
+                mi_threshold, rest_threshold, phase
             ])
+
 
     def log_trial_summary(self, trial_number, true_label, predicted_label,
                         early_cutout, accuracy_threshold, confidence, num_predictions):
@@ -97,7 +99,7 @@ class LoggerManager:
 
         try:
             size1 = Path(latest_xdf).resolve().stat().st_size
-            time.sleep(0.3)
+            time.sleep(1)
             size2 = Path(latest_xdf).resolve().stat().st_size
 
             if size2 > size1:

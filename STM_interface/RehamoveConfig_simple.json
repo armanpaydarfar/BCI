@@ -4,7 +4,7 @@
     "channels": {
         "red": {
             "pulse_width": 250.0,
-            "Sensory_current_mA": 3.0,
+            "Sensory_current_mA": 3.5,
             "Motor_current_mA": 3.5,
             "duration_sense": 5,
             "duration_Motor": 9

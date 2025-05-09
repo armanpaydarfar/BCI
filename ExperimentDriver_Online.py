@@ -153,9 +153,49 @@ SESSION_TIMESTAMP = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 logger.log_event(f"Session timestamp set: {SESSION_TIMESTAMP}")
 
 
+
+def log_confusion_matrix_from_trial_summary(logger):
+    df = pd.read_csv(logger.trial_summary_path)
+
+    # Separate into valid and ambiguous trials
+    ambiguous_trials = df[df["Predicted Label"].isna()]
+    valid_trials = df.dropna(subset=["Predicted Label"])
+
+    valid_trials.loc[:, "Predicted Label"] = valid_trials["Predicted Label"].astype(int)
+    valid_trials.loc[:, "True Label"] = valid_trials["True Label"].astype(int)
+
+    # Count correct predictions
+    correct = (valid_trials["Predicted Label"] == valid_trials["True Label"]).sum()
+    incorrect = len(valid_trials) - correct
+    ambiguous = len(ambiguous_trials)
+    total = correct + incorrect + ambiguous
+
+    # Generate confusion matrix
+    if not valid_trials.empty:
+        cm = confusion_matrix(
+            valid_trials["True Label"], valid_trials["Predicted Label"],
+            labels=[200, 100]
+        )
+        logger.log_event("Confusion Matrix (Correct/Incorrect Only):")
+        logger.log_event(f"  Actual 200 (MI)    | Predicted 200 (MI): {cm[0][0]} | Predicted 100 (REST): {cm[0][1]}")
+        logger.log_event(f"  Actual 100 (REST)  | Predicted 200 (MI): {cm[1][0]} | Predicted 100 (REST): {cm[1][1]}")
+    else:
+        logger.log_event("No non-ambiguous trials to compute confusion matrix.")
+
+    # Log summary stats
+    if total:
+        percent_correct = (correct / total) * 100
+        logger.log_event(f"✅ % Correct (excluding ambiguous): {percent_correct:.2f}%")
+        logger.log_event(f"⚠️ Ambiguous trials (not counted in matrix): {ambiguous}")
+    else:
+        logger.log_event("No trials available to compute statistics.")
+
+
+
 def append_trial_probabilities_to_csv(trial_probabilities, mode, trial_number,
                                       predicted_label, early_cutout,
-                                      mi_threshold, rest_threshold, logger):
+                                      mi_threshold, rest_threshold, logger,
+                                      phase):
     correct_class = 200 if mode == 0 else 100
     trial_probabilities = np.array(trial_probabilities)
 
@@ -174,14 +214,14 @@ def append_trial_probabilities_to_csv(trial_probabilities, mode, trial_number,
             predicted_label=predicted_label,
             early_cutout=early_cutout,
             mi_threshold=mi_threshold,
-            rest_threshold=rest_threshold
+            rest_threshold=rest_threshold,
+            phase=phase
         )
 
     logger.log_event(
         f"✅ Logged {len(trial_probabilities)} rows for Trial {trial_number} | "
-        f"True: {correct_class}, Predicted: {predicted_label}, Early Cut: {early_cutout}"
+        f"True: {correct_class}, Predicted: {predicted_label}, Early Cut: {early_cutout}, Phase: {phase}"
     )
-
 
 
 def display_fixation_period(duration=3):
@@ -213,7 +253,7 @@ def display_fixation_period(duration=3):
                 pygame.quit()
                 return
 
-        clock.tick(30)  # Maintain 30 FPS
+        clock.tick(60)  # Maintain 30 FPS
 
 # Interpolation function to compute fill amount between SHAPE_MIN and SHAPE_MAX
 def interpolate_fill(value):
@@ -298,6 +338,7 @@ def collect_baseline_during_countdown(inlet, countdown_start, countdown_duration
     Returns:
     - Updated baseline_buffer containing collected baseline samples.
     """
+    pygame.display.flip()
     current_time = pygame.time.get_ticks()
     remaining_time = countdown_duration - (current_time - countdown_start)
 
@@ -316,10 +357,11 @@ def collect_baseline_during_countdown(inlet, countdown_start, countdown_duration
 def classify_real_time(inlet, window_size_samples, step_size_samples, all_probabilities, predictions, 
                         data_buffer, mode, leaky_integrator, baseline_mean=None, update_recentering=True):
 
-    new_data, _ = inlet.pull_chunk(timeout=0.1, max_samples=int(step_size_samples))
+    new_data, _ = inlet.pull_chunk(timeout=0.05, max_samples=int(step_size_samples))
     global counter
     global Prev_T
-    
+    pygame.display.flip()
+    pygame.event.get()     # heartbeat to OS
     if new_data:
         new_data_np = np.array(new_data)
         data_buffer.extend(new_data_np)
@@ -403,7 +445,10 @@ def classify_real_time(inlet, window_size_samples, step_size_samples, all_probab
 
         probabilities = model.predict_proba(cov_matrix)[0]
         predicted_label = model.classes_[np.argmax(probabilities)]
-
+        '''
+        for cls, prob in zip(model.classes_, probabilities):
+            print(f"Class {cls}: {prob:.5f}")
+        '''
         predictions.append(predicted_label)
         all_probabilities.append([time.time(), probabilities[0], probabilities[1]])
         correct_label = 200 if mode == 0 else 100
@@ -450,7 +495,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
     start_time = time.time()
     early_stop = False
     # EEG classification parameters
-    step_size = 0.05  # Step size in seconds
+    step_size = config.STEP_SIZE  # Step size in seconds
     window_size = config.CLASSIFY_WINDOW / 1000  # Convert ms to seconds
     window_size_samples = int(window_size * config.FS)
     step_size_samples = int(step_size * config.FS)
@@ -466,7 +511,9 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
     # accuracy threshold based on mode
     accuracy_threshold = config.THRESHOLD_MI if mode == 0 else config.THRESHOLD_REST 
 
-
+    all_probabilities = []
+    predictions = []
+    pygame.display.update()
     clock = pygame.time.Clock()
 
     while time.time() - start_time < duration:
@@ -483,8 +530,20 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
 
         # Perform classification
         current_confidence, predictions, all_probabilities, data_buffer = classify_real_time(
-            inlet, window_size_samples, step_size_samples, [], [], data_buffer, mode,leaky_integrator, baseline_mean, update_recentering = config.UPDATE_DURING_MOVE
+            inlet, window_size_samples, step_size_samples,
+            all_probabilities, predictions, data_buffer,
+            mode, leaky_integrator, baseline_mean,
+            update_recentering=config.UPDATE_DURING_MOVE
         )
+        if all_probabilities:
+            prob_mi, prob_rest = all_probabilities[-1][2], all_probabilities[-1][1]  # assuming [timestamp, P(REST), P(MI)]
+            send_udp_message(
+                udp_socket_marker,
+                config.UDP_MARKER["IP"],
+                config.UDP_MARKER["PORT"],
+                f"{config.TRIGGERS['ROBOT_PROBS']},{prob_mi:.5f},{prob_rest:.5f}",
+                quiet = True
+            )
 
         # If a prediction was made, increase the counter
         if current_confidence > 0:
@@ -520,14 +579,14 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
                 pygame.quit()
                 return None
 
-        clock.tick(30)  # Maintain 30 FPS
+        clock.tick(60)  # Maintain 30 FPS
     if early_stop == False:
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_END"], logger = logger)
     # Final Decision: Return correct or incorrect class based on confidence
     final_class = correct_class if running_avg_confidence >= config.RELAXATION_RATIO*config.ACCURACY_THRESHOLD else incorrect_class
     logger.log_event(f"Confidence at the end of motion: {running_avg_confidence:.2f} after {num_predictions} predictions")
 
-    return final_class
+    return final_class, all_probabilities, early_stop
 
 
 
@@ -537,7 +596,7 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
     using a sliding window approach with early stopping based on posterior probabilities.
     """
     start_time = time.time()
-    step_size = 1 / 16  # Sliding window step size (seconds)
+    step_size = config.STEP_SIZE  # Sliding window step size (seconds)
     window_size = config.CLASSIFY_WINDOW / 1000  # Convert ms to seconds
     window_size_samples = int(window_size * config.FS)
     step_size_samples = int(step_size * config.FS)
@@ -562,6 +621,7 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
     opposed_threshold = config.THRESHOLD_REST if mode == 0 else config.THRESHOLD_MI
     # Preprocess the baseline dataset before feedback starts
     # Preprocess the baseline dataset before feedback starts
+    pygame.display.flip()
     if baseline_data is not None:
         logger.log_event("Processing baseline data...")
 
@@ -644,6 +704,16 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
             data_buffer, mode, leaky_integrator, baseline_mean
         )
 
+        if all_probabilities:
+            prob_mi, prob_rest = all_probabilities[-1][2], all_probabilities[-1][1]
+            send_udp_message(
+                udp_socket_marker,
+                config.UDP_MARKER["IP"],
+                config.UDP_MARKER["PORT"],
+                f"{config.TRIGGERS['MI_PROBS' if mode == 0 else 'REST_PROBS']},{prob_mi:.5f},{prob_rest:.5f}",
+                quiet = True
+            )
+
         running_avg_confidence = leaky_integrator.update(current_confidence)
         if FES_toggle == 1:
             FES_active = handle_fes_activation(mode, running_avg_confidence, FES_active)
@@ -666,8 +736,7 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
 
         screen.blit(message, (screen_width // 2 - message.get_width() // 2, screen_height // 2 + 300))
         pygame.display.flip()
-        clock.tick(30)
-
+        clock.tick(60)
         if len(predictions) >= min_predictions and running_avg_confidence >= accuracy_threshold:
             logger.log_event(f"Early stopping triggered! Confidence: {running_avg_confidence:.2f}")
             earlystop_flag = True
@@ -841,7 +910,8 @@ while running and current_trial < len(trial_sequence):
         inlet=inlet,
         baseline_data=baseline_data
     )
-
+    pygame.display.flip()
+    pygame.event.get()     # heartbeat to OS
     # Log the classification result
     logger.log_event(f"Classification result — Predicted: {prediction}, Ground Truth: {200 if mode == 0 else 100}")
 
@@ -860,8 +930,10 @@ while running and current_trial < len(trial_sequence):
         early_cutout=earlystop_flag,
         mi_threshold=config.THRESHOLD_MI,
         rest_threshold=config.THRESHOLD_REST,
-        logger=logger
+        logger=logger,
+        phase="MI" if mode == 0 else "REST"
     )
+
     logger.log_event(f"Stored decoder output for trial {current_trial+1}: {len(trial_probs)} timepoints.")
 
     predictions_list.append(prediction)
@@ -894,7 +966,7 @@ while running and current_trial < len(trial_sequence):
             duration = config.TIME_STATIONARY
             should_hold_and_classify = False
 
-            logger.log_event("Prediction incorrect for MI — robot remains stationary.")
+            logger.log_event("Prediction incorrect/ambiguous for MI — robot remains stationary.")
 
     else:  # Blue Ball Mode (Rest)
         if prediction == 100:  # Correct prediction
@@ -913,7 +985,7 @@ while running and current_trial < len(trial_sequence):
             udp_messages = None
             duration = config.TIME_STATIONARY
 
-            logger.log_event("Prediction incorrect for REST — robot remains stationary.")
+            logger.log_event("Prediction incorrect/ambiguous for REST — robot remains stationary.")
 
         should_hold_and_classify = False  # No secondary classification logic in REST
     # Display the feedback messages and send UDP commands (if any)
@@ -933,7 +1005,7 @@ while running and current_trial < len(trial_sequence):
     # If trial was a correct MI, continue classification during robot movement
     if should_hold_and_classify:
         logger.log_event("Entering real-time classification window during robot movement...")
-        hold_messages_and_classify(
+        final_class_robot, robot_probs, robot_earlystop = hold_messages_and_classify(
             messages=messages, 
             colors=colors, 
             offsets=offsets, 
@@ -947,6 +1019,18 @@ while running and current_trial < len(trial_sequence):
             leaky_integrator=leaky_integrator,
             baseline_mean=baseline_mean
         )
+        append_trial_probabilities_to_csv(
+            trial_probabilities=robot_probs,
+            mode=0,  # still MI internally
+            trial_number=current_trial + 1,
+            predicted_label=final_class_robot,
+            early_cutout=robot_earlystop,
+            mi_threshold=config.THRESHOLD_MI,
+            rest_threshold=config.THRESHOLD_REST,
+            logger=logger,
+            phase="ROBOT"
+        )
+
         display_fixation_period(duration=6)
         logger.log_event("Robot reset fixation (6s) complete after hold-and-classify phase.")
 
@@ -967,9 +1051,9 @@ while running and current_trial < len(trial_sequence):
     # Advance trial index and frame rate
     current_trial += 1
     pygame.display.flip()
-    clock.tick(30)
+    clock.tick(60)
 
-
+log_confusion_matrix_from_trial_summary(logger)
 logger.log_event(f"run complete")
 
 pygame.quit()
