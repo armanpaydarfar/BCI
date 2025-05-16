@@ -33,7 +33,7 @@ EOG_TOGGLE = 0  # Toggle to enable or disable EOG processing (1 = enabled, 0 = d
 
 # Experiment Parameters
 ARM_SIDE = "Left"
-TOTAL_TRIALS = 30  # Total number of trials
+TOTAL_TRIALS = 20  # Total number of trials
 TOTAL_TRIALS_ERRP = 45 # Total number of trials for ErrP experiment
 MAX_REPEATS = 3  # Maximum consecutive repeats of the same condition
 N_SPLITS = 5  # Number of splits for KFold cross-validation
@@ -43,7 +43,7 @@ TIME_STATIONARY = 2 # time for stationary feedback after no movement/failed move
 TIMING = True
 SHAPE_MAX = 0.8 #maximum fill 
 SHAPE_MIN = 0.5 #minimum fill 
-ROBOT_TRAJECTORY = "a"
+ROBOT_TRAJECTORY = ["a","y"]
 
 # Classification Parameters
 CLASSIFY_WINDOW = 500  # Duration of EEG data window for classification (milliseconds)
@@ -59,7 +59,7 @@ CLASSIFICATION_SCHEME_OPT = "FREQUENCY"
 SURFACE_LAPLACIAN_TOGGLE = 0 #apply the surface laplacian spatial filter during online
 SELECT_MOTOR_CHANNELS = 1 # toggle to select motor channels or not (can be used to select other channels too)
 INTEGRATOR_ALPHA = 0.95 # defines how fast the accumulated probability may change as new data comes in
-SHRINKAGE_PARAM = 0.3 # hyperparameter for shrinkage regularization
+SHRINKAGE_PARAM = 0.1 # hyperparameter for shrinkage regularization
 LEDOITWOLF = 0 #Set to true to use ledoit wolf shrinkage regularization - otherwise pyreimannian will be used w/ shrinkage param shown above
 
 # adaptive Recentering parameters for config
@@ -69,17 +69,17 @@ UPDATE_DURING_MOVE = 0 #this toggle defines whether or not the reimannian adapti
 
 
 # FES Parameters
-FES_toggle = 0
+FES_toggle = 1
 FES_CHANNEL = "red"
 FES_TIMING_OFFSET = 4 
 # above for motor FES, cut out X seconds before the full duration of movement. This should represent when the robot will naturally reach the end of motion (in successful case)
 
 # Screen Dimensions
-SCREEN_WIDTH = 3840
-SCREEN_HEIGHT = 2160
+#SCREEN_WIDTH = 3840
+#SCREEN_HEIGHT = 2160
 
-#SCREEN_WIDTH = 1200
-#SCREEN_HEIGHT = 800
+SCREEN_WIDTH = 1200
+SCREEN_HEIGHT = 800
 
 
 # Relevant Directories
@@ -89,7 +89,7 @@ DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
 MODEL_PATH = "/home/arman-admin/Projects/Harmony/Reiman_eeg_model.pkl"
 DATA_FILE_PATH = "/home/arman-admin/Documents/CurrentStudy/sub-PILOT007/ses-S001/eeg/sub-PILOT007_ses-S001_task-Default_run-001OFFLINE_eeg.xdf"
 
-TRAINING_SUBJECT = "PILOT007"
+TRAINING_SUBJECT = "CLIN_PILOT_001"
 
 
 #TRAINING_SESSION = "001OFFLINE"

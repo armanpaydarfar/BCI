@@ -10,8 +10,8 @@ from scipy.stats import zscore
 from Utils.preprocessing import apply_notch_filter, extract_segments, separate_classes, compute_grand_average,concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "CLASS_SUBJ_831"
-session = "S002OFFLINE_NOFES"
+subject = "CLASS_SUBJ_133"
+session = "S001OFFLINE_FES"
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
@@ -156,7 +156,7 @@ print("\n Rechecking Channel Positions After Montage Application:")
 for ch in raw.info["chs"]:
     print(f"{ch['ch_name']}: {ch['loc'][:3]}")
 '''
-highband = 30
+highband = 12
 lowband = 8
 
 time_start = -1
@@ -270,7 +270,7 @@ time_windows = np.linspace(0.1, 5.0 - window_size, num_windows)  # Avoid end cli
 
 
 # Config
-channel_name = "C3"
+channel_name = "P4"
 target_marker = 200  # for example, MI trials
 trial_index = 0      # 0 = first trial, 1 = second, etc.
 
@@ -301,13 +301,7 @@ plt.show()
 
 
 
-
-
-
-
-
-
-
+'''
 
 # **Step 1: Square all epochs to compute signal power**
 print("Squaring all epochs for signal power computation...")
@@ -390,7 +384,7 @@ for event_id in evoked_power.keys():
     figures[event_id] = fig
 
 plt.show()
-
+'''
 # **Step 6: Compute and Plot PSD**
 #raw.compute_psd(fmax=50).plot()
 # Select epochs based on marker values
@@ -398,11 +392,11 @@ epochs_marker1 = epochs['100']  # Replace '100' with the actual event ID for the
 epochs_marker2 = epochs['200']  # Replace '200' with the actual event ID for the second marker
 
 # Compute and plot PSD for the first marker
-psd_marker1 = epochs_marker1.compute_psd(fmax=50)
+psd_marker1 = epochs_marker1.compute_psd(method='welch', fmin=1, fmax=60, n_fft=512, n_overlap=256)
 psd_marker1.plot()  # Modify title based on event ID
 plt.title("PSD for rest")  # Set title separately
 # Compute and plot PSD for the second marker
-psd_marker2 = epochs_marker2.compute_psd(fmax=50)
+psd_marker2 = epochs_marker2.compute_psd(method='welch', fmin=1, fmax=60, n_fft=512, n_overlap=256)
 psd_marker2.plot()  # Modify title based on event ID
 plt.title("PSD for MI")  # Set title separately
 
@@ -502,7 +496,7 @@ for marker, tfr_avg in tfr_data.items():
 plt.show()
 
 
-
+'''
 
 ##################################################################################
 #ERD or ERS analysis below
@@ -572,7 +566,7 @@ plt.show()
 
 
 
-
+'''
 
 
 #########################

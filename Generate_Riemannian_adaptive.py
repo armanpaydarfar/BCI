@@ -5,8 +5,8 @@ import mne
 from sklearn.model_selection import KFold
 from sklearn.metrics import accuracy_score
 from pyriemann.estimation import Shrinkage
-from pyriemann.classification import MDM
-from pyriemann.estimation import Covariances
+from pyriemann.classification import MDM, FgMDM
+from pyriemann.estimation import Covariances, XdawnCovariances
 import config
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
@@ -15,16 +15,11 @@ from scipy.signal import butter, lfilter, lfilter_zi
 from Utils.preprocessing import butter_bandpass, concatenate_streams, select_motor_channels
 import glob  # Required for multi-file loading
 from scipy.stats import zscore
-
-from pyriemann.transfer import TLCenter
-from pyriemann.classification import MDM
 from pyriemann.utils.mean import mean_riemann
-from sklearn.model_selection import KFold
-from sklearn.metrics import accuracy_score
-import numpy as np
-
-import matplotlib.pyplot as plt
+from scipy.linalg import sqrtm
 import seaborn as sns
+from sklearn.covariance import LedoitWolf
+from pyriemann.preprocessing import Whitening
 
 # Load trigger mappings from config
 TRIGGERS = config.TRIGGERS
@@ -36,6 +31,36 @@ EPOCHS_START_END = {
 }
 
 
+
+
+def plot_posterior_probabilities(posterior_probs):
+    """
+    Plots the histogram of posterior probabilities for each class.
+
+    Parameters:
+        posterior_probs (dict): Dictionary containing posterior probabilities for each class.
+    """
+    plt.figure(figsize=(10, 6))
+    bins = np.linspace(0, 1, 20)  # Set bins for histogram
+
+    # Convert numerical labels to "Rest" and "MI"
+    label_map = {100: "Rest", 200: "MI"}  # Ensures proper text labels
+    renamed_probs = {label_map[int(label)]: probs for label, probs in posterior_probs.items()}
+
+    for label, probs in renamed_probs.items():
+        probs = np.array(probs).flatten()
+        sns.histplot(probs, bins=bins, alpha=0.6, label=f"{label} Probability", kde=True)
+
+    plt.xlabel("Predicted Probability")
+    plt.ylabel("Frequency")
+    plt.title("Posterior Probability Distribution Across Classes")
+    plt.legend(title="True Class")
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.show()
+
+
+
+
 # Stateful Filtering Function
 def apply_stateful_filter(raw, b, a):
     filter_states = {}  # Initialize state tracking dictionary
@@ -45,8 +70,164 @@ def apply_stateful_filter(raw, b, a):
         raw._data[ch_idx], filter_states[ch_idx] = lfilter(b, a, raw._data[ch_idx], zi=filter_states[ch_idx])
     return raw
 
+def center_cov_matrices_riemannian(cov_matrices):
+    """
+    Center a set of covariance matrices around the identity matrix using the Riemannian mean.
+
+    Parameters:
+        cov_matrices (np.ndarray): Array of shape (n_matrices, n_channels, n_channels)
+
+    Returns:
+        np.ndarray: Centered covariance matrices
+    """
+    # Compute the Riemannian mean of the covariance matrices
+    mean_cov = mean_riemann(cov_matrices, maxiter = 5000)
+
+    # Compute the inverse square root of the mean covariance
+    eigvals, eigvecs = np.linalg.eigh(mean_cov)
+    inv_sqrt_mean_cov = eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T
+
+    # Apply whitening transformation to center around the identity
+    centered_matrices = np.array([inv_sqrt_mean_cov @ C @ inv_sqrt_mean_cov for C in cov_matrices])
+
+    return centered_matrices
+
+def validate_trial_pairs(marker_values, marker_timestamps, eeg_timestamps, sfreq, EPOCHS_START_END, min_duration=1.0):
+    """
+    Validates trial start/end pairs and prints duration and skip-safety checks.
+
+    Parameters:
+        marker_values: np.array of int
+        marker_timestamps: np.array of float (seconds)
+        eeg_timestamps: np.array of float (seconds)
+        sfreq: float sampling frequency
+        EPOCHS_START_END: dict of {start_marker: end_marker}
+        min_duration: float, minimum seconds required to allow 1s skip
+    """
+    print("\n🔍 Pre-validating trial start/end pairs...")
+    
+    for start_marker, end_marker in EPOCHS_START_END.items():
+        start_indices = np.where(marker_values == int(start_marker))[0]
+        end_indices = np.where(marker_values == int(end_marker))[0]
+
+        print(f"\n🔹 Validating marker pair {start_marker} → {end_marker}")
+        print(f"   Found {len(start_indices)} start markers, {len(end_indices)} end markers")
+
+        if len(start_indices) != len(end_indices):
+            print("   ⚠️ Mismatch in marker counts — trimming to shortest length")
+            min_len = min(len(start_indices), len(end_indices))
+            start_indices = start_indices[:min_len]
+            end_indices = end_indices[:min_len]
+
+        for i, (s_idx, e_idx) in enumerate(zip(start_indices, end_indices)):
+            t_start = marker_timestamps[s_idx]
+            t_end = marker_timestamps[e_idx]
+            duration = t_end - t_start
+            safe_to_skip = duration > min_duration
+
+            if not safe_to_skip:
+                print(f"   ❌ Trial {i}: {duration:.2f}s < {min_duration}s → will be invalid if 1s is skipped")
+            else:
+                print(f"   ✅ Trial {i}: {duration:.2f}s → OK to skip 1s")
+
+        print(f"   Finished validating {len(start_indices)} trials for marker {start_marker}")
 
 
+def segment_trials_from_markers(raw, marker_values, marker_timestamps, eeg_timestamps, sfreq):
+    segments_all = []
+    labels_all = []
+
+    window_size = config.CLASSIFY_WINDOW / 1000
+    step_size = 1 / 16
+    window_samples = int(window_size * sfreq)
+    step_samples = int(step_size * sfreq)
+
+    for start_marker, end_marker in EPOCHS_START_END.items():
+        start_indices = np.where(marker_values == int(start_marker))[0]
+        end_indices = np.where(marker_values == int(end_marker))[0]
+
+        if len(start_indices) != len(end_indices):
+            print(f"⚠️ Mismatch in marker count for {start_marker}/{end_marker} — trimming")
+            min_len = min(len(start_indices), len(end_indices))
+            start_indices = start_indices[:min_len]
+            end_indices = end_indices[:min_len]
+
+        for trial_num, (s_idx, e_idx) in enumerate(zip(start_indices, end_indices)):
+            ts_start = marker_timestamps[s_idx]
+            ts_end = marker_timestamps[e_idx]
+            if ts_end - ts_start <= 1.0:
+                print(f"❌ Trial {trial_num} skipped — too short ({ts_end - ts_start:.2f}s)")
+                continue
+
+            start_sample = np.searchsorted(eeg_timestamps, ts_start + 1.0)
+            end_sample = np.searchsorted(eeg_timestamps, ts_end)
+
+            if end_sample <= start_sample:
+                print(f"❌ Trial {trial_num} invalid — end sample before start")
+                continue
+
+            baseline_start = max(0, start_sample + int(sfreq * -1.0))
+            baseline_end = start_sample
+            baseline = raw._data[:, baseline_start:baseline_end].mean(axis=1, keepdims=True)
+            raw._data -= baseline
+
+            trial_data = raw._data[:, start_sample:end_sample]
+            n_samples = trial_data.shape[1]
+            if n_samples < window_samples:
+                print(f"⚠️ Trial {trial_num} too short after skip — {n_samples} samples")
+                continue
+
+            n_windows = (n_samples - window_samples) // step_samples + 1
+            print(f"✅ Trial {trial_num} (label {start_marker}): {n_windows} segments")
+
+            for i in range(0, n_samples - window_samples + 1, step_samples):
+                segment = trial_data[:, i:i + window_samples]
+                segments_all.append(segment)
+                labels_all.append(start_marker)
+
+    return np.array(segments_all), np.array(labels_all)
+
+
+def segment_and_label_one_run(eeg_stream, marker_stream):
+    from Utils.preprocessing import select_motor_channels
+
+    marker_values = np.array([int(m[0]) for m in marker_stream["time_series"]])
+    marker_timestamps = np.array([float(m[1]) for m in marker_stream["time_series"]])
+    eeg_timestamps = np.array(eeg_stream["time_stamps"])
+    eeg_data = np.array(eeg_stream["time_series"]).T
+
+    channel_names = get_channel_names_from_xdf(eeg_stream)
+    valid_channels = [ch for ch in channel_names if ch not in {"AUX1", "AUX2", "AUX3", "AUX7", "AUX8", "AUX9", "TRIGGER"}]
+    valid_indices = [channel_names.index(ch) for ch in valid_channels]
+    eeg_data = eeg_data[valid_indices]
+
+    info = mne.create_info(ch_names=valid_channels, sfreq=config.FS, ch_types="eeg")
+    raw = mne.io.RawArray(eeg_data, info)
+
+    # Unit + montage setup
+    for ch in raw.info["chs"]:
+        ch["unit"] = 201
+    if "M1" in raw.ch_names and "M2" in raw.ch_names:
+        raw.drop_channels(["M1", "M2"])
+    raw.rename_channels({
+        "FP1": "Fp1", "FPZ": "Fpz", "FP2": "Fp2",
+        "FZ": "Fz", "CZ": "Cz", "PZ": "Pz", "POZ": "POz", "OZ": "Oz"
+    })
+    raw.set_montage(mne.channels.make_standard_montage("standard_1020"))
+
+    raw.notch_filter(60, method="iir")
+    raw.filter(l_freq=config.LOWCUT, h_freq=config.HIGHCUT, method="iir")
+    if config.SURFACE_LAPLACIAN_TOGGLE:
+        raw = mne.preprocessing.compute_current_source_density(raw)
+    if config.SELECT_MOTOR_CHANNELS:
+        raw = select_motor_channels(raw)
+
+    # Segment this run
+    return segment_trials_from_markers(
+        raw, marker_values, marker_timestamps, eeg_timestamps, config.FS
+    )
+
+'''
 def segment_epochs(epochs, window_size=config.CLASSIFY_WINDOW, step_size=0.1):
     """
     Slice each epoch into smaller overlapping windows for training.
@@ -77,264 +258,142 @@ def segment_epochs(epochs, window_size=config.CLASSIFY_WINDOW, step_size=0.1):
             segmented_labels.append(label)  # Each slice gets the same label
 
     return np.array(segmented_data), np.array(segmented_labels)
-
-
-
-def train_riemannian_model(cov_matrices, labels, subject_ids="PILOT007", n_splits=8, shrinkage_param=config.SHRINKAGE_PARAM):
+'''
+def train_riemannian_model(cov_matrices, labels, n_splits=8, shrinkage_param=config.SHRINKAGE_PARAM):
     """
-    Train an MDM classifier using Riemannian Centering Transformation (RCT) for transfer learning,
-    while collecting posterior probabilities and plotting their distributions.
+    Train an MDM classifier with k-fold cross-validation using Riemannian geometry 
+    and plot posterior probability histograms.
 
     Parameters:
-        cov_matrices (np.ndarray): Covariance matrices (n_trials, n_channels, n_channels).
+        cov_matrices (np.ndarray): Covariance matrices of shape (n_samples, n_channels, n_channels).
         labels (np.ndarray): Corresponding labels for the segments.
-        subject_ids (str or np.ndarray): Subject identifiers corresponding to each trial.
         n_splits (int): Number of splits for cross-validation.
         shrinkage_param (float): Regularization strength for Shrinkage.
 
     Returns:
-        dict: Trained models and applied transformations.
+        mdm (MDM): Trained MDM model.
     """
-    kf = KFold(n_splits=n_splits, shuffle=False,)
+
+    print("\n🚀 Starting K-Fold Cross Validation with Riemannian MDM...\n")
+
+
+    
+    # Compute the reference matrix (Riemannian mean)
+    '''
+    reference_matrix = mean_riemann(cov_matrices, maxiter=1000)
+
+    # Center covariance matrices
+    
+    cov_matrices = np.array([np.linalg.inv(reference_matrix) @ cov @ np.linalg.inv(reference_matrix)
+                              for cov in cov_matrices])
+    
+    '''
+
+    #cov_matrices = center_cov_matrices_riemannian(cov_matrices)
+    #cov_matrices = center_cov_matrices(cov_matrices, reference_matrix)
+    # Apply Shrinkage-based regularization
+
+    if config.LEDOITWOLF:
+        # Compute covariance matrices with optimized shrinkage
+        cov_matrices_shrinked = np.array([LedoitWolf().fit(cov).covariance_ for cov in cov_matrices])
+        cov_matrices = cov_matrices_shrinked    
+    else:
+        shrinkage = Shrinkage(shrinkage=shrinkage_param)
+        cov_matrices = shrinkage.fit_transform(cov_matrices)  
+
+    
+    # Apply Riemannian whitening
+    if config.RECENTERING:
+        whitener = Whitening(metric="riemann")  # Use Riemannian mean for whitening
+        cov_matrices = whitener.fit_transform(cov_matrices)
+    
+    #print(mean_riemann(cov_matrices))
+    
+    
+    # Initialize cross-validation
+    kf = KFold(n_splits=n_splits, shuffle=False)
     mdm = MDM()
-
     accuracies = []
-    posterior_probs = {label: [] for label in np.unique(labels)}  # Store probabilities for each class
+    posterior_probs = {label: [] for label in np.unique(labels)}  # Store probabilities per class
 
-    print("\n Starting K-Fold Cross Validation with RCT...\n")
-
-    # **Step 1: Format subject_ids correctly as "Subject/Class"**
-    if isinstance(subject_ids, str):  
-        subject_ids = np.array([f"{subject_ids}/Class{label}" for label in labels])  # Ensure correct format
-
-    print(f"🔹 Unique domain labels: {np.unique(subject_ids)}")
-
-    # **Step 2: Apply Shrinkage Regularization**
-
-    shrinkage = Shrinkage(shrinkage=shrinkage_param)
-    cov_matrices = shrinkage.fit_transform(cov_matrices)
-
-    # **Step 3: K-Fold Training and Evaluation**
     for fold_idx, (train_index, test_index) in enumerate(kf.split(cov_matrices), start=1):
         X_train, X_test = cov_matrices[train_index], cov_matrices[test_index]
         Y_train, Y_test = labels[train_index], labels[test_index]
-        subjects_train, subjects_test = subject_ids[train_index], subject_ids[test_index]
-        # Print the first covariance matrix before and after TLCenter
-        
-        #print("\n🔍 First Covariance Matrix (Before Centering):")
-        #print(X_train[0])  # Print the first training matrix before transformation
 
-
-        # **Step 4: Extract Subject Name Only for `target_domain`**
-        target_domain = np.unique([subj.split("/")[0] for subj in subjects_test])[0]  # Extract "PILOT007" only
-
-        #print(f"🔹 Fold {fold_idx}: Target domain = {target_domain}")
-
-        # **Step 5: Apply Re-Centering Transformation (RCT) on the TRAINING SET ONLY**
-        rct = TLCenter(target_domain=target_domain)
-        X_train_centered = rct.fit_transform(X_train, subjects_train)
-        
-        # **Step 6: Apply the same RCT transformation to the test set**
-        X_test_centered = rct.transform(X_test)
-
-        # Debugging: Verify Centered Matrices
-        mean_diag_train = np.mean([np.diag(cov) for cov in X_train_centered])
-        mean_col_train = np.mean([cov.mean(axis=0) for cov in X_train_centered])
-
-        mean_diag_test = np.mean([np.diag(cov) for cov in X_test_centered])
-        mean_col_test = np.mean([cov.mean(axis=0) for cov in X_test_centered])
-
-        #print(f"🔍 Mean Diagonal (Train): {mean_diag_train:.4f}, Mean Columns (Train): {mean_col_train.mean():.4f}")
-        #print(f"🔍 Mean Diagonal (Test): {mean_diag_test:.4f}, Mean Columns (Test): {mean_col_test.mean():.4f}")
-
-        # **Step 7: Train and Evaluate the Classifier**
-        mdm.fit(X_train_centered, Y_train)
-        Y_pred = mdm.predict(X_test_centered)
-        Y_predProb = mdm.predict_proba(X_test_centered)  # Get posterior probabilities
+        # Train and evaluate model
+        mdm.fit(X_train, Y_train)
+        Y_pred = mdm.predict(X_test)
+        Y_predProb = mdm.predict_proba(X_test)  # Get class probabilities
 
         accuracy = accuracy_score(Y_test, Y_pred)
         accuracies.append(accuracy)
+        print(f"\n ✅ Fold {fold_idx} Accuracy: {accuracy:.4f}")
 
-        print(f"\n **Fold {fold_idx} Accuracy: {accuracy:.4f}**")
-
-        # **Step 8: Store Posterior Probabilities for Each True Class**
+        # Store probabilities per class
         for idx, true_label in enumerate(Y_test):
-            posterior_probs[true_label].append(Y_predProb[idx, np.where(mdm.classes_ == true_label)[0][0]])
+            class_idx = np.where(mdm.classes_ == true_label)[0][0]
+            posterior_probs[true_label].append(Y_predProb[idx, class_idx])
 
-    # **Step 9: Print Final Accuracy**
-    print(f"\n🚀 **Final Average Accuracy with RCT:** {np.mean(accuracies):.4f}")
+    # Convert probability lists to numpy arrays
+    for label in posterior_probs:
+        posterior_probs[label] = np.array(posterior_probs[label])
 
-    # **Step 10: Retrain MDM on the Entire Dataset Using RCT**
-    target_domain = np.unique([subj.split("/")[0] for subj in subject_ids])[0]  # Pick a reference subject for final re-centering
-    rct_final = TLCenter(target_domain=target_domain)
-    cov_matrices_centered = rct_final.fit_transform(cov_matrices, subject_ids)
-    
-    mdm.fit(cov_matrices_centered, labels)
-
-    # **Step 11: Plot Posterior Probability Distributions**
+    # Plot probability histograms
     plot_posterior_probabilities(posterior_probs)
 
-    return {
-        "classifier": mdm,
-        "rct_transform": rct_final  # Save TLCenter transformation for online sessions
-    }
+    # Print overall accuracy
+    avg_accuracy = np.mean(accuracies)
+    print(f"\n🚀 **Final Average Accuracy:** {avg_accuracy:.4f}")
 
-def plot_posterior_probabilities(posterior_probs):
-    """
-    Plots the histogram of posterior probabilities for each class.
+    # Retrain the model on all data
+    mdm.fit(cov_matrices, labels)
 
-    Parameters:
-        posterior_probs (dict): Dictionary containing posterior probabilities for each class.
-    """
-    plt.figure(figsize=(10, 6))
-    bins = np.linspace(0, 1, 20)  # Set bins for histogram
-
-    for label, probs in posterior_probs.items():
-        probs = np.array(probs).flatten()
-        sns.histplot(probs, bins=bins, alpha=0.6, label=f"Class {label}", kde=True)
-
-    plt.xlabel("Predicted Probability")
-    plt.ylabel("Frequency")
-    plt.title("Posterior Probability Distribution Across Classes")
-    plt.legend(title="True Class/Domain")
-    plt.grid(True, linestyle="--", alpha=0.6)
-    plt.show()
+    return mdm
 
 def main():
     """
     Main function to generate a Riemannian-based EEG decoder.
     """
-    mne.set_log_level("WARNING")  # Options: "ERROR", "WARNING", "INFO", "DEBUG"
+    mne.set_log_level("WARNING")
 
     print("Loading XDF data...")
+    eeg_dir = os.path.join(config.DATA_DIR, f"sub-{config.TRAINING_SUBJECT}", "training_data")
+    print(f"Script is looking for XDF files in: {eeg_dir}")
 
-    # Construct EEG directory path dynamically
-    eeg_dir = os.path.join(config.DATA_DIR, f"sub-{config.TRAINING_SUBJECT}", "training_data")    
-    print(f" Script is looking for XDF files in: {eeg_dir}")
-
-    # Find all .xdf files in the session directory, excluding those with "OBS" in the filename
     xdf_files = [
-        os.path.join(eeg_dir, f) for f in os.listdir(eeg_dir) if f.endswith(".xdf") and "OBS" not in f
+        os.path.join(eeg_dir, f) for f in os.listdir(eeg_dir)
+        if f.endswith(".xdf") and "OBS" not in f
     ]
-    # Construct full paths
-    xdf_files = [os.path.join(eeg_dir, f) for f in xdf_files]
 
-    # Debugging output
-
-    # Ensure at least one file exists
     if not xdf_files:
         raise FileNotFoundError(f"No XDF files found in: {eeg_dir}")
+    print(f"Found XDF files: {xdf_files}")
 
-    print(f" Found XDF files: {xdf_files}")
+    all_segments = []
+    all_labels = []
 
-    # Load multiple XDF files (concatenating EEG streams if needed)
-    eeg_streams, marker_streams = [], []
-    for xdf_file in xdf_files:
-        eeg_s, marker_s = load_xdf(xdf_file)
-        eeg_streams.append(eeg_s)
-        marker_streams.append(marker_s)
+    for xdf_path in xdf_files:
+        print(f"\n📂 Processing file: {xdf_path}")
+        eeg_stream, marker_stream = load_xdf(xdf_path)
 
-    # Merge multiple runs (if necessary)
-    eeg_stream, marker_stream = (
-        (eeg_streams[0], marker_streams[0]) if len(eeg_streams) == 1 else concatenate_streams(eeg_streams, marker_streams)
-    )
+        segments, labels = segment_and_label_one_run(eeg_stream, marker_stream)
+        all_segments.append(segments)
+        all_labels.append(labels)
 
-    # Extract EEG and marker data
-    eeg_timestamps = np.array(eeg_stream['time_stamps'])
-    eeg_data = np.array(eeg_stream['time_series']).T  # (n_channels, n_samples)
-    channel_names = get_channel_names_from_xdf(eeg_stream)
+    # Combine all segments and labels
+    segments = np.concatenate(all_segments)
+    labels = np.concatenate(all_labels)
 
-    marker_timestamps = np.array(marker_stream['time_stamps'])
-    marker_values = np.array([int(m[0]) for m in marker_stream['time_series']])
+    # Print summary
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    label_summary = ", ".join([f"{int(lbl)}: {cnt}" for lbl, cnt in zip(unique_labels, counts)])
+    print("\n📊 Segmentation Summary:")
+    print(f"🔹 Total segments: {len(segments)}")
+    print(f"🔹 Segment shape: {segments.shape} (n_segments, n_channels, n_timepoints)")
+    print(f"🔹 Class distribution: {label_summary}")
 
-
-    # Load standard 10-20 montage
-    montage = mne.channels.make_standard_montage("standard_1020")
-
-    # Case-sensitive renaming dictionary
-    rename_dict = {
-        "FP1": "Fp1", "FPZ": "Fpz", "FP2": "Fp2",
-        "FZ": "Fz", "CZ": "Cz", "PZ": "Pz", "POZ": "POz", "OZ": "Oz"
-    }
-
-    # Drop non-EEG channels
-    non_eeg_channels = {"AUX1", "AUX2", "AUX3", "AUX7", "AUX8", "AUX9", "TRIGGER"}
-    valid_eeg_channels = [ch for ch in channel_names if ch not in non_eeg_channels]
-
-    # Filter data to keep only valid EEG channels
-    valid_indices = [channel_names.index(ch) for ch in valid_eeg_channels]  # Get indices
-    eeg_data = eeg_data[valid_indices, :]  # Keep only valid EEG data
-
-    # Create MNE Raw Object
-    sfreq = config.FS
-    info = mne.create_info(ch_names=valid_eeg_channels, sfreq=sfreq, ch_types="eeg")
-    raw = mne.io.RawArray(eeg_data, info)
-
-    first_channel_unit = raw.info["chs"][0]["unit"]
-    #print(f" First Channel Unit (FIFF Code): {first_channel_unit}")
-
-    # Convert data from Volts to microvolts (µV)
-    # Convert raw data from Volts to microvolts (µV) IMMEDIATELY AFTER LOADING
-    #raw._data /= 1e6  # Convert V → µV
-
-    # Update channel metadata in MNE so the scaling is correctly reflected
-
-    for ch in raw.info['chs']:
-        ch['unit'] = 201  # 201 corresponds to µV in MNE’s standard units
-    # Print the first EEG channel’s metadata
-
-    # Print to confirm the change
-    #print(f" Updated Units for EEG Channels: {[ch['unit'] for ch in raw.info['chs']]}")
-
-    if "M1" in raw.ch_names and "M2" in raw.ch_names:
-        raw.drop_channels(["M1", "M2"])
-        print("Removed Mastoid Channels: M1, M2")
-    else:
-        print("No Mastoid Channels Found in Data")
-
-
-    # Rename channels to match montage format
-    raw.rename_channels(rename_dict)
-
-
-    # Debug: Print missing channels
-    missing_in_montage = set(raw.ch_names) - set(montage.ch_names)
-    print(f" Channels in Raw but Missing in Montage: {missing_in_montage}")
-    raw.set_montage(montage)
-
-    # Apply Notch & Bandpass Filtering
-    # Apply Notch Filtering (Remove Powerline Noise)
-    raw.notch_filter(60, method="iir")  
-
-    # **Apply Bandpass Filtering with State Preservation**
-    #b, a = butter_bandpass(config.LOWCUT, config.HIGHCUT, sfreq, order=4)
-    #raw = apply_stateful_filter(raw, b, a)
-
-    raw.filter(l_freq=config.LOWCUT, h_freq=config.HIGHCUT, method="iir")  # Bandpass filter (8-16Hz)
-
-    # Apply Common Average Reference (CAR)
-    #raw.set_eeg_reference("average")
-
-    # Apply Surface Laplacian (CSD) if enabled
-
-    if config.SURFACE_LAPLACIAN_TOGGLE:
-        raw = mne.preprocessing.compute_current_source_density(raw)
 
     '''
-    scaler = StandardScaler()
-    raw._data = scaler.fit_transform(raw.get_data().T).T  # Transpose before & after to preserve (n_channels, n_samples)
-    training_mean = scaler.mean_
-    training_std = scaler.scale_
-    print(f" training_mean shape: {training_mean.shape}")
-    print(f" training_mean: {training_mean}")
-    print(f" training_std shape: {training_std.shape}")
-    print(f" normed data shape: {raw._data.shape}")
-    '''
-    if config.SELECT_MOTOR_CHANNELS:
-        raw = select_motor_channels(raw)
-   
-    # Print remaining channels to confirm
-    print("Remaining channels:", raw.info["ch_names"])
     # Configurable baseline duration
     BASELINE_START = -1.0  # Start of baseline period (relative to event)
     BASELINE_END = 0  # End of baseline period (relative to event)
@@ -375,6 +434,7 @@ def main():
     # Convert to MNE format and sort
     events = np.array(events)
     events = events[np.argsort(events[:, 0])]  # Sort by time index
+    #print(events)
 
     # Create MNE Epochs (without baseline correction)
     epochs = mne.Epochs(
@@ -387,39 +447,41 @@ def main():
         detrend=1, 
         preload=True
     )
-    # Define Rejection Criteria (Artifact Removal)
-    # Compute max per epoch
-    max_per_epoch = np.max(np.abs(epochs.get_data()), axis=(1, 2))  
 
-    # Compute z-scores
-    z_scores = zscore(max_per_epoch)
+    for label in epochs.event_id:
+        print(f"{label}: {len(epochs[label])} epochs")
+    '''
+ 
+    # === HARD REJECTION BASED ON PEAK AMPLITUDE ===
+    REJECTION_THRESHOLD_UV = 20  # μV
 
-    # Define a rejection criterion (e.g., 3 standard deviations)
-    reject_z_threshold = 3.0  
-    bad_epochs = np.where(np.abs(z_scores) > reject_z_threshold)[0]  
+    # Compute max abs amplitude per segment
+    max_vals = np.max(np.abs(segments), axis=(1, 2))  # shape: (n_segments,)
+    keep_mask = max_vals <= REJECTION_THRESHOLD_UV
 
-    # Drop the bad epochs
-    epochs.drop(bad_epochs)
-    print(f"Dropped {len(bad_epochs)} bad epochs based on z-score method.")
+    # Apply rejection
+    segments = segments[keep_mask]
+    labels = labels[keep_mask]
 
-   # Slice Epochs into Smaller Training Windows (e.g., 0.5s)
-    print(f"Segmenting epochs into {config.CLASSIFY_WINDOW}ms training windows...")
-    segments, labels = segment_epochs(epochs, window_size=config.CLASSIFY_WINDOW, step_size=0.1)
+    print(f"Retained {len(segments)} segments after rejecting {np.sum(~keep_mask)} high-amplitude artifacts.")
 
-    print(f"🔹 Segmented Data Shape: {segments.shape}")  # Debugging output
-
-    # Compute Covariance Matrices (for Riemannian Classifier)
-    print("Computing Covariance Matrices...")
-
-    cov_matrices = []
-    info = epochs.info  # Use the same info as the original epochs
     
     # Compute Covariance Matrices (for Riemannian Classifier)
     print("Computing Covariance Matrices...")
     #cov_matrices = np.array([np.cov(segment) for segment in segments])
     cov_matrices = np.array([ (segment @ segment.T) / np.trace(segment @ segment.T) for segment in segments ])
 
+    '''
+    for segment in segments:
+        # Convert segment into an MNE EpochsArray (shape needs to be (n_epochs, n_channels, n_samples))
+        segment = mne.EpochsArray(segment[np.newaxis, :, :], info)  # Ensure correct shape
 
+        # Compute covariance matrix using OAS regularization
+        cov = mne.compute_covariance(segment, method="oas")
+
+        # Extract covariance matrix and store
+        cov_matrices.append(cov["data"])
+    '''
     # Convert list to numpy array (shape: (n_epochs, n_channels, n_channels))
     cov_matrices = np.array(cov_matrices)
     #print(cov_matrices[0])
@@ -437,8 +499,7 @@ def main():
     os.makedirs(subject_model_dir, exist_ok=True)
 
     subject_model_path = os.path.join(subject_model_dir, f"sub-{config.TRAINING_SUBJECT}_model.pkl")
-    Training_mean_path = os.path.join(subject_model_dir, f"sub-{config.TRAINING_SUBJECT}_mean")
-    Training_std_path = os.path.join(subject_model_dir, f"sub-{config.TRAINING_SUBJECT}_std")
+
     
     # Save the trained model
     with open(subject_model_path, 'wb') as f:

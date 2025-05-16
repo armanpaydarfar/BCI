@@ -7,6 +7,7 @@ import datetime
 import os
 import csv
 import pandas as pd
+import random
 from pylsl import StreamInlet, resolve_stream
 import numpy as np
 from pyriemann.estimation import Shrinkage
@@ -945,7 +946,8 @@ while running and current_trial < len(trial_sequence):
             messages = ["Correct", "Robot Move"]
             colors = [config.green, config.green]
             offsets = [-100, 100]
-            udp_messages = [config.ROBOT_TRAJECTORY, "g"]
+            selected_trajectory = random.choice(config.ROBOT_TRAJECTORY)
+            udp_messages = [selected_trajectory, "g"]
             duration = 0.01  # Initial UDP command duration
             should_hold_and_classify = True
 

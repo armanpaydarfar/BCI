@@ -10,7 +10,7 @@ from pylsl import StreamInlet, resolve_stream
 from pathlib import Path
 from Utils.logging_manager import LoggerManager
 import config
-
+import random
 
 
 
@@ -227,7 +227,8 @@ while running and current_trial < len(trial_sequence):
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_END"], logger=logger)
         logger.log_event("Sent MI_END trigger.")
         messages = ["Robot Move"]
-        udp_messages = [config.ROBOT_TRAJECTORY, "g"]
+        selected_trajectory = random.choice(config.ROBOT_TRAJECTORY)
+        udp_messages = [selected_trajectory, "g"]
         colors = [config.green]
         duration = config.TIME_ROB
         if FES_toggle == 1:
