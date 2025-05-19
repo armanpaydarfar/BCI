@@ -41,15 +41,15 @@ TIME_MI = 5 # time for motor imagery and rest
 TIME_ROB = 13 # time allocated for robot to move
 TIME_STATIONARY = 2 # time for stationary feedback after no movement/failed movement trial
 TIMING = True
-SHAPE_MAX = 0.8 #maximum fill 
+SHAPE_MAX = 0.6 #maximum fill 
 SHAPE_MIN = 0.5 #minimum fill 
-ROBOT_TRAJECTORY = ["a","y"]
+ROBOT_TRAJECTORY = ["a"]
 
 # Classification Parameters
 CLASSIFY_WINDOW = 500  # Duration of EEG data window for classification (milliseconds)
 ACCURACY_THRESHOLD = 0.55  # Accuracy threshold to determine "Correct" (plan to obsolete)
-THRESHOLD_MI = 0.55 #Threshold for MI "correct"
-THRESHOLD_REST = 0.55 #Threshold for REST "Correct"
+THRESHOLD_MI = 0.53 #Threshold for MI "correct"
+THRESHOLD_REST = 0.53 #Threshold for REST "Correct"
 RELAXATION_RATIO = 0.5
 MIN_PREDICTIONS = 20 # Min number of predictions during Online experiment before the decoder can end early
 STEP_SIZE = 1/16
@@ -69,7 +69,7 @@ UPDATE_DURING_MOVE = 0 #this toggle defines whether or not the reimannian adapti
 
 
 # FES Parameters
-FES_toggle = 1
+FES_toggle = 0
 FES_CHANNEL = "red"
 FES_TIMING_OFFSET = 4 
 # above for motor FES, cut out X seconds before the full duration of movement. This should represent when the robot will naturally reach the end of motion (in successful case)

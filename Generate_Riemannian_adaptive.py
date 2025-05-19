@@ -183,7 +183,7 @@ def segment_trials_from_markers(raw, marker_values, marker_timestamps, eeg_times
             for i in range(0, n_samples - window_samples + 1, step_samples):
                 segment = trial_data[:, i:i + window_samples]
                 segments_all.append(segment)
-                labels_all.append(start_marker)
+                labels_all.append(int(start_marker))
 
     return np.array(segments_all), np.array(labels_all)
 
@@ -453,7 +453,7 @@ def main():
     '''
  
     # === HARD REJECTION BASED ON PEAK AMPLITUDE ===
-    REJECTION_THRESHOLD_UV = 20  # μV
+    REJECTION_THRESHOLD_UV = 50  # μV
 
     # Compute max abs amplitude per segment
     max_vals = np.max(np.abs(segments), axis=(1, 2))  # shape: (n_segments,)
@@ -490,6 +490,8 @@ def main():
 
     # Train Riemannian MDM Model
     #print(cov_matrices)
+    print("Unique training labels:", np.unique(labels))
+
     print("Training Riemannian Classifier...")
     Reimans_model = train_riemannian_model(cov_matrices, labels)
 
