@@ -92,6 +92,8 @@ class LoggerManager:
         if not all_xdfs:
             fallback_dir = subject_path / "ses-Debug"
             logger = cls(log_base=fallback_dir, mode=mode)
+            logger.log_base = fallback_dir  # ✅ Ensure attribute always exists
+            logger.is_fallback = True       # ✅ Optional but useful flag
             logger.log_event("No .xdf files found — fallback to test mode.")
             return logger
 
@@ -106,6 +108,8 @@ class LoggerManager:
                 session_dir = latest_xdf.parents[1]  # eeg/ → ses-XXX
                 run_id = next((p for p in latest_xdf.stem.split('_') if p.startswith("run-")), None)
                 logger = cls(log_base=session_dir, run_id=run_id, mode=mode)
+                logger.log_base = session_dir       # ✅ Explicitly set it
+                logger.is_fallback = False
                 logger.log_event(f"Auto-detected active recording: {latest_xdf.name}")
                 return logger
 
@@ -114,5 +118,7 @@ class LoggerManager:
 
         fallback_dir = subject_path / "ses-Debug"
         logger = cls(log_base=fallback_dir, mode=mode)
+        logger.log_base = fallback_dir          # ✅ Ensure log_base even on fallback
+        logger.is_fallback = True
         logger.log_event(f"Most recent file '{latest_xdf.name}' was not growing — fallback to test mode.")
         return logger

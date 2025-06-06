@@ -381,7 +381,9 @@ def main():
             # Compute baseline mean (per channel)
             baseline_mean = raw._data[:, baseline_start_sample:baseline_end_sample].mean(axis=1, keepdims=True)
             # Apply baseline correction manually
-            raw._data -= baseline_mean  # Subtract baseline mean
+            trial_slice = slice(start_sample, end_sample)
+            raw._data[:, trial_slice] -= baseline_mean
+            #raw._data -= baseline_mean
 
             # Store the event (aligned with new baseline)
             events.append([start_sample, 0, int(start_marker)])  # Align events with actual trial start
@@ -391,7 +393,16 @@ def main():
     events = np.array(events)
     events = events[np.argsort(events[:, 0])]  # Sort by time index
     #print(events)
+    '''
+    unique, counts = np.unique(events[:, 0], return_counts=True)
+    duplicates = unique[counts > 1]
+    if len(duplicates) > 0:
+        print(f"⚠️ Found {len(duplicates)} duplicated sample indices:")
+        for dup in duplicates:
+            print(f" - Sample {dup} occurs {counts[unique == dup][0]} times")
 
+    print("All event sample indices:\n", events[:, 0])
+    '''
     # Create MNE Epochs (without baseline correction)
     epochs = mne.Epochs(
         raw, 

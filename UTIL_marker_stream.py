@@ -52,17 +52,17 @@ def get_eeg_inlet():
 
 def get_current_eeg_timestamp(inlet, udp_received_time=0):
     inlet.flush()
+    local_timestamp = local_clock()
     sample, timestamp = inlet.pull_sample(timeout=1.0)
-    temp_timestamp = local_clock()
-
+    timestamp_after_pull = local_clock()
     if timestamp is not None:
-        stream_offset_sec = temp_timestamp - udp_received_time
+        stream_offset_sec = timestamp_after_pull - udp_received_time
         stream_offset_ms = stream_offset_sec * 1000  # Convert to milliseconds
         logging.info(f"Current EEG timestamp: {timestamp}, Stream Offset: {stream_offset_ms:.2f} ms")
         return timestamp
     else:
-        logging.warning("No new EEG timestamp available.")
-        return None
+        logging.warning("EEG Timestamp not parsed - using local_clock() as fallback.")
+        return local_timestamp
 
 
 def send_marker(marker, timestamp, prob_mi=-1.0, prob_rest=-1.0):
@@ -105,7 +105,7 @@ def process_udp_messages(eeg_inlet):
                 if timestamp is not None:
                     send_marker(marker_value, timestamp)
                 else:
-                    logging.warning("Failed to retrieve EEG timestamp. Marker not sent.")
+                    logging.warning("Failed to retrieve EEG timestamp. Marker sent using local_clock().")
 
             elif len(parts) == 3:
                 # Case 2: Marker + P(MI) + P(REST)

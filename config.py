@@ -32,7 +32,7 @@ EOG_CHANNEL_NAMES = ['AUX1'] # List of EOG channel names to use
 EOG_TOGGLE = 0  # Toggle to enable or disable EOG processing (1 = enabled, 0 = disabled)
 
 # Experiment Parameters
-ARM_SIDE = "Left"
+ARM_SIDE = "Right"
 TOTAL_TRIALS = 20  # Total number of trials
 TOTAL_TRIALS_ERRP = 45 # Total number of trials for ErrP experiment
 MAX_REPEATS = 3  # Maximum consecutive repeats of the same condition
@@ -41,17 +41,18 @@ TIME_MI = 5 # time for motor imagery and rest
 TIME_ROB = 13 # time allocated for robot to move
 TIME_STATIONARY = 2 # time for stationary feedback after no movement/failed movement trial
 TIMING = True
-SHAPE_MAX = 0.6 #maximum fill 
+SHAPE_MAX = 0.7 #maximum fill 
 SHAPE_MIN = 0.5 #minimum fill 
 ROBOT_TRAJECTORY = ["a"]
+BIG_BROTHER_MODE = True #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
 
 # Classification Parameters
 CLASSIFY_WINDOW = 500  # Duration of EEG data window for classification (milliseconds)
 ACCURACY_THRESHOLD = 0.55  # Accuracy threshold to determine "Correct" (plan to obsolete)
-THRESHOLD_MI = 0.53 #Threshold for MI "correct"
-THRESHOLD_REST = 0.53 #Threshold for REST "Correct"
+THRESHOLD_MI = 0.55 #Threshold for MI "correct"
+THRESHOLD_REST = 0.55 #Threshold for REST "Correct"
 RELAXATION_RATIO = 0.5
-MIN_PREDICTIONS = 20 # Min number of predictions during Online experiment before the decoder can end early
+MIN_PREDICTIONS = 10 # Min number of predictions during Online experiment before the decoder can end early
 STEP_SIZE = 1/16
 CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
 #CLASSIFICATION_SCHEME_OPT = "TIMESERIES"
@@ -59,13 +60,14 @@ CLASSIFICATION_SCHEME_OPT = "FREQUENCY"
 SURFACE_LAPLACIAN_TOGGLE = 0 #apply the surface laplacian spatial filter during online
 SELECT_MOTOR_CHANNELS = 1 # toggle to select motor channels or not (can be used to select other channels too)
 INTEGRATOR_ALPHA = 0.95 # defines how fast the accumulated probability may change as new data comes in
-SHRINKAGE_PARAM = 0.1 # hyperparameter for shrinkage regularization
-LEDOITWOLF = 0 #Set to true to use ledoit wolf shrinkage regularization - otherwise pyreimannian will be used w/ shrinkage param shown above
+SHRINKAGE_PARAM = 0.05 # hyperparameter for shrinkage regularization
+LEDOITWOLF = 1 #Set to true to use ledoit wolf shrinkage regularization - otherwise pyreimannian will be used w/ shrinkage param shown above
 
 # adaptive Recentering parameters for config
 RECENTERING = 1 # adaptive recentering toggle
+USE_CONFIDENCE_GATE = 0 #update Previous transform ONLY in the event the current prob is above the MI/REST threshold (or lean condition)
 UPDATE_DURING_MOVE = 0 #this toggle defines whether or not the reimannian adaptive recentering scheme updates when the robot is moving. 0 = no, 1 = yes. The algo will update always during MI
-
+SAVE_ADAPTIVE_T = True #this toggle saves "Adaptive_T" to the EEG directory during an active session between runs - this way, we can continue w/ the current estimated whitening transform. Disabling this will start a fresh transform each time
 
 
 # FES Parameters
@@ -89,7 +91,7 @@ DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
 MODEL_PATH = "/home/arman-admin/Projects/Harmony/Reiman_eeg_model.pkl"
 DATA_FILE_PATH = "/home/arman-admin/Documents/CurrentStudy/sub-PILOT007/ses-S001/eeg/sub-PILOT007_ses-S001_task-Default_run-001OFFLINE_eeg.xdf"
 
-TRAINING_SUBJECT = "CLIN_PILOT_001"
+TRAINING_SUBJECT = "CLIN_SUBJ_002"
 
 
 #TRAINING_SESSION = "001OFFLINE"
@@ -104,6 +106,7 @@ white = (255, 255, 255)
 blue = (0, 0, 255)
 red = (255, 0, 0)
 green = (0, 255, 0)
+orange = (255, 165, 0)
 
 # software triggers
 TRIGGERS = {

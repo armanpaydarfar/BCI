@@ -11,19 +11,8 @@ from pathlib import Path
 from Utils.logging_manager import LoggerManager
 import config
 import random
+import os
 
-
-
-# Initialize Pygame with dimensions from config
-pygame.init()
-screen = pygame.display.set_mode((config.SCREEN_WIDTH, config.SCREEN_HEIGHT))
-#screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-
-pygame.display.set_caption("EEG Offline Interactive Loop")
-
-# Screen dimensions
-screen_width = config.SCREEN_WIDTH
-screen_height = config.SCREEN_HEIGHT
 
 # Initialize UDP sockets
 udp_socket_marker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -55,6 +44,25 @@ config_log_subset = {
 logger.save_config_snapshot(config_log_subset)
 # Log the start of the offline pipeline
 logger.log_event("Initialized offline EEG processing pipeline.")
+
+
+pygame.init()
+
+if config.BIG_BROTHER_MODE:
+    # External display is at +0+0 (HDMI-1), so force window to (0,0)
+    os.environ["SDL_VIDEO_WINDOW_POS"] = "0,0"
+    screen = pygame.display.set_mode((1920, 1080), pygame.NOFRAME)
+    logger.log_event("🎥 Big Brother Mode ON — window placed at (0,0) on external monitor (HDMI-1).")
+else:
+    # Default fullscreen on active display (where launched)
+    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+    logger.log_event("👤 Big Brother Mode OFF — fullscreen on active display.")
+
+# Set title and get screen dimensions for animations
+pygame.display.set_caption("EEG Offline Interactive Loop")
+info = pygame.display.Info()
+screen_width = info.current_w
+screen_height = info.current_h
 
 
 def display_fixation_period(duration=3):

@@ -169,9 +169,9 @@ def segment_trials_from_markers(raw, marker_values, marker_timestamps, eeg_times
             baseline_start = max(0, start_sample + int(sfreq * -1.0))
             baseline_end = start_sample
             baseline = raw._data[:, baseline_start:baseline_end].mean(axis=1, keepdims=True)
-            raw._data -= baseline
-
-            trial_data = raw._data[:, start_sample:end_sample]
+            trial_slice = slice(start_sample, end_sample)
+            raw._data[:, trial_slice] -= baseline
+            trial_data = raw._data[:, trial_slice]
             n_samples = trial_data.shape[1]
             if n_samples < window_samples:
                 print(f"⚠️ Trial {trial_num} too short after skip — {n_samples} samples")
@@ -189,7 +189,6 @@ def segment_trials_from_markers(raw, marker_values, marker_timestamps, eeg_times
 
 
 def segment_and_label_one_run(eeg_stream, marker_stream):
-    from Utils.preprocessing import select_motor_channels
 
     marker_values = np.array([int(m[0]) for m in marker_stream["time_series"]])
     marker_timestamps = np.array([float(m[1]) for m in marker_stream["time_series"]])
@@ -293,25 +292,8 @@ def train_riemannian_model(cov_matrices, labels, n_splits=8, shrinkage_param=con
     #cov_matrices = center_cov_matrices(cov_matrices, reference_matrix)
     # Apply Shrinkage-based regularization
 
-    if config.LEDOITWOLF:
-        # Compute covariance matrices with optimized shrinkage
-        cov_matrices_shrinked = np.array([LedoitWolf().fit(cov).covariance_ for cov in cov_matrices])
-        cov_matrices = cov_matrices_shrinked    
-    else:
-        shrinkage = Shrinkage(shrinkage=shrinkage_param)
-        cov_matrices = shrinkage.fit_transform(cov_matrices)  
-
-    
-    # Apply Riemannian whitening
-    if config.RECENTERING:
-        whitener = Whitening(metric="riemann")  # Use Riemannian mean for whitening
-        cov_matrices = whitener.fit_transform(cov_matrices)
-    
-    #print(mean_riemann(cov_matrices))
-    
-    
     # Initialize cross-validation
-    kf = KFold(n_splits=n_splits, shuffle=False)
+    kf = KFold(n_splits=n_splits, shuffle=True)
     mdm = MDM()
     accuracies = []
     posterior_probs = {label: [] for label in np.unique(labels)}  # Store probabilities per class
@@ -369,7 +351,7 @@ def main():
         raise FileNotFoundError(f"No XDF files found in: {eeg_dir}")
     print(f"Found XDF files: {xdf_files}")
 
-    all_segments = []
+    all_cov_matrices = []
     all_labels = []
 
     for xdf_path in xdf_files:
@@ -377,123 +359,68 @@ def main():
         eeg_stream, marker_stream = load_xdf(xdf_path)
 
         segments, labels = segment_and_label_one_run(eeg_stream, marker_stream)
-        all_segments.append(segments)
-        all_labels.append(labels)
 
-    # Combine all segments and labels
-    segments = np.concatenate(all_segments)
-    labels = np.concatenate(all_labels)
+        # Print summary
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        label_summary = ", ".join([f"{int(lbl)}: {cnt}" for lbl, cnt in zip(unique_labels, counts)])
+        print("\n📊 Segmentation Summary:")
+        print(f"🔹 Total segments: {len(segments)}")
+        print(f"🔹 Segment shape: {segments.shape} (n_segments, n_channels, n_timepoints)")
+        print(f"🔹 Class distribution: {label_summary}")
 
-    # Print summary
-    unique_labels, counts = np.unique(labels, return_counts=True)
-    label_summary = ", ".join([f"{int(lbl)}: {cnt}" for lbl, cnt in zip(unique_labels, counts)])
-    print("\n📊 Segmentation Summary:")
-    print(f"🔹 Total segments: {len(segments)}")
-    print(f"🔹 Segment shape: {segments.shape} (n_segments, n_channels, n_timepoints)")
-    print(f"🔹 Class distribution: {label_summary}")
-
-
-    '''
-    # Configurable baseline duration
-    BASELINE_START = -1.0  # Start of baseline period (relative to event)
-    BASELINE_END = 0  # End of baseline period (relative to event)
-    TRIAL_START = 1.0  # Start of MI data (relative to event)
-    TRIAL_END = 5.0  # End of MI data (relative to event)
-
-    events = []
-    event_id_map = {}
-
-    for start_marker, end_marker in EPOCHS_START_END.items():
-        start_indices = np.where(marker_values == int(start_marker))[0]
-        end_indices = np.where(marker_values == int(end_marker))[0]
-
-        if len(start_indices) != len(end_indices):
-            print(f"Unequal markers: {start_marker} (start) and {end_marker} (end). Adjusting...")
-            min_length = min(len(start_indices), len(end_indices))
-            start_indices = start_indices[:min_length]
-            end_indices = end_indices[:min_length]
-
-        for start_idx, end_idx in zip(start_indices, end_indices):
-            # Get sample indices
-            start_sample = np.searchsorted(eeg_timestamps, marker_timestamps[start_idx])
-            end_sample = np.searchsorted(eeg_timestamps, marker_timestamps[end_idx])
-
-            # Compute baseline start sample (ensuring no negative index)
-            baseline_start_sample = max(0, start_sample + int(sfreq * BASELINE_START))
-            baseline_end_sample = start_sample + int(sfreq * BASELINE_END)
-
-            # Compute baseline mean (per channel)
-            baseline_mean = raw._data[:, baseline_start_sample:baseline_end_sample].mean(axis=1, keepdims=True)
-            # Apply baseline correction manually
-            raw._data -= baseline_mean  # Subtract baseline mean
-
-            # Store the event (aligned with new baseline)
-            events.append([start_sample, 0, int(start_marker)])  # Align events with actual trial start
-            event_id_map[str(start_marker)] = int(start_marker)
-
-    # Convert to MNE format and sort
-    events = np.array(events)
-    events = events[np.argsort(events[:, 0])]  # Sort by time index
-    #print(events)
-
-    # Create MNE Epochs (without baseline correction)
-    epochs = mne.Epochs(
-        raw, 
-        events, 
-        event_id=event_id_map, 
-        tmin=TRIAL_START,  # Only take seconds 1-4
-        tmax=TRIAL_END,  
-        baseline=None,  # Baseline correction was already applied manually
-        detrend=1, 
-        preload=True
-    )
-
-    for label in epochs.event_id:
-        print(f"{label}: {len(epochs[label])} epochs")
-    '''
- 
-    # === HARD REJECTION BASED ON PEAK AMPLITUDE ===
-    REJECTION_THRESHOLD_UV = 50  # μV
-
-    # Compute max abs amplitude per segment
-    max_vals = np.max(np.abs(segments), axis=(1, 2))  # shape: (n_segments,)
-    keep_mask = max_vals <= REJECTION_THRESHOLD_UV
-
-    # Apply rejection
-    segments = segments[keep_mask]
-    labels = labels[keep_mask]
-
-    print(f"Retained {len(segments)} segments after rejecting {np.sum(~keep_mask)} high-amplitude artifacts.")
 
     
-    # Compute Covariance Matrices (for Riemannian Classifier)
-    print("Computing Covariance Matrices...")
-    #cov_matrices = np.array([np.cov(segment) for segment in segments])
-    cov_matrices = np.array([ (segment @ segment.T) / np.trace(segment @ segment.T) for segment in segments ])
+        # === HARD REJECTION BASED ON PEAK AMPLITUDE ===
+        REJECTION_THRESHOLD_UV = 30  # μV
 
-    '''
-    for segment in segments:
-        # Convert segment into an MNE EpochsArray (shape needs to be (n_epochs, n_channels, n_samples))
-        segment = mne.EpochsArray(segment[np.newaxis, :, :], info)  # Ensure correct shape
+        # Compute max abs amplitude per segment
+        max_vals = np.max(np.abs(segments), axis=(1, 2))  # shape: (n_segments,)
+        keep_mask = max_vals <= REJECTION_THRESHOLD_UV
 
-        # Compute covariance matrix using OAS regularization
-        cov = mne.compute_covariance(segment, method="oas")
+        # Apply rejection
+        segments = segments[keep_mask]
+        labels = labels[keep_mask]
 
-        # Extract covariance matrix and store
-        cov_matrices.append(cov["data"])
-    '''
-    # Convert list to numpy array (shape: (n_epochs, n_channels, n_channels))
-    cov_matrices = np.array(cov_matrices)
-    #print(cov_matrices[0])
-    print(f"Computed {len(cov_matrices)} covariance matrices with shape: {cov_matrices.shape}")
-    #print(f" Sample cov matrix: {cov_matrices[0]}")
+        print(f"Retained {len(segments)} segments after rejecting {np.sum(~keep_mask)} high-amplitude artifacts.")
 
-    # Train Riemannian MDM Model
-    #print(cov_matrices)
-    print("Unique training labels:", np.unique(labels))
+        
+        # Compute Covariance Matrices (for Riemannian Classifier)
+        print("Computing Covariance Matrices...")
+        #cov_matrices = np.array([np.cov(segment) for segment in segments])
+        cov_matrices = np.array([ (segment @ segment.T) / np.trace(segment @ segment.T) for segment in segments ])
 
+        # Convert list to numpy array (shape: (n_epochs, n_channels, n_channels))
+        cov_matrices = np.array(cov_matrices)
+        #print(cov_matrices[0])
+        print(f"Computed {len(cov_matrices)} covariance matrices with shape: {cov_matrices.shape}")
+        #print(f" Sample cov matrix: {cov_matrices[0]}")
+
+        # Train Riemannian MDM Model
+        #print(cov_matrices)
+        print("Unique training labels:", np.unique(labels))
+
+        if config.LEDOITWOLF:
+            # Compute covariance matrices with optimized shrinkage
+            cov_matrices_shrinked = np.array([LedoitWolf().fit(cov).covariance_ for cov in cov_matrices])
+            cov_matrices = cov_matrices_shrinked    
+        else:
+            shrinkage = Shrinkage(shrinkage=config.SHRINKAGE_PARAM)
+            cov_matrices = shrinkage.fit_transform(cov_matrices)  
+
+        
+        # Apply Riemannian whitening
+        if config.RECENTERING:
+            whitener = Whitening(metric="riemann")  # Use Riemannian mean for whitening
+            cov_matrices = whitener.fit_transform(cov_matrices)
+        
+        #print(mean_riemann(cov_matrices))
+        all_cov_matrices.append(cov_matrices)
+        all_labels.append(labels)
+
+    all_labels = np.concatenate(all_labels)
+    all_cov_matrices = np.concatenate(all_cov_matrices)
     print("Training Riemannian Classifier...")
-    Reimans_model = train_riemannian_model(cov_matrices, labels)
+    Reimans_model = train_riemannian_model(all_cov_matrices, all_labels)
 
     #  Save the trained model
     # Define model save path (subject-level, not session-specific)

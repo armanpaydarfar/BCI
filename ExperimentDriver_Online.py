@@ -50,6 +50,8 @@ from Utils.experiment_utils import (
     display_multiple_messages_with_udp,
     LeakyIntegrator,
     RollingScaler,
+    save_transform,
+    load_transform
 )
 
 # Networking utilities
@@ -96,16 +98,40 @@ config_log_subset = {
     key: getattr(config, key) for key in loggable_fields if hasattr(config, key)
 }
 logger.save_config_snapshot(config_log_subset)
+
+
+eeg_dir = logger.log_base / "eeg"
+adaptive_T_path = eeg_dir / "adaptive_T.pkl"
+global Prev_T
+global counter
+Prev_T, counter = load_transform(adaptive_T_path)
+if Prev_T is None:
+    counter = 0
+    logger.log_event("ℹ️ No adaptive transform found — starting fresh with counter = 0.")
+else:
+    logger.log_event(f"✅ Loaded adaptive transform with counter = {counter}")
+
 logger.log_event("Logger initialized for online experimental driver.")
 
 
-# Initialize Pygame with dimensions from config
-pygame.init()
-screen = pygame.display.set_mode((config.SCREEN_WIDTH, config.SCREEN_HEIGHT))
-pygame.display.set_caption("BCI Online Interactive Loop")
 
-screen_width = config.SCREEN_WIDTH
-screen_height = config.SCREEN_HEIGHT
+pygame.init()
+
+if config.BIG_BROTHER_MODE:
+    # External display is at +0+0 (HDMI-1), so force window to (0,0)
+    os.environ["SDL_VIDEO_WINDOW_POS"] = "0,0"
+    screen = pygame.display.set_mode((1920, 1080), pygame.NOFRAME)
+    logger.log_event("🎥 Big Brother Mode ON — window placed at (0,0) on external monitor (HDMI-1).")
+else:
+    # Default fullscreen on active display (where launched)
+    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+    logger.log_event("👤 Big Brother Mode OFF — fullscreen on active display.")
+
+# Set title and get screen dimensions for animations
+pygame.display.set_caption("EEG Online Interactive Loop")
+info = pygame.display.Info()
+screen_width = info.current_w
+screen_height = info.current_h
 logger.log_event("Pygame initialized and display configured.")
 
 # UDP Settings
@@ -145,9 +171,7 @@ logger.log_event(f"Sampling frequency set to {fs} Hz. Filter coefficients are un
 global filter_states
 filter_states = {}
 '''
-global Prev_T
-global counter
-counter = 0
+
 # (Optional) Commented out rolling normalization
 # logger.log_event("Rolling normalization block currently disabled.")
 SESSION_TIMESTAMP = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -185,9 +209,11 @@ def log_confusion_matrix_from_trial_summary(logger):
 
     # Log summary stats
     if total:
-        percent_correct = (correct / total) * 100
-        logger.log_event(f"✅ % Correct (excluding ambiguous): {percent_correct:.2f}%")
-        logger.log_event(f"⚠️ Ambiguous trials (not counted in matrix): {ambiguous}")
+        percent_correct_incl_ambiguous = (correct / total) * 100
+        percent_correct_excl_ambiguous = (correct / (correct + incorrect)) * 100 if (correct + incorrect) > 0 else 0
+        logger.log_event(f"✅ % Correct (Including ambiguous): {percent_correct_incl_ambiguous:.2f}%")
+        logger.log_event(f"✅ % Correct (Excluding ambiguous): {percent_correct_excl_ambiguous:.2f}%")
+        logger.log_event(f"⚠️ Ambiguous trials (not counted in exclusive metric): {ambiguous}")
     else:
         logger.log_event("No trials available to compute statistics.")
 
@@ -421,35 +447,48 @@ def classify_real_time(inlet, window_size_samples, step_size_samples, all_probab
         eeg_data = raw.get_data()
         cov_matrix = (eeg_data @ eeg_data.T) / np.trace(eeg_data @ eeg_data.T)
 
+        # === Shrinkage ===
         if config.LEDOITWOLF:
-            cov_matrix_shrinked = np.array([LedoitWolf().fit(cov_matrix).covariance_])
-            cov_matrix = cov_matrix_shrinked
-            #logger.log_event("Applied Ledoit-Wolf shrinkage")
+            cov_matrix = np.array([LedoitWolf().fit(cov_matrix).covariance_])
         else:
             cov_matrix = np.expand_dims(cov_matrix, axis=0)
             shrinkage = Shrinkage(shrinkage=config.SHRINKAGE_PARAM)
             cov_matrix = shrinkage.fit_transform(cov_matrix)
-            #logger.log_event(f"Applied custom shrinkage: {config.SHRINKAGE_PARAM}")
 
+        # === Recenter (transform only) ===
         if config.RECENTERING:
             cov_matrix = np.squeeze(cov_matrix, axis=0)
-            if counter == 0:
-                Prev_T = cov_matrix
-            T_test = geodesic_riemann(Prev_T, cov_matrix, 1/(counter+1))
-            if update_recentering:
-                Prev_T = T_test
-                counter += 1
-            T_test_invsqrtm = invsqrtm(T_test)
-            cov_matrix = T_test_invsqrtm @ cov_matrix @ T_test_invsqrtm.T
-            cov_matrix = np.expand_dims(cov_matrix, axis=0)
-            #logger.log_event("Applied adaptive recentering")
 
+            if counter == 0 or Prev_T is None:
+                Prev_T = cov_matrix
+
+            # Prepare candidate transform (but don't apply yet)
+            T_test = geodesic_riemann(Prev_T, cov_matrix, 1 / (counter + 1))
+            T_invsqrtm = invsqrtm(Prev_T)
+            cov_matrix = T_invsqrtm @ cov_matrix @ T_invsqrtm.T
+            cov_matrix = np.expand_dims(cov_matrix, axis=0)
+
+        # === Classification ===
         probabilities = model.predict_proba(cov_matrix)[0]
         predicted_label = model.classes_[np.argmax(probabilities)]
-        '''
-        for cls, prob in zip(model.classes_, probabilities):
-            print(f"Class {cls}: {prob:.5f}")
-        '''
+
+        # === Confidence + Gated Update ===
+        if config.RECENTERING:
+            correct_label = 200 if mode == 0 else 100
+            correct_class_idx = np.where(model.classes_ == correct_label)[0][0]
+            current_confidence = probabilities[correct_class_idx]
+
+            should_update_T = True
+            if config.USE_CONFIDENCE_GATE:
+                #threshold_target = config.THRESHOLD_MI if correct_label == 200 else config.THRESHOLD_REST
+                threshold_target = 0.5
+                should_update_T = (current_confidence >= threshold_target and predicted_label == correct_label)
+
+            if update_recentering and should_update_T:
+                Prev_T = T_test
+                counter += 1
+
+        # === Output Prep ===
         predictions.append(predicted_label)
         all_probabilities.append([time.time(), probabilities[0], probabilities[1]])
         correct_label = 200 if mode == 0 else 100
@@ -458,8 +497,8 @@ def classify_real_time(inlet, window_size_samples, step_size_samples, all_probab
 
         data_buffer = data_buffer[step_size_samples:]
 
-        #logger.log_event(f"Predicted label: {predicted_label}, Confidence: {current_confidence:.3f}")
         return current_confidence, predictions, all_probabilities, data_buffer
+
 
     return leaky_integrator.accumulated_probability, predictions, all_probabilities, data_buffer
 
@@ -939,16 +978,15 @@ while running and current_trial < len(trial_sequence):
 
     predictions_list.append(prediction)
     ground_truth_list.append(200 if mode == 0 else 100)
-
-    # Prepare messages and UDP logic based on the prediction
-    if mode == 0:  # Red Arrow Mode (Right Arm Move)
-        if prediction == 200:  # Correct prediction
+    # Red Arrow Mode (MI)
+    if mode == 0:
+        if prediction == 200:  # Correct
             messages = ["Correct", "Robot Move"]
             colors = [config.green, config.green]
             offsets = [-100, 100]
             selected_trajectory = random.choice(config.ROBOT_TRAJECTORY)
             udp_messages = [selected_trajectory, "g"]
-            duration = 0.01  # Initial UDP command duration
+            duration = 0.01
             should_hold_and_classify = True
 
             logger.log_event("Prediction correct for MI — triggering robot movement (and FES if toggled)")
@@ -960,7 +998,17 @@ while running and current_trial < len(trial_sequence):
 
             send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_BEGIN"], logger=logger)
 
-        else:  # Incorrect prediction
+        elif prediction is None:  # Ambiguous
+            messages = ["Ambiguous", "Robot Stationary"]
+            colors = [config.orange, config.white]  # Or config.yellow if orange isn't defined
+            offsets = [-100, 100]
+            udp_messages = None
+            duration = config.TIME_STATIONARY
+            should_hold_and_classify = False
+
+            logger.log_event("Prediction ambiguous for MI — robot remains stationary.")
+
+        else:  # Incorrect
             messages = ["Incorrect", "Robot Stationary"]
             colors = [config.red, config.white]
             offsets = [-100, 100]
@@ -968,10 +1016,11 @@ while running and current_trial < len(trial_sequence):
             duration = config.TIME_STATIONARY
             should_hold_and_classify = False
 
-            logger.log_event("Prediction incorrect/ambiguous for MI — robot remains stationary.")
+            logger.log_event("Prediction incorrect for MI — robot remains stationary.")
 
-    else:  # Blue Ball Mode (Rest)
-        if prediction == 100:  # Correct prediction
+    # Blue Ball Mode (REST)
+    else:
+        if prediction == 100:  # Correct
             messages = ["Correct", "Robot Stationary"]
             colors = [config.green, config.green]
             offsets = [-100, 100]
@@ -980,14 +1029,24 @@ while running and current_trial < len(trial_sequence):
 
             logger.log_event("Prediction correct for REST — robot remains stationary.")
 
-        else:  # Incorrect prediction
+        elif prediction is None:  # Ambiguous
+            messages = ["Ambiguous", "Robot Stationary"]
+            colors = [config.orange, config.white]
+            offsets = [-100, 100]
+            udp_messages = None
+            duration = config.TIME_STATIONARY
+
+            logger.log_event("Prediction ambiguous for REST — robot remains stationary.")
+
+        else:  # Incorrect
             messages = ["Incorrect", "Robot Stationary"]
             colors = [config.red, config.white]
             offsets = [-100, 100]
             udp_messages = None
             duration = config.TIME_STATIONARY
 
-            logger.log_event("Prediction incorrect/ambiguous for REST — robot remains stationary.")
+            logger.log_event("Prediction incorrect for REST — robot remains stationary.")
+
 
         should_hold_and_classify = False  # No secondary classification logic in REST
     # Display the feedback messages and send UDP commands (if any)
@@ -1055,7 +1114,12 @@ while running and current_trial < len(trial_sequence):
     pygame.display.flip()
     clock.tick(60)
 
+if current_trial == len(trial_sequence) and config.SAVE_ADAPTIVE_T:
+    try:
+        save_transform(Prev_T, counter, adaptive_T_path)
+    except Exception as e:
+        logger.log_event(f"⚠️ Could not save transform to {adaptive_T_path}: {e}")
+
 log_confusion_matrix_from_trial_summary(logger)
 logger.log_event(f"run complete")
-
 pygame.quit()

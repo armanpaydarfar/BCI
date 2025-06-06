@@ -151,3 +151,22 @@ def display_multiple_messages_with_udp(
                 exit()
 
         pygame.time.Clock().tick(60)
+
+def save_transform(T, counter, save_path):
+    with open(save_path, 'wb') as f:
+        pickle.dump({"T": T, "counter": counter}, f)
+    print(f"✅ Saved adaptive transform and counter to: {save_path}")
+
+def load_transform(load_path):
+    if os.path.exists(load_path):
+        with open(load_path, 'rb') as f:
+            data = pickle.load(f)
+        if isinstance(data, dict) and "T" in data and "counter" in data:
+            print(f"✅ Loaded adaptive transform and counter from: {load_path}")
+            return data["T"], data["counter"]
+        else:
+            print(f"✅ Loaded legacy transform (no counter) from: {load_path}")
+            return data, 1  # assume already had 1 update
+    else:
+        print(f"ℹ️ No saved adaptive transform found at: {load_path}")
+        return None, 0
