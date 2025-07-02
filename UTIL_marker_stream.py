@@ -50,18 +50,23 @@ def get_eeg_inlet():
     logging.info("EEG stream connected.")
     return inlet
 
-def get_current_eeg_timestamp(inlet, udp_received_time=0):
+def get_current_eeg_timestamp(inlet, udp_received_time=0, timeout=0.02):
     inlet.flush()
-    local_timestamp = local_clock()
-    sample, timestamp = inlet.pull_sample(timeout=1.0)
-    timestamp_after_pull = local_clock()
+    local_timestamp = local_clock()  # For fallback
+    sample, timestamp = inlet.pull_sample(timeout=timeout)
+    timestamp_after_pull = local_clock()  # For logging
+
     if timestamp is not None:
-        stream_offset_sec = timestamp_after_pull - udp_received_time
-        stream_offset_ms = stream_offset_sec * 1000  # Convert to milliseconds
-        logging.info(f"Current EEG timestamp: {timestamp}, Stream Offset: {stream_offset_ms:.2f} ms")
+        stream_offset_ms = (timestamp_after_pull - udp_received_time) * 1000
+        pull_duration_ms = (timestamp_after_pull - local_timestamp) * 1000
+        delta_vs_local = (timestamp - local_timestamp) * 1000
+
+        logging.info(f"EEG timestamp OK: {timestamp:.6f} | Stream offset: {stream_offset_ms:.2f} ms | "
+                     f"Pull duration: {pull_duration_ms:.2f} ms | Δ(EEG vs local): {delta_vs_local:.2f} ms")
+
         return timestamp
     else:
-        logging.warning("EEG Timestamp not parsed - using local_clock() as fallback.")
+        logging.warning("⚠️ EEG timestamp unavailable — using local_clock() fallback.")
         return local_timestamp
 
 

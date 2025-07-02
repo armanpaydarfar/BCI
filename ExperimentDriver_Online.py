@@ -156,6 +156,22 @@ except FileNotFoundError:
     logger.log_event(f"❌ Error: Model file '{subject_model_path}' not found. Ensure the model has been trained.", level="error")
     exit(1)
 
+
+
+logger.log_event("This model was trained on . . .")
+eeg_dir = os.path.join(config.DATA_DIR, f"sub-{config.TRAINING_SUBJECT}", "training_data")
+logger.log_event(f"Script is looking for XDF files in: {eeg_dir}")
+
+xdf_files = [
+    os.path.join(eeg_dir, f) for f in os.listdir(eeg_dir)
+    if f.endswith(".xdf") and "OBS" not in f
+]
+
+if not xdf_files:
+    raise FileNotFoundError(f"No XDF files found in: {eeg_dir}")
+logger.log_event(f"training data: {xdf_files}")
+
+
 # (Optional) Log intended precomputed mean/std loading if re-enabled
 # logger.log_event(\"Skipped loading precomputed mean/std: section commented out.\")
 

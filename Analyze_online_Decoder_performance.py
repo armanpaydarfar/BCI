@@ -1,147 +1,175 @@
-import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import config  # Import thresholds and paths from config
-from sklearn.metrics import confusion_matrix
 import os
-import glob
-from datetime import datetime
+import re
+import numpy as np
 
-def plot_posterior_probabilities(posterior_probs):
-    plt.figure(figsize=(10, 6))
-    bins = np.linspace(0, 1, 20)
+# ---- Configurable Subject ----
+subject = "CLIN_PILOT_001"
 
-    for label, probs in posterior_probs.items():
-        probs = np.array(probs).flatten()
-        sns.histplot(probs, bins=bins, alpha=0.6, label=f"{label} Probability", kde=True)
+# ---- Prompt User to Select Session Subdirectory ----
+base_dir = os.path.expanduser(f"~/Documents/CurrentStudy/sub-{subject}")
+session_root = os.path.join(base_dir)
+if not os.path.exists(session_root):
+    raise FileNotFoundError(f"❌ Subject directory not found: {session_root}")
 
-    plt.xlabel("Predicted Probability")
-    plt.ylabel("Frequency")
-    plt.title("Online - Posterior Probability Distribution Across Classes")
-    plt.legend(title="True Class/Domain")
-    plt.grid(True, linestyle="--", alpha=0.6)
-    plt.show()
+session_dirs = [d for d in os.listdir(session_root) if os.path.isdir(os.path.join(session_root, d)) and d.startswith("ses-")]
+if not session_dirs:
+    raise FileNotFoundError(f"❌ No session directories found in: {session_root}")
 
-def analyze_posterior_probabilities(probability_file):
-    df = pd.read_csv(probability_file, delimiter=",")
-    df.columns = ["P(REST)", "P(MI)", "Correct Class"]
-    df["Class Label"] = df["Correct Class"].map({200: "MI", 100: "Rest"})
+print("Available sessions:")
+for idx, s in enumerate(session_dirs):
+    print(f" [{idx}] {s}")
 
-    threshold_mi = config.THRESHOLD_MI
-    threshold_rest = config.THRESHOLD_REST
+selected = input("➡️  Select a session by index: ").strip()
+try:
+    selected_idx = int(selected)
+    session = session_dirs[selected_idx]
+except:
+    raise ValueError("❌ Invalid session selection.")
 
-    print(f"Using Config Thresholds: MI={threshold_mi}, Rest={threshold_rest}")
+log_dir = os.path.join(session_root, session, "logs")
 
-    def classify(row):
-        if row["P(MI)"] > threshold_mi:
-            return 200
-        elif row["P(REST)"] > threshold_rest:
-            return 100
-        else:
-            return -1
+# Prompt for run folder
+run_dirs = [d for d in os.listdir(log_dir) if os.path.isdir(os.path.join(log_dir, d)) and d.startswith("ONLINE_")]
+if not run_dirs:
+    raise FileNotFoundError(f"❌ No ONLINE_ run folders found in: {log_dir}")
 
-    df["Predicted Class"] = df.apply(classify, axis=1)
+print("Available run directories:")
+for idx, r in enumerate(run_dirs):
+    print(f" [{idx}] {r}")
 
-    posterior_probs = {
-        "Rest": df[df["Correct Class"] == 100]["P(REST)"],
-        "MI": df[df["Correct Class"] == 200]["P(MI)"]
-    }
+selected_run = input("➡️  Select run index(es) (comma-separated) or press ENTER to merge all: ").strip()
 
-    plot_posterior_probabilities(posterior_probs)
+if selected_run:
+    selected_indices = [int(i) for i in selected_run.split(",")]
+    selected_run_dirs = [run_dirs[i] for i in selected_indices]
+else:
+    selected_run_dirs = run_dirs
 
-    
+# ---- Load and Combine Data ----
+df_list = []
+conf_matrices = []
+total_ambiguous = 0
+run_ids = []
 
-    
+for run_idx, run_folder in enumerate(selected_run_dirs):
+    run_path = os.path.join(log_dir, run_folder)
+    csv_files = [f for f in os.listdir(run_path) if f.startswith("decoder_output") and f.endswith(".csv")]
+    if not csv_files:
+        print(f"⚠️ No decoder output CSV in: {run_path}")
+        continue
 
-def aggregate_confusion_matrices(min_total=30):
-    """
-    Aggregates and plots confusion matrices grouped by date (model condition).
-    Skips matrices with fewer than `min_total` total samples.
+    csv_path = os.path.join(run_path, csv_files[0])
+    print(f"✅ Loaded decoder output from: {csv_path}")
+    df = pd.read_csv(csv_path)
+    df = df[df["Phase"] != "ROBOT"]  # Exclude ROBOT phase
+    df["RunID"] = f"run_{run_idx}"  # Add run ID to identify source
+    df_list.append(df)
 
-    Parameters:
-    - subject (str): Participant identifier (e.g., "CLASS_SUBJ_833")
-    - min_total (int): Minimum number of total classifications to include a confusion matrix.
-    """
-    subject = config.TRAINING_SUBJECT
-    models_base_path = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", "models")
-
-    condition_groups = {}
-
-    if not os.path.exists(models_base_path):
-        print(f"[ERROR] Models directory not found: {models_base_path}")
-        return
-
-    for root, dirs, files in os.walk(models_base_path):
-        for file in files:
-            if "confusion_matrix" in file and file.endswith(".csv"):
-                cm_path = os.path.join(root, file)
-                try:
-                    cm = pd.read_csv(cm_path, index_col=0).values
-                except Exception as e:
-                    print(f"Error loading {cm_path}: {e}")
-                    continue
-
-                if cm.sum() < min_total:
-                    print(f"[SKIP] {cm_path} has only {cm.sum()} samples.")
-                    continue
-
-                try:
-                    date_str = file.split("_")[-2]
-                    timestamp = datetime.strptime(date_str, "%Y-%m-%d")
-                    date_key = timestamp.date().isoformat()
-                except Exception as e:
-                    print(f"[ERROR] Couldn't parse date from {file}: {e}")
-                    continue
-
-                if date_key not in condition_groups:
-                    condition_groups[date_key] = []
-                condition_groups[date_key].append(cm)
-
-    for date_key, matrices in condition_groups.items():
-        aggregated = np.sum(matrices, axis=0)[:2, :2]
-        plt.figure(figsize=(6, 5))
-        ax = sns.heatmap(
-            aggregated,
-            annot=True,
-            fmt="d",
-            cmap="Blues",
-            linewidths=0.5,
-            annot_kws={"size": 9},
-            cbar=False,
-            xticklabels=["Predicted 200 (Move)", "Predicted 100 (Rest)"],
-            yticklabels=["Actual 200 (Correct Move)", "Actual 100 (Correct Rest)"]
+    # Parse confusion matrix from event_log.txt
+    log_path = os.path.join(run_path, "event_log.txt")
+    if os.path.exists(log_path):
+        with open(log_path, "r") as log_file:
+            log_text = log_file.read()
+        match = re.search(
+            r"Actual 200.*?MI\): (\d+).*?REST\): (\d+).*?Actual 100.*?MI\): (\d+).*?REST\): (\d+)",
+            log_text,
+            re.DOTALL
         )
-        ax.set_xticklabels(ax.get_xticklabels(), fontsize=8)
-        ax.set_yticklabels(ax.get_yticklabels(), fontsize=8)
-        plt.title(f"Aggregated Confusion Matrix - {date_key}", fontsize=11)
-        plt.xlabel("Predicted Class", fontsize=10)
-        plt.ylabel("True Class", fontsize=10)
+        ambiguous_match = re.search(r"Ambiguous trials.*?: (\d+)", log_text)
 
-        # Calculate stats
-        TP = aggregated[0, 0]
-        FN = aggregated[0, 1]
-        FP = aggregated[1, 0]
-        TN = aggregated[1, 1]
+        if match:
+            a200_p200 = int(match.group(1))
+            a200_p100 = int(match.group(2))
+            a100_p200 = int(match.group(3))
+            a100_p100 = int(match.group(4))
+            conf_matrix = [[a200_p200, a200_p100], [a100_p200, a100_p100]]
+            conf_matrices.append(conf_matrix)
+            print(f"✅ Parsed confusion matrix from: {log_path}")
 
-        accuracy = (TP + TN) / (TP + TN + FP + FN)
-        precision = TP / (TP + FP) if (TP + FP) > 0 else 0
-        recall = TP / (TP + FN) if (TP + FN) > 0 else 0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        if ambiguous_match:
+            total_ambiguous += int(ambiguous_match.group(1))
 
-        stats_text = (f"Accuracy: {accuracy:.2f}  |  "
-                      f"Precision: {precision:.2f}  |  "
-                      f"Recall: {recall:.2f}  |  "
-                      f"F1 Score: {f1:.2f}")
+    else:
+        print(f"⚠️ event_log.txt not found in: {run_path}")
 
-        ax.text(0.5, -0.25, stats_text, ha='center', va='center', transform=ax.transAxes, fontsize=8)        
-        plt.tight_layout(rect=[0, 0.12, 1, 1])
-        plt.show()
-# Example usage
-if __name__ == "__main__":
-    analyze_posterior_probabilities(
-        "/home/arman-admin/Documents/CurrentStudy/sub-PILOT007/models/03_14 testing (adaptive reimanian)/classification_probabilities_2025-03-14_15-26-50.csv"
-    )
+# ---- Combine Decoder Data ----
+df = pd.concat(df_list, ignore_index=True)
 
-    # To aggregate and display confusion matrices for a subject:
-    aggregate_confusion_matrices()
+# Validate necessary columns
+required_cols = ["Trial", "Timestamp", "P(MI)", "P(REST)", "True Label", "Predicted Label", "Phase", "RunID"]
+for col in required_cols:
+    if col not in df.columns:
+        raise ValueError(f"Missing required column in CSV: {col}")
+
+# ---- 1. Plot Posterior Probability Histograms ----
+plt.figure(figsize=(10, 6))
+bins = np.linspace(0, 1, 20)
+
+sns.histplot(df[df["True Label"] == 200]["P(MI)"], bins=bins, kde=True, color="tab:blue", label="MI Trials")
+sns.histplot(df[df["True Label"] == 100]["P(REST)"], bins=bins, kde=True, color="tab:orange", label="Rest Trials")
+
+plt.xlabel("Posterior Probability")
+plt.ylabel("Frequency")
+plt.title("Histogram of Posterior Probabilities by True Class (Excl. ROBOT Phase)")
+plt.legend()
+plt.grid(True, linestyle="--", alpha=0.6)
+plt.tight_layout()
+plt.show()
+
+# ---- 2. Plot All Trials Together (Correct Class Probabilities) ----
+plt.figure(figsize=(12, 6))
+
+# Ensure unique identification per trial across runs
+df["GlobalTrialID"] = df["RunID"] + "_" + df["Trial"].astype(str)
+
+for gtid in df["GlobalTrialID"].unique():
+    trial_data = df[df["GlobalTrialID"] == gtid]
+    true_label = trial_data["True Label"].iloc[0]
+
+    if true_label == 200:
+        color = "tab:blue"
+        col = "P(MI)"
+    elif true_label == 100:
+        color = "tab:orange"
+        col = "P(REST)"
+    else:
+        continue
+
+    plt.plot(range(len(trial_data)), trial_data[col].values, color=color, alpha=0.5)
+
+plt.xlabel("Time (relative index)")
+plt.ylabel("Posterior Probability (Correct Class)")
+plt.title("Posterior Probability per Trial (Excl. ROBOT Phase)")
+plt.grid(True, linestyle="--", alpha=0.5)
+plt.tight_layout()
+plt.show()
+
+# ---- 3. Plot Aggregated Confusion Matrix ----
+if conf_matrices:
+    cm = np.sum(conf_matrices, axis=0)
+    total = np.sum(cm)
+    correct = cm[0][0] + cm[1][1]
+
+    total_with_ambiguous = total + total_ambiguous
+
+    accuracy_inclusive = 100.0 * correct / total_with_ambiguous if total_with_ambiguous > 0 else 0.0
+    accuracy_exclusive = 100.0 * correct / total if total > 0 else 0.0
+
+    title = (f"Aggregated Confusion Matrix\n"
+             f"Inclusive Accuracy: {accuracy_inclusive:.2f}% | "
+             f"Exclusive Accuracy: {accuracy_exclusive:.2f}% | "
+             f"Ambiguous Trials: {total_ambiguous}")
+
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=["Pred 200", "Pred 100"],
+                yticklabels=["Actual 200", "Actual 100"])
+    plt.title(title)
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.tight_layout()
+    plt.show()
+else:
+    print("⚠️ No confusion matrix data to plot.")

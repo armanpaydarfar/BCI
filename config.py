@@ -49,8 +49,8 @@ BIG_BROTHER_MODE = True #this toggle exports the game to the second monitor auto
 # Classification Parameters
 CLASSIFY_WINDOW = 500  # Duration of EEG data window for classification (milliseconds)
 ACCURACY_THRESHOLD = 0.55  # Accuracy threshold to determine "Correct" (plan to obsolete)
-THRESHOLD_MI = 0.55 #Threshold for MI "correct"
-THRESHOLD_REST = 0.55 #Threshold for REST "Correct"
+THRESHOLD_MI = 0.57 #Threshold for MI "correct"
+THRESHOLD_REST = 0.57 #Threshold for REST "Correct"
 RELAXATION_RATIO = 0.5
 MIN_PREDICTIONS = 10 # Min number of predictions during Online experiment before the decoder can end early
 STEP_SIZE = 1/16
@@ -60,14 +60,14 @@ CLASSIFICATION_SCHEME_OPT = "FREQUENCY"
 SURFACE_LAPLACIAN_TOGGLE = 0 #apply the surface laplacian spatial filter during online
 SELECT_MOTOR_CHANNELS = 1 # toggle to select motor channels or not (can be used to select other channels too)
 INTEGRATOR_ALPHA = 0.95 # defines how fast the accumulated probability may change as new data comes in
-SHRINKAGE_PARAM = 0.05 # hyperparameter for shrinkage regularization
+SHRINKAGE_PARAM = 0.1 # hyperparameter for shrinkage regularization
 LEDOITWOLF = 1 #Set to true to use ledoit wolf shrinkage regularization - otherwise pyreimannian will be used w/ shrinkage param shown above
 
 # adaptive Recentering parameters for config
 RECENTERING = 1 # adaptive recentering toggle
 USE_CONFIDENCE_GATE = 0 #update Previous transform ONLY in the event the current prob is above the MI/REST threshold (or lean condition)
 UPDATE_DURING_MOVE = 0 #this toggle defines whether or not the reimannian adaptive recentering scheme updates when the robot is moving. 0 = no, 1 = yes. The algo will update always during MI
-SAVE_ADAPTIVE_T = True #this toggle saves "Adaptive_T" to the EEG directory during an active session between runs - this way, we can continue w/ the current estimated whitening transform. Disabling this will start a fresh transform each time
+SAVE_ADAPTIVE_T = False #this toggle saves "Adaptive_T" to the EEG directory during an active session between runs - this way, we can continue w/ the current estimated whitening transform. Disabling this will start a fresh transform each time
 
 
 # FES Parameters
