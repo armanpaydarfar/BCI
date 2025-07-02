@@ -794,6 +794,9 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
         pygame.display.flip()
         clock.tick(60)
         if len(predictions) >= min_predictions and running_avg_confidence >= accuracy_threshold:
+
+            # errp check here !!!
+
             logger.log_event(f"Early stopping triggered! Confidence: {running_avg_confidence:.2f}")
             earlystop_flag = True
             if mode == 0:
