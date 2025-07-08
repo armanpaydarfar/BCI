@@ -89,7 +89,9 @@ WORKING_DIR = "/home/arman-admin/Projects/Harmony/"
 DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
 
 MODEL_PATH = "/home/arman-admin/Projects/Harmony/Reiman_eeg_model.pkl"
+MODEL_PATH_ERRP = "C:/Users/ccsmy/Downloads/thesis/new/BCI/coledata/Errp_model.pkl"
 DATA_FILE_PATH = "/home/arman-admin/Documents/CurrentStudy/sub-PILOT007/ses-S001/eeg/sub-PILOT007_ses-S001_task-Default_run-001OFFLINE_eeg.xdf"
+DATA_FILE_PATH_ERRP = "C:/Users/ccsmy/Downloads/thesis/new/BCI/coledata/sub-P503_ses-S001_task-Default_run-001_eeg.xdf"
 
 TRAINING_SUBJECT = "CLIN_SUBJ_002"
 
@@ -119,18 +121,17 @@ TRIGGERS = {
     "ROBOT_END": "320",
     "ROBOT_EARLYSTOP": "340",
     "ROBOT_CONFIRM_STOP": "345",
+    "ROBOT_PAUSE": "360",
+    "ROBOT_CONFIRM_PAUSE": "365",
+    "ROBOT_RESUME": "370",
+    "ROBOT_CONFIRM_RESUME": "375",
     "ROBOT_PROBS": "3000",
-    
-    "ROBOT_RESTART": "350",
 
     "ERRP_BEGIN": "400",
-    "ERRP_END": "420",
-    
+    "ERRP_END": "420",    
     
     "REST_BEGIN": "100",
     "REST_END": "120",
     "REST_EARLYSTOP": "140",
     "REST_PROBS": "1000"
-
-
 }

@@ -20,6 +20,9 @@ from pyriemann.utils.geodesic import geodesic_riemann
 from pyriemann.utils.base import invsqrtm
 from sklearn.covariance import LedoitWolf
 
+from scipy.signal import welch, resample
+from Utils.stream_utils import get_channel_names_from_xdf
+
 # MNE for real-time EEG processing
 import mne
 mne.set_log_level("WARNING")  # Options: "ERROR", "WARNING", "INFO", "DEBUG"
@@ -154,6 +157,15 @@ try:
     logger.log_event(f"✅ Model successfully loaded from: {subject_model_path}")
 except FileNotFoundError:
     logger.log_event(f"❌ Error: Model file '{subject_model_path}' not found. Ensure the model has been trained.", level="error")
+    exit(1)
+
+# Load the trained ERRP model from the subject directory
+try:
+    with open(config.MODEL_PATH_ERRP, 'rb') as f:
+        model_errp = pickle.load(f)
+    logger.log_event(f"✅ ERRP Model successfully loaded from: {subject_model_path}")
+except FileNotFoundError:
+    logger.log_event(f"❌ Error: ERRP Model file '{config.MODEL_PATH_ERRP}' not found. Ensure the model has been trained.", level="error")
     exit(1)
 
 
@@ -518,8 +530,129 @@ def classify_real_time(inlet, window_size_samples, step_size_samples, all_probab
 
     return leaky_integrator.accumulated_probability, predictions, all_probabilities, data_buffer
 
+def compute_psd_single_sample(sample, fs, window, nfft, noverlap, freq_range):
+    """
+    Compute power spectral density (PSD) for a single trial and all channels using Welch's method.
 
+    Parameters:
+      sample     : numpy array of shape (n_channels, n_times)
+      fs         : sampling frequency (Hz)
+      window     : 1D array containing the window to apply (e.g., Hanning window)
+      nfft       : FFT length
+      noverlap   : Number of overlapping samples
+      freq_range : Array of frequencies (Hz) at which to extract the PSD estimates
 
+    Returns:
+      psd_array  : numpy array of shape (n_channels, len(freq_range))
+    """
+    n_channels, _ = sample.shape
+    psd_array = np.zeros((n_channels, len(freq_range)))
+
+    for ch in range(n_channels):
+        # Compute Welch's PSD for the current channel
+        f, pxx = welch(sample[ch, :], fs=fs, window=window, nfft=nfft, noverlap=noverlap)
+        # For each target frequency, find the closest frequency index
+        indices = [np.argmin(np.abs(f - freq)) for freq in freq_range]
+        psd_array[ch, :] = pxx[indices]
+
+    return psd_array
+
+def classify_errp(inlet):
+    new_data, _ = inlet.pull_chunk(timeout=0.1, max_samples=config.FS)
+    errp_np = np.array(new_data) #??? now how --new_data[-config.FS*.8:-config.FS*.2] -Ignore first 200 ms for visual delay and last 200 ms
+    # Convert to MNE RawArray
+
+    #new
+    eeg_data = np.array(new_data['time_series']).T
+    eeg_timestamps = np.array(new_data['time_stamps'])
+    channel_names = get_channel_names_from_xdf(new_data) # WILL THIS WORK WITH LSL STREAMS?
+    montage = mne.channels.make_standard_montage("standard_1020")
+    rename_dict = {
+        "FZ": "Fz", "CZ": "Cz"
+    }
+    non_eeg_channels = {"AUX1", "AUX2", "AUX3", "AUX7", "AUX8", "AUX9", "TRIGGER", }
+    valid_eeg_channels = [ch for ch in channel_names if ch not in non_eeg_channels]
+    valid_indices = [channel_names.index(ch) for ch in valid_eeg_channels]  
+    eeg_data = eeg_data[valid_indices, :]  
+
+    sfreq = config.FS
+    info = mne.create_info(ch_names=valid_eeg_channels, sfreq=sfreq, ch_types="eeg")
+    raw = mne.io.RawArray(eeg_data, info)
+    errp_channels = ["FZ", "CZ", "FC1", "FC2", "F3", "F4", "FC5", "FC6"]
+    channels_to_keep = [ch for ch in raw.ch_names if ch in errp_channels]
+    channels_to_drop = [ch for ch in raw.ch_names if ch not in errp_channels]
+    if not channels_to_keep:
+        print("Warning: No ErrP-relevant channels found. Check your channel names or update the errp_channels list.")
+    else:
+        raw.drop_channels(channels_to_drop)
+        print("Retained ErrP-relevant channels:", channels_to_keep)
+        print("Dropped channels not relevant to ErrP analysis:", channels_to_drop)
+        
+    first_channel_unit = raw.info["chs"][0]["unit"]
+    print(f"First Channel Unit (FIFF Code): {first_channel_unit}")
+
+    # Convert from volts to microvolts (data now in SI units)
+    raw._data /= 1e3  
+    for ch in raw.info['chs']:
+        ch['unit'] = 201  # FIFF_UNIT_V
+
+    print(f"Updated Units for EEG Channels: {[ch['unit'] for ch in raw.info['chs']]}")
+
+    if "M1" in raw.ch_names and "M2" in raw.ch_names:
+        raw.drop_channels(["M1", "M2"])
+        print("Removed Mastoid Channels: M1, M2")
+    else:
+        print("No Mastoid Channels Found in Data")
+
+    raw.rename_channels(rename_dict)
+    missing_in_montage = set(raw.ch_names) - set(montage.ch_names)
+    print(f"Channels in Raw but Missing in Montage: {missing_in_montage}")
+
+    raw.set_montage(montage, match_case=True, on_missing="warn")
+    highband = 10
+    lowband = 1
+    raw.notch_filter(60, method="iir")  
+    raw.filter(l_freq=lowband, h_freq=highband, fir_design="firwin")  
+    print("\n Final EEG Channels After Processing:", raw.ch_names)
+
+    print(raw.shape)
+    rawcr = raw.copy().crop(tmin=0.2, tmax=0.8)
+    print(rawcr.shape)
+
+    #USE ERRP DECODER HERE
+    # Spatial projection
+    sample = rawcr.get_data()
+    proj_err = sample.T @ model_errp['spatialFilter']
+    proj_err = proj_err.T
+
+    # ??? NEEDS RIGHT DIMS STILL PASTED FROM ERRPDECODER
+    rf = model_errp['resample']['resample_factor']
+    n_ds = int(proj_err.shape[1] / rf)
+    res_err = resample(proj_err, num=n_ds, axis=-1)
+    t_feats = res_err.flatten()
+
+    # PSD features
+    psd_err = compute_psd_single_sample(
+        proj_err,  # Add batch dimension
+        fs,
+        model_errp['psd']['window'],
+        model_errp['psd']['nfft'],
+        model_errp['psd']['noverlap'],
+        model_errp['psd']['freq_range']
+    )
+    p_feats = psd_err.flatten()
+
+    # Combine & normalize
+    feats = np.concatenate([t_feats, p_feats])  # Concatenate time-domain and PSD features
+    feats_norm = model_errp['scaler'].transform([feats])  # Normalize (scaler expects 2D input: (n_samples, n_features))
+
+    # Predict
+    pred = model_errp['classifier'].predict(feats_norm)
+
+    if pred == 1:
+        return True
+    else:
+        return False    
 
 
 def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode, udp_socket, udp_ip, udp_port,
@@ -610,11 +743,10 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
         # **Early stopping condition - stop the robot from moving, display message regarding early stop, and stop FES**
         if num_predictions >= min_predictions_before_stop and running_avg_confidence < config.RELAXATION_RATIO * accuracy_threshold:
             early_stop = True
+            inlet.flush()
+            logger.log_event(f"Pause triggered! Confidence: {running_avg_confidence:.2f} after {num_predictions} predictions")
 
-            logger.log_event(f"Early stop triggered! Confidence: {running_avg_confidence:.2f} after {num_predictions} predictions")
-
-            send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_EARLYSTOP"], logger=logger)
-            send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_END"], logger=logger)
+            send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_PAUSE"], logger=logger)
 
             if FES_toggle == 1:
                 send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP", logger=logger)
@@ -623,11 +755,40 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
                 logger.log_event("FES is disabled — no FES_STOP sent.")
 
             display_multiple_messages_with_udp(
-                ["Stopping Robot"], [(255, 0, 0)], [0], duration=5,
-                udp_messages=["s"], udp_socket=udp_socket, udp_ip=udp_ip, udp_port=udp_port, logger = logger
+                ["Pausing Robot"], [(255, 0, 0)], [0], duration=5,
+                udp_messages=["p"], udp_socket=udp_socket, udp_ip=udp_ip, udp_port=udp_port, logger = logger
             )
-            break
 
+            #Test for ERRP here !!!
+            is_ERRP = classify_errp(inlet)
+            if (is_ERRP):
+                early_stop = False
+                send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_RESUME"])
+                if FES_toggle == 1:
+                    send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_MOTOR_GO", logger=logger)
+                    logger.log_event("FES_MOTOR_GO signal sent due to robot resume.")
+                else:
+                    logger.log_event("FES is disabled — no FES_MOTOR_GO sent.")
+                display_multiple_messages_with_udp(
+                    ["ErrP detected, Resuming Robot"], [(255, 0, 0)], [0], duration=5,
+                    udp_messages=["r"], udp_socket=udp_socket, udp_ip=udp_ip, udp_port=udp_port
+                )
+
+            else:
+                early_stop = True
+                send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_EARLYSTOP"], logger=logger)
+                send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_END"], logger=logger)
+                display_multiple_messages_with_udp(
+                    ["No ErrP, Stopping Robot"], [(255, 0, 0)], [0], duration=5,
+                    udp_messages=["s"], udp_socket=udp_socket, udp_ip=udp_ip, udp_port=udp_port
+                )
+
+            #how to know how long to wait???
+                while time.time() - start_time < duration:
+                    #clock.tick(30)
+                    time.sleep(0.1)     
+
+            break
 
         # Check for quit events
         for event in pygame.event.get():
@@ -638,6 +799,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
         clock.tick(60)  # Maintain 30 FPS
     if early_stop == False:
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_END"], logger = logger)
+        #NO FES STOP HERE ???
     # Final Decision: Return correct or incorrect class based on confidence
     final_class = correct_class if running_avg_confidence >= config.RELAXATION_RATIO*config.ACCURACY_THRESHOLD else incorrect_class
     logger.log_event(f"Confidence at the end of motion: {running_avg_confidence:.2f} after {num_predictions} predictions")
@@ -794,8 +956,6 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
         pygame.display.flip()
         clock.tick(60)
         if len(predictions) >= min_predictions and running_avg_confidence >= accuracy_threshold:
-
-            # errp check here !!!
 
             logger.log_event(f"Early stopping triggered! Confidence: {running_avg_confidence:.2f}")
             earlystop_flag = True

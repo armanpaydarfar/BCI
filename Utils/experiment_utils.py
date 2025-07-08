@@ -114,6 +114,52 @@ def generate_trial_sequence(total_trials=30, max_repeats=3):
     print("⚠️ [generate_trial_sequence] Warning: Falling back to shuffled sequence due to constraint failure.")
     return fallback
 
+def generate_trial_sequence_errp(total_trials=45, max_repeats=3):
+    """
+    Generate a balanced 3 class sequence with no more than `max_repeats` consecutive values.
+
+    Parameters:
+        total_trials (int): Total number of trials.
+        max_repeats (int): Maximum allowed repetitions of the same class.
+
+    Returns:
+        list: A valid 3 class sequence (0s, 1s, and 2s).
+    """
+
+    n_per_type = total_trials // 3
+    counts = {0: n_per_type, 1: n_per_type, 2: n_per_type}
+
+    # Backtracking helper that builds the sequence recursively.
+    def backtrack(seq, counts):
+        # Base case: If the sequence is complete, return it.
+        if len(seq) == total_trials:
+            return seq
+        
+        # Build a list of valid trial types
+        valid = []
+        for t in [0, 1, 2]:
+            if counts[t] > 0:
+                # Check if adding this type would break the repeat rule.
+                if len(seq) < max_repeats or not all(prev == t for prev in seq[-max_repeats:]):
+                    valid.append(t)
+                    
+        # Randomize the order of trying valid options to maintain randomness.
+        random.shuffle(valid)
+        for t in valid:
+            # Choose t and update the counts.
+            seq.append(t)
+            counts[t] -= 1
+            # Continue building the sequence recursively.
+            result = backtrack(seq, counts)
+            if result is not None:
+                return result   # Valid complete sequence found.
+            # Backtrack: remove the last choice and restore the count.
+            seq.pop()
+            counts[t] += 1
+        return None  # No valid extension from this state.
+    
+    # Start the backtracking process with an empty sequence.
+    return backtrack([], counts)
 
 def display_multiple_messages_with_udp(
     messages, colors, offsets, duration=13,
