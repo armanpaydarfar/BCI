@@ -51,7 +51,7 @@ CLASSIFY_WINDOW = 500  # Duration of EEG data window for classification (millise
 ACCURACY_THRESHOLD = 0.55  # Accuracy threshold to determine "Correct" (plan to obsolete)
 THRESHOLD_MI = 0.57 #Threshold for MI "correct"
 THRESHOLD_REST = 0.57 #Threshold for REST "Correct"
-RELAXATION_RATIO = 0.5
+RELAXATION_RATIO = 1
 MIN_PREDICTIONS = 10 # Min number of predictions during Online experiment before the decoder can end early
 STEP_SIZE = 1/16
 CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
@@ -85,15 +85,15 @@ SCREEN_HEIGHT = 800
 
 
 # Relevant Directories
-WORKING_DIR = "/home/arman-admin/Projects/Harmony/"
-DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
+WORKING_DIR = "/home/millanslab/Projects/Harmony/"
+DATA_DIR = "/home/millanslab/Documents/CurrentStudy"
 
-MODEL_PATH = "/home/arman-admin/Projects/Harmony/Reiman_eeg_model.pkl"
-MODEL_PATH_ERRP = "C:/Users/ccsmy/Downloads/thesis/new/BCI/coledata/Errp_model.pkl"
-DATA_FILE_PATH = "/home/arman-admin/Documents/CurrentStudy/sub-PILOT007/ses-S001/eeg/sub-PILOT007_ses-S001_task-Default_run-001OFFLINE_eeg.xdf"
-DATA_FILE_PATH_ERRP = "C:/Users/ccsmy/Downloads/thesis/new/BCI/coledata/sub-P503_ses-S001_task-Default_run-001_eeg.xdf"
+#MODEL_PATH = "/home/arman-admin/Projects/Harmony/Reiman_eeg_model.pkl"
+#MODEL_PATH_ERRP = "C:/Users/ccsmy/Downloads/thesis/new/BCI/coledata/Errp_model.pkl"
+#DATA_FILE_PATH = "/home/millanslab/Documents/CurrentStudy/sub-P444/ses-S001/eeg/sub-P444_ses-S001_task-Default_run-001OFFLINE_eeg.xdf"
+#DATA_FILE_PATH_ERRP = "C:/Users/ccsmy/Downloads/thesis/new/BCI/coledata/sub-P503_ses-S001_task-Default_run-001_eeg.xdf"
 
-TRAINING_SUBJECT = "CLIN_SUBJ_002"
+TRAINING_SUBJECT = "P503"
 
 
 #TRAINING_SESSION = "001OFFLINE"

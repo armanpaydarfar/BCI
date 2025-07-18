@@ -4,6 +4,7 @@ from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
 from Utils.stream_utils import load_xdf
 import config
 from Utils.stream_utils import get_channel_names_from_xdf
+import os
 
 import mne
 from mne import concatenate_epochs
@@ -99,9 +100,21 @@ def main():
     """
     Main function to generate an LDA decoder from EEG data.
     """
-    # Load data
+
     print("Loading XDF data...")
-    eeg_stream, marker_stream = load_xdf(config.DATA_FILE_PATH_ERRP)
+    eeg_dir = os.path.join(config.DATA_DIR, f"sub-{config.TRAINING_SUBJECT}", "training_data")
+    print(f"Script is looking for XDF files in: {eeg_dir}")
+
+    xdf_files = [
+        os.path.join(eeg_dir, f) for f in os.listdir(eeg_dir)
+        if f.endswith(".xdf") and "OBS" not in f
+    ]
+
+    if not xdf_files:
+        raise FileNotFoundError(f"No XDF files found in: {eeg_dir}")
+    print(f"Found XDF files: {xdf_files}")
+
+    eeg_stream, marker_stream = load_xdf(xdf_files[0])
     # Extract EEG and marker data
     eeg_data = np.array(eeg_stream['time_series']).T
     eeg_timestamps = np.array(eeg_stream['time_stamps'])
@@ -314,9 +327,21 @@ def main():
     for key in decoder:
         print(" -", key)
 
-    with open(config.MODEL_PATH_ERRP, 'wb') as f:
+    
+        #  Save the trained model
+    # Define model save path (subject-level, not session-specific)
+    subject_model_dir = os.path.join(config.DATA_DIR, f"sub-{config.TRAINING_SUBJECT}", "models")
+    os.makedirs(subject_model_dir, exist_ok=True)
+
+    subject_model_path = os.path.join(subject_model_dir, f"sub-{config.TRAINING_SUBJECT}_model_Errp.pkl")
+
+    
+    # Save the trained model
+    with open(subject_model_path, 'wb') as f:
         pickle.dump(decoder, f)
-    print(f"Model saved to {config.MODEL_PATH_ERRP}")
+
+    print(f"✅ Trained model saved at: {subject_model_path}")
+
 
 if __name__ == "__main__":
     main()

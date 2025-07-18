@@ -119,7 +119,7 @@ def show_feedback(duration=5, mode=0):
         progress = elapsed_time / duration
 
         screen.fill(config.black)
-        if mode == 0:
+        if mode == 0 or mode == 2:  # MI or ERRP
             draw_arrow_fill(progress, screen_width, screen_height, show_threshold=False)
             draw_ball_fill(0, screen_width, screen_height, show_threshold=False)
             draw_fixation_cross(screen_width, screen_height)
@@ -226,7 +226,7 @@ while running and current_trial < len(trial_sequence):
         logger.log_event("Sent REST_BEGIN trigger.")
 
     # Show feedback
-    logger.log_event(f"Feedback period started {'MI' if mode == 0 else "REST" if mode == 1 else "ERRP"}) for {config.TIME_MI} sec.")
+    logger.log_event(f"Feedback period started {'MI' if mode == 0 else "REST" if mode == 1 else "ERRP"} for {config.TIME_MI} sec.")
     if not show_feedback(duration=config.TIME_MI, mode=mode):
         break
 
@@ -249,7 +249,7 @@ while running and current_trial < len(trial_sequence):
     elif mode == 2:  # ERRP
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_END"], logger=logger)
         logger.log_event("Sent MI_END trigger.")
-        messages = ["Robot Move Errp"]
+        messages = ["Robot Move"]
         selected_trajectory = random.choice(config.ROBOT_TRAJECTORY)
         udp_messages = [selected_trajectory, "g"]
         colors = [config.green]
@@ -282,7 +282,7 @@ while running and current_trial < len(trial_sequence):
         logger.log_event("Sent ROBOT_END trigger.")
         if mode == 2:
             send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_EARLYSTOP"], logger=logger)
-            # check below ???
+            # message after it stops errp trial
             display_multiple_messages_with_udp(
                 messages=["Robot Move"], colors=[config.green], offsets=[0],
                 duration=5, udp_messages=["s"],

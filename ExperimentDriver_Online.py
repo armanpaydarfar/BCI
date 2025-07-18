@@ -149,6 +149,7 @@ logger.log_event(f"FES toggle status: {'Enabled' if FES_toggle else 'Disabled'}.
 # Construct the correct model path based on the subject
 subject_model_dir = os.path.join(config.DATA_DIR, f"sub-{config.TRAINING_SUBJECT}", "models")
 subject_model_path = os.path.join(subject_model_dir, f"sub-{config.TRAINING_SUBJECT}_model.pkl")
+subject_model_Errp_path = os.path.join(subject_model_dir, f"sub-{config.TRAINING_SUBJECT}_model_Errp.pkl")
 
 # Load the trained model from the subject directory
 try:
@@ -161,11 +162,11 @@ except FileNotFoundError:
 
 # Load the trained ERRP model from the subject directory
 try:
-    with open(config.MODEL_PATH_ERRP, 'rb') as f:
+    with open(subject_model_Errp_path, 'rb') as f:
         model_errp = pickle.load(f)
-    logger.log_event(f"✅ ERRP Model successfully loaded from: {subject_model_path}")
+    logger.log_event(f"✅ ERRP Model successfully loaded from: {subject_model_Errp_path}")
 except FileNotFoundError:
-    logger.log_event(f"❌ Error: ERRP Model file '{config.MODEL_PATH_ERRP}' not found. Ensure the model has been trained.", level="error")
+    logger.log_event(f"❌ Error: ERRP Model file '{subject_model_Errp_path}' not found. Ensure the model has been trained.", level="error")
     exit(1)
 
 
@@ -558,14 +559,18 @@ def compute_psd_single_sample(sample, fs, window, nfft, noverlap, freq_range):
     return psd_array
 
 def classify_errp(inlet):
-    new_data, _ = inlet.pull_chunk(timeout=0.1, max_samples=config.FS)
-    errp_np = np.array(new_data) #??? now how --new_data[-config.FS*.8:-config.FS*.2] -Ignore first 200 ms for visual delay and last 200 ms
-    # Convert to MNE RawArray
+    #whole function takes about 2 seconds to run
+    data_buffer = []
+    while len(data_buffer) < int(config.FS):
+        new_data, _ = inlet.pull_chunk(timeout=0.1, max_samples=int(config.FS))
+        data_buffer.extend(new_data)
+
+    errp_np = np.array(new_data)
 
     #new
-    eeg_data = np.array(new_data['time_series']).T
-    eeg_timestamps = np.array(new_data['time_stamps'])
-    channel_names = get_channel_names_from_xdf(new_data) # WILL THIS WORK WITH LSL STREAMS?
+    eeg_data = np.array(errp_np).T
+    eeg_timestamps = np.array(errp_np)
+    
     montage = mne.channels.make_standard_montage("standard_1020")
     rename_dict = {
         "FZ": "Fz", "CZ": "Cz"
@@ -612,12 +617,12 @@ def classify_errp(inlet):
     highband = 10
     lowband = 1
     raw.notch_filter(60, method="iir")  
-    raw.filter(l_freq=lowband, h_freq=highband, fir_design="firwin")  
+    raw.filter(l_freq=lowband, h_freq=highband, fir_design="firwin")  # signal too short warning
     print("\n Final EEG Channels After Processing:", raw.ch_names)
 
-    print(raw.shape)
+    
     rawcr = raw.copy().crop(tmin=0.2, tmax=0.8)
-    print(rawcr.shape)
+
 
     #USE ERRP DECODER HERE
     # Spatial projection
@@ -625,7 +630,6 @@ def classify_errp(inlet):
     proj_err = sample.T @ model_errp['spatialFilter']
     proj_err = proj_err.T
 
-    # ??? NEEDS RIGHT DIMS STILL PASTED FROM ERRPDECODER
     rf = model_errp['resample']['resample_factor']
     n_ds = int(proj_err.shape[1] / rf)
     res_err = resample(proj_err, num=n_ds, axis=-1)
@@ -759,7 +763,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
                 udp_messages=["p"], udp_socket=udp_socket, udp_ip=udp_ip, udp_port=udp_port, logger = logger
             )
 
-            #Test for ERRP here !!!
+            #Test for ERRP here
             is_ERRP = classify_errp(inlet)
             if (is_ERRP):
                 early_stop = False
@@ -773,6 +777,11 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
                     ["ErrP detected, Resuming Robot"], [(255, 0, 0)], [0], duration=5,
                     udp_messages=["r"], udp_socket=udp_socket, udp_ip=udp_ip, udp_port=udp_port
                 )
+                #how to know how long to wait for rest of motion after resuming???!!!
+
+                while time.time() - start_time < duration:
+                    #clock.tick(30)
+                    time.sleep(0.1) 
 
             else:
                 early_stop = True
@@ -782,11 +791,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
                     ["No ErrP, Stopping Robot"], [(255, 0, 0)], [0], duration=5,
                     udp_messages=["s"], udp_socket=udp_socket, udp_ip=udp_ip, udp_port=udp_port
                 )
-
-            #how to know how long to wait???
-                while time.time() - start_time < duration:
-                    #clock.tick(30)
-                    time.sleep(0.1)     
+    
 
             break
 
@@ -797,11 +802,13 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
                 return None
 
         clock.tick(60)  # Maintain 30 FPS
+    #might mess up logging by changing early stop !!!
     if early_stop == False:
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_END"], logger = logger)
         #NO FES STOP HERE ???
     # Final Decision: Return correct or incorrect class based on confidence
     final_class = correct_class if running_avg_confidence >= config.RELAXATION_RATIO*config.ACCURACY_THRESHOLD else incorrect_class
+    # ^^^ always outputs incorrect after an errp trial, okay !!!
     logger.log_event(f"Confidence at the end of motion: {running_avg_confidence:.2f} after {num_predictions} predictions")
 
     return final_class, all_probabilities, early_stop
