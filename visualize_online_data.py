@@ -10,8 +10,8 @@ from scipy.stats import zscore
 from Utils.preprocessing import apply_notch_filter, extract_segments, separate_classes, compute_grand_average,concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "CLIN_PILOT_001"
-session = "S001ONLINE"
+subject = "LAB_SUBJ_001"
+session = "S004ONLINE"
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")

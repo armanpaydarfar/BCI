@@ -158,7 +158,7 @@ except FileNotFoundError:
 
 
 
-logger.log_event("This model was trained on . . .")
+logger.log_event("finding training dataset . . .")
 eeg_dir = os.path.join(config.DATA_DIR, f"sub-{config.TRAINING_SUBJECT}", "training_data")
 logger.log_event(f"Script is looking for XDF files in: {eeg_dir}")
 
