@@ -118,12 +118,26 @@ def generate_trial_sequence(total_trials=30, max_repeats=3):
 def display_multiple_messages_with_udp(
     messages, colors, offsets, duration=13,
     udp_messages=None, udp_socket=None, udp_ip=None, udp_port=None,
-    logger=None
-):
+    logger=None, eeg_state=None):
+    """
+    Displays multiple messages on screen and optionally sends a UDP message once.
+
+    Parameters:
+    - messages (list of str): List of messages to display.
+    - colors (list of tuples): Corresponding RGB color tuples.
+    - offsets (list of int): Vertical offsets for each message.
+    - duration (int): Duration in seconds to display messages.
+    - udp_messages (list of str): UDP messages to send once.
+    - udp_socket: UDP socket object for communication.
+    - udp_ip (str): IP address to send UDP messages to.
+    - udp_port (int): Port number to send UDP messages to.
+    - logger: Logger object for event tracking.
+    - eeg_state: Optional EEGState object to update during this display loop.
+    """
     font = pygame.font.SysFont(None, 96)
     end_time = pygame.time.get_ticks() + duration * 1000
-
     udp_sent = False
+
     while pygame.time.get_ticks() < end_time:
         pygame.display.get_surface().fill((0, 0, 0))
         for i, text in enumerate(messages):
@@ -135,6 +149,11 @@ def display_multiple_messages_with_udp(
             )
         pygame.display.flip()
 
+        # Update EEG buffer if provided
+        if eeg_state is not None:
+            eeg_state.update()
+
+        # Send UDP messages once
         if udp_messages and not udp_sent:
             for msg in udp_messages:
                 udp_socket.sendto(msg.encode('utf-8'), (udp_ip, udp_port))

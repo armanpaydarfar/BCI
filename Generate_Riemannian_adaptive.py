@@ -11,8 +11,7 @@ import config
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from Utils.stream_utils import load_xdf, get_channel_names_from_xdf
-from scipy.signal import butter, lfilter, lfilter_zi
-from Utils.preprocessing import butter_bandpass, concatenate_streams, select_motor_channels
+from Utils.preprocessing import select_motor_channels
 import glob  # Required for multi-file loading
 from scipy.stats import zscore
 from pyriemann.utils.mean import mean_riemann
@@ -20,6 +19,12 @@ from scipy.linalg import sqrtm
 import seaborn as sns
 from sklearn.covariance import LedoitWolf
 from pyriemann.preprocessing import Whitening
+from Utils.preprocessing import (
+    get_valid_channel_mask_and_metadata,
+    initialize_filter_bank,
+    apply_streaming_filters
+)
+
 
 # Load trigger mappings from config
 TRIGGERS = config.TRIGGERS
@@ -58,39 +63,6 @@ def plot_posterior_probabilities(posterior_probs):
     plt.grid(True, linestyle="--", alpha=0.6)
     plt.show()
 
-
-
-
-# Stateful Filtering Function
-def apply_stateful_filter(raw, b, a):
-    filter_states = {}  # Initialize state tracking dictionary
-    for ch_idx in range(len(raw.ch_names)):
-        if ch_idx not in filter_states:
-            filter_states[ch_idx] = lfilter_zi(b, a) * raw._data[ch_idx][0]  # Initialize filter state
-        raw._data[ch_idx], filter_states[ch_idx] = lfilter(b, a, raw._data[ch_idx], zi=filter_states[ch_idx])
-    return raw
-
-def center_cov_matrices_riemannian(cov_matrices):
-    """
-    Center a set of covariance matrices around the identity matrix using the Riemannian mean.
-
-    Parameters:
-        cov_matrices (np.ndarray): Array of shape (n_matrices, n_channels, n_channels)
-
-    Returns:
-        np.ndarray: Centered covariance matrices
-    """
-    # Compute the Riemannian mean of the covariance matrices
-    mean_cov = mean_riemann(cov_matrices, maxiter = 5000)
-
-    # Compute the inverse square root of the mean covariance
-    eigvals, eigvecs = np.linalg.eigh(mean_cov)
-    inv_sqrt_mean_cov = eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T
-
-    # Apply whitening transformation to center around the identity
-    centered_matrices = np.array([inv_sqrt_mean_cov @ C @ inv_sqrt_mean_cov for C in cov_matrices])
-
-    return centered_matrices
 
 def validate_trial_pairs(marker_values, marker_timestamps, eeg_timestamps, sfreq, EPOCHS_START_END, min_duration=1.0):
     """
@@ -132,132 +104,162 @@ def validate_trial_pairs(marker_values, marker_timestamps, eeg_timestamps, sfreq
 
         print(f"   Finished validating {len(start_indices)} trials for marker {start_marker}")
 
-
-def segment_trials_from_markers(raw, marker_values, marker_timestamps, eeg_timestamps, sfreq):
-    segments_all = []
-    labels_all = []
-
-    window_size = config.CLASSIFY_WINDOW / 1000
-    step_size = 1 / 16
-    window_samples = int(window_size * sfreq)
-    step_samples = int(step_size * sfreq)
-
-    for start_marker, end_marker in EPOCHS_START_END.items():
-        start_indices = np.where(marker_values == int(start_marker))[0]
-        end_indices = np.where(marker_values == int(end_marker))[0]
-
-        if len(start_indices) != len(end_indices):
-            print(f"⚠️ Mismatch in marker count for {start_marker}/{end_marker} — trimming")
-            min_len = min(len(start_indices), len(end_indices))
-            start_indices = start_indices[:min_len]
-            end_indices = end_indices[:min_len]
-
-        for trial_num, (s_idx, e_idx) in enumerate(zip(start_indices, end_indices)):
-            ts_start = marker_timestamps[s_idx]
-            ts_end = marker_timestamps[e_idx]
-            if ts_end - ts_start <= 1.0:
-                print(f"❌ Trial {trial_num} skipped — too short ({ts_end - ts_start:.2f}s)")
-                continue
-
-            start_sample = np.searchsorted(eeg_timestamps, ts_start + 1.0)
-            end_sample = np.searchsorted(eeg_timestamps, ts_end)
-
-            if end_sample <= start_sample:
-                print(f"❌ Trial {trial_num} invalid — end sample before start")
-                continue
-
-            baseline_start = max(0, start_sample + int(sfreq * -1.0))
-            baseline_end = start_sample
-            baseline = raw._data[:, baseline_start:baseline_end].mean(axis=1, keepdims=True)
-            trial_slice = slice(start_sample, end_sample)
-            raw._data[:, trial_slice] -= baseline
-            trial_data = raw._data[:, trial_slice]
-            n_samples = trial_data.shape[1]
-            if n_samples < window_samples:
-                print(f"⚠️ Trial {trial_num} too short after skip — {n_samples} samples")
-                continue
-
-            n_windows = (n_samples - window_samples) // step_samples + 1
-            print(f"✅ Trial {trial_num} (label {start_marker}): {n_windows} segments")
-
-            for i in range(0, n_samples - window_samples + 1, step_samples):
-                segment = trial_data[:, i:i + window_samples]
-                segments_all.append(segment)
-                labels_all.append(int(start_marker))
-
-    return np.array(segments_all), np.array(labels_all)
-
-
 def segment_and_label_one_run(eeg_stream, marker_stream):
+    """
+    Preprocesses and segments EEG data for one run, closely replicating online preprocessing logic.
+    Includes causal filtering with state tracking, baseline subtraction, and sliding window segmentation.
 
+    Parameters:
+        eeg_stream: dict containing EEG data and timestamps
+        marker_stream: dict containing marker data and timestamps
+
+    Returns:
+        segments_all: np.ndarray of shape (n_segments, n_channels, n_samples)
+        labels_all: np.ndarray of shape (n_segments,)
+    """
     marker_values = np.array([int(m[0]) for m in marker_stream["time_series"]])
     marker_timestamps = np.array([float(m[1]) for m in marker_stream["time_series"]])
     eeg_timestamps = np.array(eeg_stream["time_stamps"])
     eeg_data = np.array(eeg_stream["time_series"]).T
 
+    # Select valid EEG channels and metadata cleanup
     channel_names = get_channel_names_from_xdf(eeg_stream)
-    valid_channels = [ch for ch in channel_names if ch not in {"AUX1", "AUX2", "AUX3", "AUX7", "AUX8", "AUX9", "TRIGGER"}]
-    valid_indices = [channel_names.index(ch) for ch in valid_channels]
-    eeg_data = eeg_data[valid_indices]
+    eeg_data, valid_channels, dummy_raw = get_valid_channel_mask_and_metadata(eeg_data, channel_names)
 
-    info = mne.create_info(ch_names=valid_channels, sfreq=config.FS, ch_types="eeg")
-    raw = mne.io.RawArray(eeg_data, info)
-
-    # Unit + montage setup
-    for ch in raw.info["chs"]:
-        ch["unit"] = 201
-    if "M1" in raw.ch_names and "M2" in raw.ch_names:
-        raw.drop_channels(["M1", "M2"])
-    raw.rename_channels({
-        "FP1": "Fp1", "FPZ": "Fpz", "FP2": "Fp2",
-        "FZ": "Fz", "CZ": "Cz", "PZ": "Pz", "POZ": "POz", "OZ": "Oz"
-    })
-    raw.set_montage(mne.channels.make_standard_montage("standard_1020"))
-
-    raw.notch_filter(60, method="iir")
-    raw.filter(l_freq=config.LOWCUT, h_freq=config.HIGHCUT, method="iir")
     if config.SURFACE_LAPLACIAN_TOGGLE:
-        raw = mne.preprocessing.compute_current_source_density(raw)
+        dummy_raw = mne.preprocessing.compute_current_source_density(dummy_raw)
+
     if config.SELECT_MOTOR_CHANNELS:
-        raw = select_motor_channels(raw)
+        dummy_raw = select_motor_channels(dummy_raw)
+        motor_indices = [valid_channels.index(ch) for ch in dummy_raw.ch_names]
+        eeg_data = eeg_data[motor_indices]
+        valid_channels = dummy_raw.ch_names
 
-    # Segment this run
-    return segment_trials_from_markers(
-        raw, marker_values, marker_timestamps, eeg_timestamps, config.FS
+    # === Filter setup ===
+    filter_bank = initialize_filter_bank(
+        fs=config.FS,
+        lowcut=config.LOWCUT,
+        highcut=config.HIGHCUT,
+        notch_freqs=[60],
+        notch_q=30
     )
+    filter_state = {}  # Stateful tracking
 
-'''
-def segment_epochs(epochs, window_size=config.CLASSIFY_WINDOW, step_size=0.1):
+
+    # === Segmentation configuration ===
+    window_size = config.CLASSIFY_WINDOW / 1000
+    step_size = 1 / 16
+    window_samples = int(window_size * config.FS)
+    step_samples = int(step_size * config.FS)
+    chunk_samples = int(window_size * config.FS)  # based on config.py parameters (256 for a 512Hz window)
+
+    segments_all = []
+    labels_all = []
+
+    # === Precompute all trial windows ===
+    trial_windows = []
+    for start_marker, end_marker in EPOCHS_START_END.items():
+        start_indices = np.where(marker_values == int(start_marker))[0]
+        end_indices = np.where(marker_values == int(end_marker))[0]
+        if len(start_indices) != len(end_indices):
+            min_len = min(len(start_indices), len(end_indices))
+            start_indices = start_indices[:min_len]
+            end_indices = end_indices[:min_len]
+        for s_idx, e_idx in zip(start_indices, end_indices):
+            ts_start = marker_timestamps[s_idx]
+            ts_end = marker_timestamps[e_idx]
+            if ts_end - ts_start > 1.0:
+                trial_windows.append((ts_start, ts_end, int(start_marker)))
+
+    # === Sort windows and get min/max bounds ===
+    trial_windows.sort()
+    filter_warmup = 1.0 
+    trial_bounds = [(start - 1.0, end) for (start, end, _) in trial_windows]
+    valid_start = trial_bounds[0][0] - filter_warmup
+    valid_end = trial_bounds[-1][1]
+
+    # === Extract only relevant data segment ===
+    global_start = np.searchsorted(eeg_timestamps, valid_start) 
+    global_end = np.searchsorted(eeg_timestamps, valid_end)
+    raw_global = eeg_data[:, global_start:global_end]
+    rel_timestamps = eeg_timestamps[global_start:global_end]
+
+    # === Stream through global segment with filter continuity ===
+    filter_state = {}
+    filtered_global = np.zeros_like(raw_global)
+
+    for chunk_start in range(0, raw_global.shape[1], chunk_samples):
+        chunk_end = min(chunk_start + chunk_samples, raw_global.shape[1])
+        chunk = raw_global[:, chunk_start:chunk_end]
+        filtered_chunk, filter_state = apply_streaming_filters(chunk, filter_bank, filter_state)
+        filtered_global[:, chunk_start:chunk_end] = filtered_chunk
+
+    # === For each trial, extract and label segments ===
+    for trial_num, (ts_start, ts_end, label) in enumerate(trial_windows):
+        rel_start = np.searchsorted(rel_timestamps, ts_start)
+        rel_end = np.searchsorted(rel_timestamps, ts_end)
+        baseline_end = np.searchsorted(rel_timestamps, ts_start)
+        decision_start = np.searchsorted(rel_timestamps, ts_start + 1.0)
+
+        if rel_end <= decision_start or baseline_end <= 0:
+            continue
+
+        baseline = filtered_global[:, :baseline_end].mean(axis=1, keepdims=True)
+        trial_data = filtered_global[:, decision_start:rel_end] - baseline
+        n_samples = trial_data.shape[1]
+
+        if n_samples < window_samples:
+            continue
+
+        for i in range(0, n_samples - window_samples + 1, step_samples):
+            segment = trial_data[:, i:i + window_samples]
+            segments_all.append(segment)
+            labels_all.append(label)
+
+
+    return np.array(segments_all), np.array(labels_all)
+
+
+
+def compute_processed_covariances(segments, labels):
     """
-    Slice each epoch into smaller overlapping windows for training.
+    Computes regularized and optionally whitened covariance matrices from EEG segments.
 
-    Parameters:
-        epochs (mne.Epochs): The full 5s epochs.
-        window_size (float): Length of each training segment (e.g., 0.5s).
-        step_size (float): Overlap between consecutive windows (e.g., 0.1s).
-    
+    Args:
+        segments (np.ndarray): EEG data segments, shape (n_trials, n_channels, n_timepoints).
+        labels (np.ndarray): Labels corresponding to each segment.
+        fs (float): Sampling frequency, used for future flexibility (not required now).
+
     Returns:
-        np.ndarray: Segmented data (n_segments, n_channels, n_timepoints).
-        np.ndarray: Corresponding labels for each segment.
+        np.ndarray: Processed covariance matrices.
     """
-    window_size = window_size/1000
-    sfreq = epochs.info["sfreq"]  # Sampling frequency
-    step_samples = int(step_size * sfreq)  # Convert step size to samples
-    window_samples = int(window_size * sfreq)  # Convert window size to samples
+    print("Computing raw covariance matrices...")
+    cov_matrices = np.array([
+        (seg @ seg.T) / np.trace(seg @ seg.T) for seg in segments
+    ])
 
-    segmented_data = []
-    segmented_labels = []
+    print(f"Covariance shape: {cov_matrices.shape}")
+    print("Label distribution:", dict(zip(*np.unique(labels, return_counts=True))))
 
-    for i, epoch in enumerate(epochs.get_data()):  # Iterate over each full epoch
-        label = epochs.events[i, -1]  # Get the class label
+    if config.LEDOITWOLF:
+        print("Applying Ledoit-Wolf shrinkage...")
+        cov_matrices = np.array([
+            LedoitWolf().fit(cov).covariance_ for cov in cov_matrices
+        ])
+    else:
+        print(f"Applying shrinkage (λ={config.SHRINKAGE_PARAM})...")
+        shrinker = Shrinkage(shrinkage=config.SHRINKAGE_PARAM)
+        cov_matrices = shrinker.fit_transform(cov_matrices)
 
-        for start in range(0, epoch.shape[1] - window_samples + 1, step_samples):
-            end = start + window_samples
-            segmented_data.append(epoch[:, start:end])
-            segmented_labels.append(label)  # Each slice gets the same label
+    if config.RECENTERING:
+        print("Applying Riemannian whitening...")
+        whitener = Whitening(metric="riemann")
+        cov_matrices = whitener.fit_transform(cov_matrices)
 
-    return np.array(segmented_data), np.array(segmented_labels)
-'''
+    print(f"Processed covariance matrices shape: {cov_matrices.shape}")
+    return cov_matrices
+
+
 def train_riemannian_model(cov_matrices, labels, n_splits=8, shrinkage_param=config.SHRINKAGE_PARAM):
     """
     Train an MDM classifier with k-fold cross-validation using Riemannian geometry 
@@ -384,34 +386,7 @@ def main():
         print(f"Retained {len(segments)} segments after rejecting {np.sum(~keep_mask)} high-amplitude artifacts.")
 
         
-        # Compute Covariance Matrices (for Riemannian Classifier)
-        print("Computing Covariance Matrices...")
-        #cov_matrices = np.array([np.cov(segment) for segment in segments])
-        cov_matrices = np.array([ (segment @ segment.T) / np.trace(segment @ segment.T) for segment in segments ])
-
-        # Convert list to numpy array (shape: (n_epochs, n_channels, n_channels))
-        cov_matrices = np.array(cov_matrices)
-        #print(cov_matrices[0])
-        print(f"Computed {len(cov_matrices)} covariance matrices with shape: {cov_matrices.shape}")
-        #print(f" Sample cov matrix: {cov_matrices[0]}")
-
-        # Train Riemannian MDM Model
-        #print(cov_matrices)
-        print("Unique training labels:", np.unique(labels))
-
-        if config.LEDOITWOLF:
-            # Compute covariance matrices with optimized shrinkage
-            cov_matrices_shrinked = np.array([LedoitWolf().fit(cov).covariance_ for cov in cov_matrices])
-            cov_matrices = cov_matrices_shrinked    
-        else:
-            shrinkage = Shrinkage(shrinkage=config.SHRINKAGE_PARAM)
-            cov_matrices = shrinkage.fit_transform(cov_matrices)  
-
-        
-        # Apply Riemannian whitening
-        if config.RECENTERING:
-            whitener = Whitening(metric="riemann")  # Use Riemannian mean for whitening
-            cov_matrices = whitener.fit_transform(cov_matrices)
+        cov_matrices = compute_processed_covariances(segments, labels)
         
         #print(mean_riemann(cov_matrices))
         all_cov_matrices.append(cov_matrices)

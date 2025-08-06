@@ -19,21 +19,18 @@ from scipy.signal import butter, lfilter, lfilter_zi
 from pyriemann.utils.geodesic import geodesic_riemann
 from pyriemann.utils.base import invsqrtm
 from sklearn.covariance import LedoitWolf
+from collections import deque
 
 # MNE for real-time EEG processing
 import mne
 mne.set_log_level("WARNING")  # Options: "ERROR", "WARNING", "INFO", "DEBUG"
 # Preprocessing functions (updated for MNE integration)
 from Utils.preprocessing import (
-    butter_bandpass,
-    filter_with_state,
-    apply_car_filter,
-    apply_notch_filter,
-    flatten_single_segment,
-    extract_and_flatten_segment,
-    parse_eeg_and_eog,
-    remove_eog_artifacts,
     select_motor_channels,
+    initialize_filter_bank,
+    apply_streaming_filters,
+    get_valid_channel_mask_and_metadata,
+
 )
 
 # Visualization utilities
@@ -53,6 +50,9 @@ from Utils.experiment_utils import (
     save_transform,
     load_transform
 )
+
+#import EEG stream object for tracking/filtering 
+from Utils.EEGStreamState import EEGStreamState
 
 # Networking utilities
 from Utils.networking import send_udp_message
@@ -102,8 +102,12 @@ logger.save_config_snapshot(config_log_subset)
 
 eeg_dir = logger.log_base / "eeg"
 adaptive_T_path = eeg_dir / "adaptive_T.pkl"
+
 global Prev_T
 global counter
+
+
+
 Prev_T, counter = load_transform(adaptive_T_path)
 if Prev_T is None:
     counter = 0
@@ -112,7 +116,6 @@ else:
     logger.log_event(f"✅ Loaded adaptive transform with counter = {counter}")
 
 logger.log_event("Logger initialized for online experimental driver.")
-
 
 
 pygame.init()
@@ -180,13 +183,17 @@ predictions_list = []
 ground_truth_list = []
 
 fs = config.FS
-'''
-# b, a = butter_bandpass(config.LOWCUT, config.HIGHCUT, fs, order=4)  # ← unused, from earlier iteration
-logger.log_event(f"Sampling frequency set to {fs} Hz. Filter coefficients are unused in this version.")
 
-global filter_states
-filter_states = {}
-'''
+
+filtered_buffer = deque(maxlen=2048)
+filter_state_tracker = initialize_filter_bank(
+    fs=config.FS,
+    lowcut=config.LOWCUT,
+    highcut=config.HIGHCUT,
+    notch_freqs=[60],
+    notch_q=30
+)
+
 
 # (Optional) Commented out rolling normalization
 # logger.log_event("Rolling normalization block currently disabled.")
@@ -267,12 +274,13 @@ def append_trial_probabilities_to_csv(trial_probabilities, mode, trial_number,
     )
 
 
-def display_fixation_period(duration=3):
+def display_fixation_period(duration=3, eeg_state=None):
     """
-    Displays a blank screen with fixation cross for a given duration.
+    Displays a blank screen with a fixation cross for a given duration.
     
     Parameters:
     - duration (int): Time in seconds for which the fixation period lasts.
+    - eeg_state: Optional EEGState object to be updated during the fixation period.
     """
     start_time = time.time()
     clock = pygame.time.Clock()
@@ -281,22 +289,26 @@ def display_fixation_period(duration=3):
         # Fill screen with background color
         pygame.display.get_surface().fill(config.black)
 
-        # Draw the fixation cross (assuming you have a function for it)
-        draw_fixation_cross(screen_width, screen_height)  # Existing function in your code
+        # Draw UI elements
+        draw_fixation_cross(screen_width, screen_height)
+        draw_ball_fill(0, screen_width, screen_height)
+        draw_arrow_fill(0, screen_width, screen_height)
+        draw_time_balls(0, screen_width, screen_height)
 
-        # Draw blank shapes (assuming placeholders)
-        draw_ball_fill(0, screen_width, screen_height)  # Empty fill
-        draw_arrow_fill(0, screen_width, screen_height)  # Empty fill
-        draw_time_balls(0,screen_width,screen_height)
-        pygame.display.flip()  # Update display
+        pygame.display.flip()
 
-        # Check for quit events
+        # Update EEG buffer if provided
+        if eeg_state is not None:
+            eeg_state.update()
+
+        # Handle quit events
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
                 return
 
-        clock.tick(60)  # Maintain 30 FPS
+        clock.tick(60)
+
 
 # Interpolation function to compute fill amount between SHAPE_MIN and SHAPE_MAX
 def interpolate_fill(value):
@@ -368,212 +380,118 @@ def handle_fes_activation(mode, running_avg_confidence, fes_active):
     # No change in state
     return fes_active
 
-def collect_baseline_during_countdown(inlet, countdown_start, countdown_duration, baseline_buffer):
-    """
-    Monitors countdown time and collects baseline EEG data during the last 0.5s.
-
-    Parameters:
-    - inlet: LSL EEG stream inlet.
-    - countdown_start: Start time of countdown (pygame ticks).
-    - countdown_duration: Total countdown duration in milliseconds.
-    - baseline_buffer: List to store baseline EEG data.
-
-    Returns:
-    - Updated baseline_buffer containing collected baseline samples.
-    """
-    pygame.display.flip()
-    current_time = pygame.time.get_ticks()
-    remaining_time = countdown_duration - (current_time - countdown_start)
-
-    if remaining_time <= 1000 and not baseline_buffer:  # When 0.5s remain, flush and start collecting
-        logger.log_event("Flushing buffer and collecting baseline data...")
-        inlet.flush()  # Remove old EEG data
-
-    if remaining_time <= 1000:  # Collect EEG data continuously
-        new_data, _ = inlet.pull_chunk(timeout=0.1, max_samples=config.FS // 2)  # 0.5s worth of samples
-        if new_data:
-            baseline_buffer.extend(new_data)
-
-    return baseline_buffer
-
-
-def classify_real_time(inlet, window_size_samples, step_size_samples, all_probabilities, predictions, 
-                        data_buffer, mode, leaky_integrator, baseline_mean=None, update_recentering=True):
-
-    new_data, _ = inlet.pull_chunk(timeout=0.05, max_samples=int(step_size_samples))
+def classify_real_time(eeg_state, window_size_samples, step_size, all_probabilities, predictions, mode, leaky_integrator, update_recentering=True):
     global counter
     global Prev_T
+
     pygame.display.flip()
-    pygame.event.get()     # heartbeat to OS
-    if new_data:
-        new_data_np = np.array(new_data)
-        data_buffer.extend(new_data_np)
+    pygame.event.get()  # Heartbeat to OS
 
-        if len(data_buffer) < config.FS:
-            return leaky_integrator.accumulated_probability, predictions, all_probabilities, data_buffer
+    try:
+        window, _ = eeg_state.get_baseline_corrected_window(window_size_samples)
+    except ValueError:
+        return leaky_integrator.accumulated_probability, predictions, all_probabilities
 
-        sliding_window_np = np.array(data_buffer[-window_size_samples:]).T
+    # === Covariance Matrix ===
+    cov_matrix = (window @ window.T) / np.trace(window @ window.T)
 
-        sfreq = config.FS
-        info = mne.create_info(ch_names=channel_names, sfreq=sfreq, ch_types="eeg")
-        raw = mne.io.RawArray(sliding_window_np, info)
+    if config.LEDOITWOLF:
+        cov_matrix = np.array([LedoitWolf().fit(cov_matrix).covariance_])
+    else:
+        cov_matrix = np.expand_dims(cov_matrix, axis=0)
+        shrinkage = Shrinkage(shrinkage=config.SHRINKAGE_PARAM)
+        cov_matrix = shrinkage.fit_transform(cov_matrix)
 
-        aux_channels = {"AUX1", "AUX2", "AUX3", "AUX7", "AUX8", "AUX9", "TRIGGER"}
-        existing_aux = [ch for ch in aux_channels if ch in raw.ch_names]
-        if existing_aux:
-            raw.drop_channels(existing_aux)
-            #logger.log_event(f"Dropped AUX channels: {existing_aux}")
+    # === Adaptive Recentering ===
+    if config.RECENTERING:
+        cov_matrix = np.squeeze(cov_matrix, axis=0)
 
-        rename_dict = {
-            "FP1": "Fp1", "FPZ": "Fpz", "FP2": "Fp2",
-            "FZ": "Fz", "CZ": "Cz", "PZ": "Pz", "POZ": "POz", "OZ": "Oz"
-        }
-        raw.rename_channels(rename_dict)
+        if counter == 0 or Prev_T is None:
+            Prev_T = cov_matrix
 
-        mastoid_channels = ["M1", "M2"]
-        existing_mastoids = [ch for ch in mastoid_channels if ch in raw.ch_names]
-        if existing_mastoids:
-            raw.drop_channels(existing_mastoids)
-            #logger.log_event(f"Dropped mastoid channels: {existing_mastoids}")
+        T_test = geodesic_riemann(Prev_T, cov_matrix, 1 / (counter + 1))
+        T_invsqrtm = invsqrtm(Prev_T)
+        cov_matrix = T_invsqrtm @ cov_matrix @ T_invsqrtm.T
+        cov_matrix = np.expand_dims(cov_matrix, axis=0)
 
-        montage = mne.channels.make_standard_montage("standard_1020")
-        raw.set_montage(montage, match_case=True, on_missing="warn")
-        #logger.log_event("Montage set to standard_1020")
+    # === Classification ===
+    probabilities = model.predict_proba(cov_matrix)[0]
+    predicted_label = model.classes_[np.argmax(probabilities)]
 
-        for ch in raw.info['chs']:
-            ch['unit'] = 201  # µV
+    correct_label = 200 if mode == 0 else 100
+    correct_class_idx = np.where(model.classes_ == correct_label)[0][0]
+    current_confidence = probabilities[correct_class_idx]
 
-        raw.notch_filter(60, method="iir")
-        #logger.log_event("Applied 60Hz notch filter")
-
-        raw.filter(l_freq=config.LOWCUT, h_freq=config.HIGHCUT, method="iir")
-        #logger.log_event(f"Applied bandpass filter: {config.LOWCUT}–{config.HIGHCUT} Hz")
-
-        if config.SURFACE_LAPLACIAN_TOGGLE:
-            raw = mne.preprocessing.compute_current_source_density(raw)
-            #logger.log_event("Applied surface Laplacian")
-
-        if config.SELECT_MOTOR_CHANNELS:
-            raw = select_motor_channels(raw)
-            #logger.log_event("Selected motor channels")
-
-        raw._data -= baseline_mean
-        #logger.log_event("Baseline correction applied")
-
-        eeg_data = raw.get_data()
-        cov_matrix = (eeg_data @ eeg_data.T) / np.trace(eeg_data @ eeg_data.T)
-
-        # === Shrinkage ===
-        if config.LEDOITWOLF:
-            cov_matrix = np.array([LedoitWolf().fit(cov_matrix).covariance_])
-        else:
-            cov_matrix = np.expand_dims(cov_matrix, axis=0)
-            shrinkage = Shrinkage(shrinkage=config.SHRINKAGE_PARAM)
-            cov_matrix = shrinkage.fit_transform(cov_matrix)
-
-        # === Recenter (transform only) ===
-        if config.RECENTERING:
-            cov_matrix = np.squeeze(cov_matrix, axis=0)
-
-            if counter == 0 or Prev_T is None:
-                Prev_T = cov_matrix
-
-            # Prepare candidate transform (but don't apply yet)
-            T_test = geodesic_riemann(Prev_T, cov_matrix, 1 / (counter + 1))
-            T_invsqrtm = invsqrtm(Prev_T)
-            cov_matrix = T_invsqrtm @ cov_matrix @ T_invsqrtm.T
-            cov_matrix = np.expand_dims(cov_matrix, axis=0)
-
-        # === Classification ===
-        probabilities = model.predict_proba(cov_matrix)[0]
-        predicted_label = model.classes_[np.argmax(probabilities)]
-
-        # === Confidence + Gated Update ===
-        if config.RECENTERING:
+    # === Determine if recentering update should occur ===
+    should_update_T = False
+    if config.RECENTERING and update_recentering:
+        if config.USE_CONFIDENCE_GATE:
             correct_label = 200 if mode == 0 else 100
             correct_class_idx = np.where(model.classes_ == correct_label)[0][0]
             current_confidence = probabilities[correct_class_idx]
-
+            predicted_correct = (predicted_label == correct_label)
+            confident_enough = (current_confidence >= config.RECENTERING_CONFIDENCE_THRESHOLD)
+            should_update_T = predicted_correct and confident_enough
+        else:
+            # Always update if gating is disabled
             should_update_T = True
-            if config.USE_CONFIDENCE_GATE:
-                #threshold_target = config.THRESHOLD_MI if correct_label == 200 else config.THRESHOLD_REST
-                threshold_target = 0.5
-                should_update_T = (current_confidence >= threshold_target and predicted_label == correct_label)
 
-            if update_recentering and should_update_T:
-                Prev_T = T_test
-                counter += 1
-
-        # === Output Prep ===
-        predictions.append(predicted_label)
-        all_probabilities.append([time.time(), probabilities[0], probabilities[1]])
-        correct_label = 200 if mode == 0 else 100
-        correct_class_idx = np.where(model.classes_ == correct_label)[0][0]
-        current_confidence = probabilities[correct_class_idx]
-
-        data_buffer = data_buffer[step_size_samples:]
-
-        return current_confidence, predictions, all_probabilities, data_buffer
+    if should_update_T:
+        Prev_T = T_test
+        counter += 1
 
 
-    return leaky_integrator.accumulated_probability, predictions, all_probabilities, data_buffer
+    # === Update Logs ===
+    predictions.append(predicted_label)
+    all_probabilities.append([time.time(), probabilities[0], probabilities[1]])
+
+    return current_confidence, predictions, all_probabilities
 
 
 
 
-
-def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode, udp_socket, udp_ip, udp_port,
-                               data_buffer, leaky_integrator, baseline_mean):
+def hold_messages_and_classify(messages, colors, offsets, duration, mode, udp_socket, udp_ip, udp_port,
+                               eeg_state, leaky_integrator):
     """
     Holds visual messages on the screen while running real-time EEG classification in the background.
-    If classification confidence drops below a threshold, sends an "s" message to stop the robot.
-    
-    Early stopping will only be enabled after a minimum number of classifications.
-
-    Parameters:
-    - messages (list): List of messages to display.
-    - colors (list): Corresponding colors for each message.
-    - offsets (list): Y-axis offsets for each message.
-    - duration (int): Maximum duration to hold messages (seconds).
-    - inlet: LSL EEG inlet for real-time data acquisition.
-    - mode (int): 0 for Motor Imagery (200), 1 for Rest (100).
-    - udp_socket: Socket for sending UDP messages.
-    - udp_ip (str): IP address for UDP communication.
-    - udp_port (int): Port for UDP communication.
-    - data_buffer (list): Accumulated EEG data from `show_feedback`.
-    - leaky_integrator (LeakyIntegrator): The existing leaky integrator instance.
+    Classifies every STEP_SIZE seconds using the most recent WINDOW_SIZE seconds of EEG data.
 
     Returns:
-    - int: Final classification result (200 or 100).
+    - int: Final classification result (200 or 100)
+    - list: All classification probabilities
+    - bool: Whether an early stop occurred
     """
-
     font = pygame.font.SysFont(None, 72)
     start_time = time.time()
     early_stop = False
-    # EEG classification parameters
-    step_size = config.STEP_SIZE  # Step size in seconds
-    window_size = config.CLASSIFY_WINDOW / 1000  # Convert ms to seconds
+
+    step_size = config.STEP_SIZE  # e.g. 1/16s
+    window_size = config.CLASSIFY_WINDOW / 1000  # ms → seconds
     window_size_samples = int(window_size * config.FS)
-    step_size_samples = int(step_size * config.FS)
 
-    # Define correct and incorrect classes
-    correct_class = 200 if mode == 0 else 100  # 200 = Motor Imagery, 100 = Rest
-    incorrect_class = 100 if mode == 0 else 200  # Opposite class
+    correct_class = 200 if mode == 0 else 100
+    incorrect_class = 100 if mode == 0 else 200
 
-    # Minimum number of predictions before early stopping is allowed
     min_predictions_before_stop = config.MIN_PREDICTIONS
-    num_predictions = 0  # Counter for predictions made
-
-    # accuracy threshold based on mode
+    num_predictions = 0
     accuracy_threshold = config.THRESHOLD_MI if mode == 0 else config.THRESHOLD_REST 
 
     all_probabilities = []
     predictions = []
+    running_avg_confidence = 0.5
+    current_confidence = 0.5
+
+    last_classify_time = 0  # Classify immediately
     pygame.display.update()
     clock = pygame.time.Clock()
 
     while time.time() - start_time < duration:
-        # Draw visual messages
+        now = time.time()
+
+        # === Update EEG Buffer ===
+        eeg_state.update()
+
+        # === Draw Messages ===
         pygame.display.get_surface().fill((0, 0, 0))
         for i, text in enumerate(messages):
             message = font.render(text, True, colors[i])
@@ -584,69 +502,75 @@ def hold_messages_and_classify(messages, colors, offsets, duration, inlet, mode,
             )
         pygame.display.flip()
 
-        # Perform classification
-        current_confidence, predictions, all_probabilities, data_buffer = classify_real_time(
-            inlet, window_size_samples, step_size_samples,
-            all_probabilities, predictions, data_buffer,
-            mode, leaky_integrator, baseline_mean,
-            update_recentering=config.UPDATE_DURING_MOVE
-        )
-        if all_probabilities:
-            prob_mi, prob_rest = all_probabilities[-1][2], all_probabilities[-1][1]  # assuming [timestamp, P(REST), P(MI)]
-            send_udp_message(
-                udp_socket_marker,
-                config.UDP_MARKER["IP"],
-                config.UDP_MARKER["PORT"],
-                f"{config.TRIGGERS['ROBOT_PROBS']},{prob_mi:.5f},{prob_rest:.5f}",
-                quiet = True
-            )
+        # === Classify every step_size seconds ===
+        if now - last_classify_time >= step_size:
+            try:
+                current_confidence, predictions, all_probabilities = classify_real_time(
+                    eeg_state, window_size_samples, step_size,
+                    all_probabilities, predictions,
+                    mode, leaky_integrator,
+                    update_recentering=config.UPDATE_DURING_MOVE
+                )
+                last_classify_time = now
 
-        # If a prediction was made, increase the counter
-        if current_confidence > 0:
-            num_predictions += 1
+                if all_probabilities:
+                    prob_mi, prob_rest = all_probabilities[-1][2], all_probabilities[-1][1]
+                    send_udp_message(
+                        udp_socket_marker,
+                        config.UDP_MARKER["IP"],
+                        config.UDP_MARKER["PORT"],
+                        f"{config.TRIGGERS['ROBOT_PROBS']},{prob_mi:.5f},{prob_rest:.5f}",
+                        quiet=True
+                    )
 
-        # **Update leaky integrator confidence (uses same instance from `show_feedback`)**
-        running_avg_confidence = leaky_integrator.update(current_confidence)
-        # **Early stopping condition - stop the robot from moving, display message regarding early stop, and stop FES**
-        if num_predictions >= min_predictions_before_stop and running_avg_confidence < config.RELAXATION_RATIO * accuracy_threshold:
-            early_stop = True
+                if current_confidence > 0:
+                    num_predictions += 1
 
-            logger.log_event(f"Early stop triggered! Confidence: {running_avg_confidence:.2f} after {num_predictions} predictions")
+                running_avg_confidence = leaky_integrator.update(current_confidence)
 
-            send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_EARLYSTOP"], logger=logger)
-            send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_END"], logger=logger)
+                if num_predictions >= min_predictions_before_stop and running_avg_confidence < config.RELAXATION_RATIO * accuracy_threshold:
+                    early_stop = True
 
-            if FES_toggle == 1:
-                send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP", logger=logger)
-                logger.log_event("FES_STOP signal sent due to early stop.")
-            else:
-                logger.log_event("FES is disabled — no FES_STOP sent.")
+                    logger.log_event(f"Early stop triggered! Confidence: {running_avg_confidence:.2f} after {num_predictions} predictions")
 
-            display_multiple_messages_with_udp(
-                ["Stopping Robot"], [(255, 0, 0)], [0], duration=5,
-                udp_messages=["s"], udp_socket=udp_socket, udp_ip=udp_ip, udp_port=udp_port, logger = logger
-            )
-            break
+                    send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_EARLYSTOP"], logger=logger)
+                    send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_END"], logger=logger)
 
+                    if FES_toggle == 1:
+                        send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP", logger=logger)
+                        logger.log_event("FES_STOP signal sent due to early stop.")
+                    else:
+                        logger.log_event("FES is disabled — no FES_STOP sent.")
 
-        # Check for quit events
+                    display_multiple_messages_with_udp(
+                        ["Stopping Robot"], [(255, 0, 0)], [0], duration=5,
+                        udp_messages=["s"], udp_socket=udp_socket, udp_ip=udp_ip, udp_port=udp_port, logger=logger
+                    )
+                    break
+
+            except ValueError:
+                # Not enough data in buffer yet, skip
+                pass
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
                 return None
 
-        clock.tick(60)  # Maintain 30 FPS
-    if early_stop == False:
-        send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_END"], logger = logger)
-    # Final Decision: Return correct or incorrect class based on confidence
-    final_class = correct_class if running_avg_confidence >= config.RELAXATION_RATIO*config.ACCURACY_THRESHOLD else incorrect_class
+        clock.tick(60)
+
+    if not early_stop:
+        send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_END"], logger=logger)
+
+    final_class = correct_class if running_avg_confidence >= config.RELAXATION_RATIO * accuracy_threshold else incorrect_class
     logger.log_event(f"Confidence at the end of motion: {running_avg_confidence:.2f} after {num_predictions} predictions")
 
     return final_class, all_probabilities, early_stop
 
 
 
-def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
+
+def show_feedback(duration=5, mode=0, eeg_state = None):
     """
     Displays feedback animation, collects EEG data, and performs real-time classification
     using a sliding window approach with early stopping based on posterior probabilities.
@@ -656,12 +580,9 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
     window_size = config.CLASSIFY_WINDOW / 1000  # Convert ms to seconds
     window_size_samples = int(window_size * config.FS)
     step_size_samples = int(step_size * config.FS)
-    global filter_states
-
     FES_active = False
     all_probabilities = []
     predictions = []
-    data_buffer = []  # Buffer for EEG data
     leaky_integrator = LeakyIntegrator(alpha=config.INTEGRATOR_ALPHA)  # Confidence smoothing
     min_predictions = config.MIN_PREDICTIONS
     earlystop_flag = False
@@ -678,64 +599,7 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
     # Preprocess the baseline dataset before feedback starts
     # Preprocess the baseline dataset before feedback starts
     pygame.display.flip()
-    if baseline_data is not None:
-        logger.log_event("Processing baseline data...")
 
-        # Convert to MNE RawArray
-        sfreq = config.FS
-        info = mne.create_info(ch_names=channel_names, sfreq=sfreq, ch_types="eeg")
-        raw_baseline = mne.io.RawArray(baseline_data.T, info)
-
-        # Drop AUX and Mastoid channels
-        aux_channels = {"AUX1", "AUX2", "AUX3", "AUX7", "AUX8", "AUX9", "TRIGGER"}
-        dropped_aux = [ch for ch in aux_channels if ch in raw_baseline.ch_names]
-        raw_baseline.drop_channels(dropped_aux)
-        logger.log_event(f"Dropped AUX channels: {dropped_aux}")
-
-        mastoid_channels = ["M1", "M2"]
-        dropped_mastoids = [ch for ch in mastoid_channels if ch in raw_baseline.ch_names]
-        raw_baseline.drop_channels(dropped_mastoids)
-        logger.log_event(f"Dropped mastoid channels: {dropped_mastoids}")
-
-        # Ensure standard 10-20 montage
-        montage = mne.channels.make_standard_montage("standard_1020")
-        raw_baseline.rename_channels({
-            "FP1": "Fp1", "FPZ": "Fpz", "FP2": "Fp2",
-            "FZ": "Fz", "CZ": "Cz", "PZ": "Pz", "POZ": "POz", "OZ": "Oz"
-        })
-        raw_baseline.set_montage(montage, match_case=True, on_missing="warn")
-        logger.log_event("Standard 10–20 montage set on baseline data.")
-
-        # Convert to µV
-        for ch in raw_baseline.info['chs']:
-            ch['unit'] = 201  # µV
-        logger.log_event("Channel units set to µV.")
-
-        # Apply Notch Filter
-        raw_baseline.notch_filter(60, method="iir")
-        logger.log_event("Applied 60Hz notch filter to baseline data.")
-
-        # Apply Bandpass Filter
-        raw_baseline.filter(l_freq=config.LOWCUT, h_freq=config.HIGHCUT, method="iir")
-        logger.log_event(f"Applied bandpass filter: {config.LOWCUT}–{config.HIGHCUT} Hz.")
-
-        if config.SURFACE_LAPLACIAN_TOGGLE:
-            raw_baseline = mne.preprocessing.compute_current_source_density(raw_baseline)
-            logger.log_event("Applied surface Laplacian to baseline data.")
-
-        if config.SELECT_MOTOR_CHANNELS:
-            raw_baseline = select_motor_channels(raw_baseline)
-            logger.log_event("Selected motor channels from baseline data.")
-
-        # Compute mean across time for baseline correction
-        baseline_mean = np.mean(raw_baseline.get_data(), axis=1, keepdims=True)
-        logger.log_event(f"Computed baseline mean: shape = {baseline_mean.shape}")
-
-    else:
-        baseline_mean = None
-        logger.log_event("No baseline data provided — skipping baseline correction.")
-
-        
     # Send UDP triggers
     if mode == 0:  # Red Arrow Mode (Motor Imagery)
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_BEGIN"], logger=logger)
@@ -749,16 +613,27 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["REST_BEGIN"], logger=logger)
         FES_active = False
 
-    inlet.flush()
-
     clock = pygame.time.Clock()
     running_avg_confidence = 0.5  # Initial placeholder
+    current_confidence = 0.5 # Initial placeholder for initial window updates
+    last_classify_time = start_time + window_size  # Skip first second
 
     while time.time() - start_time < duration:
-        current_confidence, predictions, all_probabilities, data_buffer = classify_real_time(
-            inlet, window_size_samples, step_size_samples, all_probabilities, predictions,
-            data_buffer, mode, leaky_integrator, baseline_mean
-        )
+        eeg_state.update()
+
+        now = time.time()
+        if now >= last_classify_time:
+            current_confidence, predictions, all_probabilities = classify_real_time(
+                eeg_state,
+                window_size_samples,
+                step_size_samples,
+                all_probabilities,
+                predictions,
+                mode,
+                leaky_integrator
+            )
+            last_classify_time += step_size  # or: last_classify_time = now
+
 
         if all_probabilities:
             prob_mi, prob_rest = all_probabilities[-1][2], all_probabilities[-1][1]
@@ -805,7 +680,9 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
             else:
                 send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["REST_EARLYSTOP"], logger=logger)
             break
-
+    
+    pygame.display.flip()
+    pygame.time.delay(300)  # ~300 ms delay to allow the visual feedback to complete rendering
     # Final Decision
     if running_avg_confidence >= accuracy_threshold:
         final_class = correct_class
@@ -830,312 +707,293 @@ def show_feedback(duration=5, mode=0, inlet=None, baseline_data=None):
     else:
         logger.log_event("FES disable not needed.")
 
-    return final_class,running_avg_confidence, leaky_integrator, data_buffer, baseline_mean, all_probabilities, earlystop_flag
+    return final_class, running_avg_confidence, leaky_integrator, all_probabilities, earlystop_flag
 
 
+def main():
+    # === Main Game Loop Initialization ===
 
-# Main Game Loop
-logger.log_event("Resolving EEG data stream via LSL...")
-streams = resolve_stream('type', 'EEG')
-inlet = StreamInlet(streams[0])
-logger.log_event("✅ EEG stream detected and inlet established.")
+    # Connect to EEG stream
+    logger.log_event("Resolving EEG data stream via LSL...")
+    streams = resolve_stream('type', 'EEG')
+    inlet = StreamInlet(streams[0])
+    logger.log_event("✅ EEG stream detected and inlet established.")
 
-# Generate and log trial sequence
-trial_sequence = generate_trial_sequence(total_trials=config.TOTAL_TRIALS, max_repeats=config.MAX_REPEATS)
-logger.log_event(f"Trial Sequence generated: {trial_sequence}")
-mode_labels = ["MI" if t == 0 else "REST" for t in trial_sequence]
-logger.log_event(f"Trial Sequence (labeled): {mode_labels}")
-current_trial = 0
+    # Initialize EEG handler
+    eeg_state = EEGStreamState(inlet=inlet, config=config, logger=logger)
+    logger.log_event("EEGStreamState object created — ready to pull and process data.")
 
-# Fetch and log channel names from stream
-channel_names = get_channel_names_from_lsl()
-logger.log_event(f"Channel names detected in LSL stream: {channel_names}")
+    # Generate and log trial sequence
+    trial_sequence = generate_trial_sequence(total_trials=config.TOTAL_TRIALS, max_repeats=config.MAX_REPEATS)
+    mode_labels = ["MI" if t == 0 else "REST" for t in trial_sequence]
+    logger.log_event(f"Trial Sequence generated: {trial_sequence}")
+    logger.log_event(f"Trial Sequence (labeled): {mode_labels}")
+    current_trial = 0
 
-# Load 10–20 montage and rename channels for MNE compatibility
-montage = mne.channels.make_standard_montage("standard_1020")
-rename_dict = {
-    "FP1": "Fp1", "FPZ": "Fpz", "FP2": "Fp2",
-    "FZ": "Fz", "CZ": "Cz", "PZ": "Pz", "POZ": "POz", "OZ": "Oz"
-}
+    # Initialize experiment state
+    all_results = []
+    running = True
+    clock = pygame.time.Clock()
 
-# Filter for EEG-only channels
-non_eeg_channels = {"AUX1", "AUX2", "AUX3", "AUX7", "AUX8", "AUX9", "TRIGGER"}
-valid_eeg_channels = [ch for ch in channel_names if ch not in non_eeg_channels]
-valid_indices = [channel_names.index(ch) for ch in valid_eeg_channels]
-logger.log_event(f"Filtered EEG channels (excluding AUX/Trigger): {valid_eeg_channels}")
+    # Begin with fixation screen
+    display_fixation_period(duration=3, eeg_state=eeg_state)
+    logger.log_event("Initial fixation period complete. Beginning experimental loop.")
 
-# Initialize MNE Raw object for online data structure
-sfreq = config.FS
-info = mne.create_info(ch_names=valid_eeg_channels, sfreq=sfreq, ch_types="eeg")
-raw = mne.io.RawArray(np.zeros((len(valid_eeg_channels), 1)), info)
+    while running and current_trial < len(trial_sequence):
+        logger.log_event(f"--- Trial {current_trial+1}/{len(trial_sequence)} START ---")
 
-# Apply montage and unit conversion
-raw.rename_channels(rename_dict)
-raw.set_montage(montage, match_case=True, on_missing="warn")
-for ch in raw.info['chs']:
-    ch['unit'] = 201  # Set unit to µV
+        # === 1. Fixation Cross and Trial UI ===
+        screen.fill(config.black)
+        draw_fixation_cross(screen_width, screen_height)
+        draw_arrow_fill(0, screen_width, screen_height)
+        draw_ball_fill(0, screen_width, screen_height)
+        draw_time_balls(0, screen_width, screen_height)
+        pygame.display.flip()
+        logger.log_event("Initial screen rendered: fixation cross, bar, ball, and time indicators.")
 
-logger.log_event(f"Applied 10–20 montage and prepared Raw object. Final channels: {raw.ch_names}")
+        # === 2. Countdown + User Input Handling ===
+        backdoor_mode = None
+        waiting_for_press = True
+        countdown_start = None
+        countdown_duration = 3000  # ms
 
-# Initialize data buffer and experiment state
-all_results = []
-running = True
-clock = pygame.time.Clock()
+        while waiting_for_press:
+            eeg_state.update()
+            # Handle input events
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                    waiting_for_press = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_RIGHT:
+                        backdoor_mode = 0  # Force MI
+                    elif event.key == pygame.K_DOWN:
+                        backdoor_mode = 1  # Force REST
+                    elif event.key == pygame.K_SPACE:
+                        logger.log_event("Space bar pressed — proceeding without override.")
+                    waiting_for_press = False
 
-# Begin with fixation screen
-display_fixation_period(duration=3)
-logger.log_event("Initial fixation period complete. Beginning experimental loop.")
+            # If TIMING mode, do automatic countdown
+            if config.TIMING:
+                if countdown_start is None:
+                    countdown_start = pygame.time.get_ticks()
+                    logger.log_event("Countdown timer initiated.")
 
-while running and current_trial < len(trial_sequence):
-    logger.log_event(f"--- Trial {current_trial+1}/{len(trial_sequence)} START ---")
+                elapsed_time = pygame.time.get_ticks() - countdown_start
+                draw_time_balls(1, screen_width, screen_height)
+                pygame.display.flip()
 
-    # Initial fixation cross
-    screen.fill(config.black)
-    draw_fixation_cross(screen_width, screen_height)
-    draw_arrow_fill(0, screen_width, screen_height)
-    draw_ball_fill(0, screen_width, screen_height)
-    draw_time_balls(0, screen_width, screen_height)
-    pygame.display.flip()
-    logger.log_event("Initial screen rendered: fixation cross, bar, ball, and time indicators.")
+                if elapsed_time >= countdown_duration:
+                    logger.log_event("Countdown expired — proceeding to trial.")
+                    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_SPACE))
+                    waiting_for_press = False
 
-    # Wait for user input or automatic countdown
-    backdoor_mode = None
-    waiting_for_press = True
-    countdown_start = None
-    countdown_duration = 3000  # ms
-    baseline_buffer = []
+        # Handle early quit
+        if not running:
+            logger.log_event("Experiment terminated early via quit event.")
+            break
 
-    while waiting_for_press:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-                waiting_for_press = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_RIGHT:
-                    backdoor_mode = 0
-                elif event.key == pygame.K_DOWN:
-                    backdoor_mode = 1
-                elif event.key == pygame.K_SPACE:
-                    logger.log_event("Space bar pressed — proceeding without override.")
-                waiting_for_press = False
+        # === 3. Trial Mode Selection ===
+        if backdoor_mode is not None:
+            mode = backdoor_mode
+            logger.log_event(f"Backdoor override activated: {'MI' if mode == 0 else 'REST'}")
+        else:
+            mode = trial_sequence[current_trial]
+            logger.log_event(f"Trial mode selected from sequence: {'MI' if mode == 0 else 'REST'}")
 
-        if config.TIMING:
-            if countdown_start is None:
-                countdown_start = pygame.time.get_ticks()
-                logger.log_event("Countdown timer initiated.")
-
-            elapsed_time = pygame.time.get_ticks() - countdown_start
-
-            # Dynamically collect baseline EEG during countdown
-            baseline_buffer = collect_baseline_during_countdown(
-                inlet, countdown_start, countdown_duration, baseline_buffer
+        # === 4. Extract Baseline from EEG Buffer ===
+        try:
+            eeg_state.compute_baseline(duration_sec=config.BASELINE_DURATION)
+            logger.log_event(
+                f"Computed baseline: shape={eeg_state.baseline_mean.shape}, "
+                f"duration={config.BASELINE_DURATION}s"
             )
+        except ValueError as e:
+            logger.log_event(f"⚠️ Could not compute baseline: {e}")
+            continue  # Skip this trial if not enough data
 
-            next_trial_mode = trial_sequence[current_trial]
-            draw_time_balls(1, screen_width, screen_height)
-            pygame.display.flip()
-
-            if elapsed_time >= countdown_duration:
-                logger.log_event("Countdown expired — preparing for feedback loop")
-                pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_SPACE))
-                waiting_for_press = False
-
-    if not running:
-        logger.log_event("Experiment terminated early via quit event.")
-        break
-
-    # Determine trial mode
-    if backdoor_mode is not None:
-        mode = backdoor_mode
-        logger.log_event(f"Backdoor override activated: {'MI' if mode == 0 else 'REST'}")
-    else:
-        mode = trial_sequence[current_trial]
-        logger.log_event(f"Trial mode selected from sequence: {'MI' if mode == 0 else 'REST'}")
-
-
-
-    # Compute baseline mean after countdown ends
-    baseline_data = np.array(baseline_buffer)
-    logger.log_event(f"Collected baseline data: shape={baseline_data.shape}, total_samples={baseline_data.size}")
-        
-    # Show feedback and perform classification
-    logger.log_event(f"Starting feedback classification — Mode: {'MI' if mode == 0 else 'REST'}")
-    prediction,confidence, leaky_integrator, data_buffer, baseline_mean, trial_probs, earlystop_flag = show_feedback(
-        duration=config.TIME_MI,
-        mode=mode,
-        inlet=inlet,
-        baseline_data=baseline_data
-    )
-    pygame.display.flip()
-    pygame.event.get()     # heartbeat to OS
-    # Log the classification result
-    logger.log_event(f"Classification result — Predicted: {prediction}, Ground Truth: {200 if mode == 0 else 100}")
-
-    # Send end-of-trial marker
-    if mode == 0:
-        send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_END"], logger=logger)
-    else:
-        send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["REST_END"], logger=logger)
-
-    # Log and store classification outcome
-    append_trial_probabilities_to_csv(
-        trial_probabilities=trial_probs,
-        mode=mode,
-        trial_number=current_trial + 1,
-        predicted_label=prediction,
-        early_cutout=earlystop_flag,
-        mi_threshold=config.THRESHOLD_MI,
-        rest_threshold=config.THRESHOLD_REST,
-        logger=logger,
-        phase="MI" if mode == 0 else "REST"
-    )
-
-    logger.log_event(f"Stored decoder output for trial {current_trial+1}: {len(trial_probs)} timepoints.")
-
-    predictions_list.append(prediction)
-    ground_truth_list.append(200 if mode == 0 else 100)
-    # Red Arrow Mode (MI)
-    if mode == 0:
-        if prediction == 200:  # Correct
-            messages = ["Correct", "Robot Move"]
-            colors = [config.green, config.green]
-            offsets = [-100, 100]
-            selected_trajectory = random.choice(config.ROBOT_TRAJECTORY)
-            udp_messages = [selected_trajectory, "g"]
-            duration = 0.01
-            should_hold_and_classify = True
-
-            logger.log_event("Prediction correct for MI — triggering robot movement (and FES if toggled)")
-
-            if FES_toggle == 1:
-                send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_MOTOR_GO", logger=logger)
-            else:
-                logger.log_event("FES disabled — skipping motor stimulation.")
-
-            send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_BEGIN"], logger=logger)
-
-        elif prediction is None:  # Ambiguous
-            messages = ["Ambiguous", "Robot Stationary"]
-            colors = [config.orange, config.white]  # Or config.yellow if orange isn't defined
-            offsets = [-100, 100]
-            udp_messages = None
-            duration = config.TIME_STATIONARY
-            should_hold_and_classify = False
-
-            logger.log_event("Prediction ambiguous for MI — robot remains stationary.")
-
-        else:  # Incorrect
-            messages = ["Incorrect", "Robot Stationary"]
-            colors = [config.red, config.white]
-            offsets = [-100, 100]
-            udp_messages = None
-            duration = config.TIME_STATIONARY
-            should_hold_and_classify = False
-
-            logger.log_event("Prediction incorrect for MI — robot remains stationary.")
-
-    # Blue Ball Mode (REST)
-    else:
-        if prediction == 100:  # Correct
-            messages = ["Correct", "Robot Stationary"]
-            colors = [config.green, config.green]
-            offsets = [-100, 100]
-            udp_messages = None
-            duration = config.TIME_STATIONARY
-
-            logger.log_event("Prediction correct for REST — robot remains stationary.")
-
-        elif prediction is None:  # Ambiguous
-            messages = ["Ambiguous", "Robot Stationary"]
-            colors = [config.orange, config.white]
-            offsets = [-100, 100]
-            udp_messages = None
-            duration = config.TIME_STATIONARY
-
-            logger.log_event("Prediction ambiguous for REST — robot remains stationary.")
-
-        else:  # Incorrect
-            messages = ["Incorrect", "Robot Stationary"]
-            colors = [config.red, config.white]
-            offsets = [-100, 100]
-            udp_messages = None
-            duration = config.TIME_STATIONARY
-
-            logger.log_event("Prediction incorrect for REST — robot remains stationary.")
-
-
-        should_hold_and_classify = False  # No secondary classification logic in REST
-    # Display the feedback messages and send UDP commands (if any)
-    logger.log_event(f"Displaying feedback: '{messages[0]}' | Action: '{messages[1]}' | Duration: {duration}s")
-    display_multiple_messages_with_udp(
-        messages=messages,
-        colors=colors,
-        offsets=offsets,
-        duration=duration,
-        udp_messages=udp_messages,
-        udp_socket=udp_socket_robot,
-        udp_ip=config.UDP_ROBOT["IP"],
-        udp_port=config.UDP_ROBOT["PORT"],
-        logger=logger  # Pass logger to internal UDP calls
-    )
-
-    # If trial was a correct MI, continue classification during robot movement
-    if should_hold_and_classify:
-        logger.log_event("Entering real-time classification window during robot movement...")
-        final_class_robot, robot_probs, robot_earlystop = hold_messages_and_classify(
-            messages=messages, 
-            colors=colors, 
-            offsets=offsets, 
-            duration=config.TIME_ROB - 6,  # Monitor for 7s out of total 13s movement
-            inlet=inlet, 
-            mode=0,  # Motor Imagery
-            udp_socket=udp_socket_robot, 
-            udp_ip=config.UDP_ROBOT["IP"], 
-            udp_port=config.UDP_ROBOT["PORT"],
-            data_buffer=data_buffer,
-            leaky_integrator=leaky_integrator,
-            baseline_mean=baseline_mean
+                    
+        # Show feedback and perform classification
+        logger.log_event(f"Starting feedback classification — Mode: {'MI' if mode == 0 else 'REST'}")
+        prediction, confidence, leaky_integrator, trial_probs, earlystop_flag = show_feedback(
+            duration=config.TIME_MI,
+            mode=mode,
+            eeg_state=eeg_state
         )
+
+        pygame.display.flip()
+        pygame.event.get()     # heartbeat to OS
+        # Log the classification result
+        logger.log_event(f"Classification result — Predicted: {prediction}, Ground Truth: {200 if mode == 0 else 100}")
+
+        # Send end-of-trial marker
+        if mode == 0:
+            send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_END"], logger=logger)
+        else:
+            send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["REST_END"], logger=logger)
+
+        # Log and store classification outcome
         append_trial_probabilities_to_csv(
-            trial_probabilities=robot_probs,
-            mode=0,  # still MI internally
+            trial_probabilities=trial_probs,
+            mode=mode,
             trial_number=current_trial + 1,
-            predicted_label=final_class_robot,
-            early_cutout=robot_earlystop,
+            predicted_label=prediction,
+            early_cutout=earlystop_flag,
             mi_threshold=config.THRESHOLD_MI,
             rest_threshold=config.THRESHOLD_REST,
             logger=logger,
-            phase="ROBOT"
+            phase="MI" if mode == 0 else "REST"
         )
 
-        display_fixation_period(duration=6)
-        logger.log_event("Robot reset fixation (6s) complete after hold-and-classify phase.")
+        logger.log_event(f"Stored decoder output for trial {current_trial+1}: {len(trial_probs)} timepoints.")
 
-    logger.log_trial_summary(
-        trial_number=current_trial + 1,
-        true_label=200 if mode == 0 else 100,
-        predicted_label=prediction,
-        early_cutout=earlystop_flag,
-        accuracy_threshold=config.THRESHOLD_MI if mode == 0 else config.THRESHOLD_REST,
-        confidence=confidence,
-        num_predictions=len(trial_probs)
-    )
+        predictions_list.append(prediction)
+        ground_truth_list.append(200 if mode == 0 else 100)
+        # Red Arrow Mode (MI)
+        if mode == 0:
+            if prediction == 200:  # Correct
+                messages = ["Correct", "Robot Move"]
+                colors = [config.green, config.green]
+                offsets = [-100, 100]
+                selected_trajectory = random.choice(config.ROBOT_TRAJECTORY)
+                udp_messages = [selected_trajectory, "g"]
+                duration = 0.01
+                should_hold_and_classify = True
 
-    # Inter-trial fixation (common to all trials)
-    display_fixation_period(duration=3)
-    logger.log_event(f"Trial {current_trial+1} complete. Proceeding to next.")
+                logger.log_event("Prediction correct for MI — triggering robot movement (and FES if toggled)")
 
-    # Advance trial index and frame rate
-    current_trial += 1
-    pygame.display.flip()
-    clock.tick(60)
+                if FES_toggle == 1:
+                    send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_MOTOR_GO", logger=logger)
+                else:
+                    logger.log_event("FES disabled — skipping motor stimulation.")
 
-if current_trial == len(trial_sequence) and config.SAVE_ADAPTIVE_T:
-    try:
-        save_transform(Prev_T, counter, adaptive_T_path)
-    except Exception as e:
-        logger.log_event(f"⚠️ Could not save transform to {adaptive_T_path}: {e}")
+                send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_BEGIN"], logger=logger)
 
-log_confusion_matrix_from_trial_summary(logger)
-logger.log_event(f"run complete")
-pygame.quit()
+            elif prediction is None:  # Ambiguous
+                messages = ["Ambiguous", "Robot Stationary"]
+                colors = [config.orange, config.white]  # Or config.yellow if orange isn't defined
+                offsets = [-100, 100]
+                udp_messages = None
+                duration = config.TIME_STATIONARY
+                should_hold_and_classify = False
+
+                logger.log_event("Prediction ambiguous for MI — robot remains stationary.")
+
+            else:  # Incorrect
+                messages = ["Incorrect", "Robot Stationary"]
+                colors = [config.red, config.white]
+                offsets = [-100, 100]
+                udp_messages = None
+                duration = config.TIME_STATIONARY
+                should_hold_and_classify = False
+
+                logger.log_event("Prediction incorrect for MI — robot remains stationary.")
+
+        # Blue Ball Mode (REST)
+        else:
+            if prediction == 100:  # Correct
+                messages = ["Correct", "Robot Stationary"]
+                colors = [config.green, config.green]
+                offsets = [-100, 100]
+                udp_messages = None
+                duration = config.TIME_STATIONARY
+
+                logger.log_event("Prediction correct for REST — robot remains stationary.")
+
+            elif prediction is None:  # Ambiguous
+                messages = ["Ambiguous", "Robot Stationary"]
+                colors = [config.orange, config.white]
+                offsets = [-100, 100]
+                udp_messages = None
+                duration = config.TIME_STATIONARY
+
+                logger.log_event("Prediction ambiguous for REST — robot remains stationary.")
+
+            else:  # Incorrect
+                messages = ["Incorrect", "Robot Stationary"]
+                colors = [config.red, config.white]
+                offsets = [-100, 100]
+                udp_messages = None
+                duration = config.TIME_STATIONARY
+
+                logger.log_event("Prediction incorrect for REST — robot remains stationary.")
+
+
+            should_hold_and_classify = False  # No secondary classification logic in REST
+        # Display the feedback messages and send UDP commands (if any)
+        logger.log_event(f"Displaying feedback: '{messages[0]}' | Action: '{messages[1]}' | Duration: {duration}s")
+        display_multiple_messages_with_udp(
+            messages=messages,
+            colors=colors,
+            offsets=offsets,
+            duration=duration,
+            udp_messages=udp_messages,
+            udp_socket=udp_socket_robot,
+            udp_ip=config.UDP_ROBOT["IP"],
+            udp_port=config.UDP_ROBOT["PORT"],
+            logger=logger,  # Pass logger to internal UDP calls
+            eeg_state=eeg_state  # Add EEG buffer updates during display loop
+        )
+
+
+        # If trial was a correct MI, continue classification during robot movement
+        if should_hold_and_classify:
+            logger.log_event("Entering real-time classification window during robot movement...")
+            final_class_robot, robot_probs, robot_earlystop = hold_messages_and_classify(
+                messages=messages, 
+                colors=colors, 
+                offsets=offsets, 
+                duration=config.TIME_ROB - 6,  # Monitor for 7s out of total 13s movement
+                mode=0,  # Motor Imagery
+                udp_socket=udp_socket_robot, 
+                udp_ip=config.UDP_ROBOT["IP"], 
+                udp_port=config.UDP_ROBOT["PORT"],
+                eeg_state=eeg_state,
+                leaky_integrator=leaky_integrator
+            )
+            append_trial_probabilities_to_csv(
+                trial_probabilities=robot_probs,
+                mode=0,  # still MI internally
+                trial_number=current_trial + 1,
+                predicted_label=final_class_robot,
+                early_cutout=robot_earlystop,
+                mi_threshold=config.THRESHOLD_MI,
+                rest_threshold=config.THRESHOLD_REST,
+                logger=logger,
+                phase="ROBOT"
+            )
+
+            display_fixation_period(duration=6, eeg_state=eeg_state)
+            logger.log_event("Robot reset fixation (6s) complete after hold-and-classify phase.")
+
+        logger.log_trial_summary(
+            trial_number=current_trial + 1,
+            true_label=200 if mode == 0 else 100,
+            predicted_label=prediction,
+            early_cutout=earlystop_flag,
+            accuracy_threshold=config.THRESHOLD_MI if mode == 0 else config.THRESHOLD_REST,
+            confidence=confidence,
+            num_predictions=len(trial_probs)
+        )
+
+        # Inter-trial fixation (common to all trials)
+        display_fixation_period(duration=3, eeg_state=eeg_state)
+        logger.log_event(f"Trial {current_trial+1} complete. Proceeding to next.")
+
+        # Advance trial index and frame rate
+        current_trial += 1
+        pygame.display.flip()
+        clock.tick(60)
+
+    if current_trial == len(trial_sequence) and config.SAVE_ADAPTIVE_T:
+        try:
+            save_transform(Prev_T, counter, adaptive_T_path)
+        except Exception as e:
+            logger.log_event(f"⚠️ Could not save transform to {adaptive_T_path}: {e}")
+
+    log_confusion_matrix_from_trial_summary(logger)
+    logger.log_event(f"run complete")
+    pygame.quit()
+
+if __name__ == "__main__":
+    main()

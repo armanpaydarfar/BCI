@@ -2,6 +2,7 @@ from scipy.signal import butter, filtfilt, iirnotch, lfilter
 import numpy as np
 import config
 from sklearn.linear_model import LinearRegression
+import mne 
 
 def concatenate_streams(eeg_streams, marker_streams):
     """
@@ -28,6 +29,58 @@ def concatenate_streams(eeg_streams, marker_streams):
     return merged_eeg, merged_markers
 
 
+def get_valid_channel_mask_and_metadata(eeg_data, channel_names):
+    """
+    Filters out non-EEG channels and returns valid EEG data and channel names.
+    Applies unit conversion (Volts to µV) and adjusts metadata accordingly.
+
+    Parameters:
+        eeg_data (np.ndarray): Raw EEG data of shape (n_channels, n_times).
+        channel_names (list): List of channel names from XDF stream.
+
+    Returns:
+        filtered_data (np.ndarray): EEG data with only valid EEG channels.
+        valid_channels (list): Corresponding names of valid EEG channels.
+        raw (mne.io.RawArray): MNE Raw object with updated metadata and montage.
+    """
+
+    # === Rename channels if needed ===
+    rename_dict = {
+        "FP1": "Fp1", "FPZ": "Fpz", "FP2": "Fp2",
+        "FZ": "Fz", "CZ": "Cz", "PZ": "Pz", "POZ": "POz", "OZ": "Oz"
+    }
+    renamed_channel_names = [rename_dict.get(ch, ch) for ch in channel_names]
+
+    # Define non-EEG channels
+    non_eeg_channels = {"AUX1", "AUX2", "AUX3", "AUX7", "AUX8", "AUX9", "TRIGGER"}
+
+    # Retain only EEG channels
+    valid_channels = [ch for ch in renamed_channel_names if ch not in non_eeg_channels]
+    valid_indices = [i for i, ch in enumerate(renamed_channel_names) if ch in valid_channels]
+    filtered_data = eeg_data[valid_indices, :]
+
+    # Create MNE Raw object for unit metadata and spatial ops
+    info = mne.create_info(ch_names=valid_channels, sfreq=config.FS, ch_types="eeg")
+    raw = mne.io.RawArray(filtered_data.copy(), info)
+
+    # Convert Volts to microvolts (µV) and update metadata
+    for ch in raw.info["chs"]:
+        ch["unit"] = 201  # 201 = µV in MNE FIFF codes
+    print(f"Updated Units for EEG Channels: {[ch['unit'] for ch in raw.info['chs']]}")
+
+    # Drop M1/M2 if present
+    if "M1" in raw.ch_names and "M2" in raw.ch_names:
+        raw.drop_channels(["M1", "M2"])
+        print("Removed Mastoid Channels: M1, M2")
+        valid_channels = raw.ch_names
+        filtered_data = raw.get_data()
+    else:
+        print("No Mastoid Channels Found in Data")
+
+    return filtered_data, valid_channels, raw
+
+
+
 def select_motor_channels(raw, keep_prefixes=("CP", "P", "C")):
     """
     Filters the MNE raw object to keep only CP (centroparietal), P (parietal), and C (central) channels.
@@ -51,50 +104,88 @@ def select_motor_channels(raw, keep_prefixes=("CP", "P", "C")):
 
     return raw  # Return modified Raw object
 
-
-
-def apply_notch_filter(eeg_data, sampling_rate, line_freq=60, quality_factor=30, harmonics=2):
+def initialize_filter_bank(fs, lowcut, highcut, notch_freqs=[60], notch_q=30, order=4):
     """
-    Apply a notch filter to the EEG dataset to remove line noise.
-
+    Initializes causal filter coefficients for bandpass and notch filters.
+    
     Parameters:
-        eeg_data (np.ndarray): EEG data of shape (n_samples, n_channels).
-        sampling_rate (int): Sampling rate of the EEG data in Hz.
-        line_freq (float): Line noise frequency to filter (default: 50 Hz).
-        quality_factor (float): Quality factor of the notch filter (default: 30).
-        harmonics (int): Number of harmonics to filter (default: 1, filters only the line frequency).
+        fs (float): Sampling rate in Hz
+        lowcut (float): Low cutoff for bandpass
+        highcut (float): High cutoff for bandpass
+        notch_freqs (list): Frequencies to notch filter (e.g., [60])
+        notch_q (float): Q factor for notch filters
+        order (int): Order for bandpass filter
 
     Returns:
-        np.ndarray: Filtered EEG data of the same shape as input.
+        dict: {'bandpass': (b, a), 'notch': [(b, a), ...]}
     """
-    filtered_data = eeg_data.copy()
+    # Bandpass filter
+    nyq = 0.5 * fs
+    bp_b, bp_a = butter(order, [lowcut / nyq, highcut / nyq], btype='band')
 
-    for harmonic in range(1, harmonics + 1):
-        target_freq = line_freq * harmonic
-        b, a = iirnotch(target_freq, quality_factor, sampling_rate)
-        filtered_data = filtfilt(b, a, filtered_data, axis=0)
+    # Notch filters
+    notch_filters = []
+    for freq in notch_freqs:
+        b, a = iirnotch(freq / nyq, notch_q)
+        notch_filters.append((b, a))
 
-    return filtered_data
-
-
-# Bandpass Filter Design Function
-def butter_bandpass(lowcut, highcut, fs, order=4):
-    nyq = 0.5 * fs  # Nyquist frequency
-    low = lowcut / nyq
-    high = highcut / nyq
-    b, a = butter(order, [low, high], btype='band')
-    return b, a
-
-# Function to Apply Filter with State Tracking
-def filter_with_state(data, b, a, zi):
-    filtered_data, zf = lfilter(b, a, data, zi=zi)  # Apply filter with prior state
-    return filtered_data, zf  # Return filtered signal & final state
+    return {
+        'bandpass': (bp_b, bp_a),
+        'notch': notch_filters
+    }
 
 
-def apply_car_filter(data):
-    avg = np.mean(data, axis=0)
-    return data - avg
 
+def apply_streaming_filters(data, filter_bank, filter_state=None):
+    """
+    Applies notch and bandpass filters in sequence using lfilter with state.
+
+    Parameters:
+        data (ndarray): EEG data (channels x samples)
+        filter_bank (dict): Output from initialize_filter_bank
+        filter_state (dict or None): Previous zi values for filters (optional)
+
+    Returns:
+        filtered (ndarray): Filtered data
+        updated_state (dict): Updated filter state for streaming
+    """
+    if not isinstance(filter_bank, dict) or 'bandpass' not in filter_bank:
+        raise ValueError("Invalid filter_bank: must be a dict with at least 'bandpass' key.")
+    if 'notch' not in filter_bank:
+        print("⚠️ No notch filters found in filter_bank — skipping notch filtering.")
+
+    if filter_state is None:
+        filter_state = {}
+
+    filtered = data
+    updated_state = {}
+
+    # --- Apply notch filters (if any) ---
+    for idx, notch_coeffs in enumerate(filter_bank.get('notch', [])):
+        b, a = notch_coeffs
+        key = f'notch_{idx}'
+        zi = filter_state.get(key)
+        if zi is None:
+            zi = np.zeros((data.shape[0], len(a) - 1))
+        filtered, zf = lfilter(b, a, filtered, axis=1, zi=zi)
+        updated_state[key] = zf
+
+    # --- Apply bandpass filter ---
+    bp_b, bp_a = filter_bank['bandpass']
+    key = 'bandpass'
+    zi = filter_state.get(key)
+    if zi is None:
+        zi = np.zeros((data.shape[0], len(bp_a) - 1))
+    filtered, zf = lfilter(bp_b, bp_a, filtered, axis=1, zi=zi)
+    updated_state[key] = zf
+
+    return filtered, updated_state
+
+
+def reset_filter_state(filter_bank, n_channels):
+    return {
+        k: np.zeros((n_channels, len(a) - 1)) for k, (b, a) in filter_bank['notch'] + [('bandpass', filter_bank['bandpass'])]
+    }
 
 
 def compute_grand_average(data, sampling_rate, mode="trials"):

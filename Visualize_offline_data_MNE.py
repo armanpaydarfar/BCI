@@ -10,8 +10,8 @@ from scipy.stats import zscore
 from Utils.preprocessing import apply_notch_filter, extract_segments, separate_classes, compute_grand_average,concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "LAB_SUBJ_001"
-session = "S005OFFLINE"
+subject = "DELAND"
+session = "S001OFFLINE"
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
@@ -105,7 +105,7 @@ print(f"First Channel Unit (FIFF Code): {first_channel_unit}")
 
 # Convert data from Volts to microvolts (µV)
 # Convert raw data from Volts to microvolts (µV) IMMEDIATELY AFTER LOADING
-#raw._data /= 1e6  # Convert V → µV
+raw._data /= 1e6  # Convert V → µV
 
 # Update channel metadata in MNE so the scaling is correctly reflected
 
