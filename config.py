@@ -50,11 +50,11 @@ BIG_BROTHER_MODE = True #this toggle exports the game to the second monitor auto
 CLASSIFY_WINDOW = 1000  # Duration of EEG data window for classification (milliseconds)
 FILTER_BUFFER_SIZE = 2048 #4s at 512 Hz
 BASELINE_DURATION = 1 #seconds
-ACCURACY_THRESHOLD = 0.65  # Accuracy threshold to determine "Correct" (plan to obsolete)
+ACCURACY_THRESHOLD = 0.65  # OBS Accuracy threshold to determine "Correct" (plan to obsolete)
 THRESHOLD_MI = 0.65 #Threshold for MI "correct"
 THRESHOLD_REST = 0.65 #Threshold for REST "Correct"
 RELAXATION_RATIO = 0.5
-MIN_PREDICTIONS = 10 # Min number of predictions during Online experiment before the decoder can end early
+MIN_PREDICTIONS = 24 # Min number of predictions during Online experiment before the decoder can end early
 STEP_SIZE = 1/16
 CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
 #CLASSIFICATION_SCHEME_OPT = "TIMESERIES"
@@ -67,7 +67,7 @@ LEDOITWOLF = 0 #Set to true to use ledoit wolf shrinkage regularization - otherw
 
 # adaptive Recentering parameters for config
 RECENTERING = 1 # adaptive recentering toggle
-USE_CONFIDENCE_GATE = 0 #update Previous transform ONLY in the event the current prob is above the MI/REST threshold (or lean condition)
+USE_CONFIDENCE_GATE = 0 #update Previous transform ONLY in the event of lean condition
 UPDATE_DURING_MOVE = 0 #this toggle defines whether or not the reimannian adaptive recentering scheme updates when the robot is moving. 0 = no, 1 = yes. The algo will update always during MI
 SAVE_ADAPTIVE_T = False #this toggle saves "Adaptive_T" to the EEG directory during an active session between runs - this way, we can continue w/ the current estimated whitening transform. Disabling this will start a fresh transform each time
 

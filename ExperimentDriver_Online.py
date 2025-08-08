@@ -380,7 +380,7 @@ def handle_fes_activation(mode, running_avg_confidence, fes_active):
     # No change in state
     return fes_active
 
-def classify_real_time(eeg_state, window_size_samples, step_size, all_probabilities, predictions, mode, leaky_integrator, update_recentering=True):
+def classify_real_time(eeg_state, window_size_samples, all_probabilities, predictions, mode, leaky_integrator, update_recentering=True):
     global counter
     global Prev_T
 
@@ -481,7 +481,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, mode, udp_so
     running_avg_confidence = 0.5
     current_confidence = 0.5
 
-    last_classify_time = 0  # Classify immediately
+    next_tick = time.time()  # Classify immediately
     pygame.display.update()
     clock = pygame.time.Clock()
 
@@ -503,54 +503,48 @@ def hold_messages_and_classify(messages, colors, offsets, duration, mode, udp_so
         pygame.display.flip()
 
         # === Classify every step_size seconds ===
-        if now - last_classify_time >= step_size:
-            try:
-                current_confidence, predictions, all_probabilities = classify_real_time(
-                    eeg_state, window_size_samples, step_size,
-                    all_probabilities, predictions,
-                    mode, leaky_integrator,
-                    update_recentering=config.UPDATE_DURING_MOVE
+        if now >= next_tick:
+            current_confidence, predictions, all_probabilities = classify_real_time(
+                eeg_state, window_size_samples,
+                all_probabilities, predictions,
+                mode, leaky_integrator,
+                update_recentering=config.UPDATE_DURING_MOVE
+            )
+            next_tick += step_size 
+            if all_probabilities:
+                prob_mi, prob_rest = all_probabilities[-1][2], all_probabilities[-1][1]
+                send_udp_message(
+                    udp_socket_marker,
+                    config.UDP_MARKER["IP"],
+                    config.UDP_MARKER["PORT"],
+                    f"{config.TRIGGERS['ROBOT_PROBS']},{prob_mi:.5f},{prob_rest:.5f}",
+                    quiet=True
                 )
-                last_classify_time = now
 
-                if all_probabilities:
-                    prob_mi, prob_rest = all_probabilities[-1][2], all_probabilities[-1][1]
-                    send_udp_message(
-                        udp_socket_marker,
-                        config.UDP_MARKER["IP"],
-                        config.UDP_MARKER["PORT"],
-                        f"{config.TRIGGERS['ROBOT_PROBS']},{prob_mi:.5f},{prob_rest:.5f}",
-                        quiet=True
-                    )
+            if current_confidence > 0:
+                num_predictions += 1
 
-                if current_confidence > 0:
-                    num_predictions += 1
+            running_avg_confidence = leaky_integrator.update(current_confidence)
 
-                running_avg_confidence = leaky_integrator.update(current_confidence)
+            if num_predictions >= min_predictions_before_stop and running_avg_confidence < config.RELAXATION_RATIO * accuracy_threshold:
+                early_stop = True
 
-                if num_predictions >= min_predictions_before_stop and running_avg_confidence < config.RELAXATION_RATIO * accuracy_threshold:
-                    early_stop = True
+                logger.log_event(f"Early stop triggered! Confidence: {running_avg_confidence:.2f} after {num_predictions} predictions")
 
-                    logger.log_event(f"Early stop triggered! Confidence: {running_avg_confidence:.2f} after {num_predictions} predictions")
+                send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_EARLYSTOP"], logger=logger)
+                send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_END"], logger=logger)
 
-                    send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_EARLYSTOP"], logger=logger)
-                    send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_END"], logger=logger)
+                if FES_toggle == 1:
+                    send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP", logger=logger)
+                    logger.log_event("FES_STOP signal sent due to early stop.")
+                else:
+                    logger.log_event("FES is disabled — no FES_STOP sent.")
 
-                    if FES_toggle == 1:
-                        send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP", logger=logger)
-                        logger.log_event("FES_STOP signal sent due to early stop.")
-                    else:
-                        logger.log_event("FES is disabled — no FES_STOP sent.")
-
-                    display_multiple_messages_with_udp(
-                        ["Stopping Robot"], [(255, 0, 0)], [0], duration=5,
-                        udp_messages=["s"], udp_socket=udp_socket, udp_ip=udp_ip, udp_port=udp_port, logger=logger
-                    )
-                    break
-
-            except ValueError:
-                # Not enough data in buffer yet, skip
-                pass
+                display_multiple_messages_with_udp(
+                    ["Stopping Robot"], [(255, 0, 0)], [0], duration=5,
+                    udp_messages=["s"], udp_socket=udp_socket, udp_ip=udp_ip, udp_port=udp_port, logger=logger
+                )
+                break
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -616,23 +610,22 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
     clock = pygame.time.Clock()
     running_avg_confidence = 0.5  # Initial placeholder
     current_confidence = 0.5 # Initial placeholder for initial window updates
-    last_classify_time = start_time + window_size  # Skip first second
+    next_tick = start_time + window_size  # Skip first second
 
     while time.time() - start_time < duration:
         eeg_state.update()
 
         now = time.time()
-        if now >= last_classify_time:
+        if now >= next_tick:
             current_confidence, predictions, all_probabilities = classify_real_time(
                 eeg_state,
                 window_size_samples,
-                step_size_samples,
                 all_probabilities,
                 predictions,
                 mode,
                 leaky_integrator
             )
-            last_classify_time += step_size  # or: last_classify_time = now
+            next_tick += step_size 
 
 
         if all_probabilities:
