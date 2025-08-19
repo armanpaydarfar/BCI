@@ -20,11 +20,13 @@ UDP_FES = {
 # EEG Settings
 CAP_TYPE = 32
 LOWCUT = 8  # Hz
-HIGHCUT = 12  # Hz
+HIGHCUT = 16  # Hz
+LOWCUT_ERRP = 1 #Hz
+HIGHCUT_ERRP = 10 #Hz
 FS = 512  # Sampling frequency (Hz)
+MOTOR_CHANNEL_NAMES = ['C3', 'Cz', 'C4', 'CP5', 'CP1', 'CP2', 'CP6', 'P7','P3', 'Pz', 'P4', 'P8', 'POz']
+ERRP_CHANNEL_NAMES = ['F3', 'Fz', 'F4', 'FC1', 'FC2', 'Cz']
 
-EEG_CHANNEL_NAMES = ['F7', 'F3', 'FZ', 'F4', 'F8', 'FC5', 'FC1', 'FC2', 'FC6', 'C3', 'CZ', 'C4', 
-                     'CP5', 'CP1', 'CP2', 'CP6', 'P7', 'P3', 'PZ', 'P4', 'P8', 'POZ'] # List of EEG channel names to use
 '''
 EEG_CHANNEL_NAMES = ['ALL']
 '''
@@ -33,7 +35,7 @@ EOG_TOGGLE = 0  # Toggle to enable or disable EOG processing (1 = enabled, 0 = d
 
 # Experiment Parameters
 ARM_SIDE = "Right"
-TOTAL_TRIALS = 30  # Total number of trials
+TOTAL_TRIALS = 20  # Total number of trials
 TOTAL_TRIALS_ERRP = 45 # Total number of trials for ErrP experiment
 MAX_REPEATS = 3  # Maximum consecutive repeats of the same condition
 N_SPLITS = 5  # Number of splits for KFold cross-validation
@@ -41,7 +43,7 @@ TIME_MI = 5 # time for motor imagery and rest
 TIME_ROB = 13 # time allocated for robot to move
 TIME_STATIONARY = 2 # time for stationary feedback after no movement/failed movement trial
 TIMING = True
-SHAPE_MAX = 0.9 #maximum fill 
+SHAPE_MAX = 0.7 #maximum fill 
 SHAPE_MIN = 0.5 #minimum fill 
 ROBOT_TRAJECTORY = ["a"]
 BIG_BROTHER_MODE = True #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
@@ -50,19 +52,20 @@ BIG_BROTHER_MODE = True #this toggle exports the game to the second monitor auto
 CLASSIFY_WINDOW = 1000  # Duration of EEG data window for classification (milliseconds)
 FILTER_BUFFER_SIZE = 2048 #4s at 512 Hz
 BASELINE_DURATION = 1 #seconds
-ACCURACY_THRESHOLD = 0.65  # OBS Accuracy threshold to determine "Correct" (plan to obsolete)
-THRESHOLD_MI = 0.65 #Threshold for MI "correct"
-THRESHOLD_REST = 0.65 #Threshold for REST "Correct"
-RELAXATION_RATIO = 0.5
-MIN_PREDICTIONS = 24 # Min number of predictions during Online experiment before the decoder can end early
+ACCURACY_THRESHOLD = 0.6  # OBS Accuracy threshold to determine "Correct" (plan to obsolete)
+THRESHOLD_MI = 0.6 #Threshold for MI "correct"
+THRESHOLD_REST = 0.6 #Threshold for REST "Correct"
+RELAXATION_RATIO = 0.4
+MIN_PREDICTIONS = 8 # Min number of predictions during Online experiment before the decoder can end early
 STEP_SIZE = 1/16
 CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
 #CLASSIFICATION_SCHEME_OPT = "TIMESERIES"
 CLASSIFICATION_SCHEME_OPT = "FREQUENCY"
 SURFACE_LAPLACIAN_TOGGLE = 0 #apply the surface laplacian spatial filter during online
 SELECT_MOTOR_CHANNELS = 1 # toggle to select motor channels or not (can be used to select other channels too)
-INTEGRATOR_ALPHA = 0.9 # defines how fast the accumulated probability may change as new data comes in
-SHRINKAGE_PARAM = 0.01 # hyperparameter for shrinkage regularization
+SELECT_ERRP_CHANNELS = 0 #toggle to select ERRP channels
+INTEGRATOR_ALPHA = 0.96 # defines how fast the accumulated probability may change as new data comes in
+SHRINKAGE_PARAM = 0.1 # hyperparameter for shrinkage regularization
 LEDOITWOLF = 0 #Set to true to use ledoit wolf shrinkage regularization - otherwise pyreimannian will be used w/ shrinkage param shown above
 
 # adaptive Recentering parameters for config

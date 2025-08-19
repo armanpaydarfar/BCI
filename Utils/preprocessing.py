@@ -29,80 +29,61 @@ def concatenate_streams(eeg_streams, marker_streams):
     return merged_eeg, merged_markers
 
 
-def get_valid_channel_mask_and_metadata(eeg_data, channel_names):
-    """
-    Filters out non-EEG channels and returns valid EEG data and channel names.
-    Applies unit conversion (Volts to µV) and adjusts metadata accordingly.
+def get_valid_channel_mask_and_metadata(eeg_data, channel_names, fs, drop_mastoids=True):
+    # 1) Normalize names here (single source of truth)
+    rename_dict = {"FP1":"Fp1","FPZ":"Fpz","FP2":"Fp2","FZ":"Fz","CZ":"Cz","PZ":"Pz","POZ":"POz","OZ":"Oz"}
+    norm_names = [rename_dict.get(ch, ch) for ch in channel_names]
 
-    Parameters:
-        eeg_data (np.ndarray): Raw EEG data of shape (n_channels, n_times).
-        channel_names (list): List of channel names from XDF stream.
+    # 2) Drop non-EEG
+    non_eeg = {"AUX1","AUX2","AUX3","AUX7","AUX8","AUX9","TRIGGER"}
+    valid_mask = [nm not in non_eeg for nm in norm_names]
+    valid_indices = [i for i, keep in enumerate(valid_mask) if keep]
+    valid_channels = [norm_names[i] for i in valid_indices]
 
-    Returns:
-        filtered_data (np.ndarray): EEG data with only valid EEG channels.
-        valid_channels (list): Corresponding names of valid EEG channels.
-        raw (mne.io.RawArray): MNE Raw object with updated metadata and montage.
-    """
+    # 3) Build Raw for metadata/selection
+    info = mne.create_info(ch_names=valid_channels, sfreq=fs, ch_types="eeg")
+    raw = mne.io.RawArray(eeg_data[valid_indices, :].copy(), info)
 
-    # === Rename channels if needed ===
-    rename_dict = {
-        "FP1": "Fp1", "FPZ": "Fpz", "FP2": "Fp2",
-        "FZ": "Fz", "CZ": "Cz", "PZ": "Pz", "POZ": "POz", "OZ": "Oz"
-    }
-    renamed_channel_names = [rename_dict.get(ch, ch) for ch in channel_names]
-
-    # Define non-EEG channels
-    non_eeg_channels = {"AUX1", "AUX2", "AUX3", "AUX7", "AUX8", "AUX9", "TRIGGER"}
-
-    # Retain only EEG channels
-    valid_channels = [ch for ch in renamed_channel_names if ch not in non_eeg_channels]
-    valid_indices = [i for i, ch in enumerate(renamed_channel_names) if ch in valid_channels]
-    filtered_data = eeg_data[valid_indices, :]
-
-    # Create MNE Raw object for unit metadata and spatial ops
-    info = mne.create_info(ch_names=valid_channels, sfreq=config.FS, ch_types="eeg")
-    raw = mne.io.RawArray(filtered_data.copy(), info)
-
-    # Convert Volts to microvolts (µV) and update metadata
-    for ch in raw.info["chs"]:
-        ch["unit"] = 201  # 201 = µV in MNE FIFF codes
-    print(f"Updated Units for EEG Channels: {[ch['unit'] for ch in raw.info['chs']]}")
-
-    # Drop M1/M2 if present
-    if "M1" in raw.ch_names and "M2" in raw.ch_names:
+    # 4) Optionally drop M1/M2 AND update mapping accordingly
+    if drop_mastoids and "M1" in raw.ch_names and "M2" in raw.ch_names:
         raw.drop_channels(["M1", "M2"])
-        print("Removed Mastoid Channels: M1, M2")
         valid_channels = raw.ch_names
-        filtered_data = raw.get_data()
-    else:
-        print("No Mastoid Channels Found in Data")
+        # recompute mapping from original channel_names → valid_channels after drop
+        valid_indices = [i for i, nm in enumerate(norm_names)
+                         if nm in valid_channels and nm not in non_eeg]
 
-    return filtered_data, valid_channels, raw
+    return valid_channels, raw, valid_indices
 
 
 
-def select_motor_channels(raw, keep_prefixes=("CP", "P", "C")):
+def select_channels(raw, keep_channels=None):
     """
-    Filters the MNE raw object to keep only CP (centroparietal), P (parietal), and C (central) channels.
+    Filters the MNE Raw object to keep only explicitly specified channels.
 
     Parameters:
     - raw (mne.io.Raw): The MNE Raw object containing EEG data.
-    - keep_prefixes (tuple): Channel name prefixes to keep (default: ("CP", "P", "C")).
+    - keep_channels (list[str]): Exact channel names to keep (e.g., ["C3", "Cz", "C4"]).
+                                If None, keeps all channels.
 
     Returns:
     - raw (mne.io.Raw): The modified MNE Raw object with only the selected channels.
     """
 
-    # Get all channel names from the MNE Raw object
     channel_names = raw.info["ch_names"]
 
-    # Find indices of channels that start with CP, P, or C
-    selected_channels = [ch for ch in channel_names if ch.startswith(keep_prefixes)]
+    if keep_channels is not None:
+        # Ensure only channels that exist in the data are selected
+        selected_channels = [ch for ch in keep_channels if ch in channel_names]
+        missing = [ch for ch in keep_channels if ch not in channel_names]
+        if missing:
+            raise ValueError(f"Requested channels not found in Raw: {missing}")
+    else:
+        selected_channels = channel_names
 
-    # Select only these channels
     raw.pick_channels(selected_channels)
+    return raw
 
-    return raw  # Return modified Raw object
+
 
 def initialize_filter_bank(fs, lowcut, highcut, notch_freqs=[60], notch_q=30, order=4):
     """
@@ -484,35 +465,3 @@ def parse_eeg_and_eog(eeg_stream, channel_names):
         eog_selected = None
 
     return eeg_selected, eog_selected
-
-
-def extract_psd_features(eeg_data, fs=512, bands=[(0.5, 4), (4, 8), (8, 13), (13, 30), (30, 50)]):
-    """
-    Extract power spectral density (PSD) features for predefined frequency bands.
-
-    Parameters:
-        eeg_data (np.ndarray): 3D array of EEG data (n_samples x window_samples x n_channels).
-        fs (int): Sampling frequency of the EEG data in Hz.
-        bands (list): List of tuples defining frequency bands (low_freq, high_freq).
-
-    Returns:
-        np.ndarray: Feature matrix of shape (n_samples, n_bands * n_channels).
-    """
-    n_samples, window_samples, n_channels = eeg_data.shape
-    psd_features = []
-
-    for sample_idx in range(n_samples):
-        sample_features = []
-        for band in bands:
-            band_power = []
-            for channel in range(n_channels):
-                # Compute PSD using Welch's method
-                freqs, psd = welch(eeg_data[sample_idx, :, channel], fs=fs, nperseg=128)
-                
-                # Integrate power within the frequency band
-                band_power.append(np.sum(psd[(freqs >= band[0]) & (freqs <= band[1])]))
-            
-            sample_features.extend(band_power)
-        psd_features.append(sample_features)
-    
-    return np.array(psd_features)

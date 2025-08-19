@@ -11,7 +11,7 @@ import config
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from Utils.stream_utils import load_xdf, get_channel_names_from_xdf
-from Utils.preprocessing import select_motor_channels
+from Utils.preprocessing import select_channels
 import glob  # Required for multi-file loading
 from scipy.stats import zscore
 from pyriemann.utils.mean import mean_riemann
@@ -123,17 +123,25 @@ def segment_and_label_one_run(eeg_stream, marker_stream):
     eeg_data = np.array(eeg_stream["time_series"]).T
 
     # Select valid EEG channels and metadata cleanup
-    channel_names = get_channel_names_from_xdf(eeg_stream)
-    eeg_data, valid_channels, dummy_raw = get_valid_channel_mask_and_metadata(eeg_data, channel_names)
+    all_channel_names = get_channel_names_from_xdf(eeg_stream)  # raw labels from XDF
 
-    if config.SURFACE_LAPLACIAN_TOGGLE:
-        dummy_raw = mne.preprocessing.compute_current_source_density(dummy_raw)
+    valid_channel_names, valid_raw, valid_indices = get_valid_channel_mask_and_metadata(
+        eeg_data, all_channel_names, fs=config.FS, drop_mastoids=True
+    )
 
+    # Map EEG data to the "valid" coordinate system (original -> valid)
+    eeg_data = eeg_data[valid_indices, :]
+
+    # Keep names in the same (normalized) space as valid_raw
+    current_channel_names = list(valid_channel_names)
+    print("channel names after metadata extraction:", current_channel_names)
+
+    # --- Explicit motor subset (if enabled) ---
     if config.SELECT_MOTOR_CHANNELS:
-        dummy_raw = select_motor_channels(dummy_raw)
-        motor_indices = [valid_channels.index(ch) for ch in dummy_raw.ch_names]
-        eeg_data = eeg_data[motor_indices]
-        valid_channels = dummy_raw.ch_names
+        sel_raw = select_channels(valid_raw, keep_channels=config.MOTOR_CHANNEL_NAMES)
+        subset_indices_valid = [current_channel_names.index(ch) for ch in sel_raw.ch_names]
+        eeg_data = eeg_data[subset_indices_valid, :]
+        current_channel_names = list(sel_raw.ch_names)
 
     # === Filter setup ===
     filter_bank = initialize_filter_bank(

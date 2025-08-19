@@ -6,20 +6,29 @@ from Utils.preprocessing import (
     initialize_filter_bank,
     apply_streaming_filters,
     get_valid_channel_mask_and_metadata,
-    select_motor_channels,
+    select_channels,
 )
 
 class EEGStreamState:
-    def __init__(self, inlet: StreamInlet, config, logger=None):
+    def __init__(self, inlet: StreamInlet, config, mode = "motor", logger=None):
         self.inlet = inlet
         self.config = config
         self.logger = logger
+        self.mode = mode
+
+        # Override with ERRP-specific values if selected
+        self.lowcut = config.LOWCUT
+        self.highcut = config.HIGHCUT
+        if self.mode == "errp":
+            self.lowcut = config.LOWCUT_ERRP
+            self.highcut = config.HIGHCUT_ERRP
+
 
         # Filtering
         self.filter_bank = initialize_filter_bank(
             fs=config.FS,
-            lowcut=config.LOWCUT,
-            highcut=config.HIGHCUT,
+            lowcut=self.lowcut,
+            highcut=self.highcut,
             notch_freqs=[60],
             notch_q=30
         )
@@ -33,7 +42,7 @@ class EEGStreamState:
         # Channel selection
         self.channel_names = None
         self.valid_channel_indices = None
-        self.motor_indices = None
+        self.subset_indices = None
         self.final_indices = None  # NEW: final indices used for slicing in real-time
 
         self.first_chunk_processed = False
@@ -44,7 +53,6 @@ class EEGStreamState:
             chunk, timestamps = self.inlet.pull_chunk(timeout=0.0)
             if not chunk or not timestamps:
                 return  # No new data
-
             raw_chunk = np.array(chunk).T  # shape: (n_channels, n_samples)
 
             # === One-time channel selection logic ===
@@ -52,29 +60,30 @@ class EEGStreamState:
                 all_ch_names = self._get_channel_names()
 
                 # Get valid EEG data, channel names, and MNE Raw object
-                filtered_data, valid_channel_names, valid_raw = get_valid_channel_mask_and_metadata(
-                    raw_chunk, all_ch_names
+                valid_channel_names, valid_raw, valid_indices = get_valid_channel_mask_and_metadata(
+                    raw_chunk, all_ch_names, fs=self.config.FS, drop_mastoids=True
                 )
-
                 # Store indices of valid EEG channels in original stream
-                self.valid_channel_indices = [all_ch_names.index(ch) for ch in valid_channel_names]
+                            
+                self.valid_channel_indices = valid_indices
                 self.channel_names = valid_channel_names
 
-                # Optional: apply surface Laplacian
-                if self.config.SURFACE_LAPLACIAN_TOGGLE:
-                    valid_raw = mne.preprocessing.compute_current_source_density(valid_raw)
-
                 # Optional: select only motor-related EEG channels
-                if self.config.SELECT_MOTOR_CHANNELS:
-                    motor_raw = select_motor_channels(valid_raw)
-                    self.motor_indices = [self.channel_names.index(ch) for ch in motor_raw.ch_names]
+                if self.mode == "motor":
+                    motor_raw = select_channels(valid_raw, keep_channels = self.config.MOTOR_CHANNEL_NAMES)
+                    self.subset_indices = [self.channel_names.index(ch) for ch in motor_raw.ch_names]
                     self.channel_names = motor_raw.ch_names
-                    self.final_indices = [self.valid_channel_indices[i] for i in self.motor_indices]
+                    self.final_indices = [self.valid_channel_indices[i] for i in self.subset_indices]
+                elif self.mode == "errp":
+                    errp_raw = select_channels(valid_raw, keep_channels = self.config.ERRP_CHANNEL_NAMES)
+                    self.subset_indices = [self.channel_names.index(ch) for ch in errp_raw.ch_names]
+                    self.channel_names = errp_raw.ch_names
+                    self.final_indices = [self.valid_channel_indices[i] for i in self.subset_indices]
+                
                 else:
                     self.final_indices = self.valid_channel_indices
 
                 self.first_chunk_processed = True
-
             # === Fast real-time slicing using precomputed indices ===
             if self.final_indices is not None:
                 raw_chunk = raw_chunk[self.final_indices]
@@ -112,21 +121,23 @@ class EEGStreamState:
         return window, list(self.timestamps)[-window_size_samples:]
     
     def _get_channel_names(self):
+        """
+        Read raw channel labels from the LSL stream metadata without any renaming.
+        Renaming/normalization should be done in the preprocessing helper only.
+        """
         info = self.inlet.info()
         ch = info.desc().child("channels").child("channel")
         names = []
-        rename_dict = {
-            "FP1": "Fp1", "FPZ": "Fpz", "FP2": "Fp2",
-            "FZ": "Fz", "CZ": "Cz", "PZ": "Pz", "POZ": "POz", "OZ": "Oz"
-        }
+
         while ch.name():
             label_node = ch.child("label").first_child()
             if not label_node:
-                raise RuntimeError("Channel label missing")
-            raw_label = label_node.value()
-            names.append(rename_dict.get(raw_label, raw_label))  # <--- unify here
+                raise RuntimeError("Channel label missing in LSL stream metadata")
+            names.append(label_node.value())  # <-- raw, unmodified label
             ch = ch.next_sibling()
+
         return names
+
 
 
 

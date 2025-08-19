@@ -7,10 +7,10 @@ from scipy.signal import welch
 import config
 from scipy.stats import zscore
 # Custom utility functions
-from Utils.preprocessing import apply_notch_filter, extract_segments, separate_classes, compute_grand_average,concatenate_streams
+from Utils.preprocessing import concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "DELAND"
+subject = "LAB_SUBJ_001"
 session = "S001OFFLINE"
 
 # Construct the EEG directory path dynamically

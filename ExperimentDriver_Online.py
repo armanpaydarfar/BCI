@@ -25,14 +25,6 @@ from collections import deque
 import mne
 mne.set_log_level("WARNING")  # Options: "ERROR", "WARNING", "INFO", "DEBUG"
 # Preprocessing functions (updated for MNE integration)
-from Utils.preprocessing import (
-    select_motor_channels,
-    initialize_filter_bank,
-    apply_streaming_filters,
-    get_valid_channel_mask_and_metadata,
-
-)
-
 # Visualization utilities
 from Utils.visualization import (
     draw_arrow_fill,
@@ -183,17 +175,6 @@ predictions_list = []
 ground_truth_list = []
 
 fs = config.FS
-
-
-filtered_buffer = deque(maxlen=2048)
-filter_state_tracker = initialize_filter_bank(
-    fs=config.FS,
-    lowcut=config.LOWCUT,
-    highcut=config.HIGHCUT,
-    notch_freqs=[60],
-    notch_q=30
-)
-
 
 # (Optional) Commented out rolling normalization
 # logger.log_event("Rolling normalization block currently disabled.")
