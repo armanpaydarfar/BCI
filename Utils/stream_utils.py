@@ -17,15 +17,94 @@ def get_eeg_data(inlet, duration=1.0, sampling_rate=512):
     data, _ = inlet.pull_chunk(timeout=duration + 0.5, max_samples=samples)
     return np.array(data[-samples:])
 
-def load_xdf(file_path):
-    streams, _ = pyxdf.load_xdf(file_path)
-    eeg_stream = next((s for s in streams if s['info']['type'][0] == 'EEG'), None)
-    marker_stream = next((s for s in streams if s['info']['type'][0] == 'Markers'), None)
+def load_xdf(file_path, dejitter=False, sync=False, report=True):
+    streams, _ = pyxdf.load_xdf(
+        file_path,
+        dejitter_timestamps=dejitter,
+        synchronize_clocks=sync
+    )
+
+    eeg_stream = None
+    marker_stream = None
+    for s in streams:
+        typ = s["info"].get("type", [""])[0].lower()
+        if eeg_stream is None and typ == "eeg":
+            eeg_stream = s
+        if marker_stream is None and (typ == "markers" or typ == "marker"):
+            marker_stream = s
 
     if eeg_stream is None or marker_stream is None:
         raise ValueError("Both EEG and Marker streams must be present in the XDF file.")
 
-    print("EEG and Marker streams successfully loaded.")
+    if report:
+        info = eeg_stream["info"]
+        name = info.get("name", [""])[0]
+        src  = info.get("source_id", [""])[0]
+        try:
+            nominal = float(info.get("nominal_srate", ["nan"])[0])
+        except Exception:
+            nominal = float("nan")
+
+        ts = np.asarray(eeg_stream["time_stamps"], dtype=float)
+        dt = np.diff(ts)
+        eff = 1.0 / np.median(dt) if dt.size else float("nan")
+
+        if dt.size:
+            # ---- config knobs ----
+            spike_factor = 2.0          # dt > spike_factor * median => spike
+            tol_ms = 0.001              # on-target tolerance in ms (±0.001 ms)
+            # -----------------------
+
+            info = eeg_stream["info"]
+            try:
+                nominal = float(info.get("nominal_srate", ["nan"])[0])
+            except Exception:
+                nominal = float("nan")
+
+            dt_ms   = dt * 1e3
+            n       = dt_ms.size
+            med_ms  = float(np.median(dt_ms))
+            mean_ms = float(np.mean(dt_ms))
+            std_ms  = float(np.std(dt_ms))
+            q01_ms  = float(np.quantile(dt_ms, 0.01))
+            q25_ms  = float(np.quantile(dt_ms, 0.25))
+            q75_ms  = float(np.quantile(dt_ms, 0.75))
+            q99_ms  = float(np.quantile(dt_ms, 0.99))
+            iqr_ms  = q75_ms - q25_ms
+            min_ms  = float(dt_ms.min())
+            max_ms  = float(dt_ms.max())
+
+            eff_fs_med = 1000.0 / med_ms if med_ms > 0 else float("nan")
+
+            neg      = int(np.sum(dt_ms < 0))
+            neg_pct  = 100.0 * neg / n
+            spikes   = int(np.sum(dt_ms > spike_factor * med_ms))
+            spikes_pct = 100.0 * spikes / n
+
+            if np.isfinite(nominal) and nominal > 0:
+                exp_dt_ms    = 1000.0 / nominal
+                delta_med_ms = med_ms - exp_dt_ms       # how far median dt is from ideal
+                ppm          = 1e6 * (delta_med_ms / exp_dt_ms)
+            else:
+                exp_dt_ms = delta_med_ms = ppm = float("nan")
+
+            correct = int(np.sum(np.abs(dt_ms - exp_dt_ms) <= tol_ms))
+            correct_pct = 100.0 * correct / n
+
+            # Trimmed mean rate (ignore big tails)
+            mask_trim = (dt_ms > 0.5 * exp_dt_ms) & (dt_ms < 1.5 * exp_dt_ms)
+            eff_fs_trim = 1000.0 / float(np.mean(dt_ms[mask_trim])) if np.any(mask_trim) else float("nan")
+
+            name = info.get("name", [""])[0]; src = info.get("source_id", [""])[0]
+            print(f"[EEG] name={name}  source_id={src}  nominal={nominal:.3f} Hz  effective (median)≈{eff_fs_med:.3f} Hz")
+            print(f"[EEG ts stats] n_dt={n} | median={med_ms:.6f} ms | mean={mean_ms:.6f} ms | std={std_ms:.3f} ms | IQR={iqr_ms:.3f} ms")
+            print(f"[EEG ts tails] min/1%/99%/max = [{min_ms:.6f}, {q01_ms:.6f}, {q99_ms:.6f}, {max_ms:.6f}] ms")
+            print(f"[EEG dt quality] on-target(±{tol_ms:.3f} ms) = {correct}/{n} ({correct_pct:.2f}%) | "
+                f"negatives = {neg} ({neg_pct:.2f}%) | spikes(>{spike_factor}×median) = {spikes} ({spikes_pct:.2f}%)")
+            print(f"[EEG vs nominal] expected={exp_dt_ms:.6f} ms | Δmedian={delta_med_ms:.6f} ms ({ppm:.1f} ppm) | mean_trimmed≈{eff_fs_trim:.3f} Hz")
+
+
+
     return eeg_stream, marker_stream
 
 def get_channel_names_from_xdf(eeg_stream):
