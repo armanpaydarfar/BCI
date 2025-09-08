@@ -215,8 +215,8 @@ def log_confusion_matrix_from_trial_summary(logger):
     if total:
         percent_correct_incl_ambiguous = (correct / total) * 100
         percent_correct_excl_ambiguous = (correct / (correct + incorrect)) * 100 if (correct + incorrect) > 0 else 0
-        logger.log_event(f"✅ % Correct (Including ambiguous): {percent_correct_incl_ambiguous:.2f}%")
-        logger.log_event(f"✅ % Correct (Excluding ambiguous): {percent_correct_excl_ambiguous:.2f}%")
+        logger.log_event(f"✅ % Total Accuracy (Including ambiguous): {percent_correct_incl_ambiguous:.2f}%")
+        logger.log_event(f"✅ % Decision Accuracy (Excluding ambiguous): {percent_correct_excl_ambiguous:.2f}%")
         logger.log_event(f"⚠️ Ambiguous trials (not counted in exclusive metric): {ambiguous}")
     else:
         logger.log_event("No trials available to compute statistics.")

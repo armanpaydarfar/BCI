@@ -20,7 +20,7 @@ UDP_FES = {
 # EEG Settings
 CAP_TYPE = 32
 LOWCUT = 8  # Hz
-HIGHCUT = 16  # Hz
+HIGHCUT = 12  # Hz
 LOWCUT_ERRP = 1 #Hz
 HIGHCUT_ERRP = 10 #Hz
 FS = 512  # Sampling frequency (Hz)
@@ -46,7 +46,7 @@ TIMING = True
 SHAPE_MAX = 0.7 #maximum fill 
 SHAPE_MIN = 0.5 #minimum fill 
 ROBOT_TRAJECTORY = ["a"]
-BIG_BROTHER_MODE = True #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
+BIG_BROTHER_MODE = False #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
 
 # Classification Parameters
 CLASSIFY_WINDOW = 1000  # Duration of EEG data window for classification (milliseconds)
@@ -65,7 +65,7 @@ SURFACE_LAPLACIAN_TOGGLE = 0 #apply the surface laplacian spatial filter during 
 SELECT_MOTOR_CHANNELS = 1 # toggle to select motor channels or not (can be used to select other channels too)
 SELECT_ERRP_CHANNELS = 0 #toggle to select ERRP channels
 INTEGRATOR_ALPHA = 0.96 # defines how fast the accumulated probability may change as new data comes in
-SHRINKAGE_PARAM = 0.1 # hyperparameter for shrinkage regularization
+SHRINKAGE_PARAM = 0.02 # hyperparameter for shrinkage regularization
 LEDOITWOLF = 0 #Set to true to use ledoit wolf shrinkage regularization - otherwise pyreimannian will be used w/ shrinkage param shown above
 
 # adaptive Recentering parameters for config
@@ -76,7 +76,7 @@ SAVE_ADAPTIVE_T = False #this toggle saves "Adaptive_T" to the EEG directory dur
 
 
 # FES Parameters
-FES_toggle = 0
+FES_toggle = 1
 FES_CHANNEL = "red"
 FES_TIMING_OFFSET = 4 
 # above for motor FES, cut out X seconds before the full duration of movement. This should represent when the robot will naturally reach the end of motion (in successful case)

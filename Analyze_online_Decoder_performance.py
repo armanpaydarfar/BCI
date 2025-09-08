@@ -6,7 +6,7 @@ import re
 import numpy as np
 
 # ---- Configurable Subject ----
-subject = "CLIN_PILOT_001"
+subject = "LAB_SUBJ_001"
 
 # ---- Prompt User to Select Session Subdirectory ----
 base_dir = os.path.expanduser(f"~/Documents/CurrentStudy/sub-{subject}")
@@ -159,8 +159,8 @@ if conf_matrices:
     accuracy_exclusive = 100.0 * correct / total if total > 0 else 0.0
 
     title = (f"Aggregated Confusion Matrix\n"
-             f"Inclusive Accuracy: {accuracy_inclusive:.2f}% | "
-             f"Exclusive Accuracy: {accuracy_exclusive:.2f}% | "
+             f"Total Accuracy: {accuracy_inclusive:.2f}% | "
+             f"Decision Accuracy: {accuracy_exclusive:.2f}% | "
              f"Ambiguous Trials: {total_ambiguous}")
 
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",

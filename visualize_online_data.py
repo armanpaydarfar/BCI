@@ -7,11 +7,11 @@ from scipy.signal import welch
 import config
 from scipy.stats import zscore
 # Custom utility functions
-from Utils.preprocessing import apply_notch_filter, extract_segments, separate_classes, compute_grand_average,concatenate_streams
+from Utils.preprocessing import concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
 subject = "LAB_SUBJ_001"
-session = "S004ONLINE"
+session = "S007OFFLINE"
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
@@ -156,16 +156,19 @@ print("\n Rechecking Channel Positions After Montage Application:")
 for ch in raw.info["chs"]:
     print(f"{ch['ch_name']}: {ch['loc'][:3]}")
 '''
-highband = 30
+highband = 12
 lowband = 8
 
 time_start = -1
 baseline_period = 1
 time_end = 2
 
+#raw._data /= 1e6
+
+
 # Preprocessing
-raw.notch_filter(60)  # Notch filter at 50Hz
-raw.filter(l_freq=lowband, h_freq=highband, fir_design="firwin")  # Bandpass filter (8-16Hz)
+raw.notch_filter(60)  # Notch filter at 60Hz
+raw.filter(l_freq=lowband, h_freq=highband, method = 'iir')  # Bandpass filter (8-16Hz)
 #print(f" Data Range Before Scaling: min={raw._data.min()}, max={raw._data.max()}")
 
 # Compute Surface Laplacian (CSD)
@@ -247,7 +250,7 @@ for event_code in ["100", "200"]:
 
 # Define your desired range for each class
 start_idx = 0
-end_idx = 20
+end_idx = 60
 
 # Limit number of trials per class by index range
 subset_epochs_list = []

@@ -11,7 +11,7 @@ from Utils.preprocessing import concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
 subject = "LAB_SUBJ_001"
-session = "S001OFFLINE"
+session = "S007OFFLINE"
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
@@ -268,7 +268,7 @@ window_size = 0.5  # Each window covers 500ms
 time_windows = np.linspace(0.1, 5.0 - window_size, num_windows)  # Avoid end clipping
 
 
-
+'''
 # Config
 channel_name = "P4"
 target_marker = 200  # for example, MI trials
@@ -299,7 +299,7 @@ plt.legend()
 plt.tight_layout()
 plt.show()
 
-
+'''
 
 '''
 

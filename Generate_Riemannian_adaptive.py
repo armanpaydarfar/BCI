@@ -25,6 +25,15 @@ from Utils.preprocessing import (
     apply_streaming_filters
 )
 
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    roc_curve,
+    roc_auc_score,
+)
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # Load trigger mappings from config
 TRIGGERS = config.TRIGGERS
@@ -37,10 +46,10 @@ EPOCHS_START_END = {
 
 
 
-
 def plot_posterior_probabilities(posterior_probs):
     """
-    Plots the histogram of posterior probabilities for each class.
+    Plots the histogram of posterior probabilities for each class,
+    with a dotted vertical line at the class mean.
 
     Parameters:
         posterior_probs (dict): Dictionary containing posterior probabilities for each class.
@@ -49,12 +58,24 @@ def plot_posterior_probabilities(posterior_probs):
     bins = np.linspace(0, 1, 20)  # Set bins for histogram
 
     # Convert numerical labels to "Rest" and "MI"
-    label_map = {100: "Rest", 200: "MI"}  # Ensures proper text labels
-    renamed_probs = {label_map[int(label)]: probs for label, probs in posterior_probs.items()}
+    label_map = {100: "Rest", 200: "MI"}
+    renamed_probs = {label_map.get(int(label), str(label)): probs
+                     for label, probs in posterior_probs.items()}
+
+    # Define class colors (feel free to adjust)
+    palette = {"Rest": "skyblue", "MI": "darkorange"}
 
     for label, probs in renamed_probs.items():
         probs = np.array(probs).flatten()
-        sns.histplot(probs, bins=bins, alpha=0.6, label=f"{label} Probability", kde=True)
+        color = palette.get(label, None)
+
+        sns.histplot(probs, bins=bins, alpha=0.6, label=f"{label} Probability",
+                     kde=True, color=color)
+
+        # Add mean line in same color
+        mean_val = np.mean(probs)
+        plt.axvline(mean_val, color=color, linestyle="--", linewidth=1.5,
+                    label=f"{label} Mean = {mean_val:.2f}")
 
     plt.xlabel("Predicted Probability")
     plt.ylabel("Frequency")
@@ -62,7 +83,6 @@ def plot_posterior_probabilities(posterior_probs):
     plt.legend(title="True Class")
     plt.grid(True, linestyle="--", alpha=0.6)
     plt.show()
-
 
 def validate_trial_pairs(marker_values, marker_timestamps, eeg_timestamps, sfreq, EPOCHS_START_END, min_duration=1.0):
     """
@@ -268,79 +288,396 @@ def compute_processed_covariances(segments, labels):
     return cov_matrices
 
 
-def train_riemannian_model(cov_matrices, labels, n_splits=8, shrinkage_param=config.SHRINKAGE_PARAM):
+
+# ---------- plotting helpers -------------------------------------------------
+def _plot_scores_hist_with_thresholds(scores, y_bin, t_low, t_high, bins=30):
+    s0 = scores[y_bin == 0]
+    s1 = scores[y_bin == 1]
+    plt.figure(figsize=(9, 5))
+    plt.hist(s0, bins=bins, alpha=0.6, density=True, label="True REST")
+    plt.hist(s1, bins=bins, alpha=0.6, density=True, label="True MI")
+    plt.axvline(t_low,  color="black", ls="--", lw=1.5, label=f"t_low={t_low:.3f}")
+    plt.axvline(t_high, color="black", ls="--", lw=1.5, label=f"t_high={t_high:.3f}")
+    yl = plt.ylim()
+    plt.fill_betweenx(yl, t_low, t_high, color="gray", alpha=0.12, label="Ambiguous")
+    plt.xlabel("Score (P[MI])"); plt.ylabel("Density")
+    plt.title("Score Distributions with Dual Thresholds")
+    plt.legend(); plt.grid(True, ls=":", alpha=0.6); plt.tight_layout(); plt.show()
+
+
+def _plot_risk_coverage(scores, y_bin, center, widths, c_fp, c_fn, c_reject):
+    cov, acc, cost = [], [], []
+    for w in widths:
+        tl, th = np.clip(center - w / 2, 0, 1), np.clip(center + w / 2, 0, 1)
+        pred = np.full_like(y_bin, -1)
+        pred[scores >= th] = 1
+        pred[scores <= tl] = 0
+        U  = (pred == -1).sum()
+        TP = ((pred == 1) & (y_bin == 1)).sum()
+        TN = ((pred == 0) & (y_bin == 0)).sum()
+        FP = ((pred == 1) & (y_bin == 0)).sum()
+        FN = ((pred == 0) & (y_bin == 1)).sum()
+        decided = TP + TN + FP + FN
+        cov.append(decided / len(y_bin))
+        acc.append((TP + TN) / decided if decided else np.nan)
+        cost.append(c_fp * FP + c_fn * FN + c_reject * U)
+    cov, acc, cost = np.array(cov), np.array(acc), np.array(cost)
+
+    plt.figure(figsize=(9, 4))
+    plt.plot(cov * 100, acc, marker="o")
+    plt.xlabel("Coverage (%)"); plt.ylabel("Decided-only Accuracy")
+    plt.title("Risk–Coverage: Accuracy vs Coverage")
+    plt.grid(True, ls=":", alpha=0.6); plt.tight_layout(); plt.show()
+
+    plt.figure(figsize=(9, 4))
+    plt.plot(cov * 100, cost, marker="o")
+    plt.xlabel("Coverage (%)"); plt.ylabel(f"Cost (c_fp={c_fp}, c_fn={c_fn}, c_reject={c_reject})")
+    plt.title("Risk–Coverage: Cost vs Coverage")
+    plt.grid(True, ls=":", alpha=0.6); plt.tight_layout(); plt.show()
+
+
+def _plot_roc_with_point(scores, y_bin, t_high):
+    fpr, tpr, thr = roc_curve(y_bin, scores)
+    auc = roc_auc_score(y_bin, scores)
+    idx = np.argmin(np.abs(thr - t_high))
+    plt.figure(figsize=(6, 6))
+    plt.plot(fpr, tpr, label=f"ROC (AUC={auc:.3f})")
+    plt.plot([0, 1], [0, 1], ls="--", alpha=0.7, label="Chance")
+    plt.scatter(fpr[idx], tpr[idx], s=60, label=f"operating @ t_high={t_high:.3f}")
+    plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
+    plt.title("ROC (Positive = MI)"); plt.legend()
+    plt.grid(True, ls=":", alpha=0.6); plt.tight_layout(); plt.show()
+
+
+def _plot_confusion_with_reject(true_all, pred_all, rest_label, mi_label):
     """
-    Train an MDM classifier with k-fold cross-validation using Riemannian geometry 
-    and plot posterior probability histograms.
+    Heatmap-like view for confusion-with-reject.
+    Rows: true class (REST, MI)
+    Cols: predicted (REST, AMB, MI)
+    pred_all uses -1 for ambiguous.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
 
-    Parameters:
-        cov_matrices (np.ndarray): Covariance matrices of shape (n_samples, n_channels, n_channels).
-        labels (np.ndarray): Corresponding labels for the segments.
-        n_splits (int): Number of splits for cross-validation.
-        shrinkage_param (float): Regularization strength for Shrinkage.
+    # Ensure ndarray
+    true_all = np.asarray(true_all)
+    pred_all = np.asarray(pred_all)
 
-    Returns:
-        mdm (MDM): Trained MDM model.
+    REST, MI, AMB = rest_label, mi_label, -1
+
+    mat = np.array([
+        np.sum((true_all == REST) & (pred_all == REST)),
+        np.sum((true_all == REST) & (pred_all == AMB)),
+        np.sum((true_all == REST) & (pred_all == MI)),
+        np.sum((true_all == MI)   & (pred_all == REST)),
+        np.sum((true_all == MI)   & (pred_all == AMB)),
+        np.sum((true_all == MI)   & (pred_all == MI)),
+    ], dtype=int).reshape(2, 3)
+
+    plt.figure(figsize=(6.5, 4.8))
+    im = plt.imshow(mat, cmap="Blues")
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.xticks([0, 1, 2], ["REST", "AMB", "MI"])
+    plt.yticks([0, 1], ["REST (true)", "MI (true)"])
+
+    # annotate counts
+    for i in range(2):
+        for j in range(3):
+            plt.text(j, i, str(mat[i, j]), ha="center", va="center", fontsize=11)
+
+    plt.title("Confusion with Reject (counts)")
+    plt.tight_layout()
+    plt.show()
+
+
+def pick_dual_thresholds_target_ambiguity(
+    y_true_bin, pos_scores,
+    target_ambig=0.20,
+    c_fp=1.0, c_fn=1.0,               # tie-break costs among feasible pairs
+    n_grid=401, min_gap=0.0,
+    # --- optional performance constraints on the decided subset ---
+    tpr_min=None,                     # e.g., 0.85  (MI recall ≥ 85%)
+    fpr_max=None,                     # e.g., 0.05  (false MI rate ≤ 5%)
+    ppv_min=None,                     # e.g., 0.80  (MI precision ≥ 80%)
+    npv_min=None,                     # e.g., 0.90  (REST precision ≥ 90%)
+    # --- optional "make it look sane" constraint ---
+    require_center_around_half=False  # if True, force t_low <= 0.5 <= t_high
+):
+    """
+    Choose (t_low, t_high) on P(MI) so that ambiguous fraction U/N ≲ target_ambig,
+    constraints on decided-only metrics are satisfied, and among feasible pairs
+    we minimize (c_fp*FP + c_fn*FN). If infeasible, return the nearest-violation pair.
+    """
+    y = np.asarray(y_true_bin, dtype=int).ravel()
+    s = np.asarray(pos_scores, dtype=float).ravel()
+    N = len(y)
+    grid = np.linspace(0.0, 1.0, n_grid)
+
+    best_feas = None    # (cost, Urate, tpr, fpr, ppv, npv, tl, th)
+    best_violation = None  # (total_slack, Urate_gap, cost, tl, th, tpr, fpr, ppv, npv)
+
+    for tl in grid:
+        for th in grid:
+            if th < max(tl, tl + min_gap):
+                continue
+            if require_center_around_half and not (tl <= 0.5 <= th):
+                continue
+
+            # classify with reject
+            pred = np.full_like(y, -1)
+            pred[s >= th] = 1
+            pred[s <= tl] = 0
+
+            U = np.sum(pred == -1)
+            Urate = U / N
+
+            # decided subset
+            decided = (pred != -1)
+            if not decided.any():
+                continue
+            yd, pd = y[decided], pred[decided]
+
+            TP = np.sum((pd == 1) & (yd == 1))
+            TN = np.sum((pd == 0) & (yd == 0))
+            FP = np.sum((pd == 1) & (yd == 0))
+            FN = np.sum((pd == 0) & (yd == 1))
+
+            tpr = TP / (TP + FN) if (TP + FN) else 0.0
+            fpr = FP / (FP + TN) if (FP + TN) else 0.0
+            ppv = TP / (TP + FP) if (TP + FP) else 0.0
+            npv = TN / (TN + FN) if (TN + FN) else 0.0
+
+            # constraint slacks (0 if satisfied, >0 if violated)
+            slack_tpr = max(0.0, (tpr_min - tpr)) if tpr_min is not None else 0.0
+            slack_fpr = max(0.0, (fpr - fpr_max)) if fpr_max is not None else 0.0
+            slack_ppv = max(0.0, (ppv_min - ppv)) if ppv_min is not None else 0.0
+            slack_npv = max(0.0, (npv_min - npv)) if npv_min is not None else 0.0
+            total_slack = slack_tpr + slack_fpr + slack_ppv + slack_npv
+
+            cost = c_fp * FP + c_fn * FN
+
+            # Feasible if ambiguity and all constraints satisfied
+            if (Urate <= target_ambig) and (total_slack == 0.0):
+                if (best_feas is None or
+                    cost < best_feas[0] or
+                    (cost == best_feas[0] and Urate < best_feas[1])):
+                    best_feas = (cost, Urate, tpr, fpr, ppv, npv, tl, th)
+            else:
+                # Keep closest infeasible pair (smallest total_slack),
+                # tie-break by |Urate - target_ambig|, then by cost
+                Urate_gap = abs(Urate - target_ambig)
+                cand = (total_slack, Urate_gap, cost, tl, th, tpr, fpr, ppv, npv)
+                if (best_violation is None or
+                    cand < best_violation):
+                    best_violation = cand
+
+    if best_feas is not None:
+        cost, Urate, tpr, fpr, ppv, npv, tl, th = best_feas
+        info = dict(feasible=True, Urate=Urate, tpr=tpr, fpr=fpr, ppv=ppv, npv=npv, cost=cost)
+        return tl, th, info
+    else:
+        # return the least-violating pair and tell the caller what it achieved
+        total_slack, Urate_gap, cost, tl, th, tpr, fpr, ppv, npv = best_violation
+        info = dict(feasible=False, Urate=None, tpr=tpr, fpr=fpr, ppv=ppv, npv=npv,
+                    cost=cost, total_slack=total_slack)
+        return tl, th, info
+
+
+# ---------- threshold learner (unchanged) ------------------------------------
+def _dual_thresholds(y_true_bin, scores, c_fp=1.0, c_fn=1.0, c_reject=0.3,
+                     n_grid=201, min_gap=0.0):
+    grid = np.linspace(0, 1, n_grid)
+    best = (np.inf, 0.5, 0.5)  # cost, tl, th
+    for tl in grid:
+        for th in grid:
+            if th < max(tl, tl + min_gap):
+                continue
+            pred = np.full_like(y_true_bin, -1)
+            pred[scores >= th] = 1
+            pred[scores <= tl] = 0
+            U  = (pred == -1).sum()
+            FP = ((pred == 1) & (y_true_bin == 0)).sum()
+            FN = ((pred == 0) & (y_true_bin == 1)).sum()
+            cost = c_fp * FP + c_fn * FN + c_reject * U
+            if cost < best[0]:
+                best = (cost, tl, th)
+    return best[1], best[2]
+
+
+# ---------- main training function -------------------------------------------
+def train_riemannian_model(
+    cov_matrices,
+    labels,
+    n_splits=8,
+    use_dual_thresholds=True,
+    c_fp=1.0, c_fn=1.0, c_reject=0.3,
+    n_grid=201,
+    min_gap=0.0,
+    target_ambig=0.3,          # keep ~20% ambiguity by default
+    # --- NEW constraint knobs (decided-only metrics) ---
+    tpr_min=None,              # e.g., 0.85 for MI recall >= 85%
+    fpr_max=None,              # e.g., 0.10 for false MI rate <= 10%
+    ppv_min=None,              # e.g., 0.80 for MI precision >= 80%
+    npv_min=None,              # e.g., 0.90 for REST precision >= 90%
+    require_center_around_half=False,  # force t_low <= 0.5 <= t_high (optional aesthetics)
+):
+    """
+    Trains MDM with k-fold CV, learns dual thresholds to mirror online driver,
+    prints aggregated report, and generates diagnostic plots.
     """
 
     print("\n🚀 Starting K-Fold Cross Validation with Riemannian MDM...\n")
 
+    # Informational note: when target_ambig is set, c_reject is ignored during selection
+    if target_ambig is not None and (c_reject not in (None, 0.0)):
+        print("[Note] target_ambig is set; c_reject is ignored for threshold SELECTION "
+              "(still used only in the reported overall cost below).")
 
-    
-    # Compute the reference matrix (Riemannian mean)
-    '''
-    reference_matrix = mean_riemann(cov_matrices, maxiter=1000)
+    classes = np.sort(np.unique(labels))
+    if len(classes) != 2:
+        raise ValueError("Function expects binary classes.")
+    rest_label, mi_label = classes[0], classes[1]
 
-    # Center covariance matrices
-    
-    cov_matrices = np.array([np.linalg.inv(reference_matrix) @ cov @ np.linalg.inv(reference_matrix)
-                              for cov in cov_matrices])
-    
-    '''
-
-    #cov_matrices = center_cov_matrices_riemannian(cov_matrices)
-    #cov_matrices = center_cov_matrices(cov_matrices, reference_matrix)
-    # Apply Shrinkage-based regularization
-
-    # Initialize cross-validation
-    kf = KFold(n_splits=n_splits, shuffle=True)
+    kf  = KFold(n_splits=n_splits, shuffle=True, random_state=42)
     mdm = MDM()
-    accuracies = []
-    posterior_probs = {label: [] for label in np.unique(labels)}  # Store probabilities per class
 
-    for fold_idx, (train_index, test_index) in enumerate(kf.split(cov_matrices), start=1):
-        X_train, X_test = cov_matrices[train_index], cov_matrices[test_index]
-        Y_train, Y_test = labels[train_index], labels[test_index]
+    # Aggregation containers
+    acc_argmax    = []
+    t_lows, t_highs = [], []
+    all_true, all_pred, all_scores, all_true_bin = [], [], [], []
+    posterior_probs = {lbl: [] for lbl in classes}
 
-        # Train and evaluate model
-        mdm.fit(X_train, Y_train)
-        Y_pred = mdm.predict(X_test)
-        Y_predProb = mdm.predict_proba(X_test)  # Get class probabilities
+    for fold_idx, (tr, te) in enumerate(kf.split(cov_matrices), 1):
+        X_tr, X_te = cov_matrices[tr], cov_matrices[te]
+        y_tr, y_te = labels[tr], labels[te]
 
-        accuracy = accuracy_score(Y_test, Y_pred)
-        accuracies.append(accuracy)
-        print(f"\n ✅ Fold {fold_idx} Accuracy: {accuracy:.4f}")
+        mdm.fit(X_tr, y_tr)
+        prob_tr = mdm.predict_proba(X_tr)
+        prob_te = mdm.predict_proba(X_te)
+        pos_idx = np.where(mdm.classes_ == mi_label)[0][0]
+        scr_tr  = prob_tr[:, pos_idx]
+        scr_te  = prob_te[:, pos_idx]
 
-        # Store probabilities per class
-        for idx, true_label in enumerate(Y_test):
-            class_idx = np.where(mdm.classes_ == true_label)[0][0]
-            posterior_probs[true_label].append(Y_predProb[idx, class_idx])
+        # baseline argmax accuracy
+        y_pred_argmax = mdm.predict(X_te)
+        acc = accuracy_score(y_te, y_pred_argmax)
+        acc_argmax.append(acc)
+        print(f"✅ Fold {fold_idx} Argmax Accuracy: {acc:.4f}")
 
-    # Convert probability lists to numpy arrays
-    for label in posterior_probs:
-        posterior_probs[label] = np.array(posterior_probs[label])
+        # dual thresholds on TRAIN split
+        if use_dual_thresholds:
+            y_tr_bin = (y_tr == mi_label).astype(int)
+            if target_ambig is not None:
+                # --- NEW: pass constraint knobs into the ambiguity-target picker
+                tl, th, diag = pick_dual_thresholds_target_ambiguity(
+                    y_true_bin=y_tr_bin,
+                    pos_scores=scr_tr,
+                    target_ambig=target_ambig,
+                    c_fp=c_fp, c_fn=c_fn,
+                    n_grid=n_grid, min_gap=min_gap,
+                    tpr_min=tpr_min, fpr_max=fpr_max,
+                    ppv_min=ppv_min, npv_min=npv_min,
+                    require_center_around_half=require_center_around_half
+                )
+                print(f"   ↳ thresholds@ambig={target_ambig:.2f}: "
+                      f"t_low={tl:.3f}, t_high={th:.3f}, feasible={diag.get('feasible', False)}, "
+                      f"train_TPR={diag.get('tpr', float('nan')):.3f}, "
+                      f"train_FPR={diag.get('fpr', float('nan')):.3f}, "
+                      f"train_PPV={diag.get('ppv', float('nan')):.3f}, "
+                      f"train_NPV={diag.get('npv', float('nan')):.3f}")
+            else:
+                # cost-based picker (uses c_reject)
+                tl, th = _dual_thresholds(y_tr_bin, scr_tr, c_fp, c_fn, c_reject,
+                                          n_grid, min_gap)
+        else:
+            tl = th = 0.5
 
-    # Plot probability histograms
+        t_lows.append(tl); t_highs.append(th)
+
+        # apply thresholds to TEST
+        pred = np.full_like(y_te, -1)
+        pred[scr_te >= th] = mi_label
+        pred[scr_te <= tl] = rest_label
+
+        # aggregate
+        all_true.extend(y_te); all_pred.extend(pred)
+        all_scores.extend(scr_te)
+        all_true_bin.extend((y_te == mi_label).astype(int))
+
+        # posterior for histogram
+        for idx, true_lbl in enumerate(y_te):
+            posterior_probs[true_lbl].append(
+                prob_te[idx, np.where(mdm.classes_ == true_lbl)[0][0]]
+            )
+
+    # ---------- aggregated report ----------
+    all_true     = np.asarray(all_true)
+    all_pred     = np.asarray(all_pred)
+    all_scores   = np.asarray(all_scores)
+    all_true_bin = np.asarray(all_true_bin)
+
+    decided = all_pred != -1
+    cm_decided = confusion_matrix(all_true[decided], all_pred[decided],
+                                  labels=[rest_label, mi_label])
+    TN, FP, FN, TP = cm_decided.ravel()
+    U  = (all_pred == -1).sum()
+    coverage = decided.mean()
+    decided_acc = (TP + TN) / (TP + TN + FP + FN) if decided.any() else np.nan
+    cost = c_fp * FP + c_fn * FN + c_reject * U
+
+    # (Optional) decided-only diagnostic metrics
+    TPR = TP / (TP + FN) if (TP + FN) else np.nan   # MI recall
+    FPR = FP / (FP + TN) if (FP + TN) else np.nan   # false MI rate
+    PPV = TP / (TP + FP) if (TP + FP) else np.nan   # MI precision
+    NPV = TN / (TN + FN) if (TN + FN) else np.nan   # REST precision
+
+    tl_star, th_star = float(np.median(t_lows)), float(np.median(t_highs))
+
+    print("\n====== Aggregated Report ======")
+    print(f"Argmax Accuracy (mean): {np.mean(acc_argmax):.4f}")
+    print(f"Learned thresholds (medians): t_low*={tl_star:.3f}, t_high*={th_star:.3f}")
+    print(f"Coverage (decided %): {coverage*100:.2f}% (Ambiguity {(1.0-coverage)*100:.2f}%)")
+    print(f"Decided-only Accuracy: {decided_acc:.4f}")
+    print(f"Decided-only: TPR(MI)={TPR:.3f}, FPR(MI)={FPR:.3f}, PPV(MI)={PPV:.3f}, NPV(REST)={NPV:.3f}")
+    print(f"Overall Cost (c_fp={c_fp}, c_fn={c_fn}, c_reject={c_reject}): {cost:.1f}")
+
+    print("\nConfusion (decided-only; rows=true [REST, MI], cols=pred [REST, MI]):")
+    print(cm_decided)
+
+    print("\nAmbiguous counts by true class:")
+    print(f"U_rest={(all_pred == -1)[all_true == rest_label].sum()}, "
+          f"U_mi={(all_pred == -1)[all_true == mi_label].sum()}, "
+          f"Total U={U}")
+
+    # Mode B thresholds for your online config
+    THRESHOLD_REST = 1.0 - tl_star  # compare to P(REST)
+    THRESHOLD_MI   = th_star        # compare to P(MI)
+    print("\nMode B thresholds for config:")
+    print(f"  THRESHOLD_REST (use with P(REST) ≥ ...): {THRESHOLD_REST:.3f}")
+    print(f"  THRESHOLD_MI   (use with P(MI)   ≥ ...): {THRESHOLD_MI:.3f}")
+
+    # ---------- plots ----------
+    _plot_scores_hist_with_thresholds(all_scores, all_true_bin, tl_star, th_star)
+
+    center = (tl_star + th_star) / 2.0
+    widths = np.linspace(0.0, 0.9, 35)
+    _plot_risk_coverage(all_scores, all_true_bin, center, widths, c_fp, c_fn, c_reject)
+
+    _plot_roc_with_point(all_scores, all_true_bin, th_star)
+
+    _plot_confusion_with_reject(all_true, all_pred, rest_label, mi_label)
+
+    # posterior histograms (your original helper)
+    for lbl in posterior_probs:
+        posterior_probs[lbl] = np.array(posterior_probs[lbl])
     plot_posterior_probabilities(posterior_probs)
 
-    # Print overall accuracy
-    avg_accuracy = np.mean(accuracies)
-    print(f"\n🚀 **Final Average Accuracy:** {avg_accuracy:.4f}")
-
-    # Retrain the model on all data
+    # ---------- fit final model (unchanged) ----------
     mdm.fit(cov_matrices, labels)
-
     return mdm
+
+
+
 
 def main():
     """
