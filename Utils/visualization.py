@@ -148,6 +148,43 @@ def draw_fixation_cross(screen_width, screen_height):
                      line_thickness)
 
 
+
+def draw_progress_bar(progress, screen_width, screen_height, color=config.green, height_ratio=0.05):
+    """
+    Draws a horizontal progress bar at the bottom of the screen.
+
+    Args:
+        progress (float): Value between 0.0 and 1.0 representing completion.
+        screen_width (int): Width of the display.
+        screen_height (int): Height of the display.
+        color (tuple): RGB color of the fill.
+        height_ratio (float): Bar height as a fraction of screen height.
+    """
+    progress = max(0.0, min(1.0, progress))  # clamp
+
+    # Bar geometry
+    bar_width = int(screen_width * 0.6)
+    bar_height = int(screen_height * height_ratio)
+    bar_x = (screen_width - bar_width) // 2
+    bar_y = int(screen_height * 0.8)  # 80% down the screen
+
+    # Border
+    pygame.draw.rect(
+        pygame.display.get_surface(), config.white,
+        (bar_x, bar_y, bar_width, bar_height), width=2
+    )
+
+    # Fill
+    fill_width = int(bar_width * progress)
+    if fill_width > 0:
+        pygame.draw.rect(
+            pygame.display.get_surface(), color,
+            (bar_x + 2, bar_y + 2, max(0, fill_width - 4), bar_height - 4)
+        )
+
+
+
+
 '''
 def draw_arrow_fill(progress, screen_width, screen_height):
     arrow_width, arrow_length, tip_length = 80, 200, 40

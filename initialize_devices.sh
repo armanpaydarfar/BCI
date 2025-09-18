@@ -50,10 +50,18 @@ if [[ "$harmony_initialized" == "n" ]]; then
 
   sleep 60
   echo "Starting harmony process..."
-  open_terminal "sshpass -p 'Harmonic-03' ssh -tt root@192.168.2.1 'cd /opt/hbi/dev/bin/tools && ./bmi_exercise && exec bash'"
+  experiment_type=$(python3 -c "import config; print(config.EXPERIMENT_TYPE)")
+  if [[ "$experiment_type" == "BIMANUAL" ]]; then
+    robot_binary="MI_Bimanual"
+  else
+    robot_binary="bmi_exercise"
+  fi
+
+  open_terminal "sshpass -p 'Harmonic-03' ssh -tt root@192.168.2.1 'cd /opt/hbi/dev/bin/tools && ./\"${robot_binary}\" && exec bash'"
 else
   echo "Skipping Harmony initialization as it is already running."
 fi
+
 
 # Step 6: Conditionally run STMsetup.py
 fes_toggle=$(check_fes_toggle)
