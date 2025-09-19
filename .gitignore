@@ -39,3 +39,19 @@ ENV/
 
 # macOS metadata
 .DS_Store
+
+# === Harmony-specific ===
+# Raw EEG/experiment recordings
+*.xdf
+*.bdf
+*.edf
+
+# Large logs and temp output
+logs/
+*.log
+*.npy
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.pdf

@@ -10,8 +10,8 @@ from scipy.stats import zscore
 from Utils.preprocessing import concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "LAB_SUBJ_001"
-session = "S007OFFLINE"
+subject = "LAB_SUBJ_003"
+session = "S001ONLINE"
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
@@ -227,7 +227,7 @@ events = np.column_stack((
 # ---- Step 3: Create Epochs ----
 epochs = mne.Epochs(
     raw, events, event_id=event_dict, tmin=time_start, tmax=time_end,
-    baseline=None, detrend=1, preload=True
+    baseline=(-1,0), detrend=1, preload=True
 )
 
 '''

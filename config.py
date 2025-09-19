@@ -46,15 +46,15 @@ TIMING = True
 SHAPE_MAX = 0.7 #maximum fill 
 SHAPE_MIN = 0.5 #minimum fill 
 ROBOT_TRAJECTORY = ["a"]
-BIG_BROTHER_MODE = False #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
+BIG_BROTHER_MODE = True #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
 
 # Classification Parameters
 CLASSIFY_WINDOW = 1000  # Duration of EEG data window for classification (milliseconds)
 FILTER_BUFFER_SIZE = 2048 #4s at 512 Hz
 BASELINE_DURATION = 1 #seconds
 ACCURACY_THRESHOLD = 0.6  # OBS Accuracy threshold to determine "Correct" (plan to obsolete)
-THRESHOLD_MI = 0.6 #Threshold for MI "correct"
-THRESHOLD_REST = 0.6 #Threshold for REST "Correct"
+THRESHOLD_MI = 0.60 #Threshold for MI "correct"
+THRESHOLD_REST = 0.60 #Threshold for REST "Correct"
 RELAXATION_RATIO = 0.4
 MIN_PREDICTIONS = 8 # Min number of predictions during Online experiment before the decoder can end early
 STEP_SIZE = 1/16
@@ -96,7 +96,7 @@ DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
 MODEL_PATH = "/home/arman-admin/Projects/Harmony/Reiman_eeg_model.pkl"
 DATA_FILE_PATH = "/home/arman-admin/Documents/CurrentStudy/sub-PILOT007/ses-S001/eeg/sub-PILOT007_ses-S001_task-Default_run-001OFFLINE_eeg.xdf"
 
-TRAINING_SUBJECT = "PILOT007"
+TRAINING_SUBJECT = "LAB_SUBJ_003"
 
 
 #TRAINING_SESSION = "001OFFLINE"
