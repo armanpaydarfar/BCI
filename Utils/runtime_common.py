@@ -523,18 +523,45 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
         screen.blit(message, (screen_width // 2 - message.get_width() // 2, screen_height // 2 + 300))
         pygame.display.flip()
         clock.tick(60)
-        if len(predictions) >= min_predictions and running_avg_confidence >= accuracy_threshold:
-            logger.log_event(f"Early stopping triggered! Confidence: {running_avg_confidence:.2f}")
+        # --- Early-stop logic (supports correct-only or either-threshold) ---
+        hit_correct   = (len(predictions) >= min_predictions) and (running_avg_confidence >= accuracy_threshold)
+        hit_incorrect = (len(predictions) >= min_predictions) and (running_avg_confidence <= (1 - opposed_threshold))
+
+        should_earlystop = hit_correct or (config.EARLYSTOP_MODE == "either" and hit_incorrect)
+        if should_earlystop:
             earlystop_flag = True
-            if mode == 0:
-                if FES_toggle == 1:
-                    send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP", logger=logger)
-                else:
-                    logger.log_event("FES is disabled.")
-                send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_EARLYSTOP"], logger=logger)
+
+            # Figure out which class triggered the stop (for logging/triggers)
+            if hit_correct:
+                stop_reason = "correct"
+                trigger_key = "MI_EARLYSTOP" if mode == 0 else "REST_EARLYSTOP"
             else:
-                send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["REST_EARLYSTOP"], logger=logger)
+                stop_reason = "incorrect"
+                trigger_key = "REST_EARLYSTOP" if mode == 0 else "MI_EARLYSTOP"
+
+            logger.log_event(
+                f"Early stopping triggered ({stop_reason}). "
+                f"Confidence={running_avg_confidence:.2f}, "
+                f"min_preds={min_predictions}, "
+                f"mode={'MI' if mode==0 else 'REST'}"
+            )
+
+            # Stop FES if active
+            if FES_toggle == 1:
+                send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP", logger=logger)
+            else:
+                logger.log_event("FES is disabled.")
+
+            # Emit the appropriate EARLYSTOP trigger
+            send_udp_message(
+                udp_socket_marker,
+                config.UDP_MARKER["IP"],
+                config.UDP_MARKER["PORT"],
+                config.TRIGGERS[trigger_key],
+                logger=logger
+            )
             break
+
     
     pygame.display.flip()
     pygame.time.delay(300)  # ~300 ms delay to allow the visual feedback to complete rendering
@@ -562,4 +589,6 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
     else:
         logger.log_event("FES disable not needed.")
 
+
+    send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_END" if mode==0 else "REST_END"], logger=logger)
     return final_class, running_avg_confidence, leaky_integrator, all_probabilities, earlystop_flag

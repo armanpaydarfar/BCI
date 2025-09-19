@@ -39,6 +39,10 @@ SHAPE_MIN = 0.5 #minimum fill
 ROBOT_TRAJECTORY = ["a"]
 BIG_BROTHER_MODE = True #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
 
+# Early-stop policy: "correct_only" (current behavior) or "either"
+EARLYSTOP_MODE = "correct_only"
+
+
 
 # Classification Parameters
 CLASSIFY_WINDOW = 1000  # Duration of EEG data window for classification (milliseconds)
