@@ -54,7 +54,7 @@ if [[ "$harmony_initialized" == "n" ]]; then
   if [[ "$experiment_type" == "BIMANUAL" ]]; then
     robot_binary="MI_Bimanual"
   else
-    robot_binary="bmi_exercise"
+    robot_binary="Gaze_Tracking"
   fi
 
   open_terminal "sshpass -p 'Harmonic-03' ssh -tt root@192.168.2.1 'cd /opt/hbi/dev/bin/tools && ./\"${robot_binary}\" && exec bash'"

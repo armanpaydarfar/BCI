@@ -10,8 +10,8 @@ from scipy.stats import zscore
 from Utils.preprocessing import concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "LAB_SUBJ_001"
-session = "S007OFFLINE"
+subject = "CLIN_SUBJ_002"
+session = "S004ONLINE"
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
@@ -163,7 +163,7 @@ time_start = -1
 baseline_period = 1
 time_end = 2
 
-#raw._data /= 1e6
+raw._data /= 1e6
 
 
 # Preprocessing
@@ -189,29 +189,51 @@ min_trial_duration = 1.5  # in seconds
 voltage_threshold = 20.0  # in microvolts
 
 # ---- Step 1: Match Start-End Markers and Prune by Duration ----
+min_trial_duration = 1.5           # keep your current minimum
+max_trial_duration = 2.5          # <5.00s => drop "timeouts"
+EPS = 0.02                         # tolerance for float rounding
+
+# Optional: per-class overrides (uncomment to use)
+# per_class_max = {100: 4.99, 200: 4.99}  # e.g., same cap for REST(100) and MI(200)
+
 valid_start_indices = []
+durations_all = []                 # (optional) collect durations for QA / plotting
 
 for idx, code in enumerate(marker_data):
-    if code in [100, 200]:  # MI or REST
+    if code in [100, 200]:  # MI or REST starts
         t_start = marker_timestamps[idx]
 
-        # Search for matching end marker (e.g., 120 for 100, 220 for 200)
-        end_code = code + 20
+        end_code = code + 20        # 120 for 100, 220 for 200
         end_time = None
         for j in range(idx + 1, len(marker_data)):
             if marker_data[j] == end_code:
                 end_time = marker_timestamps[j]
                 break
 
-        if end_time:
-            duration = end_time - t_start
-            print(f"Start: {t_start:.2f}s → End: {end_time:.2f}s | Duration: {duration:.2f}s")
-            if duration >= min_trial_duration:
-                valid_start_indices.append(idx)
-            else:
-                print(f"⚠️ Skipped: Duration {duration:.2f}s too short.")
-        else:
+        if not end_time:
             print(f"⚠️ Skipped: No end marker found for start at {t_start:.2f}s")
+            continue
+
+        duration = end_time - t_start
+        durations_all.append((idx, code, duration))
+        print(f"Start: {t_start:.2f}s → End: {end_time:.2f}s | Duration: {duration:.2f}s")
+
+        # Determine cap to use (per-class if provided, else global)
+        cap = max_trial_duration  # default
+        # if 'per_class_max' in locals() and code in per_class_max:
+        #     cap = per_class_max[code]
+
+        # Keep trials within [min, cap], dropping "timeouts" ~5s
+        if (duration + EPS) >= min_trial_duration and (duration - EPS) <= cap:
+            valid_start_indices.append(idx)
+        else:
+            reason = []
+            if (duration + EPS) < min_trial_duration:
+                reason.append(f"too short (<{min_trial_duration}s)")
+            if (duration - EPS) > cap:
+                reason.append(f"timeout/too long (>{cap}s)")
+            print(f"⚠️ Skipped: Duration {duration:.2f}s ({', '.join(reason)})")
+
 # ---- Step 2: Build Events Array ----
 marker_data_valid = [marker_data[i] for i in valid_start_indices]
 marker_timestamps_valid = [marker_timestamps[i] for i in valid_start_indices]
@@ -250,7 +272,7 @@ for event_code in ["100", "200"]:
 
 # Define your desired range for each class
 start_idx = 0
-end_idx = 60
+end_idx = 43
 
 # Limit number of trials per class by index range
 subset_epochs_list = []

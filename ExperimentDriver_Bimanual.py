@@ -22,7 +22,6 @@ from Utils.visualization import (
 # Experiment utilities
 from Utils.experiment_utils import (
     generate_trial_sequence,
-    display_multiple_messages_with_udp,
     save_transform,
     load_transform
 )
@@ -31,7 +30,7 @@ from Utils.experiment_utils import (
 from Utils.EEGStreamState import EEGStreamState
 
 # Networking utilities
-from Utils.networking import send_udp_message
+from Utils.networking import send_udp_message,display_multiple_messages_with_udp
 
 # Stream utilities (LSL channel names)
 from Utils.stream_utils import get_channel_names_from_lsl
@@ -211,13 +210,16 @@ def perform_master_positioning(
     send_udp_message(
         udp_socket_robot,
         config.UDP_ROBOT["IP"], config.UDP_ROBOT["PORT"],
-        config.ROBOT_OPCODES["MASTER_UNLOCK"],   # from config dict
-        logger=logger
+        config.ROBOT_OPCODES["MASTER_UNLOCK"],
+        logger=logger,
+        expect_ack=True,           # <— wait & log ACK:c
+        max_retries=1
     )
+
     send_udp_message(
         udp_socket_marker,
         config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"],
-        config.TRIGGERS["MASTER_UNLOCK"],        # from config dict
+        config.TRIGGERS["MASTER_UNLOCK"],
         logger=logger
     )
     logger.log_event(f"{master_arm} arm UNLOCKED — user may position arm.")
@@ -251,15 +253,19 @@ def perform_master_positioning(
     send_udp_message(
         udp_socket_robot,
         config.UDP_ROBOT["IP"], config.UDP_ROBOT["PORT"],
-        config.ROBOT_OPCODES["MASTER_LOCK"],     # from config dict
-        logger=logger
+        config.ROBOT_OPCODES["MASTER_LOCK"],
+        logger=logger,
+        expect_ack=True,           # <— wait & log ACK:c
+        max_retries=1
     )
+
     send_udp_message(
         udp_socket_marker,
         config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"],
-        config.TRIGGERS["MASTER_LOCK"],          # from config dict
+        config.TRIGGERS["MASTER_LOCK"],
         logger=logger
     )
+
     logger.log_event(f"{master_arm} arm LOCKED in position.")
 
     # --- 4. Short fixation cross before MI starts ---
@@ -528,7 +534,7 @@ def main():
                 messages=messages, 
                 colors=colors, 
                 offsets=offsets, 
-                duration=config.TIME_ROB - 6,  # Monitor for 7s out of total 13s movement
+                duration=config.TIME_ROB,  # Monitor for 7s out of total 13s movement
                 mode=0,  # Motor Imagery
                 udp_socket=udp_socket_robot, 
                 udp_ip=config.UDP_ROBOT["IP"], 
@@ -548,27 +554,23 @@ def main():
                 phase="ROBOT"
             )
             # --- Robot HOME + reset for MI trials ---
+            display_fixation_period(duration=1, eeg_state=eeg_state)
             # Send HOME opcode to robot
-            logger.log_event("Robot fixation period 3s before homing.")
-            display_fixation_period(duration=3, eeg_state=eeg_state)
-            send_udp_message(
+            acked, _ = send_udp_message(
                 udp_socket_robot,
-                config.UDP_ROBOT["IP"], config.UDP_ROBOT["PORT"],
-                config.ROBOT_OPCODES["HOME"],
-                logger=logger
+                config.UDP_ROBOT["IP"],
+                config.UDP_ROBOT["PORT"],
+                config.ROBOT_OPCODES["HOME"],   # this is 'h'
+                logger=logger,
+                expect_ack=True,                # <--- wait for ACK
+                ack_timeout=1.0,                # optional, default 0.5s
+                max_retries=1                   # optional, resend once if timeout
             )
-            logger.log_event("Sent HOME opcode to robot at end of MI trial.")
 
-            # (Optional but recommended) mark robot phase end for alignment
-            send_udp_message(
-                udp_socket_marker,
-                config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"],
-                config.TRIGGERS["ROBOT_END"],
-                logger=logger
-            )
+            logger.log_event("Sent HOME opcode to robot at end of MI trial.")
             # Run the same 3s reset fixation
-            display_fixation_period(duration=3, eeg_state=eeg_state)
-            logger.log_event("Robot reset fixation (3s) complete.")
+            display_fixation_period(duration=4, eeg_state=eeg_state)
+            logger.log_event("Robot reset fixation (4s) complete.")
 
 
         logger.log_trial_summary(

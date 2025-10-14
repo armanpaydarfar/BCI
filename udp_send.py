@@ -1,8 +1,8 @@
 import socket
 import config
 # Server address and port (update as needed)
-server_address = config.UDP_ROBOT["IP"]  # Change to the IP of the FES script's machine
-server_port = config.UDP_ROBOT["PORT"]            # Match the port used in the FES script
+server_address = config.UDP_MARKER["IP"]  # Change to the IP of the FES script's machine
+server_port = config.UDP_MARKER["PORT"]            # Match the port used in the FES script
 server_address_port = (server_address, server_port)
 
 buffer_size = 1024

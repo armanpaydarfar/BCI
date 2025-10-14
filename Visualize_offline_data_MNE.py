@@ -11,7 +11,7 @@ from Utils.preprocessing import concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
 subject = "LAB_SUBJ_001"
-session = "S007OFFLINE"
+session = "S0010ONLINE_A"
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
@@ -236,7 +236,7 @@ marker_labels = {
 }
 # Create Epochs with rejection
 epochs = mne.Epochs(
-    raw, events, event_id=event_dict, tmin=time_start, tmax=time_end, baseline = None, detrend=1, preload=True
+    raw, events, event_id=event_dict, tmin=time_start, tmax=time_end, baseline = None, detrend=1, preload=True, event_repeated = 'merge'
 )
 
 
@@ -420,7 +420,7 @@ plt.show()
 
 # Define Time Windows for ERD/ERS
 baseline = (time_start, time_start+baseline_period)  # Pre-event window
-window_size = 0.5  # Window duration in seconds
+window_size = 1  # Window duration in seconds
 time_windows = np.arange(0, 5, window_size)  # Start times
 
 # Compute ERD/ERS Using MNE's Updated API
@@ -455,7 +455,7 @@ print(f"Dynamic ERD/ERS Color Scale: vmin={vmin:.2f}, vmax={vmax:.2f}")
 
 # Plot ERD/ERS Topographic Maps Using `tmin` and `tmax`
 figures = {}
-skip_factor = 2  # Plot every 2nd time window
+skip_factor = 1  # Plot every 2nd time window
 
 for marker, tfr_avg in tfr_data.items():
     selected_indices = range(0, len(time_windows), skip_factor)  # Select every other index

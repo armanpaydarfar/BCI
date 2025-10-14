@@ -22,7 +22,6 @@ from Utils.visualization import (
 # Experiment utilities
 from Utils.experiment_utils import (
     generate_trial_sequence,
-    display_multiple_messages_with_udp,
     LeakyIntegrator,
     RollingScaler,
     save_transform,
@@ -30,7 +29,7 @@ from Utils.experiment_utils import (
 )
 
 # UDP helper
-from Utils.networking import send_udp_message
+from Utils.networking import send_udp_message,display_multiple_messages_with_udp
 
 # --------- Runtime "globals" (wired by each driver right after init) ---------
 # These names intentionally match what the original functions referenced.
@@ -367,7 +366,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, mode, udp_so
                 update_recentering=config.UPDATE_DURING_MOVE
             )
             next_tick += step_size 
-            if all_probabilities:
+            if all_probabilities and getattr(config, "SEND_PROBS", False):
                 prob_mi, prob_rest = all_probabilities[-1][2], all_probabilities[-1][1]
                 send_udp_message(
                     udp_socket_marker,
@@ -397,7 +396,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, mode, udp_so
                     logger.log_event("FES is disabled — no FES_STOP sent.")
 
                 display_multiple_messages_with_udp(
-                    ["Stopping Robot"], [(255, 0, 0)], [0], duration=5,
+                    ["Stopping Robot"], [(255, 0, 0)], [0], duration=3,
                     udp_messages=[config.ROBOT_OPCODES["STOP"]], udp_socket=udp_socket, udp_ip=udp_ip, udp_port=udp_port, logger=logger
                 )
                 break
@@ -490,15 +489,16 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
             next_tick += step_size 
 
 
-        if all_probabilities:
+        if all_probabilities and getattr(config, "SEND_PROBS", False):
             prob_mi, prob_rest = all_probabilities[-1][2], all_probabilities[-1][1]
             send_udp_message(
                 udp_socket_marker,
                 config.UDP_MARKER["IP"],
                 config.UDP_MARKER["PORT"],
                 f"{config.TRIGGERS['MI_PROBS' if mode == 0 else 'REST_PROBS']},{prob_mi:.5f},{prob_rest:.5f}",
-                quiet = True
+                quiet=True
             )
+
 
         running_avg_confidence = leaky_integrator.update(current_confidence)
         if FES_toggle == 1:

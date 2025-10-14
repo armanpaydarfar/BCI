@@ -4,9 +4,7 @@
 WORKING_DIR = "/home/arman-admin/Projects/Harmony/"
 DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
 
-MODEL_PATH = "/home/arman-admin/Projects/Harmony/Reiman_eeg_model.pkl"
-
-TRAINING_SUBJECT = "PILOT007"
+TRAINING_SUBJECT = "CLIN_SUBJ_002"
 
 
 # EEG Settings
@@ -30,7 +28,7 @@ TOTAL_TRIALS_ERRP = 45 # Total number of trials for ErrP experiment
 MAX_REPEATS = 3  # Maximum consecutive repeats of the same condition
 N_SPLITS = 5  # Number of splits for KFold cross-validation
 TIME_MI = 5 # time for motor imagery and rest
-TIME_ROB = 13 # time allocated for robot to move
+TIME_ROB = 7 # time allocated for robot to move
 TIME_STATIONARY = 2 # time for stationary feedback after no movement/failed movement trial
 TIME_MASTER_MOVE = 5 # allowed timing for participant to position robot with master arm. Bimanual experiment.
 TIMING = True #obsolete
@@ -38,6 +36,8 @@ SHAPE_MAX = 0.7 #maximum fill
 SHAPE_MIN = 0.5 #minimum fill 
 ROBOT_TRAJECTORY = ["a"]
 BIG_BROTHER_MODE = True #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
+SEND_PROBS = True
+
 
 # Early-stop policy: "correct_only" (current behavior) or "either"
 EARLYSTOP_MODE = "correct_only"
@@ -51,7 +51,7 @@ BASELINE_DURATION = 1 #seconds
 ACCURACY_THRESHOLD = 0.6  # OBS Accuracy threshold to determine "Correct" (plan to obsolete)
 THRESHOLD_MI = 0.6 #Threshold for MI "correct"
 THRESHOLD_REST = 0.6 #Threshold for REST "Correct"
-RELAXATION_RATIO = 0.4
+RELAXATION_RATIO = 0.6 # relaxation ratio for sustained MI during movement
 MIN_PREDICTIONS = 8 # Min number of predictions during Online experiment before the decoder can end early
 STEP_SIZE = 1/16
 CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
@@ -84,10 +84,6 @@ FES_TIMING_OFFSET = 4
 SCREEN_WIDTH = 1200
 SCREEN_HEIGHT = 800
 
-
-#TRAINING_SESSION = "001OFFLINE"
-
-
 USE_PREVIOUS_ONLINE_STATS = False # for z-score normalization of data coming in - this defines the starting point, False = use the stats from the training session, true = use previous online stats
 
 
@@ -106,12 +102,23 @@ TRIGGERS = {
     "MI_EARLYSTOP": "240",
     "MI_PROBS": "2000",
 
+    #"TRAJECTORY_STAGE": "290",
+    #"ACK_TRAJECTORY_STAGE":"295",
     "ROBOT_BEGIN": "300",
+    "ACK_ROBOT_BEGIN": "305",
     "ROBOT_END": "320",
+    "ACK_ROBOT_END": "325",
     "ROBOT_EARLYSTOP": "340",
-    "ROBOT_CONFIRM_STOP": "345",
+    "ACK_ROBOT_STOP": "345",
     "ROBOT_PROBS": "3000",
-    "ROBOT_RESTART": "350",
+    #"ROBOT_RESTART": "350",
+    "ROBOT_PAUSE": "360",
+    "ACK_ROBOT_PAUSE": "365",
+    "ROBOT_RESUME": "370",
+    "ACK_ROBOT_RESUME": "375",
+    "ROBOT_HOME": "380",
+    "ACK_ROBOT_HOME": "385",
+
 
     "ERRP_BEGIN": "400",
     "ERRP_END": "420",
@@ -123,7 +130,10 @@ TRIGGERS = {
     "REST_PROBS": "1000",
 
     "MASTER_UNLOCK": "500",
+    "ACK_MASTER_UNLOCK": "505",
     "MASTER_LOCK": "520",
+    "ACK_MASTER_LOCK": "525",
+
 
 }
 
@@ -136,10 +146,11 @@ ROBOT_OPCODES = {
     "GO": "g",                # Execute movement (after MI success)
     "HOME": "h",              # Home
     "STOP": "s",              # Stop. Will return home automatically after several seconds
-    "Pause": "p",             # Pause (several window allowed for resume)
+    "PAUSE": "p",             # Pause (several window allowed for resume)
     "RESUME": "r",            # Resume (resume trajectory if paused)
     "MASTER_UNLOCK": "m",     # Unlock master arm
     "MASTER_LOCK": "c",       # Lock master arm
+    "QUERY": "q",             # Query joint angles, torques, velocities, end effector positions.
     "EXIT": "e"               # Exit / emergency stop
 }
 
@@ -157,4 +168,9 @@ UDP_ROBOT = {
 UDP_FES = {
     "IP": "127.0.0.1",
     "PORT": 5005
+}
+
+UDP_CONTROL_BIND = {
+    "IP":   "192.168.2.2",  # your control Control Modul's IP
+    "PORT": 8080
 }

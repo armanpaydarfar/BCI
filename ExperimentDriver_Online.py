@@ -22,7 +22,6 @@ from Utils.visualization import (
 # Experiment utilities
 from Utils.experiment_utils import (
     generate_trial_sequence,
-    display_multiple_messages_with_udp,
     save_transform,
     load_transform
 )
@@ -31,7 +30,7 @@ from Utils.experiment_utils import (
 from Utils.EEGStreamState import EEGStreamState
 
 # Networking utilities
-from Utils.networking import send_udp_message
+from Utils.networking import send_udp_message, display_multiple_messages_with_udp
 
 # Configuration parameters
 import config
@@ -328,12 +327,10 @@ def main():
                 colors = [config.green, config.green]
                 offsets = [-100, 100]
                 selected_trajectory = random.choice(config.ROBOT_TRAJECTORY)
-                udp_messages = [selected_trajectory, "g"]
+                udp_messages = [selected_trajectory, config.ROBOT_OPCODES["GO"]]
                 duration = 0.01
                 should_hold_and_classify = True
-
                 logger.log_event("Prediction correct for MI — triggering robot movement (and FES if toggled)")
-
                 if FES_toggle == 1:
                     send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_MOTOR_GO", logger=logger)
                 else:
@@ -415,7 +412,7 @@ def main():
                 messages=messages, 
                 colors=colors, 
                 offsets=offsets, 
-                duration=config.TIME_ROB - 6,  # Monitor for 7s out of total 13s movement
+                duration=config.TIME_ROB,  # Monitor for 7s out of total 13s movement
                 mode=0,  # Motor Imagery
                 udp_socket=udp_socket_robot, 
                 udp_ip=config.UDP_ROBOT["IP"], 
@@ -434,10 +431,28 @@ def main():
                 logger=logger,
                 phase="ROBOT"
             )
+            #mark robot phase end for alignment
+            # --- Robot HOME + reset for MI trials ---
+            # Send HOME opcode to robot
+            if not robot_earlystop: 
+                logger.log_event("Robot fixation period 3s before homing.")
+                display_fixation_period(duration=2, eeg_state=eeg_state)
+                acked, _ = send_udp_message(
+                    udp_socket_robot,
+                    config.UDP_ROBOT["IP"],
+                    config.UDP_ROBOT["PORT"],
+                    config.ROBOT_OPCODES["HOME"],   # this is 'h'
+                    logger=logger,
+                    expect_ack=True,                # <--- wait for ACK
+                    ack_timeout=1.0,                # optional, default 0.5s
+                    max_retries=1                   # optional, resend once if timeout
+                )
 
-            display_fixation_period(duration=6, eeg_state=eeg_state)
-            logger.log_event("Robot reset fixation (6s) complete after hold-and-classify phase.")
-
+                logger.log_event("Sent HOME opcode to robot at end of MI trial.")
+            # Run the same 3s reset fixation
+            display_fixation_period(duration=3, eeg_state=eeg_state)
+            logger.log_event("Robot reset fixation (3s) complete.")
+        
         logger.log_trial_summary(
             trial_number=current_trial + 1,
             true_label=200 if mode == 0 else 100,

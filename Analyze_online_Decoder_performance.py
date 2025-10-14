@@ -6,7 +6,7 @@ import re
 import numpy as np
 
 # ---- Configurable Subject ----
-subject = "LAB_SUBJ_001"
+subject = "CLIN_SUBJ_002"
 
 # ---- Prompt User to Select Session Subdirectory ----
 base_dir = os.path.expanduser(f"~/Documents/CurrentStudy/sub-{subject}")
@@ -164,8 +164,8 @@ if conf_matrices:
              f"Ambiguous Trials: {total_ambiguous}")
 
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-                xticklabels=["Pred 200", "Pred 100"],
-                yticklabels=["Actual 200", "Actual 100"])
+                xticklabels=["Pred MI", "Pred REST"],
+                yticklabels=["Actual MI", "Actual REST"])
     plt.title(title)
     plt.xlabel("Predicted")
     plt.ylabel("Actual")
