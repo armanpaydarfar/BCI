@@ -10,8 +10,8 @@ from scipy.stats import zscore
 from Utils.preprocessing import concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "LAB_SUBJ_001"
-session = "S0010ONLINE_A"
+subject = "LAB_SUBJ_W"
+session = "S001ONLINE"
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
@@ -74,6 +74,19 @@ channel_names = get_channel_names_from_xdf(eeg_stream)
 marker_data = np.array([int(value[0]) for value in marker_stream['time_series']])
 #marker_timestamps = np.array(marker_stream['time_stamps'])
 marker_timestamps = np.array([float(value[1]) for value in marker_stream['time_series']])
+
+
+# 🔻 Remove all markers >= 1000
+keep = marker_data < 1000
+removed = int(marker_data.size - keep.sum())
+marker_data = marker_data[keep]
+marker_timestamps = marker_timestamps[keep]
+print(f"🧹 Removed {removed} markers >= 1000; kept {marker_data.size}.")
+
+
+
+
+
 #print(marker_stream['time_series'])
 #print(marker_timestamps)
 print("\n EEG Channels from XDF:", channel_names)
@@ -121,7 +134,13 @@ if "M1" in raw.ch_names and "M2" in raw.ch_names:
     print("Removed Mastoid Channels: M1, M2")
 else:
     print("No Mastoid Channels Found in Data")
-
+'''
+if "T7" in raw.ch_names and "T8" in raw.ch_names:
+    raw.drop_channels(["T7", "T8"])
+    print("Removed Mastoid Channels: T7, T8")
+else:
+    print("No T Channels Found in Data")
+'''
 
 # Rename channels to match montage format
 raw.rename_channels(rename_dict)
@@ -156,7 +175,7 @@ print("\n Rechecking Channel Positions After Montage Application:")
 for ch in raw.info["chs"]:
     print(f"{ch['ch_name']}: {ch['loc'][:3]}")
 '''
-highband = 12
+highband = 13
 lowband = 8
 
 time_start = -1
@@ -236,7 +255,7 @@ marker_labels = {
 }
 # Create Epochs with rejection
 epochs = mne.Epochs(
-    raw, events, event_id=event_dict, tmin=time_start, tmax=time_end, baseline = None, detrend=1, preload=True, event_repeated = 'merge'
+    raw, events, event_id=event_dict, tmin=time_start, tmax=time_end, baseline = (-1,0), detrend=1, preload=True
 )
 
 

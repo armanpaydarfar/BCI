@@ -513,6 +513,9 @@ def main():
             should_hold_and_classify = False  # No secondary classification logic in REST
         # Display the feedback messages and send UDP commands (if any)
         logger.log_event(f"Displaying feedback: '{messages[0]}' | Action: '{messages[1]}' | Duration: {duration}s")
+        if should_hold_and_classify == False: 
+            send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_HOME"], logger=logger) 
+        
         display_multiple_messages_with_udp(
             messages=messages,
             colors=colors,
@@ -554,8 +557,9 @@ def main():
                 phase="ROBOT"
             )
             # --- Robot HOME + reset for MI trials ---
-            display_fixation_period(duration=1, eeg_state=eeg_state)
+            display_fixation_period(duration=2, eeg_state=eeg_state)
             # Send HOME opcode to robot
+            send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_HOME"], logger=logger)
             acked, _ = send_udp_message(
                 udp_socket_robot,
                 config.UDP_ROBOT["IP"],

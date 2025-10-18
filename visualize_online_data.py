@@ -10,8 +10,8 @@ from scipy.stats import zscore
 from Utils.preprocessing import concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "CLIN_SUBJ_002"
-session = "S004ONLINE"
+subject = "LAB_SUBJ_W"
+session = "S001ONLINE"
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
@@ -156,7 +156,7 @@ print("\n Rechecking Channel Positions After Montage Application:")
 for ch in raw.info["chs"]:
     print(f"{ch['ch_name']}: {ch['loc'][:3]}")
 '''
-highband = 12
+highband = 13
 lowband = 8
 
 time_start = -1
@@ -189,8 +189,8 @@ min_trial_duration = 1.5  # in seconds
 voltage_threshold = 20.0  # in microvolts
 
 # ---- Step 1: Match Start-End Markers and Prune by Duration ----
-min_trial_duration = 1.5           # keep your current minimum
-max_trial_duration = 2.5          # <5.00s => drop "timeouts"
+min_trial_duration = 1.0           # keep your current minimum
+max_trial_duration = 5.4         # <5.00s => drop "timeouts"
 EPS = 0.02                         # tolerance for float rounding
 
 # Optional: per-class overrides (uncomment to use)

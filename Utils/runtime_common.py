@@ -410,12 +410,6 @@ def hold_messages_and_classify(messages, colors, offsets, duration, mode, udp_so
 
     if not early_stop:
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_END"], logger=logger)
-        if FES_toggle == 1:
-            send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_STOP", logger=logger)
-            logger.log_event("FES_STOP signal sent after robot motion complete successfully.")
-        else:
-            logger.log_event("FES is disabled — no FES_STOP sent.")
-
 
     final_class = correct_class if running_avg_confidence >= config.RELAXATION_RATIO * accuracy_threshold else incorrect_class
     logger.log_event(f"Confidence at the end of motion: {running_avg_confidence:.2f} after {num_predictions} predictions")
@@ -487,17 +481,15 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
                 leaky_integrator
             )
             next_tick += step_size 
-
-
-        if all_probabilities and getattr(config, "SEND_PROBS", False):
-            prob_mi, prob_rest = all_probabilities[-1][2], all_probabilities[-1][1]
-            send_udp_message(
-                udp_socket_marker,
-                config.UDP_MARKER["IP"],
-                config.UDP_MARKER["PORT"],
-                f"{config.TRIGGERS['MI_PROBS' if mode == 0 else 'REST_PROBS']},{prob_mi:.5f},{prob_rest:.5f}",
-                quiet=True
-            )
+            if all_probabilities and getattr(config, "SEND_PROBS", False):
+                prob_mi, prob_rest = all_probabilities[-1][2], all_probabilities[-1][1]
+                send_udp_message(
+                    udp_socket_marker,
+                    config.UDP_MARKER["IP"],
+                    config.UDP_MARKER["PORT"],
+                    f"{config.TRIGGERS['MI_PROBS' if mode == 0 else 'REST_PROBS']},{prob_mi:.5f},{prob_rest:.5f}",
+                    quiet=True
+                )
 
 
         running_avg_confidence = leaky_integrator.update(current_confidence)
@@ -564,7 +556,6 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
 
     
     pygame.display.flip()
-    pygame.time.delay(300)  # ~300 ms delay to allow the visual feedback to complete rendering
     # Final Decision
     if running_avg_confidence >= accuracy_threshold:
         final_class = correct_class
@@ -591,4 +582,5 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
 
 
     send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_END" if mode==0 else "REST_END"], logger=logger)
+    pygame.time.delay(300)  # ~300 ms delay to allow the visual feedback to complete rendering
     return final_class, running_avg_confidence, leaky_integrator, all_probabilities, earlystop_flag

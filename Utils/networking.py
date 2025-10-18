@@ -9,6 +9,18 @@ import select
 
 
 
+try:
+    _RO = getattr(_config, "ROBOT_OPCODES", {}) or {}
+    _SYMBOLIC_TRAJ = {
+        _RO.get("TRAJECTORY_A", "a"),
+        _RO.get("TRAJECTORY_X", "x"),
+        _RO.get("TRAJECTORY_Y", "y"),
+        _RO.get("TRAJECTORY_Z", "z"),
+    }
+except Exception:
+    _SYMBOLIC_TRAJ = {"a", "x", "y", "z"}
+
+
 # =========================================================
 # Constants 
 # =========================================================
@@ -322,7 +334,13 @@ def display_multiple_messages_with_udp(
             # Defer send ONLY if this op is a staged trajectory immediately followed by 'g'
             # (so we don't accidentally skip control ops like 'c')
             # <<< CHANGED: gate the deferral on _is_coords_string(op)
-            if op != "g" and _is_coords_string(op) and (i + 1) < len(udp_messages) and _to_wire(udp_messages[i + 1]) == "g":  # <<< CHANGED
+            # Defer send if this op is a trajectory (coordinate OR symbolic a/x/y/z) immediately followed by 'g'
+            if (
+                op != "g"
+                and (_is_coords_string(op) or op in {"a", "x", "y", "z"})
+                and (i + 1) < len(udp_messages)
+                and _to_wire(udp_messages[i + 1]) == "g"
+            ):
                 i += 1
                 continue
 
@@ -575,9 +593,11 @@ def send_udp_message(
       None (legacy) or (acked: bool, query_payload|None) depending on flags.
     """
     # unified logger
-    def _log(msg: str):
-        if not quiet:
-            _udp_log(logger, msg)
+    if not quiet:
+        # keep a tiny local alias (no inner function)
+        _log = lambda m: _udp_log(logger, m)
+    else:
+        _log = lambda m: None  # noqa: E731
 
     s = _ensure_control_socket(logger)
     if s is None:
@@ -587,6 +607,16 @@ def send_udp_message(
     # Robot endpoint for reply filtering
     robot_ip   = getattr(_config, "UDP_ROBOT", {}).get("IP", _ROBOT_IP)
     robot_port = int(getattr(_config, "UDP_ROBOT", {}).get("PORT", _ROBOT_PORT))
+
+    # ---------------- PATCH: prepare ACK→marker map once when needed ----------------
+    if expect_ack:
+        try:
+            _ack_to_trigger_map = _build_ack_map(_config)  # e.g., {'g': 305, 'h': 385, ...}
+        except Exception:
+            _ack_to_trigger_map = {}
+    else:
+        _ack_to_trigger_map = None
+    # -----------------------------------------------------------------------------
 
     attempts = 0
     while True:
@@ -622,9 +652,7 @@ def send_udp_message(
 
         _log(f"{prefix} {kind}: {message}")
 
-        # -------------------------  <<< ADD: pending-target bookkeeping >>>  -------------------------
-        # Make standalone 'g' legal after a 'c' sent via this helper, and clear on 'm'/'h'.
-        # Uses config tokens if present so it stays correct even if you remap opcodes.
+        # ---------------- pending-target bookkeeping (unchanged) ----------------
         try:
             ro = getattr(_config, "ROBOT_OPCODES", {}) or {}
             tok_c = ro.get("MASTER_LOCK",   "c")
@@ -633,7 +661,6 @@ def send_udp_message(
         except Exception:
             tok_c, tok_m, tok_h = "c", "m", "h"
 
-        # keep state in sync
         global _pending_target_ready, _pending_target_ctx
         if message == tok_c:
             _pending_target_ready = True
@@ -641,7 +668,7 @@ def send_udp_message(
         elif message in (tok_m, tok_h):
             _pending_target_ready = False
             _pending_target_ctx   = None
-        # --------------------------------------------------------------------------------------------
+        # ------------------------------------------------------------------------
 
         # Fast exit
         if not expect_ack and not capture_query:
@@ -651,6 +678,7 @@ def send_udp_message(
         end = time.time() + ack_timeout
         acked = False
         query_payload = None
+        ack_token_matched = None   # ---------------- PATCH: remember which token matched
 
         while time.time() < end:
             r, _, _ = select.select([s], [], [], max(0.0, end - time.time()))
@@ -676,12 +704,28 @@ def send_udp_message(
                     if token.startswith("q"):
                         _log(f"[ROBOT->UDP] {txt}")
                         acked = True
-                        if not capture_query: return (True, None)
+                        ack_token_matched = "q"  # -------- PATCH
+                        if not capture_query:
+                            # -------- PATCH: forward ACK→marker if mapped
+                            if _ack_to_trigger_map:
+                                trig = _ack_to_trigger_map.get(ack_token_matched)
+                                if trig:
+                                    _send_marker_trigger(_config, logger, trig)
+                            # ------------------------------------------------
+                            return (True, None)
                 else:
                     if token == message:
                         _log(f"[ROBOT->UDP] {txt}")
                         acked = True
-                        if not capture_query: return (True, None)
+                        ack_token_matched = token  # -------- PATCH
+                        if not capture_query:
+                            # -------- PATCH: forward ACK→marker if mapped
+                            if _ack_to_trigger_map:
+                                trig = _ack_to_trigger_map.get(ack_token_matched)
+                                if trig:
+                                    _send_marker_trigger(_config, logger, trig)
+                            # ------------------------------------------------
+                            return (True, None)
                 # unrelated ACKs ignored during this wait
                 continue
 
@@ -694,6 +738,12 @@ def send_udp_message(
 
         # Window ended
         if expect_ack and acked:
+            # -------- PATCH: emit marker if we matched an ACK but deferred return
+            if _ack_to_trigger_map and ack_token_matched is not None:
+                trig = _ack_to_trigger_map.get(ack_token_matched)
+                if trig:
+                    _send_marker_trigger(_config, logger, trig)
+            # -------------------------------------------------------------------
             return (True, query_payload)
         if not expect_ack:
             return query_payload
@@ -705,3 +755,4 @@ def send_udp_message(
             continue
 
         return (False, query_payload)
+

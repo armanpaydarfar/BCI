@@ -437,6 +437,7 @@ def main():
             if not robot_earlystop: 
                 logger.log_event("Robot fixation period 3s before homing.")
                 display_fixation_period(duration=2, eeg_state=eeg_state)
+                send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_HOME"], logger=logger)
                 acked, _ = send_udp_message(
                     udp_socket_robot,
                     config.UDP_ROBOT["IP"],

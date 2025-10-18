@@ -4,17 +4,15 @@
 WORKING_DIR = "/home/arman-admin/Projects/Harmony/"
 DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
 
-TRAINING_SUBJECT = "CLIN_SUBJ_002"
-
-
+TRAINING_SUBJECT = "LAB_SUBJ_W"
 # EEG Settings
 CAP_TYPE = 32
 LOWCUT = 8  # Hz
-HIGHCUT = 12  # Hz
+HIGHCUT = 13  # Hz
 LOWCUT_ERRP = 1 #Hz
 HIGHCUT_ERRP = 10 #Hz
 FS = 512  # Sampling frequency (Hz)
-MOTOR_CHANNEL_NAMES = ['C3', 'Cz', 'C4', 'CP5', 'CP1', 'CP2', 'CP6', 'P7','P3', 'Pz', 'P4', 'P8', 'POz']
+MOTOR_CHANNEL_NAMES = ['FC1','FC2','C3', 'Cz', 'C4', 'CP5', 'CP1', 'CP2', 'CP6', 'P7','P3', 'Pz', 'P4', 'P8', 'POz']
 ERRP_CHANNEL_NAMES = ['F3', 'Fz', 'F4', 'FC1', 'FC2', 'Cz']
 EOG_CHANNEL_NAMES = ['AUX1'] # List of EOG channel names to use
 EOG_TOGGLE = 0  # Toggle to enable or disable EOG processing (1 = enabled, 0 = disabled)
@@ -22,7 +20,7 @@ EOG_TOGGLE = 0  # Toggle to enable or disable EOG processing (1 = enabled, 0 = d
 
 # Experiment Parameters
 ARM_SIDE = "Right"
-EXPERIMENT_TYPE = "BIMANUAL" # BIMANUAL or BASE
+EXPERIMENT_TYPE = "BASE" # BIMANUAL or BASE
 TOTAL_TRIALS = 20  # Total number of trials
 TOTAL_TRIALS_ERRP = 45 # Total number of trials for ErrP experiment
 MAX_REPEATS = 3  # Maximum consecutive repeats of the same condition
@@ -34,9 +32,9 @@ TIME_MASTER_MOVE = 5 # allowed timing for participant to position robot with mas
 TIMING = True #obsolete
 SHAPE_MAX = 0.7 #maximum fill 
 SHAPE_MIN = 0.5 #minimum fill 
-ROBOT_TRAJECTORY = ["a"]
+ROBOT_TRAJECTORY = ["a"] # Not using
 BIG_BROTHER_MODE = True #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
-SEND_PROBS = True
+SEND_PROBS = False
 
 
 # Early-stop policy: "correct_only" (current behavior) or "either"
@@ -49,8 +47,8 @@ CLASSIFY_WINDOW = 1000  # Duration of EEG data window for classification (millis
 FILTER_BUFFER_SIZE = 2048 #4s at 512 Hz
 BASELINE_DURATION = 1 #seconds
 ACCURACY_THRESHOLD = 0.6  # OBS Accuracy threshold to determine "Correct" (plan to obsolete)
-THRESHOLD_MI = 0.6 #Threshold for MI "correct"
-THRESHOLD_REST = 0.6 #Threshold for REST "Correct"
+THRESHOLD_MI = 0.63 #Threshold for MI "correct"
+THRESHOLD_REST = 0.63 #Threshold for REST "Correct"
 RELAXATION_RATIO = 0.6 # relaxation ratio for sustained MI during movement
 MIN_PREDICTIONS = 8 # Min number of predictions during Online experiment before the decoder can end early
 STEP_SIZE = 1/16
@@ -72,9 +70,9 @@ SAVE_ADAPTIVE_T = False #this toggle saves "Adaptive_T" to the EEG directory dur
 
 
 # FES Parameters
-FES_toggle = 0
+FES_toggle = 1
 FES_CHANNEL = "red"
-FES_TIMING_OFFSET = 4 
+FES_TIMING_OFFSET = 7 
 # above for motor FES, cut out X seconds before the full duration of movement. This should represent when the robot will naturally reach the end of motion (in successful case)
 
 # Screen Dimensions

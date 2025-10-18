@@ -264,7 +264,9 @@ while running and current_trial < len(trial_sequence):
     if mode == 0:
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_END"], logger=logger)
         logger.log_event("Sent ROBOT_END trigger.")
-        
+        display_fixation_period(duration = 2)
+        send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_HOME"], logger=logger)
+
         acked, _ = send_udp_message(
         udp_socket_robot,
         config.UDP_ROBOT["IP"],
