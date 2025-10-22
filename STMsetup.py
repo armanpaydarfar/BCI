@@ -242,19 +242,19 @@ def endSetup():
 	conf["channels"]["red"]["Sensory_current_mA"] = RH_stsRed_i.get()
 	conf["channels"]["red"]["Motor_current_mA"] = RH_mtsRed_i.get()
 	conf["channels"]["red"]["duration_sense"] = config.TIME_MI
-	conf["channels"]["red"]["duration_Motor"] = config.TIME_ROB - config.FES_TIMING_OFFSET
+	conf["channels"]["red"]["duration_Motor"] = config.TIME_ROB
 	conf["channels"]["red"]["pulse_width"] = RH_stsRed_p.get()
 	
 	conf["channels"]["blue"]["Sensory_current_mA"] = RH_stsBlue_i.get()
 	conf["channels"]["blue"]["Motor_current_mA"] = RH_mtsBlue_i.get()
 	conf["channels"]["blue"]["duration_sense"] = config.TIME_MI
-	conf["channels"]["blue"]["duration_Motor"] = config.TIME_ROB - config.FES_TIMING_OFFSET
+	conf["channels"]["blue"]["duration_Motor"] = config.TIME_ROB
 	conf["channels"]["blue"]["pulse_width"] = RH_stsBlue_p.get()
 	
 	conf["channels"]["black"]["Sensory_current_mA"] = LH_stsBlack_i.get()
 	conf["channels"]["black"]["Motor_current_mA"] = LH_mtsBlack_i.get()
 	conf["channels"]["black"]["duration_sense"] = config.TIME_MI
-	conf["channels"]["black"]["duration_Motor"] = config.TIME_ROB - config.FES_TIMING_OFFSET
+	conf["channels"]["black"]["duration_Motor"] = config.TIME_ROB
 	conf["channels"]["black"]["pulse_width"] = LH_stsBlack_p.get()
 	
 	

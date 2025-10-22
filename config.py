@@ -1,61 +1,55 @@
 # Configuration file for EEG experiments
 
-# UDP Settings
-UDP_MARKER = {
-    "IP": "127.0.0.1",
-    "PORT": 12345
-}
+# Relevant Directories
+WORKING_DIR = "/home/arman-admin/Projects/Harmony/"
+DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
 
-UDP_ROBOT = {
-    "IP": "192.168.2.1",
-    "PORT": 8080
-}
-
-UDP_FES = {
-    "IP": "127.0.0.1",
-    "PORT": 5005
-}
-
-
+TRAINING_SUBJECT = "CLIN_SUBJ_003"
 # EEG Settings
 CAP_TYPE = 32
 LOWCUT = 8  # Hz
-HIGHCUT = 12  # Hz
+HIGHCUT = 13  # Hz
 LOWCUT_ERRP = 1 #Hz
 HIGHCUT_ERRP = 10 #Hz
 FS = 512  # Sampling frequency (Hz)
 MOTOR_CHANNEL_NAMES = ['C3', 'Cz', 'C4', 'CP5', 'CP1', 'CP2', 'CP6', 'P7','P3', 'Pz', 'P4', 'P8', 'POz']
 ERRP_CHANNEL_NAMES = ['F3', 'Fz', 'F4', 'FC1', 'FC2', 'Cz']
-
-'''
-EEG_CHANNEL_NAMES = ['ALL']
-'''
 EOG_CHANNEL_NAMES = ['AUX1'] # List of EOG channel names to use
 EOG_TOGGLE = 0  # Toggle to enable or disable EOG processing (1 = enabled, 0 = disabled)
 
+
 # Experiment Parameters
 ARM_SIDE = "Right"
+EXPERIMENT_TYPE = "BASE" # BIMANUAL or BASE
 TOTAL_TRIALS = 20  # Total number of trials
 TOTAL_TRIALS_ERRP = 45 # Total number of trials for ErrP experiment
 MAX_REPEATS = 3  # Maximum consecutive repeats of the same condition
 N_SPLITS = 5  # Number of splits for KFold cross-validation
 TIME_MI = 5 # time for motor imagery and rest
-TIME_ROB = 13 # time allocated for robot to move
+TIME_ROB = 7 # time allocated for robot to move
 TIME_STATIONARY = 2 # time for stationary feedback after no movement/failed movement trial
-TIMING = True
+TIME_MASTER_MOVE = 5 # allowed timing for participant to position robot with master arm. Bimanual experiment.
+TIMING = True #obsolete
 SHAPE_MAX = 0.7 #maximum fill 
 SHAPE_MIN = 0.5 #minimum fill 
-ROBOT_TRAJECTORY = ["a"]
+ROBOT_TRAJECTORY = ["a"] # Not using
 BIG_BROTHER_MODE = True #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
+SEND_PROBS = True
+
+
+# Early-stop policy: "correct_only" (current behavior) or "either"
+EARLYSTOP_MODE = "correct_only"
+
+
 
 # Classification Parameters
 CLASSIFY_WINDOW = 1000  # Duration of EEG data window for classification (milliseconds)
 FILTER_BUFFER_SIZE = 2048 #4s at 512 Hz
 BASELINE_DURATION = 1 #seconds
 ACCURACY_THRESHOLD = 0.6  # OBS Accuracy threshold to determine "Correct" (plan to obsolete)
-THRESHOLD_MI = 0.60 #Threshold for MI "correct"
-THRESHOLD_REST = 0.60 #Threshold for REST "Correct"
-RELAXATION_RATIO = 0.4
+THRESHOLD_MI = 0.6 #Threshold for MI "correct"
+THRESHOLD_REST = 0.6 #Threshold for REST "Correct"
+RELAXATION_RATIO = 0.6 # relaxation ratio for sustained MI during movement
 MIN_PREDICTIONS = 8 # Min number of predictions during Online experiment before the decoder can end early
 STEP_SIZE = 1/16
 CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
@@ -78,7 +72,7 @@ SAVE_ADAPTIVE_T = False #this toggle saves "Adaptive_T" to the EEG directory dur
 # FES Parameters
 FES_toggle = 1
 FES_CHANNEL = "red"
-FES_TIMING_OFFSET = 4 
+FES_TIMING_OFFSET = 7 
 # above for motor FES, cut out X seconds before the full duration of movement. This should represent when the robot will naturally reach the end of motion (in successful case)
 
 # Screen Dimensions
@@ -87,20 +81,6 @@ FES_TIMING_OFFSET = 4
 
 SCREEN_WIDTH = 1200
 SCREEN_HEIGHT = 800
-
-
-# Relevant Directories
-WORKING_DIR = "/home/arman-admin/Projects/Harmony/"
-DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
-
-MODEL_PATH = "/home/arman-admin/Projects/Harmony/Reiman_eeg_model.pkl"
-DATA_FILE_PATH = "/home/arman-admin/Documents/CurrentStudy/sub-PILOT007/ses-S001/eeg/sub-PILOT007_ses-S001_task-Default_run-001OFFLINE_eeg.xdf"
-
-TRAINING_SUBJECT = "LAB_SUBJ_003"
-
-
-#TRAINING_SESSION = "001OFFLINE"
-
 
 USE_PREVIOUS_ONLINE_STATS = False # for z-score normalization of data coming in - this defines the starting point, False = use the stats from the training session, true = use previous online stats
 
@@ -120,13 +100,23 @@ TRIGGERS = {
     "MI_EARLYSTOP": "240",
     "MI_PROBS": "2000",
 
+    #"TRAJECTORY_STAGE": "290",
+    #"ACK_TRAJECTORY_STAGE":"295",
     "ROBOT_BEGIN": "300",
+    "ACK_ROBOT_BEGIN": "305",
     "ROBOT_END": "320",
+    "ACK_ROBOT_END": "325",
     "ROBOT_EARLYSTOP": "340",
-    "ROBOT_CONFIRM_STOP": "345",
+    "ACK_ROBOT_STOP": "345",
     "ROBOT_PROBS": "3000",
-    
-    "ROBOT_RESTART": "350",
+    #"ROBOT_RESTART": "350",
+    "ROBOT_PAUSE": "360",
+    "ACK_ROBOT_PAUSE": "365",
+    "ROBOT_RESUME": "370",
+    "ACK_ROBOT_RESUME": "375",
+    "ROBOT_HOME": "380",
+    "ACK_ROBOT_HOME": "385",
+
 
     "ERRP_BEGIN": "400",
     "ERRP_END": "420",
@@ -135,7 +125,50 @@ TRIGGERS = {
     "REST_BEGIN": "100",
     "REST_END": "120",
     "REST_EARLYSTOP": "140",
-    "REST_PROBS": "1000"
+    "REST_PROBS": "1000",
+
+    "MASTER_UNLOCK": "500",
+    "ACK_MASTER_UNLOCK": "505",
+    "MASTER_LOCK": "520",
+    "ACK_MASTER_LOCK": "525",
 
 
+}
+
+# Robot Opcodes (symbolic names → opcode character)
+ROBOT_OPCODES = {
+    "TRAJECTORY_A": "a",      # straight ahead motion
+    "TRAJECTORY_X": "x",      # Slightly raised motion
+    "TRAJECTORY_Y": "y",      # Accross side motion
+    "TRAJECTORY_Z": "z",      # Reach up motion
+    "GO": "g",                # Execute movement (after MI success)
+    "HOME": "h",              # Home
+    "STOP": "s",              # Stop. Will return home automatically after several seconds
+    "PAUSE": "p",             # Pause (several window allowed for resume)
+    "RESUME": "r",            # Resume (resume trajectory if paused)
+    "MASTER_UNLOCK": "m",     # Unlock master arm
+    "MASTER_LOCK": "c",       # Lock master arm
+    "QUERY": "q",             # Query joint angles, torques, velocities, end effector positions.
+    "EXIT": "e"               # Exit / emergency stop
+}
+
+# UDP Settings
+UDP_MARKER = {
+    "IP": "127.0.0.1",
+    "PORT": 12345
+}
+
+UDP_ROBOT = {
+    "IP": "192.168.2.1",
+    "PORT": 8080
+}
+
+UDP_FES = {
+    "IP": "127.0.0.1",
+    "PORT": 5005
+}
+
+UDP_CONTROL_BIND = {
+    "IP":   "192.168.2.2",  # your control Control Modul's IP
+    "PORT": 8080
 }

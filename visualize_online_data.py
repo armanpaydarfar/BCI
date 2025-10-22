@@ -10,7 +10,7 @@ from scipy.stats import zscore
 from Utils.preprocessing import concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "LAB_SUBJ_003"
+subject = "CLIN_SUBJ_003"
 session = "S001ONLINE"
 
 # Construct the EEG directory path dynamically
@@ -126,6 +126,27 @@ else:
 # Rename channels to match montage format
 raw.rename_channels(rename_dict)
 
+# ==========================================
+# Optional: Restrict to a subset of channels (e.g., motor region)
+# ==========================================
+# You can comment this line out or modify the list in-script as needed
+#ANALYSIS_CHANNEL_NAMES = ['C3','Cz','C4','CP5','CP1','CP2','CP6','P7','P3','Pz','P4','P8','POz']
+ANALYSIS_CHANNEL_NAMES = [
+    'F7', 'F3', 'Fz', 'F4', 'F8',
+    'FC5', 'FC6',
+    'C3', 'Cz', 'C4',
+    'CP5', 'CP1', 'CP2', 'CP6',
+    'P7', 'P3', 'Pz', 'P4', 'P8',
+    'PO7', 'PO3', 'POz', 'PO4', 'PO8'
+]
+#for clin subject 003, above!
+
+# Filter to only keep channels present in both raw and the target list
+keep_channels = [ch for ch in ANALYSIS_CHANNEL_NAMES if ch in raw.ch_names]
+raw.pick_channels(keep_channels)
+print(f"✅ Keeping only motor channels: {keep_channels}")
+
+
 
 # Debug: Print missing channels
 missing_in_montage = set(raw.ch_names) - set(montage.ch_names)
@@ -156,14 +177,14 @@ print("\n Rechecking Channel Positions After Montage Application:")
 for ch in raw.info["chs"]:
     print(f"{ch['ch_name']}: {ch['loc'][:3]}")
 '''
-highband = 12
+highband = 13
 lowband = 8
 
 time_start = -1
 baseline_period = 1
 time_end = 2
 
-#raw._data /= 1e6
+raw._data /= 1e6
 
 
 # Preprocessing
@@ -186,32 +207,54 @@ import config
 
 # ---- Parameters ----
 min_trial_duration = 1.5  # in seconds
-voltage_threshold = 20.0  # in microvolts
+voltage_threshold = 10.0  # in microvolts
 
 # ---- Step 1: Match Start-End Markers and Prune by Duration ----
+min_trial_duration = 1.0           # keep your current minimum
+max_trial_duration = 4.0         # <5.00s => drop "timeouts"
+EPS = 0.02                         # tolerance for float rounding
+
+# Optional: per-class overrides (uncomment to use)
+# per_class_max = {100: 4.99, 200: 4.99}  # e.g., same cap for REST(100) and MI(200)
+
 valid_start_indices = []
+durations_all = []                 # (optional) collect durations for QA / plotting
 
 for idx, code in enumerate(marker_data):
-    if code in [100, 200]:  # MI or REST
+    if code in [100, 200]:  # MI or REST starts
         t_start = marker_timestamps[idx]
 
-        # Search for matching end marker (e.g., 120 for 100, 220 for 200)
-        end_code = code + 20
+        end_code = code + 20        # 120 for 100, 220 for 200
         end_time = None
         for j in range(idx + 1, len(marker_data)):
             if marker_data[j] == end_code:
                 end_time = marker_timestamps[j]
                 break
 
-        if end_time:
-            duration = end_time - t_start
-            print(f"Start: {t_start:.2f}s → End: {end_time:.2f}s | Duration: {duration:.2f}s")
-            if duration >= min_trial_duration:
-                valid_start_indices.append(idx)
-            else:
-                print(f"⚠️ Skipped: Duration {duration:.2f}s too short.")
-        else:
+        if not end_time:
             print(f"⚠️ Skipped: No end marker found for start at {t_start:.2f}s")
+            continue
+
+        duration = end_time - t_start
+        durations_all.append((idx, code, duration))
+        print(f"Start: {t_start:.2f}s → End: {end_time:.2f}s | Duration: {duration:.2f}s")
+
+        # Determine cap to use (per-class if provided, else global)
+        cap = max_trial_duration  # default
+        # if 'per_class_max' in locals() and code in per_class_max:
+        #     cap = per_class_max[code]
+
+        # Keep trials within [min, cap], dropping "timeouts" ~5s
+        if (duration + EPS) >= min_trial_duration and (duration - EPS) <= cap:
+            valid_start_indices.append(idx)
+        else:
+            reason = []
+            if (duration + EPS) < min_trial_duration:
+                reason.append(f"too short (<{min_trial_duration}s)")
+            if (duration - EPS) > cap:
+                reason.append(f"timeout/too long (>{cap}s)")
+            print(f"⚠️ Skipped: Duration {duration:.2f}s ({', '.join(reason)})")
+
 # ---- Step 2: Build Events Array ----
 marker_data_valid = [marker_data[i] for i in valid_start_indices]
 marker_timestamps_valid = [marker_timestamps[i] for i in valid_start_indices]
@@ -249,7 +292,7 @@ for event_code in ["100", "200"]:
 
 
 # Define your desired range for each class
-start_idx = 0
+start_idx = 10
 end_idx = 60
 
 # Limit number of trials per class by index range
@@ -331,7 +374,7 @@ for marker, tfr_avg in tfr_data.items():
         # Extract correct mappable object for color bar
         img = tfr_avg.plot_topomap(
             tmin=t_start, tmax=t_end,
-            axes=ax, cmap="viridis", show=False, vlim=(vmin, vmax), colorbar=False
+            axes=ax, cmap="viridis", show=False, vlim=(vmin, vmax), colorbar=False,show_names=True 
         )
 
         # Extract the colorbar mappable from the plot

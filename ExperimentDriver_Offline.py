@@ -3,8 +3,8 @@ import socket
 import sys
 import time
 from Utils.visualization import draw_arrow_fill, draw_ball_fill, draw_fixation_cross, draw_time_balls
-from Utils.experiment_utils import generate_trial_sequence, display_multiple_messages_with_udp
-from Utils.networking import send_udp_message
+from Utils.experiment_utils import generate_trial_sequence
+from Utils.networking import send_udp_message,display_multiple_messages_with_udp
 import config
 from pylsl import StreamInlet, resolve_stream
 from pathlib import Path
@@ -264,6 +264,19 @@ while running and current_trial < len(trial_sequence):
     if mode == 0:
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_END"], logger=logger)
         logger.log_event("Sent ROBOT_END trigger.")
+        display_fixation_period(duration = 2)
+        send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_HOME"], logger=logger)
+
+        acked, _ = send_udp_message(
+        udp_socket_robot,
+        config.UDP_ROBOT["IP"],
+        config.UDP_ROBOT["PORT"],
+        config.ROBOT_OPCODES["HOME"],   # this is 'h'
+        logger=logger,
+        expect_ack=True,                # <--- wait for ACK
+        ack_timeout=1.0,                # optional, default 0.5s
+        max_retries=1                   # optional, resend once if timeout
+    )
 
     display_fixation_period(duration=3)
     logger.log_event("Displayed fixation period.")

@@ -114,7 +114,7 @@ def generate_trial_sequence(total_trials=30, max_repeats=3):
     print("⚠️ [generate_trial_sequence] Warning: Falling back to shuffled sequence due to constraint failure.")
     return fallback
 
-
+'''
 def display_multiple_messages_with_udp(
     messages, colors, offsets, duration=13,
     udp_messages=None, udp_socket=None, udp_ip=None, udp_port=None,
@@ -170,7 +170,7 @@ def display_multiple_messages_with_udp(
                 exit()
 
         pygame.time.Clock().tick(60)
-
+'''
 def save_transform(T, counter, save_path):
     with open(save_path, 'wb') as f:
         pickle.dump({"T": T, "counter": counter}, f)
