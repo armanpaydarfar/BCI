@@ -6,7 +6,7 @@ import re
 import numpy as np
 
 # ---- Configurable Subject ----
-subject = "CLIN_SUBJ_002"
+subject = "CLIN_SUBJ_003"
 
 # ---- Prompt User to Select Session Subdirectory ----
 base_dir = os.path.expanduser(f"~/Documents/CurrentStudy/sub-{subject}")

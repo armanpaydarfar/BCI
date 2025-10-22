@@ -10,7 +10,7 @@ from scipy.stats import zscore
 from Utils.preprocessing import concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "LAB_SUBJ_W"
+subject = "CLIN_SUBJ_003"
 session = "S001ONLINE"
 
 # Construct the EEG directory path dynamically
@@ -134,16 +134,29 @@ if "M1" in raw.ch_names and "M2" in raw.ch_names:
     print("Removed Mastoid Channels: M1, M2")
 else:
     print("No Mastoid Channels Found in Data")
-'''
+
 if "T7" in raw.ch_names and "T8" in raw.ch_names:
     raw.drop_channels(["T7", "T8"])
     print("Removed Mastoid Channels: T7, T8")
 else:
     print("No T Channels Found in Data")
-'''
+
 
 # Rename channels to match montage format
 raw.rename_channels(rename_dict)
+
+# ==========================================
+# Optional: Restrict to a subset of channels (e.g., motor region)
+# ==========================================
+# You can comment this line out or modify the list in-script as needed
+MOTOR_CHANNEL_NAMES = ['C3','Cz','C4','CP5','CP1','CP2','CP6','P7','P3','Pz','P4','P8','POz']
+
+# Filter to only keep channels present in both raw and the target list
+keep_channels = [ch for ch in MOTOR_CHANNEL_NAMES if ch in raw.ch_names]
+raw.pick_channels(keep_channels)
+print(f"✅ Keeping only motor channels: {keep_channels}")
+
+
 
 
 # Debug: Print missing channels
@@ -289,7 +302,7 @@ time_windows = np.linspace(0.1, 5.0 - window_size, num_windows)  # Avoid end cli
 
 '''
 # Config
-channel_name = "P4"
+channel_name = "FC1"
 target_marker = 200  # for example, MI trials
 trial_index = 0      # 0 = first trial, 1 = second, etc.
 
@@ -319,7 +332,6 @@ plt.tight_layout()
 plt.show()
 
 '''
-
 '''
 
 # **Step 1: Square all epochs to compute signal power**
