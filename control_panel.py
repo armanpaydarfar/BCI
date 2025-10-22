@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 # ----------------- Paths & constants -----------------
-ROOT = os.path.expanduser("~/Projects/Harmony_Bimanual")
+ROOT = os.path.expanduser("~/Projects/Harmony")
 CONFIG_PY = os.path.join(ROOT, "config.py")
 
 MARKER_PY = os.path.join(ROOT, "UTIL_marker_stream.py")

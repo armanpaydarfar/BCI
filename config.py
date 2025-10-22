@@ -4,7 +4,7 @@
 WORKING_DIR = "/home/arman-admin/Projects/Harmony/"
 DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
 
-TRAINING_SUBJECT = "CLIN_SUBJ_003"
+TRAINING_SUBJECT = "F25CLASS_SUBJ_006"
 # EEG Settings
 CAP_TYPE = 32
 LOWCUT = 8  # Hz
@@ -12,7 +12,7 @@ HIGHCUT = 13  # Hz
 LOWCUT_ERRP = 1 #Hz
 HIGHCUT_ERRP = 10 #Hz
 FS = 512  # Sampling frequency (Hz)
-MOTOR_CHANNEL_NAMES = ['C3', 'Cz', 'C4', 'CP5', 'CP1', 'CP2', 'CP6', 'P7','P3', 'Pz', 'P4', 'P8', 'POz']
+MOTOR_CHANNEL_NAMES = ['FC1','FC2','C3', 'Cz', 'C4', 'CP5', 'CP1', 'CP2', 'CP6', 'P7','P3', 'Pz', 'P4', 'P8', 'POz']
 ERRP_CHANNEL_NAMES = ['F3', 'Fz', 'F4', 'FC1', 'FC2', 'Cz']
 EOG_CHANNEL_NAMES = ['AUX1'] # List of EOG channel names to use
 EOG_TOGGLE = 0  # Toggle to enable or disable EOG processing (1 = enabled, 0 = disabled)
@@ -70,7 +70,7 @@ SAVE_ADAPTIVE_T = False #this toggle saves "Adaptive_T" to the EEG directory dur
 
 
 # FES Parameters
-FES_toggle = 1
+FES_toggle = 0
 FES_CHANNEL = "red"
 FES_TIMING_OFFSET = 7 
 # above for motor FES, cut out X seconds before the full duration of movement. This should represent when the robot will naturally reach the end of motion (in successful case)
