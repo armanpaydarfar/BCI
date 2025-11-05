@@ -10,7 +10,7 @@ from scipy.stats import zscore
 from Utils.preprocessing import concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "CLIN_SUBJ_003"
+subject = "F25CLASS_SUBJ_009"
 session = "S001ONLINE"
 
 # Construct the EEG directory path dynamically
@@ -131,6 +131,8 @@ raw.rename_channels(rename_dict)
 # ==========================================
 # You can comment this line out or modify the list in-script as needed
 #ANALYSIS_CHANNEL_NAMES = ['C3','Cz','C4','CP5','CP1','CP2','CP6','P7','P3','Pz','P4','P8','POz']
+'''
+
 ANALYSIS_CHANNEL_NAMES = [
     'F7', 'F3', 'Fz', 'F4', 'F8',
     'FC5', 'FC6',
@@ -139,14 +141,14 @@ ANALYSIS_CHANNEL_NAMES = [
     'P7', 'P3', 'Pz', 'P4', 'P8',
     'PO7', 'PO3', 'POz', 'PO4', 'PO8'
 ]
+
 #for clin subject 003, above!
 
 # Filter to only keep channels present in both raw and the target list
 keep_channels = [ch for ch in ANALYSIS_CHANNEL_NAMES if ch in raw.ch_names]
 raw.pick_channels(keep_channels)
 print(f"✅ Keeping only motor channels: {keep_channels}")
-
-
+'''
 
 # Debug: Print missing channels
 missing_in_montage = set(raw.ch_names) - set(montage.ch_names)
@@ -289,10 +291,8 @@ for event_code in ["100", "200"]:
 
 
 
-
-
 # Define your desired range for each class
-start_idx = 10
+start_idx = 20
 end_idx = 60
 
 # Limit number of trials per class by index range

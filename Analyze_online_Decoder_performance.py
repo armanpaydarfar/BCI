@@ -98,53 +98,149 @@ for run_idx, run_folder in enumerate(selected_run_dirs):
 # ---- Combine Decoder Data ----
 df = pd.concat(df_list, ignore_index=True)
 
-# Validate necessary columns
-required_cols = ["Trial", "Timestamp", "P(MI)", "P(REST)", "True Label", "Predicted Label", "Phase", "RunID"]
-for col in required_cols:
+# ---- Flexible column detection (old vs new schema) ----
+has_new = ("P(MI)_inst" in df.columns) and ("P(REST)_inst" in df.columns)
+MI_COL   = "P(MI)_inst"   if has_new else "P(MI)"
+REST_COL = "P(REST)_inst" if has_new else "P(REST)"
+
+# ---- Validate necessary columns ----
+required_always = ["Trial", "Timestamp", "True Label", "Predicted Label", "Phase", "RunID"]
+for col in required_always:
     if col not in df.columns:
         raise ValueError(f"Missing required column in CSV: {col}")
+for col in [MI_COL, REST_COL]:
+    if col not in df.columns:
+        raise ValueError(f"Missing required probability column in CSV: {col}")
 
-# ---- 1. Plot Posterior Probability Histograms ----
-plt.figure(figsize=(10, 6))
-bins = np.linspace(0, 1, 20)
-
-sns.histplot(df[df["True Label"] == 200]["P(MI)"], bins=bins, kde=True, color="tab:blue", label="MI Trials")
-sns.histplot(df[df["True Label"] == 100]["P(REST)"], bins=bins, kde=True, color="tab:orange", label="Rest Trials")
-
-plt.xlabel("Posterior Probability")
-plt.ylabel("Frequency")
-plt.title("Histogram of Posterior Probabilities by True Class (Excl. ROBOT Phase)")
-plt.legend()
-plt.grid(True, linestyle="--", alpha=0.6)
-plt.tight_layout()
-plt.show()
-
-# ---- 2. Plot All Trials Together (Correct Class Probabilities) ----
-plt.figure(figsize=(12, 6))
-
-# Ensure unique identification per trial across runs
+# ---- Ensure unique identification per trial across runs ----
 df["GlobalTrialID"] = df["RunID"] + "_" + df["Trial"].astype(str)
 
-for gtid in df["GlobalTrialID"].unique():
-    trial_data = df[df["GlobalTrialID"] == gtid]
-    true_label = trial_data["True Label"].iloc[0]
+# Exclude ROBOT phase for these visualizations
+df_vis = df[df["Phase"] != "ROBOT"].copy()
 
-    if true_label == 200:
-        color = "tab:blue"
-        col = "P(MI)"
-    elif true_label == 100:
-        color = "tab:orange"
-        col = "P(REST)"
+# ==========================================
+# 1) Posterior Probability per Trial — ALL on ONE figure
+#    (Correct-class instantaneous probability)
+# ==========================================
+import matplotlib.pyplot as plt
+
+plt.figure()
+labeled = {"MI": False, "REST": False}  # to avoid legend spam
+
+for gtid in df_vis["GlobalTrialID"].unique():
+    trial_data = df_vis[df_vis["GlobalTrialID"] == gtid]
+    if trial_data.empty:
+        continue
+
+    true_label = int(trial_data["True Label"].iloc[0])
+    if true_label == 200:   # MI trial
+        col   = MI_COL
+        color = "tab:orange"   # MI = orange
+        lab   = "MI" if not labeled["MI"] else None
+        labeled["MI"] = True
+    elif true_label == 100: # REST trial
+        col   = REST_COL
+        color = "tab:blue"     # REST = blue
+        lab   = "REST" if not labeled["REST"] else None
+        labeled["REST"] = True
     else:
         continue
 
-    plt.plot(range(len(trial_data)), trial_data[col].values, color=color, alpha=0.5)
+    y = trial_data[col].astype(float).values
+    x = range(len(y))
+    plt.plot(x, y, color=color, alpha=0.5, linewidth=1.2, label=lab)
 
 plt.xlabel("Time (relative index)")
 plt.ylabel("Posterior Probability (Correct Class)")
-plt.title("Posterior Probability per Trial (Excl. ROBOT Phase)")
+plt.title("Posterior Probability per Trial (Excl. ROBOT Phase) — All Trials")
 plt.grid(True, linestyle="--", alpha=0.5)
+plt.legend(loc="upper right")
 plt.tight_layout()
+plt.show()
+
+## ---- After you build df_vis, MI_COL, REST_COL as you already do ----
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Compute per-trial lean % (percentage of classifications where correct-class inst prob > 0.5)
+lean_records = []  # rows: {GlobalTrialID, RunID, Class, LeanPct}
+
+for gtid, trial_df in df_vis.groupby("GlobalTrialID"):
+    if trial_df.empty:
+        continue
+
+    true_label = int(trial_df["True Label"].iloc[0])
+    run_id     = str(trial_df["RunID"].iloc[0])
+
+    if true_label == 200:   # MI trial -> use MI_COL
+        cls = "MI"
+        vals = trial_df[MI_COL].astype(float).values
+    elif true_label == 100: # REST trial -> use REST_COL
+        cls = "REST"
+        vals = trial_df[REST_COL].astype(float).values
+    else:
+        continue
+
+    vals = vals[~np.isnan(vals)]
+    if vals.size == 0:
+        continue
+
+    lean_pct = float((vals > 0.5).mean() * 100.0)
+    lean_records.append({
+        "GlobalTrialID": gtid,
+        "RunID": run_id,
+        "Class": cls,
+        "LeanPct": lean_pct
+    })
+
+# Convert to DataFrame for convenience (optional)
+lean_df = pd.DataFrame(lean_records)
+
+# Split by class for plotting
+mi_vals   = lean_df.loc[lean_df["Class"] == "MI",   "LeanPct"].astype(float).values
+rest_vals = lean_df.loc[lean_df["Class"] == "REST", "LeanPct"].astype(float).values
+
+# ---- Single box-and-whisker figure (all runs on ONE plot) ----
+fig, ax = plt.subplots()
+
+# Boxplot: MI (orange) at x=1, REST (blue) at x=2
+box = ax.boxplot(
+    [mi_vals, rest_vals],
+    labels=["MI", "REST"],
+    widths=0.5,
+    patch_artist=True,
+    showfliers=False
+)
+
+# Color the boxes
+colors = ["tab:orange", "tab:blue"]  # MI=orange, REST=blue
+for patch, c in zip(box["boxes"], colors):
+    patch.set_facecolor(c)
+    patch.set_alpha(0.45)
+for median in box["medians"]:
+    median.set_linewidth(2)
+
+# Optional: overlay jittered points for each trial (to see distribution)
+def jittered_x(center, n, scale=0.06):
+    if n <= 1:
+        return np.array([center])
+    j = np.linspace(-1, 1, n) * scale
+    # shuffle a bit so they aren't in order
+    rng = np.random.default_rng(42)
+    rng.shuffle(j)
+    return center + j
+
+# MI dots at x=1, REST dots at x=2 (aligned over their respective boxes)
+x_mi   = jittered_x(1.0, len(mi_vals))
+x_rest = jittered_x(2.0, len(rest_vals))
+ax.scatter(x_mi,   mi_vals,   s=30, alpha=0.9, edgecolor="black", linewidth=0.5, color="tab:orange")
+ax.scatter(x_rest, rest_vals, s=30, alpha=0.9, edgecolor="black", linewidth=0.5, color="tab:blue")
+
+ax.set_ylim(0, 100)
+ax.set_ylabel("Lean % (correct-class prob > 0.5)")
+ax.set_title("Bar Dynamics — Lean % per Trial (All Runs on One Plot)")
+ax.grid(True, axis="y", linestyle="--", alpha=0.4)
+fig.tight_layout()
 plt.show()
 
 # ---- 3. Plot Aggregated Confusion Matrix ----

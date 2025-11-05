@@ -4,7 +4,7 @@
 WORKING_DIR = "/home/arman-admin/Projects/Harmony/"
 DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
 
-TRAINING_SUBJECT = "F25CLASS_SUBJ_006"
+TRAINING_SUBJECT = "PILOT007"
 # EEG Settings
 CAP_TYPE = 32
 LOWCUT = 8  # Hz
@@ -47,9 +47,9 @@ CLASSIFY_WINDOW = 1000  # Duration of EEG data window for classification (millis
 FILTER_BUFFER_SIZE = 2048 #4s at 512 Hz
 BASELINE_DURATION = 1 #seconds
 ACCURACY_THRESHOLD = 0.6  # OBS Accuracy threshold to determine "Correct" (plan to obsolete)
-THRESHOLD_MI = 0.6 #Threshold for MI "correct"
-THRESHOLD_REST = 0.6 #Threshold for REST "Correct"
-RELAXATION_RATIO = 0.6 # relaxation ratio for sustained MI during movement
+THRESHOLD_MI = 0.62 #Threshold for MI "correct"
+THRESHOLD_REST = 0.62 #Threshold for REST "Correct"
+RELAXATION_RATIO = 0.4 # relaxation ratio for sustained MI during movement
 MIN_PREDICTIONS = 8 # Min number of predictions during Online experiment before the decoder can end early
 STEP_SIZE = 1/16
 CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point

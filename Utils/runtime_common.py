@@ -102,19 +102,25 @@ def append_trial_probabilities_to_csv(trial_probabilities, mode, trial_number,
                                       mi_threshold, rest_threshold, logger,
                                       phase):
     correct_class = 200 if mode == 0 else 100
-    trial_probabilities = np.array(trial_probabilities)
+    trial_probabilities = np.array(trial_probabilities, dtype=float)
 
-    if trial_probabilities.shape[1] != 3:
-        logger.log_event(f"❌ Error: Unexpected shape {trial_probabilities.shape}. Expected (N,3). Skipping save.")
+    # Expect: [ts, P(REST)_inst, P(MI)_inst, P(MI)_avg, P(REST)_avg]
+    if trial_probabilities.ndim != 2 or trial_probabilities.shape[1] != 5:
+        logger.log_event(
+            f"❌ Error: Unexpected shape {trial_probabilities.shape}. "
+            f"Expected (N,5): [ts, P(REST)_inst, P(MI)_inst, P(MI)_avg, P(REST)_avg]. Skipping save."
+        )
         return
 
     for row in trial_probabilities:
-        timestamp, prob_rest, prob_mi = row
+        ts, prest_inst, pmi_inst, pmi_avg, prest_avg = row.tolist()
         logger.log_decoder_output(
             trial=trial_number,
-            timestamp=timestamp,
-            prob_mi=prob_mi,
-            prob_rest=prob_rest,
+            timestamp=ts,
+            prob_mi_inst=pmi_inst,
+            prob_rest_inst=prest_inst,
+            prob_mi_avg=pmi_avg,
+            prob_rest_avg=prest_avg,
             true_label=correct_class,
             predicted_label=predicted_label,
             early_cutout=early_cutout,
@@ -127,6 +133,7 @@ def append_trial_probabilities_to_csv(trial_probabilities, mode, trial_number,
         f"✅ Logged {len(trial_probabilities)} rows for Trial {trial_number} | "
         f"True: {correct_class}, Predicted: {predicted_label}, Early Cut: {early_cutout}, Phase: {phase}"
     )
+
 
 
 def display_fixation_period(duration=3, eeg_state=None):
@@ -332,6 +339,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, mode, udp_so
     accuracy_threshold = config.THRESHOLD_MI if mode == 0 else config.THRESHOLD_REST 
 
     all_probabilities = []
+    running_average_list = []
     predictions = []
     running_avg_confidence = 0.5
     current_confidence = 0.5
@@ -358,6 +366,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, mode, udp_so
         pygame.display.flip()
 
         # === Classify every step_size seconds ===
+        just_classified = False
         if now >= next_tick:
             current_confidence, predictions, all_probabilities = classify_real_time(
                 eeg_state, window_size_samples,
@@ -375,11 +384,21 @@ def hold_messages_and_classify(messages, colors, offsets, duration, mode, udp_so
                     f"{config.TRIGGERS['ROBOT_PROBS']},{prob_mi:.5f},{prob_rest:.5f}",
                     quiet=True
                 )
+            just_classified = True
 
             if current_confidence > 0:
                 num_predictions += 1
 
             running_avg_confidence = leaky_integrator.update(current_confidence)
+            if just_classified and all_probabilities:
+                ts, prest_inst, pmi_inst = all_probabilities[-1]
+                if mode == 0:  # MI context
+                    pmi_avg   = running_avg_confidence
+                    prest_avg = 1.0 - running_avg_confidence
+                else:          # REST context
+                    prest_avg = running_avg_confidence
+                    pmi_avg   = 1.0 - running_avg_confidence
+                all_probabilities[-1] = [ts, prest_inst, pmi_inst, pmi_avg, prest_avg]
 
             if num_predictions >= min_predictions_before_stop and running_avg_confidence < config.RELAXATION_RATIO * accuracy_threshold:
                 early_stop = True
@@ -432,6 +451,7 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
     FES_active = False
     all_probabilities = []
     predictions = []
+    running_avg_list = []
     leaky_integrator = LeakyIntegrator(alpha=config.INTEGRATOR_ALPHA)  # Confidence smoothing
     min_predictions = config.MIN_PREDICTIONS
     earlystop_flag = False
@@ -471,6 +491,7 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
         eeg_state.update()
 
         now = time.time()
+        just_classified = False
         if now >= next_tick:
             current_confidence, predictions, all_probabilities = classify_real_time(
                 eeg_state,
@@ -490,6 +511,7 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
                     f"{config.TRIGGERS['MI_PROBS' if mode == 0 else 'REST_PROBS']},{prob_mi:.5f},{prob_rest:.5f}",
                     quiet=True
                 )
+            just_classified=True
 
 
         running_avg_confidence = leaky_integrator.update(current_confidence)
@@ -498,6 +520,15 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
 
         screen.fill(config.black)
         MI_fill, Rest_fill = calculate_fill_levels(running_avg_confidence, mode)
+        if just_classified and all_probabilities:
+            ts, prest_inst, pmi_inst = all_probabilities[-1]
+            if mode == 0:  # MI trial: confidence is P(MI)
+                pmi_avg   = running_avg_confidence
+                prest_avg = 1.0 - running_avg_confidence
+            else:          # REST trial: confidence is P(REST)
+                prest_avg = running_avg_confidence
+                pmi_avg   = 1.0 - running_avg_confidence
+            all_probabilities[-1] = [ts, prest_inst, pmi_inst, pmi_avg, prest_avg]
 
         if mode == 0:
             draw_arrow_fill(MI_fill, screen_width, screen_height)

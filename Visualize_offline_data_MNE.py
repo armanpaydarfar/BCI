@@ -10,8 +10,8 @@ from scipy.stats import zscore
 from Utils.preprocessing import concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "CLIN_SUBJ_003"
-session = "S001ONLINE"
+subject = "LAB_SUBJ_001"
+session = "S001OFFLINE"
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
@@ -149,13 +149,21 @@ raw.rename_channels(rename_dict)
 # Optional: Restrict to a subset of channels (e.g., motor region)
 # ==========================================
 # You can comment this line out or modify the list in-script as needed
-MOTOR_CHANNEL_NAMES = ['C3','Cz','C4','CP5','CP1','CP2','CP6','P7','P3','Pz','P4','P8','POz']
 
+'''
+ANALYSIS_CHANNEL_NAMES = [
+    'F7', 'F3', 'Fz', 'F4', 'F8',
+    'FC5', 'FC6',
+    'C3', 'Cz', 'C4',
+    'CP5', 'CP1', 'CP2', 'CP6',
+    'P7', 'P3', 'Pz', 'P4', 'P8',
+    'PO7', 'PO3', 'POz', 'PO4', 'PO8'
+]
 # Filter to only keep channels present in both raw and the target list
-keep_channels = [ch for ch in MOTOR_CHANNEL_NAMES if ch in raw.ch_names]
+keep_channels = [ch for ch in ANALYSIS_CHANNEL_NAMES if ch in raw.ch_names]
 raw.pick_channels(keep_channels)
 print(f"✅ Keeping only motor channels: {keep_channels}")
-
+'''
 
 
 
@@ -501,7 +509,7 @@ for marker, tfr_avg in tfr_data.items():
         # Extract correct mappable object for color bar
         img = tfr_avg.plot_topomap(
             tmin=t_start, tmax=t_end,
-            axes=ax, cmap="viridis", show=False, vlim=(vmin, vmax), colorbar=False
+            axes=ax, cmap="viridis", show=False, vlim=(vmin, vmax), colorbar=False, show_names = True
         )
 
         # Extract the colorbar mappable from the plot
