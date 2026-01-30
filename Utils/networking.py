@@ -8,19 +8,6 @@ import pygame
 import select
 
 
-
-try:
-    _RO = getattr(_config, "ROBOT_OPCODES", {}) or {}
-    _SYMBOLIC_TRAJ = {
-        _RO.get("TRAJECTORY_A", "a"),
-        _RO.get("TRAJECTORY_X", "x"),
-        _RO.get("TRAJECTORY_Y", "y"),
-        _RO.get("TRAJECTORY_Z", "z"),
-    }
-except Exception:
-    _SYMBOLIC_TRAJ = {"a", "x", "y", "z"}
-
-
 # =========================================================
 # Constants 
 # =========================================================
@@ -66,6 +53,20 @@ _ROBOT_IP   = None
 _ROBOT_PORT = None
 _BIND_IP    = None
 _BIND_PORT  = None
+
+try:
+    _RO = getattr(_config, "ROBOT_OPCODES", {}) or {}
+    _SYMBOLIC_TRAJ = {
+        _RO.get("TRAJECTORY_A", "a"),
+        _RO.get("TRAJECTORY_X", "x"),
+        _RO.get("TRAJECTORY_Y", "y"),
+        _RO.get("TRAJECTORY_Z", "z"),
+    }
+except Exception:
+    _SYMBOLIC_TRAJ = {"a", "x", "y", "z"}
+
+
+
 
 if _config is not None:
     try:
@@ -164,25 +165,31 @@ def _is_coords_string(s: str) -> bool:
 
 def _build_ack_map(config):
     """
-    Map opcode tokens (what appears after ACK:) -> marker trigger.
-    Only map motion/control (300-series). No trigger for COORDS_STAGED_RAD.
+    Map ACK base tokens (e.g., 'g','h','p','r','s','m','c') -> marker trigger ints.
+    Keys are normalized via _base_token so 'h;dur=3' maps under 'h'.
     """
     if config is None:
         return {}
     try:
         ro = config.ROBOT_OPCODES
         tr = config.TRIGGERS
+
+        def k(name, default):
+            # normalize whatever is in config (with or without parameters)
+            return _base_token(ro.get(name, default))
+
         return {
-            ro.get("GO", "g"):               tr.get("ACK_ROBOT_BEGIN"),
-            ro.get("STOP", "s"):             tr.get("ACK_ROBOT_STOP"),
-            ro.get("HOME", "h"):             tr.get("ACK_ROBOT_HOME"),
-            ro.get("Pause", "p"):            tr.get("ACK_ROBOT_PAUSE"),
-            ro.get("RESUME", "r"):           tr.get("ACK_ROBOT_RESUME"),
-            ro.get("MASTER_UNLOCK", "m"):    tr.get("ACK_MASTER_UNLOCK"),
-            ro.get("MASTER_LOCK", "c"):      tr.get("ACK_MASTER_LOCK"),
+            k("GO",            "g"): tr.get("ACK_ROBOT_BEGIN"),
+            k("STOP",          "s"): tr.get("ACK_ROBOT_STOP"),
+            k("HOME",          "h"): tr.get("ACK_ROBOT_HOME"),
+            k("PAUSE",         "p"): tr.get("ACK_ROBOT_PAUSE"),
+            k("RESUME",        "r"): tr.get("ACK_ROBOT_RESUME"),
+            k("MASTER_UNLOCK", "m"): tr.get("ACK_MASTER_UNLOCK"),
+            k("MASTER_LOCK",   "c"): tr.get("ACK_MASTER_LOCK"),
         }
     except Exception:
         return {}
+
 
 def _send_marker_trigger(config, logger, trigger_value: str):
     """Fire a software trigger to the marker stream."""
@@ -289,6 +296,25 @@ def _await_ack_blocking(expected_token: str, logger=None) -> bool:
             continue
         # Non-ACKs ignored here (we don’t consume telemetry during the blocking wait)
     return False
+
+# --- add near other small helpers (above send_udp_message) ---
+def _base_token(msg: str) -> str:
+    """
+    Return the opcode token without any parameters, e.g.:
+      'h;dur=3' -> 'h'
+      'q;seq=123' -> 'q'
+      'g' -> 'g'
+    Leaves coordinate strings unchanged (they're not used with exact ACKs).
+    """
+    if not isinstance(msg, str):
+        try:
+            msg = _to_wire(msg)
+        except Exception:
+            msg = str(msg)
+    s = msg.strip()
+    if _is_coords_string(s):
+        return s  # not compared against ACKs
+    return s.split(';', 1)[0]
 
 
 # =========================================================
@@ -585,8 +611,8 @@ def send_udp_message(
     Destination (ip,port) is honored; source is fixed CONTROL_BIND.
 
     - expect_ack=True: wait for ACK:<token>.
-      * For 'q', accept 'ACK:q;seq=...' (prefix match).
-      * For others, exact match to the message ('h','g','p','r','s', etc.)
+      * For 'q', accept 'ACK:q' or 'ACK:q;seq=...'.
+      * For others, accept ACK of the base opcode ('h' matches 'h;dur=3').
     - capture_query=True & message=='q': capture first non-ACK telemetry after send.
 
     Returns:
@@ -594,7 +620,6 @@ def send_udp_message(
     """
     # unified logger
     if not quiet:
-        # keep a tiny local alias (no inner function)
         _log = lambda m: _udp_log(logger, m)
     else:
         _log = lambda m: None  # noqa: E731
@@ -608,7 +633,7 @@ def send_udp_message(
     robot_ip   = getattr(_config, "UDP_ROBOT", {}).get("IP", _ROBOT_IP)
     robot_port = int(getattr(_config, "UDP_ROBOT", {}).get("PORT", _ROBOT_PORT))
 
-    # ---------------- PATCH: prepare ACK→marker map once when needed ----------------
+    # Prepare ACK→marker map once when needed
     if expect_ack:
         try:
             _ack_to_trigger_map = _build_ack_map(_config)  # e.g., {'g': 305, 'h': 385, ...}
@@ -616,11 +641,13 @@ def send_udp_message(
             _ack_to_trigger_map = {}
     else:
         _ack_to_trigger_map = None
-    # -----------------------------------------------------------------------------
+
+    # Base token of the outgoing message (e.g., 'h' for 'h;dur=3')
+    msg_token_base = _base_token(message)
 
     attempts = 0
     while True:
-        # IMPORTANT: drain BEFORE sending to avoid eating the fresh ACK
+        # Drain BEFORE sending to avoid eating the fresh ACK
         try:
             _drain_control_socket(max_ms=30, logger=logger)
         except NameError:
@@ -652,7 +679,7 @@ def send_udp_message(
 
         _log(f"{prefix} {kind}: {message}")
 
-        # ---------------- pending-target bookkeeping (unchanged) ----------------
+        # ---------------- pending-target bookkeeping (base-token aware) ----------------
         try:
             ro = getattr(_config, "ROBOT_OPCODES", {}) or {}
             tok_c = ro.get("MASTER_LOCK",   "c")
@@ -662,23 +689,25 @@ def send_udp_message(
             tok_c, tok_m, tok_h = "c", "m", "h"
 
         global _pending_target_ready, _pending_target_ctx
-        if message == tok_c:
+        msg_base = msg_token_base
+        if msg_base == tok_c:
             _pending_target_ready = True
             _pending_target_ctx   = None
-        elif message in (tok_m, tok_h):
+        elif msg_base in (tok_m, tok_h):
             _pending_target_ready = False
             _pending_target_ctx   = None
-        # ------------------------------------------------------------------------
+        # ------------------------------------------------------------------------------
 
         # Fast exit
         if not expect_ack and not capture_query:
             return None
-
+        
+        
         # Wait window
         end = time.time() + ack_timeout
         acked = False
         query_payload = None
-        ack_token_matched = None   # ---------------- PATCH: remember which token matched
+        ack_token_matched = None   # remember which base token matched
 
         while time.time() < end:
             r, _, _ = select.select([s], [], [], max(0.0, end - time.time()))
@@ -696,41 +725,45 @@ def send_udp_message(
 
             txt = data.decode("utf-8", errors="ignore").strip()
 
-            # ACK handling
+            # ACK handling (compare base tokens)
             if expect_ack and txt.startswith(ack_prefix):
-                token = txt[len(ack_prefix):].strip()
-                if message.startswith("q"):
-                    # accept ACK:q;seq=...
-                    if token.startswith("q"):
+                token_full = txt[len(ack_prefix):].strip()
+                token_base = _base_token(token_full)
+
+                if msg_token_base == "q":
+                    # accept ACK:q or ACK:q;seq=...
+                    if token_base == "q":
                         _log(f"[ROBOT->UDP] {txt}")
                         acked = True
-                        ack_token_matched = "q"  # -------- PATCH
+                        ack_token_matched = token_base  # CHANGED: store ACK’s base token
                         if not capture_query:
-                            # -------- PATCH: forward ACK→marker if mapped
                             if _ack_to_trigger_map:
-                                trig = _ack_to_trigger_map.get(ack_token_matched)
+                                # NEW: try ACK’s base token first, then the message’s base token, then "q"
+                                trig = (_ack_to_trigger_map.get(token_base)
+                                        or _ack_to_trigger_map.get(msg_token_base)
+                                        or _ack_to_trigger_map.get("q"))
                                 if trig:
                                     _send_marker_trigger(_config, logger, trig)
-                            # ------------------------------------------------
                             return (True, None)
                 else:
-                    if token == message:
+                    # control ops: 'h;dur=3' should match 'ACK:h'
+                    if token_base == msg_token_base:
                         _log(f"[ROBOT->UDP] {txt}")
                         acked = True
-                        ack_token_matched = token  # -------- PATCH
+                        ack_token_matched = token_base  # CHANGED: store ACK’s base token
                         if not capture_query:
-                            # -------- PATCH: forward ACK→marker if mapped
                             if _ack_to_trigger_map:
-                                trig = _ack_to_trigger_map.get(ack_token_matched)
+                                # NEW: try ACK’s base token first, then the message’s base token
+                                trig = (_ack_to_trigger_map.get(token_base)
+                                        or _ack_to_trigger_map.get(msg_token_base))
                                 if trig:
                                     _send_marker_trigger(_config, logger, trig)
-                            # ------------------------------------------------
                             return (True, None)
                 # unrelated ACKs ignored during this wait
                 continue
 
             # Telemetry path for q
-            if capture_query and message.startswith("q") and not txt.startswith(ack_prefix) and query_payload is None:
+            if capture_query and msg_token_base == "q" and not txt.startswith(ack_prefix) and query_payload is None:
                 query_payload = txt
                 if not expect_ack:
                     return query_payload
@@ -738,12 +771,12 @@ def send_udp_message(
 
         # Window ended
         if expect_ack and acked:
-            # -------- PATCH: emit marker if we matched an ACK but deferred return
+            # CHANGED: prefer the ACK’s token, then fall back to the message’s base token
             if _ack_to_trigger_map and ack_token_matched is not None:
-                trig = _ack_to_trigger_map.get(ack_token_matched)
+                trig = (_ack_to_trigger_map.get(ack_token_matched)
+                        or _ack_to_trigger_map.get(msg_token_base))
                 if trig:
                     _send_marker_trigger(_config, logger, trig)
-            # -------------------------------------------------------------------
             return (True, query_payload)
         if not expect_ack:
             return query_payload

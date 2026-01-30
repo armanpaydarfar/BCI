@@ -472,12 +472,6 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
     # Send UDP triggers
     if mode == 0:  # Red Arrow Mode (Motor Imagery)
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_BEGIN"], logger=logger)
-        if FES_toggle == 1:
-            send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_SENS_GO", logger=logger)
-            FES_active = True
-        else:
-            logger.log_event("FES is disabled.")
-            FES_active = False
     else:  # Blue Ball Mode (Rest)
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["REST_BEGIN"], logger=logger)
         FES_active = False

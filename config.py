@@ -34,7 +34,7 @@ SHAPE_MAX = 0.7 #maximum fill
 SHAPE_MIN = 0.5 #minimum fill 
 ROBOT_TRAJECTORY = ["a"] # Not using
 BIG_BROTHER_MODE = True #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
-SEND_PROBS = True
+SEND_PROBS = False
 
 
 # Early-stop policy: "correct_only" (current behavior) or "either"
@@ -47,8 +47,8 @@ CLASSIFY_WINDOW = 1000  # Duration of EEG data window for classification (millis
 FILTER_BUFFER_SIZE = 2048 #4s at 512 Hz
 BASELINE_DURATION = 1 #seconds
 ACCURACY_THRESHOLD = 0.6  # OBS Accuracy threshold to determine "Correct" (plan to obsolete)
-THRESHOLD_MI = 0.62 #Threshold for MI "correct"
-THRESHOLD_REST = 0.62 #Threshold for REST "Correct"
+THRESHOLD_MI = 0.6 #Threshold for MI "correct"
+THRESHOLD_REST = 0.6 #Threshold for REST "Correct"
 RELAXATION_RATIO = 0.4 # relaxation ratio for sustained MI during movement
 MIN_PREDICTIONS = 8 # Min number of predictions during Online experiment before the decoder can end early
 STEP_SIZE = 1/16
@@ -70,7 +70,7 @@ SAVE_ADAPTIVE_T = False #this toggle saves "Adaptive_T" to the EEG directory dur
 
 
 # FES Parameters
-FES_toggle = 0
+FES_toggle = 1
 FES_CHANNEL = "red"
 FES_TIMING_OFFSET = 7 
 # above for motor FES, cut out X seconds before the full duration of movement. This should represent when the robot will naturally reach the end of motion (in successful case)
@@ -142,7 +142,7 @@ ROBOT_OPCODES = {
     "TRAJECTORY_Y": "y",      # Accross side motion
     "TRAJECTORY_Z": "z",      # Reach up motion
     "GO": "g",                # Execute movement (after MI success)
-    "HOME": "h",              # Home
+    "HOME": "h;dur=3",              # Home
     "STOP": "s",              # Stop. Will return home automatically after several seconds
     "PAUSE": "p",             # Pause (several window allowed for resume)
     "RESUME": "r",            # Resume (resume trajectory if paused)

@@ -10,7 +10,7 @@ from scipy.stats import zscore
 from Utils.preprocessing import concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "LAB_SUBJ_001"
+subject = "F25CLASS_SUBJ_008"
 session = "S001OFFLINE"
 
 # Construct the EEG directory path dynamically
@@ -308,11 +308,11 @@ window_size = 0.5  # Each window covers 500ms
 time_windows = np.linspace(0.1, 5.0 - window_size, num_windows)  # Avoid end clipping
 
 
-'''
+
 # Config
-channel_name = "FC1"
+channel_name = "CP1"
 target_marker = 200  # for example, MI trials
-trial_index = 0      # 0 = first trial, 1 = second, etc.
+trial_index = 0   # 0 = first trial, 1 = second, etc.
 
 # Get channel index
 channel_index = epochs.ch_names.index(channel_name)
@@ -323,6 +323,7 @@ epochs_for_marker = epochs[target_marker]  # or epochs['200'] if using string ke
 # Get data: shape (n_trials, n_channels, n_times)
 data = epochs_for_marker.get_data()
 #print(data.shape)
+
 # Extract signal for the desired trial and channel
 signal = data[trial_index, channel_index, :]
 times = epochs_for_marker.times
@@ -339,7 +340,7 @@ plt.legend()
 plt.tight_layout()
 plt.show()
 
-'''
+
 '''
 
 # **Step 1: Square all epochs to compute signal power**
