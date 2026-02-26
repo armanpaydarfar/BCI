@@ -4,7 +4,7 @@
 WORKING_DIR = "/home/arman-admin/Projects/Harmony/"
 DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
 
-TRAINING_SUBJECT = "PILOT007"
+TRAINING_SUBJECT = "S26CLASS_SUBJ_004"
 # EEG Settings
 CAP_TYPE = 32
 LOWCUT = 8  # Hz
@@ -21,7 +21,7 @@ EOG_TOGGLE = 0  # Toggle to enable or disable EOG processing (1 = enabled, 0 = d
 # Experiment Parameters
 ARM_SIDE = "Right"
 EXPERIMENT_TYPE = "BASE" # BIMANUAL or BASE
-TOTAL_TRIALS = 20  # Total number of trials
+TOTAL_TRIALS = 30  # Total number of trials
 TOTAL_TRIALS_ERRP = 45 # Total number of trials for ErrP experiment
 MAX_REPEATS = 3  # Maximum consecutive repeats of the same condition
 N_SPLITS = 5  # Number of splits for KFold cross-validation
@@ -33,7 +33,7 @@ TIMING = True #obsolete
 SHAPE_MAX = 0.7 #maximum fill 
 SHAPE_MIN = 0.5 #minimum fill 
 ROBOT_TRAJECTORY = ["a"] # Not using
-BIG_BROTHER_MODE = True #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
+BIG_BROTHER_MODE = False #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
 SEND_PROBS = False
 
 
@@ -49,7 +49,7 @@ BASELINE_DURATION = 1 #seconds
 ACCURACY_THRESHOLD = 0.6  # OBS Accuracy threshold to determine "Correct" (plan to obsolete)
 THRESHOLD_MI = 0.6 #Threshold for MI "correct"
 THRESHOLD_REST = 0.6 #Threshold for REST "Correct"
-RELAXATION_RATIO = 0.4 # relaxation ratio for sustained MI during movement
+RELAXATION_RATIO = 0.0 # relaxation ratio for sustained MI during movement
 MIN_PREDICTIONS = 8 # Min number of predictions during Online experiment before the decoder can end early
 STEP_SIZE = 1/16
 CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
@@ -172,3 +172,16 @@ UDP_CONTROL_BIND = {
     "IP":   "192.168.2.2",  # your control Control Modul's IP
     "PORT": 8080
 }
+
+
+
+# === Arduino actuator ===
+USE_ARDUINO = True          # Enable or disable Arduino actuator
+ARDUINO_PORT = "/dev/ttyACM0"  # Windows: COMn / macOS: /dev/cu.usbmodemXXX
+ARDUINO_BAUD = 9600         # Arduino communication baud rate
+
+# Command mapping based on classifier output
+ARDUINO_CMD_MI   = b"1"     # Movement detected (label 200)
+ARDUINO_CMD_REST = b"0"     # Rest or ambiguous state detected
+
+SIMULATION_MODE = False

@@ -83,10 +83,6 @@ marker_data = marker_data[keep]
 marker_timestamps = marker_timestamps[keep]
 print(f"🧹 Removed {removed} markers >= 1000; kept {marker_data.size}.")
 
-
-
-
-
 #print(marker_stream['time_series'])
 #print(marker_timestamps)
 print("\n EEG Channels from XDF:", channel_names)

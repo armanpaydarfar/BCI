@@ -7,23 +7,6 @@ from pathlib import Path
 import pygame
 import select
 
-
-# =========================================================
-# Constants 
-# =========================================================
-ACK_PREFIX   = "ACK:"
-ACK_TIMEOUT  = 0.5      # seconds per wait window
-MAX_RETRIES  = 1        # resend attempts when gating
-QUERY_OPCODE = "q"
-# How long to wait after traj ACK before sending 'g' (race guard)
-STAGE_TO_GO_DELAY_S = 0.10   # 100 ms; bump to 0.12–0.15 if you still see "nothing armed"
-
-
-# --- minimal state for standalone 'g' ---
-_pending_target_ready = False
-_pending_target_ctx   = None
-
-
 # =========================================================
 # Config loader (one level up, no deeper to avoid collisions)
 # =========================================================
@@ -48,12 +31,57 @@ def _load_config():
 
 _config = _load_config()
 
+# =========================================================
+# Constants
+# =========================================================
+ACK_PREFIX   = "ACK:"
+ACK_TIMEOUT  = 0.5      # seconds per wait window
+MAX_RETRIES  = 1        # resend attempts when gating
+QUERY_OPCODE = "q"
+STAGE_TO_GO_DELAY_S = 0.10  # 100 ms
+
+# Simulation mode: suppress robot I/O, allow marker I/O
+SIMULATION_MODE = bool(getattr(_config, "SIMULATION_MODE", False)) if _config is not None else False
+print("SIM MODE:", SIMULATION_MODE)
+# --- minimal state for standalone 'g' ---
+_pending_target_ready = False
+_pending_target_ctx   = None
+
+# =========================================================
 # Endpoints (locked)
+# =========================================================
 _ROBOT_IP   = None
 _ROBOT_PORT = None
 _BIND_IP    = None
 _BIND_PORT  = None
 
+# Marker endpoint (optional)
+_MARKER_IP = None
+_MARKER_PORT = None
+
+if _config is not None:
+    try:
+        _ROBOT_IP   = _config.UDP_ROBOT["IP"]
+        _ROBOT_PORT = int(_config.UDP_ROBOT["PORT"])
+        _BIND_IP    = _config.UDP_CONTROL_BIND["IP"]
+        _BIND_PORT  = int(_config.UDP_CONTROL_BIND["PORT"])
+    except Exception:
+        pass
+    try:
+        _MARKER_IP = _config.UDP_MARKER["IP"]
+        _MARKER_PORT = int(_config.UDP_MARKER["PORT"])
+    except Exception:
+        _MARKER_IP, _MARKER_PORT = None, None
+
+# Sensible fallback if config missing
+_ROBOT_IP   = _ROBOT_IP   or "192.168.2.1"
+_ROBOT_PORT = _ROBOT_PORT or 8080
+_BIND_IP    = _BIND_IP    or "0.0.0.0"
+_BIND_PORT  = _BIND_PORT  or 8080
+
+# =========================================================
+# Derived symbols (AFTER config is loaded)
+# =========================================================
 try:
     _RO = getattr(_config, "ROBOT_OPCODES", {}) or {}
     _SYMBOLIC_TRAJ = {
@@ -65,77 +93,46 @@ try:
 except Exception:
     _SYMBOLIC_TRAJ = {"a", "x", "y", "z"}
 
-
-
-
-if _config is not None:
-    try:
-        _ROBOT_IP   = _config.UDP_ROBOT["IP"]
-        _ROBOT_PORT = int(_config.UDP_ROBOT["PORT"])
-        _BIND_IP    = _config.UDP_CONTROL_BIND["IP"]
-        _BIND_PORT  = int(_config.UDP_CONTROL_BIND["PORT"])
-    except Exception:
-        pass
-
-# Sensible fallback if config missing (keeps UI alive, but robot I/O won’t work)
-_ROBOT_IP   = _ROBOT_IP   or "192.168.2.1"
-_ROBOT_PORT = _ROBOT_PORT or 8080
-_BIND_IP    = _BIND_IP    or "0.0.0.0"
-_BIND_PORT  = _BIND_PORT  or 8080
-
-# The one socket we’ll use for ALL robot TX/RX to avoid ephemeral ports
+# =========================================================
+# Sockets
+# =========================================================
+_marker_sock = None
 _ROBOT_SOCK = None
+_generic_sock = None
+# Bind robot control socket at import-time (best effort)
 try:
-    _ROBOT_SOCK = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        _ROBOT_SOCK.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    except Exception:
-        pass
-    _ROBOT_SOCK.bind((_BIND_IP, _BIND_PORT))
-    _ROBOT_SOCK.setblocking(False)
-    # NOTE: We intentionally DO NOT connect(); we always use sendto() to (_ROBOT_IP,_ROBOT_PORT).
-    # This guarantees we keep the same local port (CONTROL_BIND) and never leak ephemeral ports.
+    if not SIMULATION_MODE:
+        _ROBOT_SOCK = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            _ROBOT_SOCK.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except Exception:
+            pass
+        _ROBOT_SOCK.bind((_BIND_IP, _BIND_PORT))
+        _ROBOT_SOCK.setblocking(False)
+    else:
+        _ROBOT_SOCK = None
 except Exception as e:
-    # If binding fails (e.g., port in use), we’ll defer to best-effort in functions.
     print(f"[ERROR] Could not bind control socket to {_BIND_IP}:{_BIND_PORT}: {e}")
     _ROBOT_SOCK = None
 
 
-
-
 # =========================================================
-# Core helpers using the bound socket
+# Logging
 # =========================================================
-def _drain_control_socket(max_ms: int = 50, logger=None):
-    """
-    Non-blocking drain of the control socket for up to max_ms to clear stale datagrams
-    (e.g., leftover ACKs from a previous command).
-    """
-    s = _ensure_control_socket(logger)
-    if s is None:
-        return
-    end = time.time() + (max_ms / 1000.0)
-    while time.time() < end:
-        r, _, _ = select.select([s], [], [], 0.0)
-        if not r:
-            break
-        try:
-            s.recvfrom(65535)  # discard
-        except BlockingIOError:
-            break
-        except Exception:
-            break
-
 def _udp_log(logger, msg: str):
     if logger is not None:
         try:
-            logger.log_event(msg); return
+            logger.log_event(msg)
+            return
         except Exception:
             pass
     print(msg)
 
+
+# =========================================================
+# Helpers
+# =========================================================
 def _to_wire(op):
-    """Stringify opcodes or 7-element coordinate vectors into wire format."""
     if isinstance(op, (bytes, bytearray)):
         return op.decode("utf-8", errors="ignore")
     if isinstance(op, str):
@@ -163,58 +160,68 @@ def _is_coords_string(s: str) -> bool:
     except Exception:
         return False
 
+
+def _base_token(msg: str) -> str:
+    """
+    'h;dur=3' -> 'h'
+    'q;seq=123' -> 'q'
+    'g' -> 'g'
+    """
+    if not isinstance(msg, str):
+        msg = _to_wire(msg)
+    s = msg.strip()
+    if _is_coords_string(s):
+        return s
+    return s.split(";", 1)[0]
+
+
 def _build_ack_map(config):
-    """
-    Map ACK base tokens (e.g., 'g','h','p','r','s','m','c') -> marker trigger ints.
-    Keys are normalized via _base_token so 'h;dur=3' maps under 'h'.
-    """
     if config is None:
         return {}
     try:
         ro = config.ROBOT_OPCODES
         tr = config.TRIGGERS
-
-        def k(name, default):
-            # normalize whatever is in config (with or without parameters)
-            return _base_token(ro.get(name, default))
-
         return {
-            k("GO",            "g"): tr.get("ACK_ROBOT_BEGIN"),
-            k("STOP",          "s"): tr.get("ACK_ROBOT_STOP"),
-            k("HOME",          "h"): tr.get("ACK_ROBOT_HOME"),
-            k("PAUSE",         "p"): tr.get("ACK_ROBOT_PAUSE"),
-            k("RESUME",        "r"): tr.get("ACK_ROBOT_RESUME"),
-            k("MASTER_UNLOCK", "m"): tr.get("ACK_MASTER_UNLOCK"),
-            k("MASTER_LOCK",   "c"): tr.get("ACK_MASTER_LOCK"),
+            _base_token(ro.get("GO", "g")):            tr.get("ACK_ROBOT_BEGIN"),
+            _base_token(ro.get("STOP", "s")):          tr.get("ACK_ROBOT_STOP"),
+            _base_token(ro.get("HOME", "h")):          tr.get("ACK_ROBOT_HOME"),
+            _base_token(ro.get("PAUSE", "p")):         tr.get("ACK_ROBOT_PAUSE"),
+            _base_token(ro.get("RESUME", "r")):        tr.get("ACK_ROBOT_RESUME"),
+            _base_token(ro.get("MASTER_UNLOCK", "m")): tr.get("ACK_MASTER_UNLOCK"),
+            _base_token(ro.get("MASTER_LOCK", "c")):   tr.get("ACK_MASTER_LOCK"),
+            _base_token(ro.get("QUERY", "q")):         tr.get("ACK_ROBOT_QUERY", None),
         }
     except Exception:
         return {}
 
-
-def _send_marker_trigger(config, logger, trigger_value: str):
-    """Fire a software trigger to the marker stream."""
-    if not trigger_value:
-        return
-    if config is None:
-        _udp_log(logger, f"[WARN] No config; cannot send marker trigger {trigger_value}.")
-        return
+def _ensure_marker_socket(logger=None):
+    """Dedicated socket for marker stream; never depends on robot bind."""
+    global _marker_sock
+    if _marker_sock is not None:
+        return _marker_sock
     try:
-        ip = config.UDP_MARKER["IP"]; port = int(config.UDP_MARKER["PORT"])
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as ms:
-            ms.sendto(str(trigger_value).encode("utf-8"), (ip, port))
-        _udp_log(logger, f"[TRIGGER] Sent marker trigger={trigger_value}")
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # bind to any local interface with ephemeral port
+        s.bind(("0.0.0.0", 0))
+        s.setblocking(False)
+        _marker_sock = s
+        return _marker_sock
     except Exception as e:
-        _udp_log(logger, f"[ERROR] Failed to send marker trigger {trigger_value}: {e}")
+        _udp_log(logger, f"[ERROR] Marker socket unavailable: {e}")
+        _marker_sock = None
+        return None
 
-
-# =========================================================
-# Import-time binding: ONE control socket on CONTROL_BIND
-# =========================================================
 def _ensure_control_socket(logger=None):
     """Ensure we have a bound control socket; bind now if import-time failed."""
     global _ROBOT_SOCK
+
+    if SIMULATION_MODE:
+        # Absolutely do not touch/bind robot sockets in sim mode.
+        return None
+
     if _ROBOT_SOCK is not None:
         return _ROBOT_SOCK
+
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -230,8 +237,68 @@ def _ensure_control_socket(logger=None):
         _ROBOT_SOCK = None
     return _ROBOT_SOCK
 
+
+def _ensure_generic_socket(logger=None):
+    """Ephemeral socket for 'other' UDP messages (never binds to control IP/port)."""
+    global _generic_sock
+    if _generic_sock is not None:
+        return _generic_sock
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("0.0.0.0", 0))
+        s.setblocking(False)
+        _generic_sock = s
+        return _generic_sock
+    except Exception as e:
+        _udp_log(logger, f"[ERROR] Generic UDP socket unavailable: {e}")
+        _generic_sock = None
+        return None
+
+
+def _drain_socket(sock, max_ms: int = 50):
+    if sock is None:
+        return
+    end = time.time() + (max_ms / 1000.0)
+    while time.time() < end:
+        r, _, _ = select.select([sock], [], [], 0.0)
+        if not r:
+            break
+        try:
+            sock.recvfrom(65535)
+        except BlockingIOError:
+            break
+        except Exception:
+            break
+
+def _drain_control_socket(max_ms: int = 50, logger=None):
+    s = _ensure_control_socket(logger)
+    if s is None:
+        return
+    _drain_socket(s, max_ms=max_ms)
+
+def _send_marker_trigger(config, logger, trigger_value: str):
+    """Fire a software trigger to the marker stream (marker-only socket)."""
+    if not trigger_value:
+        return
+    if config is None:
+        _udp_log(logger, f"[WARN] No config; cannot send marker trigger {trigger_value}.")
+        return
+    try:
+        ip = config.UDP_MARKER["IP"]
+        port = int(config.UDP_MARKER["PORT"])
+        ms = _ensure_marker_socket(logger)
+        if ms is None:
+            _udp_log(logger, f"[ERROR] Marker socket unavailable; cannot send trigger {trigger_value}.")
+            return
+        ms.sendto(str(trigger_value).encode("utf-8"), (ip, port))
+        _udp_log(logger, f"[TRIGGER] Sent marker trigger={trigger_value}")
+    except Exception as e:
+        _udp_log(logger, f"[ERROR] Failed to send marker trigger {trigger_value}: {e}")
+
 def _sendto_robot(payload: bytes, logger=None):
     """Always send FROM the bound control socket TO the robot endpoint."""
+    if SIMULATION_MODE:
+        raise RuntimeError("SIMULATION_MODE enabled; robot send suppressed.")
     s = _ensure_control_socket(logger)
     if s is None:
         raise RuntimeError("Control socket not available; cannot send to robot.")
@@ -239,17 +306,29 @@ def _sendto_robot(payload: bytes, logger=None):
 
 def _await_ack_blocking(expected_token: str, logger=None) -> bool:
     """
-    Wait up to ACK_TIMEOUT for f"ACK:{expected_token}" on the bound control socket.
-    Retries handled by caller.
+    Wait up to ACK_TIMEOUT for an ACK corresponding to `expected_token` on the control socket.
+
+    Robustness:
+      - Accepts duration-bearing tokens by matching on `_base_token()`:
+          expected_token: "h;dur=3"   will accept ACK:"h;dur=3.000000"
+          expected_token: "h"         will accept ACK:"h;dur=3.000000" (base token "h")
+      - Preserves special-case exact match for "COORDS_STAGED_RAD"
     """
+    if SIMULATION_MODE:
+        return True  # in simulation we don't wait for robot ACKs
+
     s = _ensure_control_socket(logger)
     if s is None:
         return False
+
+    expected_base = _base_token(expected_token)
+
     end = time.time() + ACK_TIMEOUT
     while time.time() < end:
         r, _, _ = select.select([s], [], [], max(0.0, end - time.time()))
         if not r:
             continue
+
         try:
             data, _ = s.recvfrom(65535)
         except BlockingIOError:
@@ -257,90 +336,62 @@ def _await_ack_blocking(expected_token: str, logger=None) -> bool:
         except Exception as e:
             _udp_log(logger, f"[ERROR] recv failed while waiting for ACK:{expected_token}: {e}")
             return False
+
         txt = data.decode("utf-8", errors="ignore").strip()
-        if txt.startswith(ACK_PREFIX):
-            token = txt[len(ACK_PREFIX):].strip()
-            # Log ALL ACKs, including ACK:q;seq=...
-            _udp_log(None if logger is None else logger, f"[ROBOT->UDP] {txt}")
-            if token == expected_token:
-                return True
-        # Non-ACKs are ignored during the blocking wait to avoid consuming telemetry.
+        if not txt.startswith(ACK_PREFIX):
+            # Ignore non-ACK chatter while we're waiting
+            continue
+
+        token = txt[len(ACK_PREFIX):].strip()
+
+        # Preserve the staged-coords special-case as an exact token.
+        if token == "COORDS_STAGED_RAD" and expected_token == "COORDS_STAGED_RAD":
+            _udp_log(logger, f"[ROBOT->UDP] {txt}")
+            return True
+
+        token_base = _base_token(token)
+
+        if token_base == expected_base:
+            _udp_log(logger, f"[ROBOT->UDP] {txt}")
+            return True
+
+        _udp_log(logger, f"[ROBOT->UDP][IGNORED DURING WAIT] {txt}")
+
     return False
 
-
-def _await_ack_blocking(expected_token: str, logger=None) -> bool:
-    s = _ensure_control_socket(logger)
-    if s is None:
-        return False
-    end = time.time() + ACK_TIMEOUT
-    while time.time() < end:
-        r, _, _ = select.select([s], [], [], max(0.0, end - time.time()))
-        if not r:
-            continue
-        try:
-            data, _ = s.recvfrom(65535)
-        except BlockingIOError:
-            continue
-        except Exception as e:
-            _udp_log(logger, f"[ERROR] recv failed while waiting for ACK:{expected_token}: {e}")
-            return False
-        txt = data.decode("utf-8", errors="ignore").strip()
-        if txt.startswith(ACK_PREFIX):
-            token = txt[len(ACK_PREFIX):].strip()
-            if token == expected_token:
-                _udp_log(logger, f"[ROBOT->UDP] {txt}")  # expected ACK
-                return True
-            else:
-                # Unrelated/stale ACK — note it but mark as ignored during this wait
-                _udp_log(logger, f"[ROBOT->UDP][IGNORED DURING WAIT] {txt}")
-            continue
-        # Non-ACKs ignored here (we don’t consume telemetry during the blocking wait)
-    return False
-
-# --- add near other small helpers (above send_udp_message) ---
-def _base_token(msg: str) -> str:
-    """
-    Return the opcode token without any parameters, e.g.:
-      'h;dur=3' -> 'h'
-      'q;seq=123' -> 'q'
-      'g' -> 'g'
-    Leaves coordinate strings unchanged (they're not used with exact ACKs).
-    """
-    if not isinstance(msg, str):
-        try:
-            msg = _to_wire(msg)
-        except Exception:
-            msg = str(msg)
-    s = msg.strip()
-    if _is_coords_string(s):
-        return s  # not compared against ACKs
-    return s.split(';', 1)[0]
-
-
+_fes_sock = None
+def _ensure_fes_socket(logger=None):
+    """Dedicated socket for FES to avoid binding conflicts."""
+    global _fes_sock
+    if _fes_sock is not None:
+        return _fes_sock
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("0.0.0.0", 0)) # Ephemeral port
+        s.setblocking(False)
+        _fes_sock = s
+        return _fes_sock
+    except Exception as e:
+        _udp_log(logger, f"[ERROR] FES socket unavailable: {e}")
+        return None
+    
 # =========================================================
 # Public API
 # =========================================================
 def display_multiple_messages_with_udp(
     messages, colors, offsets, duration=13,
     udp_messages=None, udp_socket=None, udp_ip=None, udp_port=None,
-    logger=None, eeg_state=None):
+    logger=None, eeg_state=None
+):
     """
-    One-socket model locked by config:
-      TX → UDP_ROBOT.IP:UDP_ROBOT.PORT (e.g., 192.168.2.1:8080)
-      RX ← UDP_CONTROL_BIND.IP:UDP_CONTROL_BIND.PORT (e.g., 192.168.2.2:8080)
+    Simulation mode support:
+      - If SIMULATION_MODE=True: suppress robot sends + ACK waits, but keep marker triggers working.
 
-    Changes in this version:
-      • Race guard: wait STAGE_TO_GO_DELAY_S after traj ACK before sending 'g'.
-      • Drain stale ACKs: clear the control socket before sending traj, and again before 'g'.
-      • De-dup trajectories: if NEXT op is 'g', defer sending and let the 'g' branch send it once.
-      • Logs ALL ACKs (incl. ACK:q), but triggers only for mapped control ACKs; never for COORDS_STAGED_RAD.
+    Robustness:
+      - All opcode branching uses `_base_token()` so tokens like "h;dur=3" behave like "h".
+      - Passive ACK->trigger mapping uses `_base_token()` so ACKs like "ACK:h;dur=3.000000" map to "h".
     """
-    # Resolve / ensure control socket
-    s = _ensure_control_socket(logger)
-    if s is None:
-        _udp_log(logger, "[ERROR] Control socket unavailable; robot I/O disabled.")
-
-    ack_to_trigger = _build_ack_map(_config)
+    ack_to_trigger = _build_ack_map(_config)  # already base-tokenized in your current version
     fired_triggers = set()
 
     # UI prep
@@ -350,33 +401,38 @@ def display_multiple_messages_with_udp(
 
     # ---------------- SEND PHASE ----------------
     if udp_messages:
-        # <<< ADDED: use minimal pending-goal state
         global _pending_target_ready, _pending_target_ctx
-
         i = 0
         while i < len(udp_messages):
             op = _to_wire(udp_messages[i])
+            op_base = _base_token(op)
 
-            # Defer send ONLY if this op is a staged trajectory immediately followed by 'g'
-            # (so we don't accidentally skip control ops like 'c')
-            # <<< CHANGED: gate the deferral on _is_coords_string(op)
-            # Defer send if this op is a trajectory (coordinate OR symbolic a/x/y/z) immediately followed by 'g'
+            # Defer sending trajectory if immediately followed by 'g' (base-token aware)
             if (
-                op != "g"
-                and (_is_coords_string(op) or op in {"a", "x", "y", "z"})
+                op_base != "g"
+                and (_is_coords_string(op) or op_base in _SYMBOLIC_TRAJ or op in _SYMBOLIC_TRAJ)
                 and (i + 1) < len(udp_messages)
-                and _to_wire(udp_messages[i + 1]) == "g"
+                and _base_token(_to_wire(udp_messages[i + 1])) == "g"
             ):
                 i += 1
                 continue
 
-            # --- 'g' gating ---
-            if op == "g":
-                # <<< ADDED: allow 'g' as first iff a pending target exists (set by 'c')
-                if i == 0 and _pending_target_ready:  # <<< ADDED
-                    # Drain before sending 'g' so we don't eat the fresh ACK
+            # --- 'g' gating (base-token aware) ---
+            if op_base == "g":
+                if SIMULATION_MODE:
+                    _udp_log(logger, "[SIM] Suppressed robot GO sequence ('g').")
+                    # optional: still fire the "robot begin" trigger so the experiment pipeline proceeds
+                    trig = ack_to_trigger.get("g")
+                    if trig and trig not in fired_triggers:
+                        _send_marker_trigger(_config, logger, trig)
+                        fired_triggers.add(trig)
+                    _pending_target_ready = False
+                    _pending_target_ctx = None
+                    i += 1
+                    continue
+
+                if i == 0 and _pending_target_ready:
                     _drain_control_socket(max_ms=30, logger=logger)
-                    # Send 'g' directly (no preceding traj in this packet)
                     try:
                         _sendto_robot(b"g", logger=logger)
                         _udp_log(logger, "[UDP->ROBOT] Sent opcode: g (standalone)")
@@ -385,7 +441,6 @@ def display_multiple_messages_with_udp(
                         i += 1
                         continue
 
-                    # Wait for ACK:g (with retry), reusing your existing pattern
                     ack_ok = False
                     attempts = 0
                     while not ack_ok and attempts <= MAX_RETRIES:
@@ -398,25 +453,20 @@ def display_multiple_messages_with_udp(
                             except Exception as e:
                                 _udp_log(logger, f"[ERROR] Retry send failed for 'g': {e}")
                                 break
+
                     if not ack_ok:
                         _udp_log(logger, "[ERROR] No ACK for standalone 'g'.")
                     else:
-                        # motion-begin trigger (same as your existing path)
-                        trig = ack_to_trigger.get("g") or ack_to_trigger.get(
-                            getattr(_config, "ROBOT_OPCODES", {}).get("GO", "g") if _config else "g"
-                        )
+                        trig = ack_to_trigger.get("g")
                         if trig and trig not in fired_triggers:
                             _send_marker_trigger(_config, logger, trig)
                             fired_triggers.add(trig)
 
-                    # Clear pending target after attempting to go
-                    _pending_target_ready = False        # <<< ADDED
-                    _pending_target_ctx   = None         # <<< ADDED
-
+                    _pending_target_ready = False
+                    _pending_target_ctx = None
                     i += 1
                     continue
 
-                # Fall back to original behavior (needs a preceding traj in this packet)
                 if i == 0:
                     _udp_log(logger, "[ERROR] 'g' cannot be first; skipping.")
                     i += 1
@@ -424,10 +474,8 @@ def display_multiple_messages_with_udp(
 
                 traj = _to_wire(udp_messages[i - 1])
 
-                # 0) Drain stale ACKs before starting a gated transaction
                 _drain_control_socket(max_ms=50, logger=logger)
 
-                # 1) send trajectory
                 try:
                     _sendto_robot(traj.encode("utf-8"), logger=logger)
                     _udp_log(logger, f"[UDP->ROBOT] Sent trajectory: {traj}")
@@ -436,7 +484,6 @@ def display_multiple_messages_with_udp(
                     i += 1
                     continue
 
-                # 1b) wait for ACK:<traj> or ACK:COORDS_STAGED_RAD (with retry)
                 expected = "COORDS_STAGED_RAD" if _is_coords_string(traj) else traj
                 ack_ok = False
                 attempts = 0
@@ -450,18 +497,15 @@ def display_multiple_messages_with_udp(
                         except Exception as e:
                             _udp_log(logger, f"[ERROR] Retry send failed: {e}")
                             break
+
                 if not ack_ok:
                     _udp_log(logger, f"[ERROR] No ACK for trajectory '{traj}' (expected ACK:{expected}). Skipping 'g'.")
                     i += 1
                     continue
 
-                # 1c) Race guard: give the robot time to flip "armed=true"
                 time.sleep(STAGE_TO_GO_DELAY_S)
-
-                # 1d) Optional: small drain again so a late ACK doesn't precede 'g' handling
                 _drain_control_socket(max_ms=20, logger=logger)
 
-                # 2) send 'g'
                 try:
                     _sendto_robot(b"g", logger=logger)
                     _udp_log(logger, "[UDP->ROBOT] Sent opcode: g")
@@ -470,7 +514,6 @@ def display_multiple_messages_with_udp(
                     i += 1
                     continue
 
-                # 2b) wait for ACK:g (with retry)
                 ack_ok = False
                 attempts = 0
                 while not ack_ok and attempts <= MAX_RETRIES:
@@ -483,26 +526,26 @@ def display_multiple_messages_with_udp(
                         except Exception as e:
                             _udp_log(logger, f"[ERROR] Retry send failed for 'g': {e}")
                             break
+
                 if not ack_ok:
                     _udp_log(logger, "[ERROR] No ACK for 'g' after trajectory.")
                 else:
-                    # motion-begin trigger
-                    trig = ack_to_trigger.get("g") or ack_to_trigger.get(
-                        getattr(_config, "ROBOT_OPCODES", {}).get("GO", "g") if _config else "g"
-                    )
+                    trig = ack_to_trigger.get("g")
                     if trig and trig not in fired_triggers:
                         _send_marker_trigger(_config, logger, trig)
                         fired_triggers.add(trig)
 
-                # Clear any stale pending state
-                _pending_target_ready = False          # <<< ADDED
-                _pending_target_ctx   = None           # <<< ADDED
-
+                _pending_target_ready = False
+                _pending_target_ctx = None
                 i += 1
                 continue
 
-            # --- 'q' special ---
-            if op == QUERY_OPCODE:
+            # --- 'q' special (base-token aware) ---
+            if op_base == QUERY_OPCODE:
+                if SIMULATION_MODE:
+                    _udp_log(logger, "[SIM] Suppressed robot query ('q').")
+                    i += 1
+                    continue
                 try:
                     seq = (int(time.time() * 1000) & 0xFFFFFFFF)
                     qmsg = f"q;seq={seq}"
@@ -514,26 +557,28 @@ def display_multiple_messages_with_udp(
                 continue
 
             # --- all other opcodes ---
-            try:
-                _sendto_robot(op.encode("utf-8"), logger=logger)
-                _udp_log(logger, f"[UDP->ROBOT] Sent opcode: {op}")
-            except Exception as e:
-                _udp_log(logger, f"[ERROR] Failed to send opcode '{op}': {e}")
+            if SIMULATION_MODE:
+                _udp_log(logger, f"[SIM] Suppressed robot opcode: {op}")
+            else:
+                try:
+                    _sendto_robot(op.encode("utf-8"), logger=logger)
+                    _udp_log(logger, f"[UDP->ROBOT] Sent opcode: {op}")
+                except Exception as e:
+                    _udp_log(logger, f"[ERROR] Failed to send opcode '{op}': {e}")
 
-            # <<< ADDED: flip/clear pending-target flag for the narrow ops we care about
-            if op == "c":
+            # Track internal state based on base tokens (durations won't break this)
+            if op_base == "c":
                 _pending_target_ready = True
-                _pending_target_ctx   = None  # control side doesn't need a ctx object
-            elif op in ("m", "h"):
+                _pending_target_ctx = None
+            elif op_base in ("m", "h"):
                 _pending_target_ready = False
-                _pending_target_ctx   = None
+                _pending_target_ctx = None
 
             i += 1
 
     # ---------------- UI + PASSIVE RECV ----------------
     clock = pygame.time.Clock()
     while pygame.time.get_ticks() < end_time:
-        # draw
         surface = pygame.display.get_surface()
         if surface is not None:
             surface.fill((0, 0, 0))
@@ -546,46 +591,53 @@ def display_multiple_messages_with_udp(
                 )
             pygame.display.flip()
 
-        # EEG
         if eeg_state is not None:
             try:
                 eeg_state.update()
             except Exception as e:
                 _udp_log(logger, f"[WARN] eeg_state.update() failed: {e}")
 
-        # drain all inbound datagrams from the same bound socket
-        s = _ensure_control_socket(logger)
-        if s is not None:
-            while True:
-                try:
-                    data, _ = s.recvfrom(65535)
-                except BlockingIOError:
-                    break
-                except Exception as e:
-                    _udp_log(logger, f"[ERROR] recvfrom failed: {e}")
-                    break
+        # In simulation mode we still allow marker triggers (outgoing),
+        # but we don't try to read robot UDP.
+        if not SIMULATION_MODE:
+            s = _ensure_control_socket(logger)
+            if s is not None:
+                while True:
+                    try:
+                        data, _ = s.recvfrom(65535)
+                    except BlockingIOError:
+                        break
+                    except Exception as e:
+                        _udp_log(logger, f"[ERROR] recvfrom failed: {e}")
+                        break
 
-                txt = data.decode("utf-8", errors="ignore").strip()
+                    txt = data.decode("utf-8", errors="ignore").strip()
 
-                if txt.startswith(ACK_PREFIX):
-                    token = txt[len(ACK_PREFIX):].strip()
-                    # Never trigger for coordinate staging
-                    if token == "COORDS_STAGED_RAD":
-                        _udp_log(logger, "[ROBOT->UDP] ACK:COORDS_STAGED_RAD (staged)")
+                    if txt.startswith(ACK_PREFIX):
+                        token = txt[len(ACK_PREFIX):].strip()
+
+                        # Keep special-case as-is
+                        if token == "COORDS_STAGED_RAD":
+                            _udp_log(logger, "[ROBOT->UDP] ACK:COORDS_STAGED_RAD (staged)")
+                            continue
+
+                        # Base-token mapping so ACK:h;dur=3.000000 maps to 'h'
+                        token_base = _base_token(token)
+
+                        trig = (
+                            ack_to_trigger.get(token_base)  # preferred
+                            or ack_to_trigger.get(token)    # fallback (if any legacy full-token keys exist)
+                        )
+                        if trig and trig not in fired_triggers:
+                            _send_marker_trigger(_config, logger, trig)
+                            fired_triggers.add(trig)
+
+                        _udp_log(logger, f"[ROBOT->UDP] {txt}")
                         continue
-                    # Map control ACKs to triggers (GO/HOME/PAUSE/RESUME/STOP/MASTER_*)
-                    trig = ack_to_trigger.get(token)
-                    if trig and trig not in fired_triggers:
-                        _send_marker_trigger(_config, logger, trig)
-                        fired_triggers.add(trig)
-                    # Always log ACKs (incl. ACK:q;seq=...)
-                    _udp_log(logger, f"[ROBOT->UDP] {txt}")
-                    continue
 
-                # Non-ACK: capture first Q JSON
-                if query_payload is None and txt.startswith("{") and "\"op\":\"Q\"" in txt:
-                    query_payload = txt
-                _udp_log(logger, f"[ROBOT->UDP] {txt}")
+                    if query_payload is None and txt.startswith("{") and "\"op\":\"Q\"" in txt:
+                        query_payload = txt
+                    _udp_log(logger, f"[ROBOT->UDP] {txt}")
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -602,112 +654,177 @@ def send_udp_message(
     *,
     expect_ack: bool = False,
     ack_prefix: str = "ACK:",
-    ack_timeout: float = 0.8,   # a touch friendlier than 0.5s; tune as needed
+    ack_timeout: float = 0.8,
     max_retries: int = 0,
     capture_query: bool = False
 ):
     """
-    One-off sender that ALWAYS uses the import-time bound control socket.
-    Destination (ip,port) is honored; source is fixed CONTROL_BIND.
+    Simulation mode support: True
+      - Robot: Suppress send + ACK wait (SAFETY).
+      - FES: ALWAYS SEND (Active in simulation).
+      - Marker: ALWAYS SEND.
 
-    - expect_ack=True: wait for ACK:<token>.
-      * For 'q', accept 'ACK:q' or 'ACK:q;seq=...'.
-      * For others, accept ACK of the base opcode ('h' matches 'h;dur=3').
-    - capture_query=True & message=='q': capture first non-ACK telemetry after send.
-
-    Returns:
-      None (legacy) or (acked: bool, query_payload|None) depending on flags.
+    Bug fix:
+      - In SIMULATION_MODE, never touch/bind/control-check the robot control socket.
+      - If destination is not robot/marker/FES, use a generic ephemeral socket (never the control socket).
+      - If a FES message is sent but caller passed wrong endpoint, optionally re-route based on message prefix.
     """
-    # unified logger
     if not quiet:
         _log = lambda m: _udp_log(logger, m)
     else:
         _log = lambda m: None  # noqa: E731
 
-    s = _ensure_control_socket(logger)
-    if s is None:
-        _log("[ERROR] Control socket unavailable; cannot send.")
-        return (False, None) if expect_ack else None
+    # 1) LOAD CONFIGURATIONS
+    ro = getattr(_config, "UDP_ROBOT", {}) or {}
+    mk = getattr(_config, "UDP_MARKER", {}) or {}
+    fs = getattr(_config, "UDP_FES", {}) or {}
 
-    # Robot endpoint for reply filtering
-    robot_ip   = getattr(_config, "UDP_ROBOT", {}).get("IP", _ROBOT_IP)
-    robot_port = int(getattr(_config, "UDP_ROBOT", {}).get("PORT", _ROBOT_PORT))
+    # Robot Endpoints
+    robot_ip = ro.get("IP", _ROBOT_IP)
+    robot_port = int(ro.get("PORT", _ROBOT_PORT))
 
-    # Prepare ACK→marker map once when needed
+    # Marker Endpoints
+    marker_ip = mk.get("IP", _MARKER_IP)
+    marker_port = int(mk.get("PORT", _MARKER_PORT)) if mk.get("PORT", _MARKER_PORT) else None
+
+    # FES Endpoints
+    fes_ip = fs.get("IP", None)
+    fes_port = int(fs.get("PORT", 0)) if fs.get("PORT", None) else None
+
+    # Normalize inputs
+    try:
+        port_i = int(port)
+    except Exception:
+        port_i = port
+
+    msg_str = message if isinstance(message, str) else str(message)
+
+    # 2) IDENTIFY DESTINATION
+    is_robot  = (ip == robot_ip and port_i == int(robot_port))
+    is_marker = (marker_ip is not None and marker_port is not None and ip == marker_ip and port_i == int(marker_port))
+    is_fes    = (fes_ip is not None and fes_port is not None and ip == fes_ip and port_i == int(fes_port))
+    is_traj   = _is_coords_string(msg_str)
+
+    # 2b) SAFETY: if it looks like a FES command but caller passed wrong endpoint,
+    # re-route to UDP_FES endpoint if configured.
+    # (This prevents accidental fallback to control socket which was causing your bind errors.)
+    if (not is_fes) and (fes_ip is not None and fes_port is not None):
+        if isinstance(msg_str, str) and msg_str.startswith("FES_"):
+            _log(f"[INFO] Detected FES message '{msg_str}' but destination was {ip}:{port}. "
+                 f"Routing to UDP_FES {fes_ip}:{fes_port}.")
+            ip = fes_ip
+            port_i = int(fes_port)
+            is_fes = True
+            # re-evaluate "is_robot/is_marker" after rewrite
+            is_robot = (ip == robot_ip and port_i == int(robot_port))
+            is_marker = (marker_ip is not None and marker_port is not None and ip == marker_ip and port_i == int(marker_port))
+
+    # 3) HANDLE SIMULATION MODE
+    # STRICTLY suppress Robot only. FES/Marker/Other should still send.
+    if SIMULATION_MODE and is_robot:
+        _log(f"[SIM] Robot destination passed ({ip}:{port_i}) but suppressed. message='{msg_str}'")
+        if expect_ack:
+            return (True, None)
+        return None
+
+    # 4) CHOOSE THE RIGHT SOCKET
+    # IMPORTANT: in SIMULATION_MODE we must NEVER attempt to bind/control-check the robot socket.
+    if is_marker:
+        s = _ensure_marker_socket(logger)
+        if s is None:
+            _log("[ERROR] Marker socket unavailable; cannot send.")
+            return (False, None) if expect_ack else None
+
+    elif is_fes:
+        s = _ensure_fes_socket(logger)
+        if s is None:
+            _log("[ERROR] FES socket unavailable; cannot send.")
+            return (False, None) if expect_ack else None
+
+    elif is_robot:
+        # Only robot traffic uses the control socket
+        s = _ensure_control_socket(logger)
+        if s is None:
+            _log("[ERROR] Control socket unavailable; cannot send to robot.")
+            return (False, None) if expect_ack else None
+
+    else:
+        # Unknown/other endpoint: never default to the control socket.
+        # Use a generic ephemeral socket so non-robot features keep working.
+        try:
+            s = _ensure_generic_socket(logger)  # you said you already implemented this
+        except NameError:
+            s = None
+        if s is None:
+            _log("[ERROR] Generic socket unavailable; cannot send.")
+            return (False, None) if expect_ack else None
+
+    # ACK->trigger map if needed
     if expect_ack:
         try:
-            _ack_to_trigger_map = _build_ack_map(_config)  # e.g., {'g': 305, 'h': 385, ...}
+            _ack_to_trigger_map = _build_ack_map(_config)
         except Exception:
             _ack_to_trigger_map = {}
     else:
         _ack_to_trigger_map = None
 
-    # Base token of the outgoing message (e.g., 'h' for 'h;dur=3')
-    msg_token_base = _base_token(message)
-
     attempts = 0
     while True:
-        # Drain BEFORE sending to avoid eating the fresh ACK
-        try:
+        # Only drain control socket when we expect robot ACKs
+        if is_robot:
             _drain_control_socket(max_ms=30, logger=logger)
-        except NameError:
-            pass
 
-        # Send
         try:
-            s.sendto(message.encode("utf-8"), (ip, port))
+            s.sendto(msg_str.encode("utf-8"), (ip, int(port_i)))
         except Exception as e:
-            _log(f"UDP send failed to {ip}:{port} — {e}")
+            _log(f"UDP send failed to {ip}:{port_i} — {e}")
             return (False, None) if expect_ack else None
 
-        # Consistent TX label + wording
+        # 5) DETERMINE LOG PREFIX
+        if is_robot:
+            prefix = "[UDP->ROBOT]"
+        elif is_fes:
+            prefix = "[UDP->FES]"
+        elif is_marker:
+            prefix = "[TRIGGER]"
+        else:
+            prefix = f"[UDP->{ip}:{port_i}]"
+
+        kind = "Sent trajectory" if is_traj else "Sent opcode"
+        _log(f"{prefix} {kind}: {msg_str}")
+
+        # --- INTERNAL STATE TRACKING (ROBOT ONLY) ---
+        global _pending_target_ready, _pending_target_ctx
         try:
-            ro = getattr(_config, "UDP_ROBOT", {}) or {}
-            mk = getattr(_config, "UDP_MARKER", {}) or {}
-            robot_ip, robot_port = ro.get("IP", _ROBOT_IP), int(ro.get("PORT", _ROBOT_PORT))
-            marker_ip, marker_port = mk.get("IP"), int(mk.get("PORT")) if mk.get("PORT") else None
-        except Exception:
-            robot_ip, robot_port = _ROBOT_IP, _ROBOT_PORT
-            marker_ip, marker_port = None, None
-
-        is_robot  = (ip == robot_ip and int(port) == int(robot_port))
-        is_marker = (marker_ip is not None and ip == marker_ip and int(port) == int(marker_port))
-        is_traj   = _is_coords_string(message)
-
-        prefix = "[UDP->ROBOT]" if is_robot else ("[TRIGGER]" if is_marker else f"[UDP->{ip}:{port}]")
-        kind   = "Sent trajectory" if is_traj else "Sent opcode"
-
-        _log(f"{prefix} {kind}: {message}")
-
-        # ---------------- pending-target bookkeeping (base-token aware) ----------------
-        try:
-            ro = getattr(_config, "ROBOT_OPCODES", {}) or {}
-            tok_c = ro.get("MASTER_LOCK",   "c")
-            tok_m = ro.get("MASTER_UNLOCK", "m")
-            tok_h = ro.get("HOME",          "h")
+            rop = getattr(_config, "ROBOT_OPCODES", {}) or {}
+            tok_c = rop.get("MASTER_LOCK",   "c")
+            tok_m = rop.get("MASTER_UNLOCK", "m")
+            tok_h = rop.get("HOME",          "h")
         except Exception:
             tok_c, tok_m, tok_h = "c", "m", "h"
 
-        global _pending_target_ready, _pending_target_ctx
-        msg_base = msg_token_base
-        if msg_base == tok_c:
-            _pending_target_ready = True
-            _pending_target_ctx   = None
-        elif msg_base in (tok_m, tok_h):
-            _pending_target_ready = False
-            _pending_target_ctx   = None
-        # ------------------------------------------------------------------------------
+        if is_robot:
+            msg_base = _base_token(msg_str)
+            if msg_base == _base_token(tok_c):
+                _pending_target_ready = True
+                _pending_target_ctx   = None
+            elif msg_base in (_base_token(tok_m), _base_token(tok_h)):
+                _pending_target_ready = False
+                _pending_target_ctx   = None
 
-        # Fast exit
+        # Fast exit (FES and Marker don't wait for ACKs)
         if not expect_ack and not capture_query:
             return None
-        
-        
-        # Wait window
-        end = time.time() + ack_timeout
+
+        # If this is NOT robot traffic, we generally don't wait for ACKs
+        if not is_robot:
+            return (True, None) if expect_ack else None
+
+        # --- ROBOT ACK WAIT LOOP ---
+        end = time.time() + float(ack_timeout)
         acked = False
         query_payload = None
-        ack_token_matched = None   # remember which base token matched
+        ack_token_matched = None
 
         while time.time() < end:
             r, _, _ = select.select([s], [], [], max(0.0, end - time.time()))
@@ -718,74 +835,66 @@ def send_udp_message(
             except Exception:
                 break
 
-            # Accept only from robot
             src_ip, src_port = addr[0], int(addr[1])
-            if src_ip != robot_ip or src_port != robot_port:
+            if src_ip != robot_ip or src_port != int(robot_port):
                 continue
 
             txt = data.decode("utf-8", errors="ignore").strip()
 
-            # ACK handling (compare base tokens)
             if expect_ack and txt.startswith(ack_prefix):
-                token_full = txt[len(ack_prefix):].strip()
-                token_base = _base_token(token_full)
+                token = txt[len(ack_prefix):].strip()
 
-                if msg_token_base == "q":
-                    # accept ACK:q or ACK:q;seq=...
-                    if token_base == "q":
+                # Query ACK: accept ACK:q* for any q;seq=...
+                if msg_str.startswith("q"):
+                    if token.startswith("q"):
                         _log(f"[ROBOT->UDP] {txt}")
                         acked = True
-                        ack_token_matched = token_base  # CHANGED: store ACK’s base token
+                        ack_token_matched = "q"
                         if not capture_query:
                             if _ack_to_trigger_map:
-                                # NEW: try ACK’s base token first, then the message’s base token, then "q"
-                                trig = (_ack_to_trigger_map.get(token_base)
-                                        or _ack_to_trigger_map.get(msg_token_base)
-                                        or _ack_to_trigger_map.get("q"))
+                                trig = _ack_to_trigger_map.get(ack_token_matched)
                                 if trig:
                                     _send_marker_trigger(_config, logger, trig)
                             return (True, None)
-                else:
-                    # control ops: 'h;dur=3' should match 'ACK:h'
-                    if token_base == msg_token_base:
-                        _log(f"[ROBOT->UDP] {txt}")
-                        acked = True
-                        ack_token_matched = token_base  # CHANGED: store ACK’s base token
-                        if not capture_query:
-                            if _ack_to_trigger_map:
-                                # NEW: try ACK’s base token first, then the message’s base token
-                                trig = (_ack_to_trigger_map.get(token_base)
-                                        or _ack_to_trigger_map.get(msg_token_base))
-                                if trig:
-                                    _send_marker_trigger(_config, logger, trig)
-                            return (True, None)
-                # unrelated ACKs ignored during this wait
+                    continue  # <--- important: always continue for q-case
+
+                # Non-query ACK: base-token match (durations etc.)
+                token_base = _base_token(token)
+                msg_base   = _base_token(msg_str)
+
+                if token_base == msg_base:
+                    _log(f"[ROBOT->UDP] {txt}")
+                    acked = True
+                    ack_token_matched = token_base  # store base token for trigger lookup
+                    if not capture_query:
+                        if _ack_to_trigger_map:
+                            trig = (_ack_to_trigger_map.get(ack_token_matched)
+                                    or _ack_to_trigger_map.get(msg_base))
+                            if trig:
+                                _send_marker_trigger(_config, logger, trig)
+                        return (True, None)
+
                 continue
 
-            # Telemetry path for q
-            if capture_query and msg_token_base == "q" and not txt.startswith(ack_prefix) and query_payload is None:
+            if capture_query and msg_str.startswith("q") and not txt.startswith(ack_prefix) and query_payload is None:
                 query_payload = txt
                 if not expect_ack:
                     return query_payload
-                # else keep waiting until ACK or timeout
 
-        # Window ended
         if expect_ack and acked:
-            # CHANGED: prefer the ACK’s token, then fall back to the message’s base token
             if _ack_to_trigger_map and ack_token_matched is not None:
-                trig = (_ack_to_trigger_map.get(ack_token_matched)
-                        or _ack_to_trigger_map.get(msg_token_base))
+                trig = _ack_to_trigger_map.get(ack_token_matched)
                 if trig:
                     _send_marker_trigger(_config, logger, trig)
             return (True, query_payload)
+
         if not expect_ack:
             return query_payload
 
-        # Retry?
-        if attempts < max_retries:
+        if attempts < int(max_retries):
             attempts += 1
-            _log(f"[RETRY] No expected ACK for '{message}' after {ack_timeout:.2f}s. Retrying ({attempts}/{max_retries})…")
+            _log(f"[RETRY] No expected ACK for '{msg_str}' after {ack_timeout:.2f}s. "
+                 f"Retrying ({attempts}/{max_retries})…")
             continue
 
         return (False, query_payload)
-

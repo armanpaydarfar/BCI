@@ -474,7 +474,6 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_BEGIN"], logger=logger)
     else:  # Blue Ball Mode (Rest)
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["REST_BEGIN"], logger=logger)
-        FES_active = False
 
     clock = pygame.time.Clock()
     running_avg_confidence = 0.5  # Initial placeholder
