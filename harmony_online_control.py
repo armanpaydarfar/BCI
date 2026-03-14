@@ -33,7 +33,7 @@ CAPTURE_AFTER_S    = 1.00  # extra time beyond duration to see settling
 
 # Logging / plotting toggle
 LOG_DIR = "telemetry_logs"
-SAVE_LOGS = True  # <-- Toggle this ON/OFF to save plots & files
+SAVE_LOGS = False  # <-- Toggle this ON/OFF to save plots & files
 
 # Smoothing cutoff for EE velocity (EMA on positions)
 EE_VEL_EMA_FC_HZ = 1.0

@@ -438,7 +438,10 @@ def hold_messages_and_classify(messages, colors, offsets, duration, mode, udp_so
 
 
 
-def show_feedback(duration=5, mode=0, eeg_state = None):
+def show_feedback(duration=5, mode=0, eeg_state=None,
+                  headline_text=None,
+                  subtext=None,
+                  object_text=None):
     """
     Displays feedback animation, collects EEG data, and performs real-time classification
     using a sliding window approach with early stopping based on posterior probabilities.
@@ -523,20 +526,58 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
                 pmi_avg   = 1.0 - running_avg_confidence
             all_probabilities[-1] = [ts, prest_inst, pmi_inst, pmi_avg, prest_avg]
 
+        # -------------------------------------------------
+        # Core visualization
+        # -------------------------------------------------
         if mode == 0:
             draw_arrow_fill(MI_fill, screen_width, screen_height)
             draw_fixation_cross(screen_width, screen_height)
             draw_ball_fill(Rest_fill, screen_width, screen_height)
             draw_time_balls(2, screen_width, screen_height)
-            message = pygame.font.SysFont(None, 96).render(f"Move {config.ARM_SIDE.upper()} Arm", True, config.white)
+            cue_color = config.red
         else:
             draw_ball_fill(Rest_fill, screen_width, screen_height)
             draw_fixation_cross(screen_width, screen_height)
             draw_arrow_fill(MI_fill, screen_width, screen_height)
             draw_time_balls(3, screen_width, screen_height)
-            message = pygame.font.SysFont(None, 96).render("Rest", True, config.white)
+            cue_color = config.blue
 
-        screen.blit(message, (screen_width // 2 - message.get_width() // 2, screen_height // 2 + 300))
+        # -------------------------------------------------
+        # Text overlay (backwards compatible)
+        # -------------------------------------------------
+        headline_font = pygame.font.SysFont(None, 96)
+        subtext_font = pygame.font.SysFont(None, 56)
+        object_font = pygame.font.SysFont(None, 52)
+
+        # Legacy fallback if no text passed
+        if headline_text is None:
+            if mode == 0:
+                headline_text = f"Move {config.ARM_SIDE.upper()} Arm"
+            else:
+                headline_text = "Rest"
+
+        headline_surface = headline_font.render(headline_text, True, cue_color)
+        screen.blit(
+            headline_surface,
+            (screen_width // 2 - headline_surface.get_width() // 2,
+            screen_height // 2 + 260)
+        )
+
+        if subtext is not None:
+            sub_surface = subtext_font.render(subtext, True, cue_color)
+            screen.blit(
+                sub_surface,
+                (screen_width // 2 - sub_surface.get_width() // 2,
+                screen_height // 2 + 330)
+            )
+
+        if object_text is not None:
+            obj_surface = object_font.render(object_text, True, config.white)
+            screen.blit(
+                obj_surface,
+                (screen_width // 2 - obj_surface.get_width() // 2,
+                screen_height // 2 - 360)
+            )
         pygame.display.flip()
         clock.tick(60)
         # --- Early-stop logic (supports correct-only or either-threshold) ---

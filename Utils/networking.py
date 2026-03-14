@@ -147,13 +147,21 @@ def _to_wire(op):
 
 def _is_coords_string(s: str) -> bool:
     t = s.strip()
+
+    # Strip optional list brackets
     if t.startswith("[") and t.endswith("]"):
         t = t[1:-1].strip()
+
+    # Strip optional suffixes like ;dur=...
+    t = t.split(";", 1)[0].strip()
+
     if t.count(",") != 6:
         return False
+
     parts = [p.strip() for p in t.split(",")]
     if len(parts) != 7:
         return False
+
     try:
         _ = [float(p) for p in parts]
         return True

@@ -1,10 +1,11 @@
 # Configuration file for EEG experiments
+import os
 
 # Relevant Directories
 WORKING_DIR = "/home/arman-admin/Projects/Harmony/"
 DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
 
-TRAINING_SUBJECT = "S26CLASS_SUBJ_004"
+TRAINING_SUBJECT = "PILOT007"
 # EEG Settings
 CAP_TYPE = 32
 LOWCUT = 8  # Hz
@@ -33,22 +34,39 @@ TIMING = True #obsolete
 SHAPE_MAX = 0.7 #maximum fill 
 SHAPE_MIN = 0.5 #minimum fill 
 ROBOT_TRAJECTORY = ["a"] # Not using
-BIG_BROTHER_MODE = False #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
+BIG_BROTHER_MODE = True #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
 SEND_PROBS = False
 
-
 # Early-stop policy: "correct_only" (current behavior) or "either"
-EARLYSTOP_MODE = "correct_only"
+EARLYSTOP_MODE = "either"
 
+# =========================
+# Gaze / object-selection experiment
+# =========================
+GAZE_UDP_IP = "127.0.0.1"
+GAZE_UDP_PORT = 5588
+GAZE_UDP_TIMEOUT = 0.15
 
+GAZE_SELECTION_WINDOW = 5.0
+GAZE_AVG_WINDOW = 2.0
+GAZE_MIN_DWELL_SEC = 0.75
+GO_NOGO_PROMPT_SEC = 1.25
+
+GAZE_SAMPLE_WIDTH = 1600.0
+GAZE_SAMPLE_HEIGHT = 1200.0
+
+POSE_LIBRARY_FILENAME = "poses_with_gaze_20251202_153040.npz"
+POSE_LIBRARY_PATH = os.path.join(WORKING_DIR, POSE_LIBRARY_FILENAME)
+
+ROBOT_MOVE_DUR = TIME_ROB
 
 # Classification Parameters
 CLASSIFY_WINDOW = 1000  # Duration of EEG data window for classification (milliseconds)
 FILTER_BUFFER_SIZE = 2048 #4s at 512 Hz
 BASELINE_DURATION = 1 #seconds
 ACCURACY_THRESHOLD = 0.6  # OBS Accuracy threshold to determine "Correct" (plan to obsolete)
-THRESHOLD_MI = 0.6 #Threshold for MI "correct"
-THRESHOLD_REST = 0.6 #Threshold for REST "Correct"
+THRESHOLD_MI = 0.65 #Threshold for MI "correct"
+THRESHOLD_REST = 0.65 #Threshold for REST "Correct"
 RELAXATION_RATIO = 0.0 # relaxation ratio for sustained MI during movement
 MIN_PREDICTIONS = 8 # Min number of predictions during Online experiment before the decoder can end early
 STEP_SIZE = 1/16
@@ -70,7 +88,7 @@ SAVE_ADAPTIVE_T = False #this toggle saves "Adaptive_T" to the EEG directory dur
 
 
 # FES Parameters
-FES_toggle = 1
+FES_toggle = 0
 FES_CHANNEL = "red"
 FES_TIMING_OFFSET = 7 
 # above for motor FES, cut out X seconds before the full duration of movement. This should represent when the robot will naturally reach the end of motion (in successful case)

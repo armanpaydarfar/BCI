@@ -255,7 +255,8 @@ def build_sys_cfg() -> GazeConfig:
         det_conf=0.50,
         det_iou=0.20,
         det_max_det=15,
-        det_classes=[0, 63, 64, 67, 39, 41],
+        #det_classes=[0, 63, 64, 67, 39, 41],
+        det_classes = None,
         detect_resize_width=None,
 
         # Governor

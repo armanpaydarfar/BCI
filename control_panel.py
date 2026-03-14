@@ -37,7 +37,7 @@ IMPORTANT:
 - NO --telemetry flag is passed (that caused argparse errors).
 """
 
-import os, sys, shlex, time, re, tempfile, socket, subprocess, json, threading
+import os, sys, shlex, time, re, tempfile, socket, subprocess, json, threading, glob
 import serial
 import serial.tools.list_ports
 
@@ -65,11 +65,17 @@ CONFIG_PY = os.path.join(ROOT, "config.py")
 
 MARKER_PY = os.path.join(ROOT, "UTIL_marker_stream.py")
 DRIVER_ONLINE_PY = os.path.join(ROOT, "ExperimentDriver_Online.py")
+DRIVER_ONLINE_GAZE_PY = os.path.join(ROOT, "ExperimentDriver_Online_GazeTracking.py")
+DRIVER_ONLINE_GLOVE_PY = os.path.join(ROOT, "ExperimentDriver_Online_Glove.py")
 DRIVER_BIMANUAL_PY = os.path.join(ROOT, "ExperimentDriver_Bimanual.py")
 DRIVER_OFFLINE_PY = os.path.join(ROOT, "ExperimentDriver_Offline.py")
 FES_PY = os.path.join(ROOT, "FES_listener.py")
 STMSETUP_PY = os.path.join(ROOT, "STMsetup.py")
 INIT_SH = os.path.join(ROOT, "initialize_devices.sh")
+
+# ---- Harmony scripts you want on tab 2 ----
+HARMONY_CALIBRATION_EXEC_PY = os.path.join(ROOT, "harmony_calibration_exec.py")
+HARMONY_ONLINE_CONTROL_PY   = os.path.join(ROOT, "harmony_online_control.py")
 
 # ---- Gaze scripts (same folder as control_panel.py per your note) ----
 GAZE_RUNNER_PY = os.path.join(ROOT, "gaze_runner.py")
@@ -90,6 +96,8 @@ DRIVERS = [
     "ExperimentDriver_Online",
     "ExperimentDriver_Bimanual",
     "ExperimentDriver_Offline",
+    "ExperimentDriver_Online_GazeTracking",
+    "ExperimentDriver_Online_Glove",
 ]
 
 # ----------------- Config read/write helpers -----------------
@@ -220,7 +228,7 @@ class ControlPanel(QMainWindow):
 
         # Procs (QProcess-managed)
         self.marker = Proc("Marker Stream", f'python -u "{MARKER_PY}"', ROOT)
-        self.driver = Proc("Experimental Driver", None, ROOT)
+        self.driver = Proc("Experiment Driver", None, ROOT)
         self.fes    = Proc("FES Listener", f'python -u "{FES_PY}"', ROOT)
 
         # ---- Gaze procs (NEW) ----
@@ -292,7 +300,7 @@ class ControlPanel(QMainWindow):
         self.cmb_driver = QComboBox(); self.cmb_driver.addItems(DRIVERS)
         self.cmb_driver.setCurrentText(self.driver_choice)
         self.cmb_driver.currentTextChanged.connect(self.on_driver_choice_changed)
-        fd.addWidget(QLabel("Experimental Driver:"))
+        fd.addWidget(QLabel("Experiment Driver:"))
         fd.addWidget(self.cmb_driver)
         top.addWidget(gb_drv, 2)
 
@@ -425,7 +433,7 @@ class ControlPanel(QMainWindow):
 
         # ===== Driver =====
         self.lbl_driver = QLabel("●"); self._set_led(self.lbl_driver, "stopped")
-        grid.addWidget(QLabel("<b>Experimental Driver</b>"), row, 0)
+        grid.addWidget(QLabel("<b>Experiment Driver</b>"), row, 0)
         grid.addWidget(self.lbl_driver, row, 1)
         self.btn_driver_start = QPushButton("Start")
         self.btn_driver_stop  = QPushButton("Stop")
@@ -509,38 +517,45 @@ class ControlPanel(QMainWindow):
         # Robot Test tab
         robot_tab = QWidget(); tabs.addTab(robot_tab, "Robot Test")
         rt = QVBoxLayout(robot_tab)
+
         btn_open_udp_robot = QPushButton("Open UDPRobot.py (terminal)")
         btn_open_udp_robot.clicked.connect(
             lambda: self._spawn_external(f'python -u "{os.path.join(ROOT, "UDPRobot.py")}"')
         )
         rt.addWidget(btn_open_udp_robot)
-        self.txt_udp_log = QTextEdit(); self.txt_udp_log.setReadOnly(True); self.txt_udp_log.setMaximumHeight(180)
-        rt.addWidget(QLabel("Notes:")); rt.addWidget(self.txt_udp_log)
 
-        # Gaze tab (NEW)
-        gaze_tab = QWidget(); tabs.addTab(gaze_tab, "Gaze")
-        gv = QVBoxLayout(gaze_tab)
+        # --- New Harmony controls on tab 2 ---
+        harmony_box = QGroupBox("Harmony Calibration / Online Control")
+        hb = QGridLayout(harmony_box)
 
-        roww = QHBoxLayout()
-        self.btn_gaze_run_ui = QPushButton("Run Gaze (UI mode)")
-        self.btn_gaze_run_ui.clicked.connect(self.on_gaze_runner_start)
-        roww.addWidget(self.btn_gaze_run_ui)
+        hb.addWidget(QLabel("Calibration library:"), 0, 0)
 
-        self.btn_gaze_stop_ui = QPushButton("Stop Runner")
-        self.btn_gaze_stop_ui.clicked.connect(self.on_gaze_runner_stop)
-        roww.addWidget(self.btn_gaze_stop_ui)
+        self.cmb_calibration_lib = QComboBox()
+        hb.addWidget(self.cmb_calibration_lib, 0, 1)
 
-        self.btn_gaze_query_tab = QPushButton("Query Telemetry (UDP)")
-        self.btn_gaze_query_tab.clicked.connect(self.on_gaze_service_query)
-        roww.addWidget(self.btn_gaze_query_tab)
+        self.btn_refresh_calibration_libs = QPushButton("Refresh")
+        self.btn_refresh_calibration_libs.clicked.connect(self.on_refresh_calibration_libs)
+        hb.addWidget(self.btn_refresh_calibration_libs, 0, 2)
 
-        roww.addStretch(1)
-        gv.addLayout(roww)
+        self.btn_run_harmony_calibration = QPushButton("Run harmony_calibration_exec.py")
+        self.btn_run_harmony_calibration.clicked.connect(self.on_run_harmony_calibration)
+        hb.addWidget(self.btn_run_harmony_calibration, 1, 0, 1, 3)
 
-        gv.addWidget(QLabel("Open Main → View: Gaze to see runner output + telemetry JSON."))
+        self.btn_run_harmony_online = QPushButton("Run harmony_online_control.py")
+        self.btn_run_harmony_online.clicked.connect(self.on_run_harmony_online_control)
+        hb.addWidget(self.btn_run_harmony_online, 2, 0, 1, 3)
+
+        rt.addWidget(harmony_box)
+
+        self.txt_udp_log = QTextEdit()
+        self.txt_udp_log.setReadOnly(True)
+        self.txt_udp_log.setMaximumHeight(180)
+        rt.addWidget(QLabel("Notes:"))
+        rt.addWidget(self.txt_udp_log)
 
         # Initial serial refresh
         self.on_serial_refresh()
+        self.on_refresh_calibration_libs()
 
         self._building_ui = False
         self._refresh_log_view()
@@ -570,9 +585,15 @@ class ControlPanel(QMainWindow):
             driver_path = DRIVER_ONLINE_PY
         elif self.driver_choice == "ExperimentDriver_Bimanual":
             driver_path = DRIVER_BIMANUAL_PY
-        else:
+        elif self.driver_choice == "ExperimentDriver_Offline":
             driver_path = DRIVER_OFFLINE_PY
-
+        elif self.driver_choice == "ExperimentDriver_Online_GazeTracking":
+            driver_path = DRIVER_ONLINE_GAZE_PY
+        elif self.driver_choice == "ExperimentDriver_Online_Glove":
+            driver_path = DRIVER_ONLINE_GLOVE_PY
+        else:
+            QMessageBox.warning(self, "Driver", f"Unknown driver selected: {self.driver_choice}")
+            return
         self.driver.cmd = f'python -u "{driver_path}" {mode_flag}'
 
         for p in (self.marker, self.driver, self.fes, self.gaze_runner, self.gaze_service):
@@ -879,17 +900,23 @@ class ControlPanel(QMainWindow):
 
     # ----- Arduino / Online BCI panel -----
     def on_serial_refresh(self):
+        self.cmb_serial_port.blockSignals(True)
         self.cmb_serial_port.clear()
+
         try:
             ports = list(serial.tools.list_ports.comports())
         except Exception as e:
+            self.cmb_serial_port.blockSignals(False)
             self._append_log("Panel", f"[{self._ts()}] Error listing serial ports: {e}\n")
             self.lbl_serial_status.setText("Status: Error listing ports")
             return
 
         if not ports:
             self.cmb_serial_port.addItem("No ports found", "")
+            self.serial_port_name = ""
+            self.cmb_serial_port.blockSignals(False)
             self.lbl_serial_status.setText("Status: No ports")
+            self._append_log("Panel", f"[{self._ts()}] No serial ports found\n")
             return
 
         for p in ports:
@@ -906,11 +933,13 @@ class ControlPanel(QMainWindow):
             idx = 0
 
         self.cmb_serial_port.setCurrentIndex(idx)
-        try:
-            self.cmb_serial_port.currentIndexChanged.disconnect(self.on_serial_port_changed)
-        except Exception:
-            pass
-        self.cmb_serial_port.currentIndexChanged.connect(self.on_serial_port_changed)
+        self.serial_port_name = self.cmb_serial_port.currentData() or ""
+        self.cmb_serial_port.blockSignals(False)
+
+        self.lbl_serial_status.setText(f"Status: Selected {self.serial_port_name}" if self.serial_port_name else "Status: No port selected")
+        self._append_log("Panel", f"[{self._ts()}] Serial ports refreshed. Selected: {self.serial_port_name or 'None'}\n")
+
+        self._set_cmds_for_mode_and_driver()
 
     def on_serial_port_changed(self, index: int):
         device = self.cmb_serial_port.itemData(index)
@@ -1025,6 +1054,62 @@ class ControlPanel(QMainWindow):
         self.le_model_path.setText(path)
         self._append_log("Panel", f"[{self._ts()}] Classifier model selected:\n  {path}\n")
         self._set_cmds_for_mode_and_driver()
+
+
+    # ----- Harmony calibration / online control -----
+    def on_refresh_calibration_libs(self):
+        if not hasattr(self, "cmb_calibration_lib"):
+            return
+
+        current = self.cmb_calibration_lib.currentData()
+        self.cmb_calibration_lib.clear()
+
+        # Search for .npz libraries in ROOT
+        libs = sorted(glob.glob(os.path.join(ROOT, "*.npz")))
+
+        if not libs:
+            self.cmb_calibration_lib.addItem("No calibration libraries found", "")
+            self._append_log("Panel", f"[{self._ts()}] No calibration libraries (*.npz) found in {ROOT}\n")
+            return
+
+        for lib in libs:
+            self.cmb_calibration_lib.addItem(os.path.basename(lib), lib)
+
+        # Try to restore previous selection if still present
+        if current:
+            idx = self.cmb_calibration_lib.findData(current)
+            if idx >= 0:
+                self.cmb_calibration_lib.setCurrentIndex(idx)
+
+        self._append_log("Panel", f"[{self._ts()}] Refreshed calibration libraries ({len(libs)} found)\n")
+
+    def _get_selected_calibration_library(self) -> str:
+        if not hasattr(self, "cmb_calibration_lib"):
+            return ""
+        return self.cmb_calibration_lib.currentData() or ""
+
+    def on_run_harmony_calibration(self):
+        if not os.path.exists(HARMONY_CALIBRATION_EXEC_PY):
+            QMessageBox.warning(self, "Missing", f"Not found:\n{HARMONY_CALIBRATION_EXEC_PY}")
+            return
+
+        self._spawn_external(f'python -u "{HARMONY_CALIBRATION_EXEC_PY}"')
+        self._append_log("Panel", f"[{self._ts()}] Opened harmony_calibration_exec.py\n")
+
+    def on_run_harmony_online_control(self):
+        if not os.path.exists(HARMONY_ONLINE_CONTROL_PY):
+            QMessageBox.warning(self, "Missing", f"Not found:\n{HARMONY_ONLINE_CONTROL_PY}")
+            return
+
+        calib_lib = self._get_selected_calibration_library()
+        if not calib_lib or not os.path.exists(calib_lib):
+            QMessageBox.warning(self, "Calibration Library", "Please select a valid calibration library (.npz).")
+            return
+
+        # Assumes harmony_online_control.py takes the calibration library as a positional argument.
+        # If your script expects a flag instead (for example --calib_lib), change the line below accordingly.
+        self._spawn_external(f'python -u "{HARMONY_ONLINE_CONTROL_PY}" "{calib_lib}"')
+        self._append_log("Panel", f"[{self._ts()}] Opened harmony_online_control.py with calibration library:\n  {calib_lib}\n")
 
     # ----- Driver -----
     def on_driver_start(self):
