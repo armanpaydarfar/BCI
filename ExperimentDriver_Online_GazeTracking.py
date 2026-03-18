@@ -325,6 +325,27 @@ def draw_retry_reset_screen():
 # Gaze helpers
 # =========================================================
 def gaze_udp_request(sock, payload, timeout=GAZE_UDP_TIMEOUT):
+    """
+    Request a gaze snapshot from `gaze_runner.py` via UDP.
+
+    Args:
+        sock: UDP socket connected to the gaze runner's request port.
+        payload: JSON-serializable dict. Expected keys:
+          - `cmd`: currently `"snapshot"`
+          - `include_objects`: bool (whether tracked detections are included)
+          - `query_id`: opaque value used only for debugging/logging
+        timeout: recv timeout in seconds.
+
+    Returns:
+        Decoded JSON response dict, or `None` on failure.
+
+    Expected snapshot fields (when `cmd="snapshot"`):
+        - `ok`: bool (true if snapshot is valid)
+        - `gaze_px`: (x_px, y_px) in Neon scene pixel coordinates
+          (the experiment later normalizes using `GAZE_SAMPLE_WIDTH/HEIGHT`)
+        - `gaze_hit`: None or dict describing the selected tracked object
+        - `objects`: list of tracked detections (only present when `include_objects=True`)
+    """
     try:
         sock.settimeout(timeout)
         msg = json.dumps(payload).encode("utf-8")
@@ -396,6 +417,7 @@ def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WI
 
             if hit is not None and gaze_px is not None and len(gaze_px) >= 2:
                 obj_key = make_object_key(hit)
+                # `gaze_px` are raw scene pixels; normalization happens later when mapping to the pose library.
                 x, y = float(gaze_px[0]), float(gaze_px[1])
 
                 dwell_sec_by_obj[obj_key] = dwell_sec_by_obj.get(obj_key, 0.0) + dt

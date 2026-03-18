@@ -1,3 +1,19 @@
+"""
+FES_listener.py
+
+UDP listener that triggers Functional Electrical Stimulation (FES) pulses.
+
+Protocol (UDP payload is a plain text token):
+- `FES_SENS_GO`: start sensory stimulation (uses sensory thresholds/durations)
+- `FES_MOTOR_GO`: start motor stimulation (uses motor thresholds/durations)
+- `FES_STOP`: stop the currently running stimulation loop early
+- `ping`: health check; replies with a UDP "pong"
+
+Assumptions:
+- The script runs in a loop and blocks on UDP receives.
+- Each trigger results in a time-bounded pulse loop at `FES_frequency` Hz.
+"""
+
 import time
 import json
 import socket

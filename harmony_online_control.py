@@ -172,6 +172,16 @@ def go_home():
 # ---------------- Library ----------------
 
 def load_library(path):
+    """
+    Load a calibration NPZ produced by `harmony_calibration_exec.py`.
+
+    Expected NPZ keys:
+      - `X`: end-effector positions, shape (N, 3), units mm
+      - `Q`: joint angles, shape (N, ...), units radians
+      - `G` (optional): gaze coordinates, shape (N, >=2), normalized pixel coords
+        in [0,1] with an optional confidence column as the last dimension.
+        If `G` is missing, gaze/vision mode must be disabled by the caller.
+    """
     z = np.load(path, allow_pickle=True)
     X = z["X"]    # positions mm
     Q = z["Q"]    # joint rad

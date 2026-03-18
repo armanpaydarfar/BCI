@@ -1,3 +1,17 @@
+"""
+ExperimentDriver_Offline.py
+
+Offline EEG driver / interactive replay loop.
+
+At a high level this script:
+- Resolves an LSL EEG stream (it does not itself load XDF files).
+- Generates a trial sequence and provides Pygame-based visual feedback.
+- Sends UDP markers/triggers (and optional FES/robot commands depending on config).
+
+Because this script is not structured around a `main()` function, the "phases"
+are implemented as top-level control-flow blocks.
+"""
+
 import pygame
 import socket
 import sys

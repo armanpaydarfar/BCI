@@ -106,6 +106,11 @@ FES_RE     = re.compile(r'^(FES_toggle\s*=\s*)([01])\s*$', re.M)
 SIM_RE     = re.compile(r'^(SIMULATION_MODE\s*=\s*)(True|False)(\s*(#.*)?)\s*$', re.M)
 
 def read_text(path: str) -> str:
+    """
+    Read a UTF-8 text file.
+
+    Returns an empty string if the file does not exist.
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
@@ -113,6 +118,12 @@ def read_text(path: str) -> str:
         return ""
 
 def write_atomic(path: str, text: str):
+    """
+    Write text to `path` using an atomic replace.
+
+    This reduces the chance of producing a partially-written `config.py`
+    if the application crashes mid-write.
+    """
     tmp = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
     try:
         tmp.write(text)
@@ -124,6 +135,9 @@ def write_atomic(path: str, text: str):
         raise
 
 def read_simulation_mode(default=False) -> bool:
+    """
+    Read `SIMULATION_MODE` from `config.py` using a regex match.
+    """
     txt = read_text(CONFIG_PY)
     m = SIM_RE.search(txt)
     if not m:
@@ -131,6 +145,12 @@ def read_simulation_mode(default=False) -> bool:
     return (m.group(2) == "True")
 
 def write_simulation_mode(val: bool):
+    """
+    Update `SIMULATION_MODE = True/False` inside `config.py` in-place.
+
+    Implementation detail: uses regex substitution so we don't need to import
+    or rewrite unrelated config lines.
+    """
     val_txt = "True" if val else "False"
     txt = read_text(CONFIG_PY)
     if SIM_RE.search(txt):
@@ -141,11 +161,17 @@ def write_simulation_mode(val: bool):
     write_atomic(CONFIG_PY, new)
 
 def read_training_subject(default="PILOT007"):
+    """
+    Read `TRAINING_SUBJECT` from `config.py`.
+    """
     txt = read_text(CONFIG_PY)
     m = SUBJECT_RE.search(txt)
     return m.group(3) if m else default
 
 def write_training_subject(val: str):
+    """
+    Update `TRAINING_SUBJECT = "<val>"` inside `config.py`.
+    """
     txt = read_text(CONFIG_PY)
     if SUBJECT_RE.search(txt):
         new = SUBJECT_RE.sub(rf'\g<1>"{val}"', txt)
@@ -155,6 +181,9 @@ def write_training_subject(val: str):
     write_atomic(CONFIG_PY, new)
 
 def read_fes_toggle(default=0):
+    """
+    Read `FES_toggle` from `config.py` as an integer 0/1.
+    """
     txt = read_text(CONFIG_PY)
     m = FES_RE.search(txt)
     try:
@@ -163,6 +192,11 @@ def read_fes_toggle(default=0):
         return default
 
 def write_fes_toggle(val: int):
+    """
+    Update `FES_toggle = 0/1` inside `config.py`.
+
+    Any truthy value is normalized to 1, otherwise 0.
+    """
     val = 1 if val else 0
     txt = read_text(CONFIG_PY)
     if FES_RE.search(txt):

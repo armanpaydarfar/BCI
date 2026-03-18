@@ -1,3 +1,14 @@
+"""
+ExperimentDriver_Online_Glove.py
+
+Online EEG experiment driver that additionally drives an Arduino-based glove.
+
+High-level phases:
+- Setup: connect to LSL EEG stream, load decoder model, initialize Pygame + UDP sockets
+- Trial loop: decode MI/REST and send UDP robot/FES triggers
+- Glove integration: on successful MI, send serial command to close/open the glove
+"""
+
 import pygame
 import socket
 import pickle
@@ -212,6 +223,15 @@ _RC.counter = counter
 
 
 def main():
+    """
+    Run the online MI/REST trial loop with optional glove (Arduino) control.
+
+    Notes on glove commands:
+    - The driver writes raw bytes to the serial port:
+      `b'1'` => close glove (MI)
+      `b'0'` => open glove / reset (REST/home alignment)
+    - See `config.ARDUINO_CMD_MI` and `config.ARDUINO_CMD_REST` for the intended meaning.
+    """
     # === Main Game Loop Initialization ===
 
     # Connect to EEG stream
@@ -432,6 +452,8 @@ def main():
         # If trial was a correct MI, continue classification during robot movement
         if should_hold_and_classify:
             if arduino:
+                # Arduino glove command bytes (see config intent):
+                # - b'1' is treated as MI-success -> close the glove
                 arduino.write(b'1')
                 logger.log_event("glove closing after successful MI")
 
@@ -464,6 +486,7 @@ def main():
             # --- Robot HOME + reset for MI trials ---
             # Send HOME opcode to robot
             if arduino:
+                # REST/home alignment -> open glove / reset
                 arduino.write(b'0')
                 logger.log_event("opening glove")
 

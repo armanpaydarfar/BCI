@@ -157,6 +157,20 @@ class GazeUDPServer(threading.Thread):
             self.log("stopped")
 
     def handle(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Handle an incoming JSON UDP request and return a JSON response.
+
+        Supported `cmd` values:
+          - `"ping"` / `"status"`: snapshot without objects (cheap telemetry)
+          - `"snapshot"`: snapshot; optional `include_objects` flag
+          - `"recenter"`: recenter head/gaze offsets using the most recent measurements
+          - `"set_cv"`: enable/disable YOLO/object detection (saves compute)
+          - `"stop"`: stop the gaze system (sets `stop_event`)
+
+        Snapshot responses are directly compatible with what
+        `ExperimentDriver_Online_GazeTracking.py` expects to read:
+        `gaze_px`, `gaze_hit`, and (when enabled) `objects`/tracks.
+        """
         cmd = str(req.get("cmd", "")).lower()
 
         if cmd in ("ping", "status"):

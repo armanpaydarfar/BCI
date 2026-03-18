@@ -1,3 +1,14 @@
+"""
+ExperimentDriver_Bimanual.py
+
+Online EEG experiment driver for the bimanual (robot-assisted) workflow.
+
+Key idea:
+- Decode MI/REST from the live EEG stream.
+- Orchestrate robot state transitions over UDP (including a master-arm
+  unlock/lock phase) in sync with trial phases and acknowledgements.
+"""
+
 import pygame
 import socket
 import time
@@ -295,6 +306,16 @@ def perform_master_positioning(
 
 
 def main():
+    """
+    Run the bimanual experiment trial loop.
+
+    This function is the primary entry point when the driver is launched
+    directly (e.g., from `control_panel.py`). It manages:
+    - LSL EEG stream resolution
+    - `EEGStreamState` creation and streaming window extraction
+    - per-trial robot/FES triggers and ACK-gated robot motions
+    - user/backdoor input handling and the end-of-run summary outputs
+    """
     # === Main Game Loop Initialization ===
 
     # Connect to EEG stream

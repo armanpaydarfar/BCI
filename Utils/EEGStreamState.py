@@ -10,7 +10,31 @@ from Utils.preprocessing import (
 )
 
 class EEGStreamState:
+    """
+    Stateful wrapper for real-time EEG ingestion.
+
+    Responsibilities:
+    - Pull chunks from an LSL EEG inlet (non-blocking).
+    - Select valid EEG channels once (first chunk).
+    - Apply streaming filter bank + maintain filter state.
+    - Maintain a rolling buffer of filtered samples + timestamps.
+    - Provide baseline computation and baseline-corrected windows for the decoder.
+
+    Notes:
+    - Output shapes are numpy arrays where callers typically expect
+      (n_channels, n_samples) windows.
+    - `mode` controls channel selection: `"motor"` vs `"errp"`.
+    """
     def __init__(self, inlet: StreamInlet, config, mode = "motor", logger=None):
+        """
+        Create the streaming EEG processor.
+
+        Args:
+            inlet: LSL StreamInlet for the EEG stream.
+            config: module-like config object containing filter/buffer parameters.
+            mode: `"motor"` (default) or `"errp"` to select different channel sets.
+            logger: optional LoggerManager-style object for structured warnings.
+        """
         self.inlet = inlet
         self.config = config
         self.logger = logger
@@ -48,6 +72,13 @@ class EEGStreamState:
         self.first_chunk_processed = False
 
     def update(self):
+        """
+        Pull and process any newly available EEG samples from the LSL inlet.
+
+        This function is designed to be called frequently from the UI/trial loop.
+        It performs no blocking reads (timeout=0.0) and returns immediately when
+        no new samples are available.
+        """
         try:
             # === Pull new chunk from LSL stream ===
             chunk, timestamps = self.inlet.pull_chunk(timeout=0.0)
@@ -104,6 +135,12 @@ class EEGStreamState:
 
 
     def compute_baseline(self, duration_sec=1.0):
+        """
+        Compute a per-channel baseline mean from the last `duration_sec` seconds.
+
+        Sets `self.baseline_mean` as shape (n_channels, 1) so that it can be
+        subtracted from (n_channels, n_samples) windows later.
+        """
         samples_needed = int(duration_sec * self.config.FS)
         if len(self.filtered_buffer) < samples_needed:
             raise ValueError("Not enough data in buffer to compute baseline.")
@@ -112,6 +149,16 @@ class EEGStreamState:
         self.baseline_mean = buffer_array.mean(axis=0, keepdims=True).T  # shape: (n_channels, 1)
 
     def get_baseline_corrected_window(self, window_size_samples):
+        """
+        Return a baseline-corrected window from the rolling filtered buffer.
+
+        Args:
+            window_size_samples: number of samples to include in the returned window.
+
+        Returns:
+            window: (n_channels, window_size_samples) float array
+            timestamps: list of corresponding per-sample timestamps (seconds)
+        """
         if len(self.filtered_buffer) < window_size_samples:
             raise ValueError("Not enough data in buffer for window.")
 

@@ -1,8 +1,24 @@
+"""
+Utils for extracting EEG data from LSL (live) or XDF (recorded offline).
+
+These helpers are used by different experiment workflows to:
+- verify required streams exist,
+- pull small fixed-size chunks from LSL,
+- and load synchronized EEG/marker streams from XDF files.
+
+Be mindful of sample layout:
+- In most callers, downstream code expects arrays shaped like (n_channels, n_samples)
+  for real-time windows, and `(n_samples, ...)` for certain offline operations.
+"""
+
 from pylsl import resolve_stream, StreamInlet
 import numpy as np
 import pyxdf
 
 def check_streams():
+    """
+    Resolve the expected EEG LSL stream and return an inlet for pulling samples.
+    """
     print("Checking for EEG stream...")
     eeg_streams = resolve_stream('type', 'EEG')
     if not eeg_streams:
@@ -12,12 +28,29 @@ def check_streams():
     return StreamInlet(eeg_streams[0])
 
 def get_eeg_data(inlet, duration=1.0, sampling_rate=512):
+    """
+    Pull approximately `duration` seconds of EEG samples from an LSL inlet.
+
+    Returns:
+        numpy array of shape (n_samples, n_channels) as returned by LSL chunk pull.
+        (Callers typically reshape/transposes as needed.)
+    """
     inlet.flush()
     samples = int(duration * sampling_rate)
     data, _ = inlet.pull_chunk(timeout=duration + 0.5, max_samples=samples)
     return np.array(data[-samples:])
 
 def load_xdf(file_path, dejitter=False, sync=False, report=True):
+    """
+    Load an XDF file and return `(eeg_stream, marker_stream)` dictionaries.
+
+    This function searches stream metadata by type:
+    - EEG: typ == "eeg"
+    - markers: typ in {"markers", "marker"}
+
+    The function also optionally prints EEG sampling interval statistics when
+    `report=True`.
+    """
     streams, _ = pyxdf.load_xdf(
         file_path,
         dejitter_timestamps=dejitter,

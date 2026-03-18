@@ -1,4 +1,25 @@
 # utils/networking.py
+"""
+UDP/ACK protocol helpers for Harmony experiments.
+
+This module is performance- and safety-critical: it implements the "wire format"
+between experiment drivers and the robot/FES/marker systems.
+
+Key concepts:
+1) Message payloads are typically short strings or opcodes defined in `config.py`.
+2) Some commands expect an ACK from the robot (see `send_udp_message(..., expect_ack=True)`).
+3) ACK matching uses "base tokens": e.g. robot ACK can be like `ACK:h;dur=3.000000`,
+   which should still match the base token `h`.
+
+Common protocol fields (by convention):
+- Robot opcodes / trajectories:
+  - Symbolic tokens in `config.ROBOT_OPCODES` (e.g. `h;dur=3`, `g`, `a/x/y/z`).
+  - Or direct 7-DOF joint coordinate trajectories as a single string in the
+    form `[x1,x2,x3,x4,x5,x6,x7];dur=<seconds>` (square brackets optional).
+    The validator expects exactly 7 numeric values separated by commas; any
+    optional `;<suffix>` part (commonly `;dur=...`) is allowed.
+- Robot triggers/ACKs: symbolic tokens in `config.TRIGGERS` (e.g. `ACK_ROBOT_HOME`).
+"""
 import sys
 import importlib
 import socket
@@ -40,7 +61,9 @@ MAX_RETRIES  = 1        # resend attempts when gating
 QUERY_OPCODE = "q"
 STAGE_TO_GO_DELAY_S = 0.10  # 100 ms
 
-# Simulation mode: suppress robot I/O, allow marker I/O
+# Simulation mode: suppress robot I/O, allow marker I/O.
+# NOTE: this flag is computed at import time, so any behavior gated by it is
+# decided when the module is imported (before drivers wire runtime sockets).
 SIMULATION_MODE = bool(getattr(_config, "SIMULATION_MODE", False)) if _config is not None else False
 print("SIM MODE:", SIMULATION_MODE)
 # --- minimal state for standalone 'g' ---

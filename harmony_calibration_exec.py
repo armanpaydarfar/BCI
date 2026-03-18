@@ -392,6 +392,13 @@ def main():
     # Save enhanced library
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = f"poses_with_gaze_{stamp}.npz"
+    # Output contract (consumed by `harmony_online_control.py::load_library`):
+    #   - T: (num_samples,) timestamps (seconds)
+    #   - Q: (num_samples, ...) joint angles (radians)
+    #   - X: (num_samples, 3) end-effector positions (mm)
+    #   - G: (num_samples, 3) gaze coords + confidence
+    #        * gaze_x, gaze_y are normalized to [0,1]
+    #        * third column is gaze_conf (used as validity gating later)
     np.savez_compressed(out_path, 
                         T=T, Q=Q, X=X, G=G,
                         meta=dict(side=ACTIVE_SIDE,

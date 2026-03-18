@@ -33,6 +33,8 @@ from Utils.networking import send_udp_message,display_multiple_messages_with_udp
 
 # --------- Runtime "globals" (wired by each driver right after init) ---------
 # These names intentionally match what the original functions referenced.
+# Contract: drivers must assign these before calling runtime functions. For example,
+# `udp_socket_fes` and `FES_toggle` must be valid if FES is enabled.
 config = None
 logger = None
 model = None
@@ -185,7 +187,8 @@ def calculate_fill_levels(running_avg_confidence, mode):
         mode (int): 0 for MI trial (fill square), 1 for Rest trial (fill ball).
 
     Returns:
-        tuple: (fill_arrow, fill_ball) - Values between 0 and 1 indicating fill levels.
+        tuple: (fill_arrow, fill_ball) - Values between 0 and 1 indicating fill levels
+        for the MI arrow and REST ball UI (roles swap in Rest mode).
     """
     # Ensure probability stays within configured bounds
     prob = max(0, min(1, running_avg_confidence))
@@ -215,6 +218,9 @@ def handle_fes_activation(mode, running_avg_confidence, fes_active):
     Returns:
         bool: Updated FES state after processing.
     """
+    # Thresholding logic (kept here for traceability):
+    # - MI (mode==0): running_avg_confidence > 0.5 -> activate
+    # - Rest (mode==1): running_avg_confidence < 0.5 -> deactivate
     # Determine if FES should be active:
     # - If mode is MI (0) and confidence > 0.5 → Turn on FES
     # - If mode is Rest (1) and confidence < 0.5 → Turn on FES

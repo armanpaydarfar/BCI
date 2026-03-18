@@ -326,9 +326,37 @@ class GazeSystem:
         """
         Main consumer API for your session/orchestrator.
 
+        Snapshot fields form an implicit "API contract" between `gaze_system.py`,
+        `gaze_runner.py`, and experiment drivers.
+
         include_frame:
         - True  -> include frame_bgr (COPY) for UI rendering/debug
         - False -> do NOT copy/export pixels (service/telemetry mode). CV still runs internally.
+
+        Snapshot contract (when ok=True):
+          - timing:
+              - unix_t / wall_t: timestamps (Unix seconds, and wall-clock seconds)
+              - loop_hz: measured consumer loop rate (approx)
+              - video_hz / vid_stale_s: video publish health metrics
+              - det_hz / det_age_s: detector publish rate/age
+              - infer_ms: most recent inference duration in milliseconds
+          - gaze & head/eye geometry:
+              - gaze_px: (x_px, y_px) in Neon scene pixel coordinates (smoothed)
+              - gaze_px_raw: (x_px, y_px) raw/unsmoothed samples
+              - head_yaw_deg / head_pitch_deg: head orientation
+              - gaze_yaw_deg / gaze_pitch_deg: gaze direction (with recenter applied)
+          - depth & quality (when available):
+              - depth_cm: estimated vergence depth in centimeters
+              - depth_valid: depth validity flag
+              - miss_mm: miss distance in millimeters (when computed)
+              - ipd_mm: interpupillary distance (millimeters)
+          - IMU:
+              - imu_angvel: angular velocity (rad/s) or None
+              - imu_fresh: whether IMU is recent enough to trust
+          - object tracking (optional):
+              - objects: list of tracked detections (only if include_objects=True)
+              - gaze_hit: None or a dict describing the current gaze-selected hit:
+                  { track_id, name, conf, xyxy, mode, dist_px }
         """
         now_wall = time.time()
 

@@ -1,3 +1,25 @@
+"""
+UTIL_marker_stream.py
+
+UDP -> LSL marker streaming bridge.
+
+This script listens on a UDP port for marker messages produced by experiment
+drivers, converts them into a LSL `MarkerStream`, and timestamps them using
+the associated EEG LSL stream.
+
+UDP message formats accepted:
+- `"<marker_int>"` (marker only; uses EEG LSL time as timestamp)
+- `"<marker_int>,<prob_mi>,<prob_rest>"` (marker + classifier probabilities)
+
+Output LSL stream:
+- Stream type/name: `Markers` / `MarkerStream`
+- Channels: 4 floats:
+  1) marker (float representation of int)
+  2) timestamp (LSL time, via EEG inlet)
+  3) prob_mi (float, or -1.0 default if not provided)
+  4) prob_rest (float, or -1.0 default if not provided)
+"""
+
 import socket
 import threading
 import time

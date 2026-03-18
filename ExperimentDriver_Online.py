@@ -1,3 +1,17 @@
+"""
+ExperimentDriver_Online.py
+
+Online EEG experiment driver.
+
+High-level phases:
+1) Startup (module import): initialize logger, Pygame UI, UDP sockets, model loading,
+   and wire runtime globals in `Utils.runtime_common`.
+2) `main()`: resolve EEG LSL stream, construct `EEGStreamState`, and run the
+   trial loop (fixation -> feedback/classification -> send robot/FES triggers).
+3) Shutdown: ensure robot is brought to a safe state (via triggers/acks) and
+   write per-run outputs (csv logs under the subject/session directory).
+"""
+
 import pygame
 import socket
 import pickle
@@ -188,6 +202,14 @@ _RC.counter = counter
 
 
 def main():
+    """
+    Run the online interactive trial loop.
+
+    This is the primary real-time entry point for MI/REST decoding. It relies on:
+    - `EEGStreamState` for streaming window extraction + baseline correction
+    - `Utils.runtime_common` for shared decoder/FES/UDP wiring
+    - LSL EEG stream availability and UDP robot/FES endpoints
+    """
     # === Main Game Loop Initialization ===
 
     # Connect to EEG stream
