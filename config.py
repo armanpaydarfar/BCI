@@ -90,6 +90,13 @@ SAVE_ADAPTIVE_T = False #this toggle saves "Adaptive_T" to the EEG directory dur
 XGB_MAX_DEPTH = 5
 XGB_USE_COV_MU = 1
 XGB_USE_COV_BETA = 1
+XGB_IMPORTANCE_TOP_K = 20
+
+# Online decoder backend:
+# - "mdm" (legacy default)
+# - "xgb_cov"
+# - "xgb_cov_erd"
+DECODER_BACKEND = "mdm"
 
 
 # FES Parameters

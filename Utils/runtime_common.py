@@ -10,6 +10,7 @@ from sklearn.covariance import LedoitWolf
 from pyriemann.estimation import Shrinkage
 from pyriemann.utils.geodesic import geodesic_riemann
 from pyriemann.utils.base import invsqrtm
+from pyriemann.utils.tangentspace import tangent_space
 import pandas as pd
 from sklearn.metrics import confusion_matrix
 # Visualization utils (UI draws)
@@ -55,6 +56,7 @@ FES_toggle = None
 # Adaptive recentering state
 Prev_T = None
 counter = 0
+_decoder_checked = False
 
 
 # ----------------- Common helpers -----------------
@@ -248,19 +250,184 @@ def handle_fes_activation(mode, running_avg_confidence, fes_active):
     # No change in state
     return fes_active
 
+
+def _is_xgb_bundle(obj):
+    return isinstance(obj, dict) and "model" in obj and "scaler" in obj and "label_to_bin" in obj
+
+
+def _covariance_from_window(window_2d):
+    cov = (window_2d @ window_2d.T)
+    tr = np.trace(cov)
+    if tr <= 0:
+        tr = 1e-12
+    return cov / tr
+
+
+def _shrink_single_cov(cov):
+    if config.LEDOITWOLF:
+        return LedoitWolf().fit(cov).covariance_
+    return np.squeeze(Shrinkage(shrinkage=config.SHRINKAGE_PARAM).fit_transform(np.expand_dims(cov, axis=0)), axis=0)
+
+
+def _tangent_at_identity_single(cov):
+    n_ch = cov.shape[0]
+    return tangent_space(np.expand_dims(cov, axis=0), np.eye(n_ch), metric="riemann")[0]
+
+
+def _log_bandpower(signal, fs, band):
+    lo, hi = float(band[0]), float(band[1])
+    n_t = signal.shape[1]
+    freqs = np.fft.rfftfreq(n_t, d=1.0 / fs)
+    fft = np.fft.rfft(signal, axis=1)
+    power = (np.abs(fft) ** 2) / float(max(n_t, 1))
+    mask = (freqs >= lo) & (freqs < hi)
+    if np.any(mask):
+        bp = power[:, mask].mean(axis=1)
+    else:
+        bp = np.zeros(signal.shape[0], dtype=float)
+    return np.log10(bp + 1e-12)
+
+
+def _build_xgb_features(eeg_state, window_size_samples):
+    """
+    Build online XGBoost features to match offline ordering:
+    [cov_mu] + [cov_beta] + [erd]
+    """
+    feature_spec = model.get("feature_spec", {})
+    use_cov_mu = bool(feature_spec.get("use_cov_mu", True))
+    use_cov_beta = bool(feature_spec.get("use_cov_beta", False))
+    n_cov_mu = int(feature_spec.get("n_cov_mu", 0))
+    n_cov_beta = int(feature_spec.get("n_cov_beta", 0))
+    n_erd = int(feature_spec.get("n_erd", 0))
+
+    if n_erd > 0:
+        mu_win, beta_win, _ = eeg_state.get_multiband_baseline_corrected_window(window_size_samples)
+    elif use_cov_beta:
+        mu_win, beta_win, _ = eeg_state.get_multiband_baseline_corrected_window(window_size_samples)
+    else:
+        mu_win, _ = eeg_state.get_baseline_corrected_window(window_size_samples)
+        beta_win = None
+
+    feature_blocks = []
+
+    if use_cov_mu:
+        cov_mu = _shrink_single_cov(_covariance_from_window(mu_win))
+        if config.RECENTERING:
+            global Prev_T, counter
+            if counter == 0 or Prev_T is None:
+                Prev_T = cov_mu
+            T_test = geodesic_riemann(Prev_T, cov_mu, 1 / (counter + 1))
+            T_invsqrtm = invsqrtm(Prev_T)
+            cov_mu = T_invsqrtm @ cov_mu @ T_invsqrtm.T
+            if bool(getattr(config, "UPDATE_DURING_MOVE", 0)):
+                Prev_T = T_test
+                counter += 1
+        feature_blocks.append(_tangent_at_identity_single(cov_mu))
+
+    if use_cov_beta:
+        if beta_win is None:
+            raise RuntimeError("XGBoost model expects beta covariance features, but beta stream is unavailable.")
+        cov_beta = _shrink_single_cov(_covariance_from_window(beta_win))
+        feature_blocks.append(_tangent_at_identity_single(cov_beta))
+
+    if n_erd > 0:
+        bands = feature_spec.get("erd_bands", [(8.0, 13.0), (13.0, 30.0)])
+        apply_csd = bool(feature_spec.get("apply_csd_erd_only", False))
+        if apply_csd:
+            try:
+                from Utils.xgb_feature_pipeline import apply_surface_laplacian_csd
+                mu_erd = apply_surface_laplacian_csd(mu_win, list(eeg_state.channel_names), fs=config.FS)
+                beta_erd = apply_surface_laplacian_csd(beta_win, list(eeg_state.channel_names), fs=config.FS)
+            except Exception as e:
+                logger.log_event(f"⚠️ Online CSD failed, falling back to non-CSD ERD: {e}")
+                mu_erd = mu_win
+                beta_erd = beta_win
+        else:
+            mu_erd = mu_win
+            beta_erd = beta_win
+
+        baseline_mu, baseline_beta = eeg_state.get_multiband_baseline_segments()
+        if baseline_mu is None or baseline_beta is None:
+            raise RuntimeError("Missing baseline segments for ERD feature computation.")
+        if apply_csd:
+            try:
+                from Utils.xgb_feature_pipeline import apply_surface_laplacian_csd
+                baseline_mu = apply_surface_laplacian_csd(baseline_mu, list(eeg_state.channel_names), fs=config.FS)
+                baseline_beta = apply_surface_laplacian_csd(baseline_beta, list(eeg_state.channel_names), fs=config.FS)
+            except Exception:
+                pass
+
+        erd_vals = []
+        for (lo, hi) in bands:
+            if float(hi) <= float(config.HIGHCUT):
+                w = _log_bandpower(mu_erd, config.FS, (lo, hi))
+                b = _log_bandpower(baseline_mu, config.FS, (lo, hi))
+            else:
+                w = _log_bandpower(beta_erd, config.FS, (lo, hi))
+                b = _log_bandpower(baseline_beta, config.FS, (lo, hi))
+            erd_vals.append((w - b).reshape(-1, 1))
+        erd_vec = np.hstack(erd_vals).reshape(-1)
+        feature_blocks.append(erd_vec)
+
+    feat = np.concatenate(feature_blocks, axis=0).reshape(1, -1)
+    if n_cov_mu and use_cov_mu and feat.shape[1] < n_cov_mu:
+        raise RuntimeError("Feature construction failed for covariance mu block.")
+    if n_cov_beta and use_cov_beta and feat.shape[1] < (n_cov_mu + n_cov_beta):
+        raise RuntimeError("Feature construction failed for covariance beta block.")
+    if n_erd and feat.shape[1] < (n_cov_mu + n_cov_beta + n_erd):
+        raise RuntimeError("Feature construction failed for ERD block.")
+    return feat
+
+
+def _predict_with_active_decoder(eeg_state, window_size_samples):
+    if not _is_xgb_bundle(model):
+        raise RuntimeError("XGBoost decoder bundle is not loaded.")
+    feat = _build_xgb_features(eeg_state, window_size_samples)
+    expected = int(model["scaler"].n_features_in_)
+    if feat.shape[1] != expected:
+        raise RuntimeError(f"XGBoost feature length mismatch. expected={expected}, got={feat.shape[1]}")
+    x = model["scaler"].transform(feat)
+    probs_bin = model["model"].predict_proba(x)[0]
+    rest_label = min(model["label_to_bin"], key=lambda k: model["label_to_bin"][k])
+    mi_label = max(model["label_to_bin"], key=lambda k: model["label_to_bin"][k])
+    rest_idx = int(model["label_to_bin"][rest_label])
+    mi_idx = int(model["label_to_bin"][mi_label])
+    prob_rest = float(probs_bin[rest_idx])
+    prob_mi = float(probs_bin[mi_idx])
+    pred = int(mi_label if prob_mi >= prob_rest else rest_label)
+    return np.array([prob_rest, prob_mi], dtype=float), pred
+
 def classify_real_time(eeg_state, window_size_samples, all_probabilities, predictions, mode, leaky_integrator, update_recentering=True):
+    global _decoder_checked
     global counter
     global Prev_T
 
     pygame.display.flip()
     pygame.event.get()  # Heartbeat to OS
 
+    if _is_xgb_bundle(model):
+        try:
+            probabilities, predicted_label = _predict_with_active_decoder(eeg_state, window_size_samples)
+        except ValueError:
+            return leaky_integrator.accumulated_probability, predictions, all_probabilities
+
+        if not _decoder_checked:
+            expected = int(model["scaler"].n_features_in_)
+            logger.log_event(f"XGBoost decoder initialized. expected_features={expected}")
+            _decoder_checked = True
+
+        correct_label = 200 if mode == 0 else 100
+        current_confidence = float(probabilities[1] if correct_label == 200 else probabilities[0])
+        predictions.append(int(predicted_label))
+        all_probabilities.append([time.time(), float(probabilities[0]), float(probabilities[1])])
+        return current_confidence, predictions, all_probabilities
+
+    # ---------------- Legacy MDM path (unchanged behavior) ----------------
     try:
         window, _ = eeg_state.get_baseline_corrected_window(window_size_samples)
     except ValueError:
         return leaky_integrator.accumulated_probability, predictions, all_probabilities
 
-    # === Covariance Matrix ===
     cov_matrix = (window @ window.T) / np.trace(window @ window.T)
 
     if config.LEDOITWOLF:
@@ -270,19 +437,15 @@ def classify_real_time(eeg_state, window_size_samples, all_probabilities, predic
         shrinkage = Shrinkage(shrinkage=config.SHRINKAGE_PARAM)
         cov_matrix = shrinkage.fit_transform(cov_matrix)
 
-    # === Adaptive Recentering ===
     if config.RECENTERING:
         cov_matrix = np.squeeze(cov_matrix, axis=0)
-
         if counter == 0 or Prev_T is None:
             Prev_T = cov_matrix
-
         T_test = geodesic_riemann(Prev_T, cov_matrix, 1 / (counter + 1))
         T_invsqrtm = invsqrtm(Prev_T)
         cov_matrix = T_invsqrtm @ cov_matrix @ T_invsqrtm.T
         cov_matrix = np.expand_dims(cov_matrix, axis=0)
 
-    # === Classification ===
     probabilities = model.predict_proba(cov_matrix)[0]
     predicted_label = model.classes_[np.argmax(probabilities)]
 
@@ -290,29 +453,21 @@ def classify_real_time(eeg_state, window_size_samples, all_probabilities, predic
     correct_class_idx = np.where(model.classes_ == correct_label)[0][0]
     current_confidence = probabilities[correct_class_idx]
 
-    # === Determine if recentering update should occur ===
     should_update_T = False
     if config.RECENTERING and update_recentering:
         if config.USE_CONFIDENCE_GATE:
-            correct_label = 200 if mode == 0 else 100
-            correct_class_idx = np.where(model.classes_ == correct_label)[0][0]
-            current_confidence = probabilities[correct_class_idx]
             predicted_correct = (predicted_label == correct_label)
             confident_enough = (current_confidence >= config.RECENTERING_CONFIDENCE_THRESHOLD)
             should_update_T = predicted_correct and confident_enough
         else:
-            # Always update if gating is disabled
             should_update_T = True
 
     if should_update_T:
         Prev_T = T_test
         counter += 1
 
-
-    # === Update Logs ===
     predictions.append(predicted_label)
     all_probabilities.append([time.time(), probabilities[0], probabilities[1]])
-
     return current_confidence, predictions, all_probabilities
 
 

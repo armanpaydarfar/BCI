@@ -240,6 +240,18 @@ def main():
         n_splits=int(getattr(config, "N_SPLITS", 8)),
         target_ambig=0.3,
     )
+    model_bundle["decoder_backend"] = "xgb_cov_erd"
+    model_bundle["feature_spec"] = {
+        "type": "cov_erd",
+        "use_cov_mu": bool(use_cov_mu),
+        "use_cov_beta": bool(use_cov_beta),
+        "n_cov_mu": int(n_cov_mu or 0),
+        "n_cov_beta": int(n_cov_beta or 0),
+        "n_erd": int(n_erd or 0),
+        "erd_bands": [tuple(map(float, b)) for b in getattr(config, "XGB_ERD_BANDS", [(float(config.LOWCUT), float(config.HIGHCUT)), (float(config.HIGHCUT), float(getattr(config, "XGB_ERD_BETA_HIGH", 30.0)))])],
+        "channel_names": list(channel_names) if channel_names is not None else None,
+        "apply_csd_erd_only": bool(apply_csd),
+    }
 
     _report_xgb_importance(
         model_bundle=model_bundle,

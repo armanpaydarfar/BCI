@@ -134,7 +134,14 @@ logger.log_event(f"FES toggle status: {'Enabled' if FES_toggle else 'Disabled'}.
 # Model loading
 # =========================================================
 subject_model_dir = os.path.join(config.DATA_DIR, f"sub-{config.TRAINING_SUBJECT}", "models")
-subject_model_path = os.path.join(subject_model_dir, f"sub-{config.TRAINING_SUBJECT}_model.pkl")
+decoder_backend = str(getattr(config, "DECODER_BACKEND", "mdm")).lower()
+if decoder_backend == "xgb_cov":
+    model_filename = f"sub-{config.TRAINING_SUBJECT}_xgb_cov_features.pkl"
+elif decoder_backend == "xgb_cov_erd":
+    model_filename = f"sub-{config.TRAINING_SUBJECT}_xgb_cov_erd_features.pkl"
+else:
+    model_filename = f"sub-{config.TRAINING_SUBJECT}_model.pkl"
+subject_model_path = os.path.join(subject_model_dir, model_filename)
 
 try:
     with open(subject_model_path, 'rb') as f:

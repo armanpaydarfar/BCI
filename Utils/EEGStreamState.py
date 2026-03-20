@@ -57,11 +57,27 @@ class EEGStreamState:
             notch_q=30
         )
         self.filter_state = {}
+        self.filter_bank_beta = None
+        self.filter_state_beta = {}
+        self.multiband_enabled = bool(getattr(config, "DECODER_BACKEND", "mdm") in ("xgb_cov", "xgb_cov_erd"))
+        if self.multiband_enabled:
+            beta_hi = float(getattr(config, "XGB_ERD_BETA_HIGH", 30.0))
+            self.filter_bank_beta = initialize_filter_bank(
+                fs=config.FS,
+                lowcut=float(config.HIGHCUT),
+                highcut=beta_hi,
+                notch_freqs=[60],
+                notch_q=30,
+            )
 
         # Buffers and state
         self.filtered_buffer = deque(maxlen=config.FILTER_BUFFER_SIZE)
+        self.filtered_buffer_beta = deque(maxlen=config.FILTER_BUFFER_SIZE)
         self.timestamps = deque(maxlen=config.FILTER_BUFFER_SIZE)
         self.baseline_mean = None
+        self.baseline_mean_beta = None
+        self.baseline_segment_mu = None
+        self.baseline_segment_beta = None
 
         # Channel selection
         self.channel_names = None
@@ -123,11 +139,18 @@ class EEGStreamState:
             filtered_chunk, self.filter_state = apply_streaming_filters(
                 raw_chunk, self.filter_bank, self.filter_state
             )
+            filtered_chunk_beta = None
+            if self.multiband_enabled and self.filter_bank_beta is not None:
+                filtered_chunk_beta, self.filter_state_beta = apply_streaming_filters(
+                    raw_chunk, self.filter_bank_beta, self.filter_state_beta
+                )
 
             # === Append filtered samples to buffer ===
             for i in range(filtered_chunk.shape[1]):
                 self.filtered_buffer.append(filtered_chunk[:, i])
                 self.timestamps.append(timestamps[i])
+                if filtered_chunk_beta is not None:
+                    self.filtered_buffer_beta.append(filtered_chunk_beta[:, i])
 
         except Exception as e:
             if self.logger:
@@ -147,6 +170,12 @@ class EEGStreamState:
 
         buffer_array = np.array(self.filtered_buffer)[-samples_needed:]
         self.baseline_mean = buffer_array.mean(axis=0, keepdims=True).T  # shape: (n_channels, 1)
+        self.baseline_segment_mu = buffer_array.T
+
+        if self.multiband_enabled and len(self.filtered_buffer_beta) >= samples_needed:
+            beta_array = np.array(self.filtered_buffer_beta)[-samples_needed:]
+            self.baseline_mean_beta = beta_array.mean(axis=0, keepdims=True).T
+            self.baseline_segment_beta = beta_array.T
 
     def get_baseline_corrected_window(self, window_size_samples):
         """
@@ -166,6 +195,29 @@ class EEGStreamState:
         if self.baseline_mean is not None:
             window -= self.baseline_mean
         return window, list(self.timestamps)[-window_size_samples:]
+
+    def get_multiband_baseline_corrected_window(self, window_size_samples):
+        """
+        Return baseline-corrected mu+beta windows for XGBoost feature extraction.
+        """
+        if not self.multiband_enabled:
+            raise ValueError("Multiband buffers are disabled.")
+        if len(self.filtered_buffer) < window_size_samples or len(self.filtered_buffer_beta) < window_size_samples:
+            raise ValueError("Not enough multiband data in buffer for window.")
+
+        mu_win = np.array(self.filtered_buffer)[-window_size_samples:].T
+        beta_win = np.array(self.filtered_buffer_beta)[-window_size_samples:].T
+        if self.baseline_mean is not None:
+            mu_win -= self.baseline_mean
+        if self.baseline_mean_beta is not None:
+            beta_win -= self.baseline_mean_beta
+        return mu_win, beta_win, list(self.timestamps)[-window_size_samples:]
+
+    def get_multiband_baseline_segments(self):
+        """
+        Return baseline segments used to compute ERD-style log-ratio features.
+        """
+        return self.baseline_segment_mu, self.baseline_segment_beta
     
     def _get_channel_names(self):
         """

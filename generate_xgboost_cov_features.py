@@ -195,6 +195,15 @@ def main():
         n_splits=int(getattr(config, "N_SPLITS", 8)),
         target_ambig=0.3,
     )
+    model_bundle["decoder_backend"] = "xgb_cov"
+    model_bundle["feature_spec"] = {
+        "type": "cov_only",
+        "use_cov_mu": bool(use_cov_mu),
+        "use_cov_beta": bool(use_cov_beta),
+        "n_cov_mu": int(n_cov_mu or 0),
+        "n_cov_beta": int(n_cov_beta or 0),
+        "channel_names": list(channel_names) if channel_names is not None else None,
+    }
     _report_xgb_importance_cov_only(
         model_bundle=model_bundle,
         n_cov_mu=int(n_cov_mu or 0),
