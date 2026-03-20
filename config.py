@@ -73,11 +73,11 @@ STEP_SIZE = 1/16
 CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
 #CLASSIFICATION_SCHEME_OPT = "TIMESERIES"
 CLASSIFICATION_SCHEME_OPT = "FREQUENCY"
-SURFACE_LAPLACIAN_TOGGLE = 0 #apply the surface laplacian spatial filter during online
+SURFACE_LAPLACIAN_TOGGLE = 1 #apply the surface laplacian spatial filter during offline/online-compatible preprocessing
 SELECT_MOTOR_CHANNELS = 1 # toggle to select motor channels or not (can be used to select other channels too)
 SELECT_ERRP_CHANNELS = 0 #toggle to select ERRP channels
 INTEGRATOR_ALPHA = 0.96 # defines how fast the accumulated probability may change as new data comes in
-SHRINKAGE_PARAM = 0.02 # hyperparameter for shrinkage regularization
+SHRINKAGE_PARAM = 0.1 # hyperparameter for shrinkage regularization
 LEDOITWOLF = 0 #Set to true to use ledoit wolf shrinkage regularization - otherwise pyreimannian will be used w/ shrinkage param shown above
 
 # adaptive Recentering parameters for config
@@ -85,6 +85,11 @@ RECENTERING = 1 # adaptive recentering toggle
 USE_CONFIDENCE_GATE = 0 #update Previous transform ONLY in the event of lean condition
 UPDATE_DURING_MOVE = 0 #this toggle defines whether or not the reimannian adaptive recentering scheme updates when the robot is moving. 0 = no, 1 = yes. The algo will update always during MI
 SAVE_ADAPTIVE_T = False #this toggle saves "Adaptive_T" to the EEG directory during an active session between runs - this way, we can continue w/ the current estimated whitening transform. Disabling this will start a fresh transform each time
+
+# XGBoost defaults for offline feature-branch models
+XGB_MAX_DEPTH = 5
+XGB_USE_COV_MU = 1
+XGB_USE_COV_BETA = 1
 
 
 # FES Parameters
