@@ -65,7 +65,7 @@ These areas are generally **low‑risk** and can tolerate more refactoring, docu
 - Markdown / text docs and comments.
 - Offline analysis and training scripts:
   - `Analyze_*.py`
-  - `Generate_Decoder.py`, `Generate_Riemannian*.py`
+  - `Generate_Riemannian_adaptive.py`, `generate_xgboost_*.py`
   - `Visualize_offline_data*.py`
 - Standalone plotting, report generation, and Jupyter notebooks (if present).
 - Pure visualization helpers that do not affect online control logic.

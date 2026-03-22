@@ -92,10 +92,8 @@ Key folders and scripts (non-exhaustive):
   - `FES_listener.py`, `STMsetup.py`: FES/STM listener and setup tools.
 
 - **Analysis and training**  
-  - `Generate_Riemannian_adaptive.py`: adaptive Riemannian transform generation (current path).  
-  - **Obsolete (for now)**:
-    - `Generate_Decoder.py` (superseded by `Generate_Riemannian_adaptive.py`)
-    - `Generate_Riemannian.py` (superseded by `Generate_Riemannian_adaptive.py`)
+  - `Generate_Riemannian_adaptive.py`: adaptive Riemannian / MDM training (current path; produces `sub-*_model.pkl`).  
+  - Legacy trainers `Generate_Decoder.py` (LDA) and `Generate_Riemannian.py` (non-adaptive MDM) were **removed** from the repo—use the adaptive script above.  
   - `Analyze_experiment_logs_cross_subject.py`, `Analyze_online_Decoder_performance.py`: log and performance analysis.  
   - Visualization utilities:
     - `Visualize_offline_data_MNE.py`, `visualize_online_data.py`
