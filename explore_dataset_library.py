@@ -8,9 +8,12 @@ Stages:
   deep            — optional session-held-out benchmark on explicit shortlist paths
 
 Examples:
-  python explore_dataset_library.py --out-dir ./exploration_run_001
+  python explore_dataset_library.py
+  python explore_dataset_library.py --out-dir ~/Documents/exploration_run_002
   python explore_dataset_library.py --backends mdm,xgb_cov --max-files 50
   python explore_dataset_library.py --stage deep --deep-models mdm,xgb_cov --shortlist-file paths.txt
+
+Default --out-dir is ~/Documents/exploration_run_001 so reports stay outside the repo.
 
 Outputs (baseline+screen): RUN_SUMMARY.txt, CSV (+ optional Parquet), PROPOSED_ADDITIONS.txt.
 
@@ -65,6 +68,11 @@ from Utils.dataset_exploration.scoring import (
     rank_proposals,
     report_primary_backends,
 )
+
+
+def _default_exploration_out_dir() -> Path:
+    """Write exploration artifacts under the user's Documents folder (not the repo)."""
+    return (Path.home() / "Documents" / "exploration_run_001").expanduser().resolve()
 
 
 def _parse_backends(raw: str) -> list[str]:
@@ -732,7 +740,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Harmony offline dataset library exploration")
     parser.add_argument("--data-dir", type=str, default=None, help="Override config.DATA_DIR")
     parser.add_argument("--baseline-subject", type=str, default=None, help="Override TRAINING_SUBJECT for baseline pool")
-    parser.add_argument("--out-dir", type=str, required=True, help="Output directory for reports")
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default=None,
+        help="Output directory for reports (default: ~/Documents/exploration_run_001)",
+    )
     parser.add_argument(
         "--stage",
         type=str,
@@ -793,7 +806,7 @@ def main() -> int:
 
     data_dir = Path(args.data_dir or config.DATA_DIR).expanduser().resolve()
     baseline_subject = args.baseline_subject or getattr(config, "TRAINING_SUBJECT", "PILOT007")
-    out_dir = Path(args.out_dir).expanduser().resolve()
+    out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else _default_exploration_out_dir()
 
     if args.stage == "deep":
         if not args.shortlist_file:
