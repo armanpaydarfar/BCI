@@ -267,7 +267,8 @@ The drivers in this repo are “modular” in what they require:
 
 - **Changelog and project log**  
   - **`CHANGELOG.md`**: notable integration changes, plus operational tables (config shadowing, hardware checklist, obsolete-script tombstones). Update **[Unreleased]** when behavior visible to operators or analysts changes.  
-  - **Optional Git hooks:** to get **reminders** (not auto-edits) when changing core paths without updating the changelog, enable hooks once per clone:
+  - **Cursor agents:** the rule **`.cursor/rules/finalize-documentation.md`** instructs the agent to refresh `CHANGELOG.md` / `README.md` when you ask to **commit**, **push**, or **finalize** work (unless you say to skip docs). This is not a built-in Cursor push hook; it is project convention for agent-driven sessions.  
+  - **Optional Git hooks:** **reminders only** (not auto-edits) when core paths change without staging the changelog:
     - `git config core.hooksPath .githooks`  
     - See `.githooks/README.md` for details.
 

@@ -10,6 +10,7 @@ The format is **lightweight** (this repo is not strictly semver-tagged). Add bul
 - Root `.gitignore` no longer lists `exploration_run_001/` (obsolete for in-repo paths).
 - Renamed **`CONFIG_AUDIT.md` → `CHANGELOG.md`** and expanded scope to a project log.
 - Optional **Git hooks** (`.githooks/pre-commit`): reminds you to update this file / `README.md` when key paths change (does not auto-edit files).
+- **Cursor:** `.cursor/rules/finalize-documentation.md` tells the agent to update changelog/README when you request commit/push/finalize (no automatic Cursor hook on push—agent follows the rule in chat).
 
 ## 2026-03 — harmony_dev integration (decoder + tooling)
 
