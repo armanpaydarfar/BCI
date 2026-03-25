@@ -16,6 +16,7 @@ import os
 os.environ["NUMBA_DISABLE_CACHING"] = "1"
 os.environ["MNE_USE_NUMBA"] = "false"
 
+import sys
 from typing import Optional
 
 import numpy as np
@@ -29,6 +30,8 @@ from Utils.preprocessing import (
     initialize_filter_bank,
     apply_streaming_filters,
 )
+from Utils.artifact_rejection import apply_training_artifact_rejection
+from Utils.marker_pairing import build_trial_windows_chronological
 
 
 # Mirror canonical trigger logic
@@ -81,13 +84,10 @@ def _band_edges_default() -> list[tuple[float, float]]:
     """
     Default ERD feature sets to compute.
 
-    Use a simple interpretable 2-band ERD setup:
-      - mu:   [LOWCUT, HIGHCUT]     (typically 8-13)
-      - beta: [HIGHCUT, beta_high]  (typically 13-30)
+    Default is mu-only unless users explicitly configure additional bands.
     """
     mu_lo, mu_hi = float(config.LOWCUT), float(config.HIGHCUT)
-    beta_hi = _get_beta_high()
-    return [(mu_lo, mu_hi), (mu_hi, beta_hi)]
+    return [(mu_lo, mu_hi)]
 
 
 def _compute_bandpower_fft_features(
@@ -140,12 +140,13 @@ def segment_and_extract_cov_erd(
     """
     Canonical segmentation + optional surface Laplacian + ERD features.
 
-    This matches the windowing/labels used in `Generate_Riemannian_adaptive.py`,
-    and returns:
-        segments_all: (n_windows, n_channels, window_samples)
-        labels_all: (n_windows,)
-        erd_feats_all: (n_windows, n_channels * n_bands)  if compute_erd else None
-        beta_segments_all: (n_windows, n_channels, window_samples) if return_beta_segments else omitted
+    This matches the windowing/labels used in `Generate_Riemannian_adaptive.py`.
+
+    The **last** return value is always ``channel_names`` (after validity + optional motor subset).
+
+    Return tuple:
+        - ``return_beta_segments=False``: ``(segments, labels, erd_or_None, channel_names)``
+        - ``return_beta_segments=True``: ``(segments, labels, erd_or_None, beta_segments, channel_names)``
     """
     marker_values = np.array([int(m[0]) for m in marker_stream["time_series"]])
     marker_timestamps = np.array([float(m[1]) for m in marker_stream["time_series"]])
@@ -195,22 +196,27 @@ def segment_and_extract_cov_erd(
     erd_feats_all = [] if compute_erd else None
     beta_segments_all = [] if return_beta_segments else None
 
-    # Precompute all trial windows
-    trial_windows = []
-    for start_marker, end_marker in EPOCHS_START_END.items():
-        start_indices = np.where(marker_values == int(start_marker))[0]
-        end_indices = np.where(marker_values == int(end_marker))[0]
-        if len(start_indices) != len(end_indices):
-            min_len = min(len(start_indices), len(end_indices))
-            start_indices = start_indices[:min_len]
-            end_indices = end_indices[:min_len]
-        for s_idx, e_idx in zip(start_indices, end_indices):
-            ts_start = marker_timestamps[s_idx]
-            ts_end = marker_timestamps[e_idx]
-            if ts_end - ts_start > 1.0:
-                trial_windows.append((ts_start, ts_end, int(start_marker)))
+    epochs_int = {int(a): int(b) for a, b in EPOCHS_START_END.items()}
+    max_ep = float(config.MAX_EPOCH_MARKER_DURATION_SEC)
+    trial_windows, mp_stats = build_trial_windows_chronological(
+        marker_timestamps,
+        marker_values,
+        epochs_int,
+        max_duration_sec=max_ep,
+        min_duration_sec=1.0,
+    )
+    if mp_stats.get("skipped_long_duration", 0) > 0:
+        print(
+            f"[marker_pairing] dropped {mp_stats['skipped_long_duration']} epoch(s) "
+            f"longer than {max_ep:g}s (mis-paired or duplicate markers?)",
+            file=sys.stderr,
+        )
+    if not trial_windows:
+        raise ValueError(
+            "no_valid_trials: no REST/MI begin→end pairs produced epochs with duration > 1s "
+            "(check markers 100/120 and 200/220 and XDF marker stream)."
+        )
 
-    trial_windows.sort()
     filter_warmup = 1.0
     trial_bounds = [(start - 1.0, end) for (start, end, _) in trial_windows]
     valid_start = trial_bounds[0][0] - filter_warmup
@@ -376,13 +382,40 @@ def segment_and_extract_cov_erd(
                 erd = win_bp - base_bp
                 erd_feats_all.append(erd.reshape(-1))
 
-    if return_beta_segments:
-        return (
-            np.array(segments_all),
-            np.array(labels_all),
-            np.array(erd_feats_all) if compute_erd else None,
-            np.array(beta_segments_all),
+    segments_arr = np.array(segments_all)
+    labels_arr = np.array(labels_all)
+    erd_arr = np.array(erd_feats_all) if compute_erd else None
+    beta_arr = np.array(beta_segments_all) if return_beta_segments else None
+
+    n_seg = int(segments_arr.shape[0])
+    if n_seg != int(labels_arr.shape[0]):
+        raise RuntimeError(
+            f"internal ordering bug: segments {n_seg} vs labels {int(labels_arr.shape[0])}"
+        )
+    if erd_arr is not None and int(erd_arr.shape[0]) != n_seg:
+        raise RuntimeError(
+            f"internal ordering bug: erd_feats {int(erd_arr.shape[0])} vs segments {n_seg}"
+        )
+    if beta_arr is not None and int(beta_arr.shape[0]) != n_seg:
+        raise RuntimeError(
+            f"internal ordering bug: beta_segments {int(beta_arr.shape[0])} vs segments {n_seg}"
         )
 
-    return np.array(segments_all), np.array(labels_all), (np.array(erd_feats_all) if compute_erd else None)
+    segments_arr, labels_arr, extras = apply_training_artifact_rejection(
+        segments_arr, labels_arr, erd_arr, beta_arr
+    )
+    erd_arr, beta_arr = extras[0], extras[1]
+
+    n_kept = int(segments_arr.shape[0])
+    if n_kept != int(labels_arr.shape[0]) or (
+        erd_arr is not None and int(erd_arr.shape[0]) != n_kept
+    ) or (beta_arr is not None and int(beta_arr.shape[0]) != n_kept):
+        raise RuntimeError("artifact rejection row alignment broken")
+
+    ch_out = list(current_channel_names)
+
+    if return_beta_segments:
+        return segments_arr, labels_arr, erd_arr, beta_arr, ch_out
+
+    return segments_arr, labels_arr, erd_arr, ch_out
 

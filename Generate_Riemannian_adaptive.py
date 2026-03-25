@@ -1,4 +1,5 @@
 import os
+import sys
 import numpy as np
 import pickle
 import mne
@@ -24,6 +25,8 @@ from Utils.preprocessing import (
     initialize_filter_bank,
     apply_streaming_filters
 )
+from Utils.artifact_rejection import apply_training_artifact_rejection
+from Utils.marker_pairing import build_trial_windows_chronological
 
 from sklearn.metrics import (
     accuracy_score,
@@ -96,24 +99,27 @@ def validate_trial_pairs(marker_values, marker_timestamps, eeg_timestamps, sfreq
         EPOCHS_START_END: dict of {start_marker: end_marker}
         min_duration: float, minimum seconds required to allow 1s skip
     """
-    print("\n🔍 Pre-validating trial start/end pairs...")
-    
-    for start_marker, end_marker in EPOCHS_START_END.items():
-        start_indices = np.where(marker_values == int(start_marker))[0]
-        end_indices = np.where(marker_values == int(end_marker))[0]
+    epochs_int = {int(a): int(b) for a, b in EPOCHS_START_END.items()}
+    max_ep = float(config.MAX_EPOCH_MARKER_DURATION_SEC)
+    trial_windows, mp_stats = build_trial_windows_chronological(
+        marker_timestamps,
+        marker_values,
+        epochs_int,
+        max_duration_sec=max_ep,
+        min_duration_sec=min_duration,
+    )
+    print("\n🔍 Pre-validating trial start/end pairs (chronological FIFO)...")
+    print(f"   [marker_pairing] {mp_stats} (max_epoch={max_ep:g}s)")
 
-        print(f"\n🔹 Validating marker pair {start_marker} → {end_marker}")
-        print(f"   Found {len(start_indices)} start markers, {len(end_indices)} end markers")
+    for start_marker in sorted(epochs_int.keys()):
+        end_marker = epochs_int[start_marker]
+        tw = [(a, b) for a, b, c in trial_windows if c == start_marker]
+        n_starts = int(np.sum(marker_values == int(start_marker)))
+        n_ends = int(np.sum(marker_values == int(end_marker)))
+        print(f"\n🔹 Marker pair {start_marker} → {end_marker}")
+        print(f"   Raw counts: {n_starts} starts, {n_ends} ends → {len(tw)} paired trials after FIFO + filters")
 
-        if len(start_indices) != len(end_indices):
-            print("   ⚠️ Mismatch in marker counts — trimming to shortest length")
-            min_len = min(len(start_indices), len(end_indices))
-            start_indices = start_indices[:min_len]
-            end_indices = end_indices[:min_len]
-
-        for i, (s_idx, e_idx) in enumerate(zip(start_indices, end_indices)):
-            t_start = marker_timestamps[s_idx]
-            t_end = marker_timestamps[e_idx]
+        for i, (t_start, t_end) in enumerate(tw):
             duration = t_end - t_start
             safe_to_skip = duration > min_duration
 
@@ -122,7 +128,7 @@ def validate_trial_pairs(marker_values, marker_timestamps, eeg_timestamps, sfreq
             else:
                 print(f"   ✅ Trial {i}: {duration:.2f}s → OK to skip 1s")
 
-        print(f"   Finished validating {len(start_indices)} trials for marker {start_marker}")
+        print(f"   Finished validating {len(tw)} trials for marker {start_marker}")
 
 def segment_and_label_one_run(eeg_stream, marker_stream):
     """
@@ -184,23 +190,24 @@ def segment_and_label_one_run(eeg_stream, marker_stream):
     segments_all = []
     labels_all = []
 
-    # === Precompute all trial windows ===
-    trial_windows = []
-    for start_marker, end_marker in EPOCHS_START_END.items():
-        start_indices = np.where(marker_values == int(start_marker))[0]
-        end_indices = np.where(marker_values == int(end_marker))[0]
-        if len(start_indices) != len(end_indices):
-            min_len = min(len(start_indices), len(end_indices))
-            start_indices = start_indices[:min_len]
-            end_indices = end_indices[:min_len]
-        for s_idx, e_idx in zip(start_indices, end_indices):
-            ts_start = marker_timestamps[s_idx]
-            ts_end = marker_timestamps[e_idx]
-            if ts_end - ts_start > 1.0:
-                trial_windows.append((ts_start, ts_end, int(start_marker)))
+    # === Precompute all trial windows (chronological FIFO; avoids mis-paired k-th with k-th) ===
+    epochs_int = {int(a): int(b) for a, b in EPOCHS_START_END.items()}
+    max_ep = float(config.MAX_EPOCH_MARKER_DURATION_SEC)
+    trial_windows, mp_stats = build_trial_windows_chronological(
+        marker_timestamps,
+        marker_values,
+        epochs_int,
+        max_duration_sec=max_ep,
+        min_duration_sec=1.0,
+    )
+    if mp_stats.get("skipped_long_duration", 0) > 0:
+        print(
+            f"[marker_pairing] dropped {mp_stats['skipped_long_duration']} epoch(s) "
+            f"longer than {max_ep:g}s (mis-paired or duplicate markers?)",
+            file=sys.stderr,
+        )
 
     # === Sort windows and get min/max bounds ===
-    trial_windows.sort()
     filter_warmup = 1.0 
     trial_bounds = [(start - 1.0, end) for (start, end, _) in trial_windows]
     valid_start = trial_bounds[0][0] - filter_warmup
@@ -244,12 +251,44 @@ def segment_and_label_one_run(eeg_stream, marker_stream):
             segments_all.append(segment)
             labels_all.append(label)
 
+    segments_arr = np.array(segments_all)
+    labels_arr = np.array(labels_all)
+    if segments_arr.shape[0] != labels_arr.shape[0]:
+        raise RuntimeError(
+            f"internal ordering bug: segments {segments_arr.shape[0]} vs labels {labels_arr.shape[0]}"
+        )
+    return segments_arr, labels_arr
 
-    return np.array(segments_all), np.array(labels_all)
 
 
+def _resolve_shrinkage_param(model_type: str | None = None, shrinkage_param: float | None = None) -> float:
+    """
+    Resolve shrinkage lambda with model-aware defaults.
 
-def compute_processed_covariances(segments, labels):
+    Priority:
+      1) explicit `shrinkage_param`
+      2) model-specific defaults (mdm/xgb)
+      3) backward-compatible `config.SHRINKAGE_PARAM`
+    """
+    if shrinkage_param is not None:
+        return float(shrinkage_param)
+
+    mdm_default = float(getattr(config, "SHRINKAGE_PARAM_MDM", getattr(config, "SHRINKAGE_PARAM", 0.02)))
+    xgb_default = float(getattr(config, "SHRINKAGE_PARAM_XGB", mdm_default))
+
+    mt = (model_type or "").strip().lower()
+    if mt in ("xgb", "xgb_cov", "xgb_cov_erd"):
+        return xgb_default
+    if mt in ("mdm",):
+        return mdm_default
+
+    backend = str(getattr(config, "DECODER_BACKEND", "mdm")).strip().lower()
+    if backend.startswith("xgb"):
+        return xgb_default
+    return mdm_default
+
+
+def compute_processed_covariances(segments, labels, *, model_type: str | None = None, shrinkage_param: float | None = None):
     """
     Computes regularized and optionally whitened covariance matrices from EEG segments.
 
@@ -275,8 +314,9 @@ def compute_processed_covariances(segments, labels):
             LedoitWolf().fit(cov).covariance_ for cov in cov_matrices
         ])
     else:
-        print(f"Applying shrinkage (λ={config.SHRINKAGE_PARAM})...")
-        shrinker = Shrinkage(shrinkage=config.SHRINKAGE_PARAM)
+        lam = _resolve_shrinkage_param(model_type=model_type, shrinkage_param=shrinkage_param)
+        print(f"Applying shrinkage (λ={lam})...")
+        shrinker = Shrinkage(shrinkage=lam)
         cov_matrices = shrinker.fit_transform(cov_matrices)
 
     if config.RECENTERING:
@@ -513,7 +553,7 @@ def train_riemannian_model(
     c_fp=1.0, c_fn=1.0, c_reject=0.3,
     n_grid=201,
     min_gap=0.0,
-    target_ambig=0.3,          # keep ~20% ambiguity by default
+    target_ambig=float(getattr(config, "TARGET_AMBIG", 0.20)),  # desired ambiguity fraction U/N
     # --- NEW constraint knobs (decided-only metrics) ---
     tpr_min=None,              # e.g., 0.85 for MI recall >= 85%
     fpr_max=None,              # e.g., 0.10 for false MI rate <= 10%
@@ -716,19 +756,8 @@ def main():
         print(f"🔹 Class distribution: {label_summary}")
 
 
-    
-        # === HARD REJECTION BASED ON PEAK AMPLITUDE ===
-        REJECTION_THRESHOLD_UV = 30  # μV
-
-        # Compute max abs amplitude per segment
-        max_vals = np.max(np.abs(segments), axis=(1, 2))  # shape: (n_segments,)
-        keep_mask = max_vals <= REJECTION_THRESHOLD_UV
-
-        # Apply rejection
-        segments = segments[keep_mask]
-        labels = labels[keep_mask]
-
-        print(f"Retained {len(segments)} segments after rejecting {np.sum(~keep_mask)} high-amplitude artifacts.")
+        segments, labels, _ = apply_training_artifact_rejection(segments, labels)
+        print(f"Retained {len(segments)} segments after artifact rejection.")
 
         
         cov_matrices = compute_processed_covariances(segments, labels)

@@ -23,7 +23,7 @@ def train_xgb_dual_thresholds(
     labels: np.ndarray,
     feature_tag: str,
     n_splits: int,
-    target_ambig: float = 0.3,
+    target_ambig: float = float(getattr(config, "TARGET_AMBIG", 0.20)),
 ):
     """
     Train/evaluate an XGBClassifier with the same dual-threshold selection logic

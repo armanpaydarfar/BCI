@@ -10,6 +10,10 @@ from scipy.stats import zscore
 from Utils.preprocessing import concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
+# XDF EEG amplitudes: same convention as visualize_online_data.py — time_series is
+# microvolt-scale. Keep raw._data on that scale (no ×/÷ 1e6). MNE may still label
+# channels as V in metadata; we set unit=201 below for µV where applicable.
+
 subject = "F25CLASS_SUBJ_008"
 session = "S001OFFLINE"
 
@@ -112,11 +116,7 @@ raw = mne.io.RawArray(eeg_data, info)
 first_channel_unit = raw.info["chs"][0]["unit"]
 print(f"First Channel Unit (FIFF Code): {first_channel_unit}")
 
-# Convert data from Volts to microvolts (µV)
-# Convert raw data from Volts to microvolts (µV) IMMEDIATELY AFTER LOADING
-raw._data /= 1e6  # Convert V → µV
-
-# Update channel metadata in MNE so the scaling is correctly reflected
+# Update channel metadata so MNE knows amplitudes are treated as µV-scale (same numeric array as XDF).
 
 for ch in raw.info['chs']:
     ch['unit'] = 201  # 201 corresponds to µV in MNE’s standard units

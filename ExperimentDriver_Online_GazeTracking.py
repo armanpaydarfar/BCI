@@ -74,6 +74,7 @@ loggable_fields = [
     "MOTOR_CHANNEL_NAMES", "CLASSIFY_WINDOW", "ACCURACY_THRESHOLD", "THRESHOLD_MI", "THRESHOLD_REST",
     "RELAXATION_RATIO", "MIN_PREDICTIONS", "SURFACE_LAPLACIAN_TOGGLE",
     "SELECT_MOTOR_CHANNELS", "INTEGRATOR_ALPHA", "SHRINKAGE_PARAM",
+    "SHRINKAGE_PARAM_MDM", "SHRINKAGE_PARAM_XGB",
     "LEDOITWOLF", "RECENTERING", "UPDATE_DURING_MOVE",
     "GAZE_UDP_IP", "GAZE_UDP_PORT", "GAZE_SELECTION_WINDOW", "GAZE_AVG_WINDOW",
     "GAZE_MIN_DWELL_SEC", "GAZE_UDP_TIMEOUT", "GO_NOGO_PROMPT_SEC",
@@ -91,12 +92,20 @@ logger.save_config_snapshot(config_log_subset)
 eeg_dir = logger.log_base / "eeg"
 adaptive_T_path = eeg_dir / "adaptive_T.pkl"
 
-Prev_T, counter = load_transform(adaptive_T_path)
+Prev_T, counter, Prev_T_beta, counter_beta = load_transform(adaptive_T_path)
 if Prev_T is None:
     counter = 0
-    logger.log_event("ℹ️ No adaptive transform found — starting fresh with counter = 0.")
+if Prev_T_beta is None:
+    counter_beta = 0
+if Prev_T is None and Prev_T_beta is None:
+    logger.log_event("ℹ️ No adaptive transforms — cold start for μ and β.")
 else:
-    logger.log_event(f"✅ Loaded adaptive transform with counter = {counter}")
+    parts = []
+    if Prev_T is not None:
+        parts.append(f"μ counter={counter}")
+    if Prev_T_beta is not None:
+        parts.append(f"β counter={counter_beta}")
+    logger.log_event("✅ Loaded adaptive transform: " + ", ".join(parts))
 
 logger.log_event("Logger initialized for online experimental driver.")
 
@@ -194,6 +203,8 @@ _RC.FES_toggle = FES_toggle
 
 _RC.Prev_T = Prev_T
 _RC.counter = counter
+_RC.Prev_T_beta = Prev_T_beta
+_RC.counter_beta = counter_beta
 
 # =========================================================
 # Gaze experiment helpers
@@ -1067,7 +1078,13 @@ def main():
 
     if current_trial == len(trial_sequence) and config.SAVE_ADAPTIVE_T:
         try:
-            save_transform(Prev_T, counter, adaptive_T_path)
+            save_transform(
+                _RC.Prev_T,
+                _RC.counter,
+                adaptive_T_path,
+                T_beta=_RC.Prev_T_beta,
+                counter_beta=_RC.counter_beta,
+            )
         except Exception as e:
             logger.log_event(f"⚠️ Could not save transform to {adaptive_T_path}: {e}")
 

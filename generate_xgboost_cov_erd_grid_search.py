@@ -13,7 +13,7 @@ Feature vector:
 
 Grid search:
   - max_depth (never < 3)
-  - shrinkage_param (config.SHRINKAGE_PARAM in your pipeline)
+  - shrinkage_param (model-specific default is config.SHRINKAGE_PARAM_XGB)
   - optionally: min_child_weight, gamma, subsample, colsample_bytree, reg_lambda,
     learning_rate, n_estimators (controlled via env vars).
 
@@ -51,7 +51,7 @@ from xgboost import XGBClassifier
 
 from pyriemann.estimation import Shrinkage
 from pyriemann.preprocessing import Whitening
-from pyriemann.utils.tangentspace import tangent_space
+from pyriemann.tangentspace import tangent_space
 
 from sklearn.covariance import LedoitWolf
 
@@ -131,7 +131,7 @@ def _train_eval_one_combo(
     labels: np.ndarray,
     xgb_params: Dict,
     n_splits: int,
-    target_ambig: float = 0.30,
+    target_ambig: float = float(getattr(config, "TARGET_AMBIG", 0.20)),
 ):
     """
     KFold evaluation + dual thresholds on fold-train scores.
@@ -274,7 +274,9 @@ def main():
     if not grid.max_depth:
         raise ValueError("max_depth grid ended up empty after enforcing md>=3")
 
-    target_ambig = float(os.getenv("XGB_TARGET_AMBIG", "0.30"))
+    target_ambig = float(
+        os.getenv("XGB_TARGET_AMBIG", str(getattr(config, "TARGET_AMBIG", 0.20)))
+    )
     top_k_roc = int(os.getenv("XGB_GRID_TOP_K_ROC", "5"))
 
     n_splits = int(getattr(config, "N_SPLITS", 8))
@@ -305,7 +307,7 @@ def main():
     for xdf_path in xdf_files:
         print(f"\n📂 Loading: {xdf_path}")
         eeg_stream, marker_stream = load_xdf(xdf_path, report=False)
-        segments, labels, erd_feats = segment_and_extract_cov_erd(
+        segments, labels, erd_feats, _ch_names = segment_and_extract_cov_erd(
             eeg_stream,
             marker_stream,
             compute_erd=True,

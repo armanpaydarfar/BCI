@@ -10,23 +10,19 @@ from sklearn.covariance import LedoitWolf
 from pyriemann.estimation import Shrinkage
 from pyriemann.utils.geodesic import geodesic_riemann
 from pyriemann.utils.base import invsqrtm
-from pyriemann.utils.tangentspace import tangent_space
+from pyriemann.tangentspace import tangent_space
 import pandas as pd
 from sklearn.metrics import confusion_matrix
 # Visualization utils (UI draws)
 from Utils.visualization import (
-    draw_arrow_fill,
-    draw_ball_fill,
-    draw_fixation_cross,
-    draw_time_balls,
+    draw_class_feedback_cues,
+    draw_class_fixation_idle,
 )
 # Experiment utilities
 from Utils.experiment_utils import (
     generate_trial_sequence,
     LeakyIntegrator,
     RollingScaler,
-    save_transform,
-    load_transform
 )
 
 # UDP helper
@@ -56,6 +52,8 @@ FES_toggle = None
 # Adaptive recentering state
 Prev_T = None
 counter = 0
+Prev_T_beta = None
+counter_beta = 0
 _decoder_checked = False
 
 
@@ -155,11 +153,8 @@ def display_fixation_period(duration=3, eeg_state=None):
         # Fill screen with background color
         pygame.display.get_surface().fill(config.black)
 
-        # Draw UI elements
-        draw_fixation_cross(screen_width, screen_height)
-        draw_ball_fill(0, screen_width, screen_height)
-        draw_arrow_fill(0, screen_width, screen_height)
-        draw_time_balls(0, screen_width, screen_height)
+        vis_style = getattr(config, "CLASS_VISUAL_STYLE", "classic")
+        draw_class_fixation_idle(vis_style, screen_width, screen_height)
 
         pygame.display.flip()
 
@@ -264,14 +259,77 @@ def _covariance_from_window(window_2d):
 
 
 def _shrink_single_cov(cov):
+    def _runtime_shrinkage_lambda() -> float:
+        backend = str(getattr(config, "DECODER_BACKEND", "mdm")).strip().lower()
+        if backend.startswith("xgb"):
+            return float(getattr(config, "SHRINKAGE_PARAM_XGB", getattr(config, "SHRINKAGE_PARAM", 0.1)))
+        return float(getattr(config, "SHRINKAGE_PARAM_MDM", getattr(config, "SHRINKAGE_PARAM", 0.02)))
+
     if config.LEDOITWOLF:
         return LedoitWolf().fit(cov).covariance_
-    return np.squeeze(Shrinkage(shrinkage=config.SHRINKAGE_PARAM).fit_transform(np.expand_dims(cov, axis=0)), axis=0)
+    lam = _runtime_shrinkage_lambda()
+    return np.squeeze(
+        Shrinkage(shrinkage=lam).fit_transform(np.expand_dims(cov, axis=0)),
+        axis=0,
+    )
 
 
-def _tangent_at_identity_single(cov):
-    n_ch = cov.shape[0]
-    return tangent_space(np.expand_dims(cov, axis=0), np.eye(n_ch), metric="riemann")[0]
+def _tangent_with_fitted_ref_single(cov, state_name="mu"):
+    if not isinstance(model, dict):
+        raise RuntimeError("XGBoost decoder bundle is not loaded.")
+
+    ref_key = "tangent_ref_beta" if state_name == "beta" else "tangent_ref_mu"
+    ref = model.get(ref_key, None)
+    if ref is None:
+        raise RuntimeError(
+            f"XGBoost bundle missing required fitted {ref_key}. "
+            "Retrain XGB model with fitted tangent-space references."
+        )
+    return tangent_space(np.expand_dims(cov, axis=0), ref, metric="riemann")[0]
+
+
+def _adaptive_recenter_cov(cov, state_name="mu", *, update_recentering: bool = True):
+    """
+    Apply online adaptive recentering to one covariance matrix.
+    Uses independent state per branch (mu/beta) to avoid cross-band leakage.
+    """
+    if not config.RECENTERING:
+        return cov
+
+    global Prev_T, counter, Prev_T_beta, counter_beta
+
+    if state_name == "beta":
+        if counter_beta == 0 or Prev_T_beta is None:
+            Prev_T_beta = cov
+        T_test = geodesic_riemann(Prev_T_beta, cov, 1 / (counter_beta + 1))
+        T_invsqrtm = invsqrtm(Prev_T_beta)
+        cov_rec = T_invsqrtm @ cov @ T_invsqrtm.T
+        if bool(update_recentering):
+            Prev_T_beta = T_test
+            counter_beta += 1
+        return cov_rec
+
+    if counter == 0 or Prev_T is None:
+        Prev_T = cov
+    T_test = geodesic_riemann(Prev_T, cov, 1 / (counter + 1))
+    T_invsqrtm = invsqrtm(Prev_T)
+    cov_rec = T_invsqrtm @ cov @ T_invsqrtm.T
+    if bool(update_recentering):
+        Prev_T = T_test
+        counter += 1
+    return cov_rec
+
+
+def _default_erd_bands_from_config():
+    """
+    Match offline `generate_xgboost_cov_erd_features.py` / `xgb_feature_pipeline`
+    when a bundle has no `feature_spec["erd_bands"]` (legacy or hand-built pickle).
+    """
+    bands = getattr(config, "XGB_ERD_BANDS", None)
+    if bands is not None:
+        return [tuple(map(float, b)) for b in bands]
+    # Default to mu-only unless configured otherwise.
+    return [(float(config.LOWCUT), float(config.HIGHCUT))]
 
 
 def _log_bandpower(signal, fs, band):
@@ -288,7 +346,7 @@ def _log_bandpower(signal, fs, band):
     return np.log10(bp + 1e-12)
 
 
-def _build_xgb_features(eeg_state, window_size_samples):
+def _build_xgb_features(eeg_state, window_size_samples, *, update_recentering: bool = True):
     """
     Build online XGBoost features to match offline ordering:
     [cov_mu] + [cov_beta] + [erd]
@@ -312,26 +370,18 @@ def _build_xgb_features(eeg_state, window_size_samples):
 
     if use_cov_mu:
         cov_mu = _shrink_single_cov(_covariance_from_window(mu_win))
-        if config.RECENTERING:
-            global Prev_T, counter
-            if counter == 0 or Prev_T is None:
-                Prev_T = cov_mu
-            T_test = geodesic_riemann(Prev_T, cov_mu, 1 / (counter + 1))
-            T_invsqrtm = invsqrtm(Prev_T)
-            cov_mu = T_invsqrtm @ cov_mu @ T_invsqrtm.T
-            if bool(getattr(config, "UPDATE_DURING_MOVE", 0)):
-                Prev_T = T_test
-                counter += 1
-        feature_blocks.append(_tangent_at_identity_single(cov_mu))
+        cov_mu = _adaptive_recenter_cov(cov_mu, "mu", update_recentering=update_recentering)
+        feature_blocks.append(_tangent_with_fitted_ref_single(cov_mu, "mu"))
 
     if use_cov_beta:
         if beta_win is None:
             raise RuntimeError("XGBoost model expects beta covariance features, but beta stream is unavailable.")
         cov_beta = _shrink_single_cov(_covariance_from_window(beta_win))
-        feature_blocks.append(_tangent_at_identity_single(cov_beta))
+        cov_beta = _adaptive_recenter_cov(cov_beta, "beta", update_recentering=update_recentering)
+        feature_blocks.append(_tangent_with_fitted_ref_single(cov_beta, "beta"))
 
     if n_erd > 0:
-        bands = feature_spec.get("erd_bands", [(8.0, 13.0), (13.0, 30.0)])
+        bands = feature_spec.get("erd_bands") or _default_erd_bands_from_config()
         apply_csd = bool(feature_spec.get("apply_csd_erd_only", False))
         if apply_csd:
             try:
@@ -379,10 +429,10 @@ def _build_xgb_features(eeg_state, window_size_samples):
     return feat
 
 
-def _predict_with_active_decoder(eeg_state, window_size_samples):
+def _predict_with_active_decoder(eeg_state, window_size_samples, *, update_recentering: bool = True):
     if not _is_xgb_bundle(model):
         raise RuntimeError("XGBoost decoder bundle is not loaded.")
-    feat = _build_xgb_features(eeg_state, window_size_samples)
+    feat = _build_xgb_features(eeg_state, window_size_samples, update_recentering=update_recentering)
     expected = int(model["scaler"].n_features_in_)
     if feat.shape[1] != expected:
         raise RuntimeError(f"XGBoost feature length mismatch. expected={expected}, got={feat.shape[1]}")
@@ -407,7 +457,11 @@ def classify_real_time(eeg_state, window_size_samples, all_probabilities, predic
 
     if _is_xgb_bundle(model):
         try:
-            probabilities, predicted_label = _predict_with_active_decoder(eeg_state, window_size_samples)
+            probabilities, predicted_label = _predict_with_active_decoder(
+                eeg_state,
+                window_size_samples,
+                update_recentering=bool(update_recentering),
+            )
         except ValueError:
             return leaky_integrator.accumulated_probability, predictions, all_probabilities
 
@@ -434,7 +488,8 @@ def classify_real_time(eeg_state, window_size_samples, all_probabilities, predic
         cov_matrix = np.array([LedoitWolf().fit(cov_matrix).covariance_])
     else:
         cov_matrix = np.expand_dims(cov_matrix, axis=0)
-        shrinkage = Shrinkage(shrinkage=config.SHRINKAGE_PARAM)
+        lam = float(getattr(config, "SHRINKAGE_PARAM_MDM", getattr(config, "SHRINKAGE_PARAM", 0.02)))
+        shrinkage = Shrinkage(shrinkage=lam)
         cov_matrix = shrinkage.fit_transform(cov_matrix)
 
     if config.RECENTERING:
@@ -455,12 +510,9 @@ def classify_real_time(eeg_state, window_size_samples, all_probabilities, predic
 
     should_update_T = False
     if config.RECENTERING and update_recentering:
-        if config.USE_CONFIDENCE_GATE:
-            predicted_correct = (predicted_label == correct_label)
-            confident_enough = (current_confidence >= config.RECENTERING_CONFIDENCE_THRESHOLD)
-            should_update_T = predicted_correct and confident_enough
-        else:
-            should_update_T = True
+        # Adaptive reference update is unconditional (matches the historical
+        # behavior of USE_CONFIDENCE_GATE == 0).
+        should_update_T = True
 
     if should_update_T:
         Prev_T = T_test
@@ -688,19 +740,21 @@ def show_feedback(duration=5, mode=0, eeg_state=None,
             all_probabilities[-1] = [ts, prest_inst, pmi_inst, pmi_avg, prest_avg]
 
         # -------------------------------------------------
-        # Core visualization
+        # Core visualization (classic vs modern — config.CLASS_VISUAL_STYLE)
         # -------------------------------------------------
+        vis_style = getattr(config, "CLASS_VISUAL_STYLE", "classic")
+        accum_bar = running_avg_confidence if str(vis_style).lower() == "modern" else None
         if mode == 0:
-            draw_arrow_fill(MI_fill, screen_width, screen_height)
-            draw_fixation_cross(screen_width, screen_height)
-            draw_ball_fill(Rest_fill, screen_width, screen_height)
-            draw_time_balls(2, screen_width, screen_height)
+            draw_class_feedback_cues(
+                vis_style, 0, MI_fill, Rest_fill, screen_width, screen_height, 2,
+                accumulation=accum_bar,
+            )
             cue_color = config.red
         else:
-            draw_ball_fill(Rest_fill, screen_width, screen_height)
-            draw_fixation_cross(screen_width, screen_height)
-            draw_arrow_fill(MI_fill, screen_width, screen_height)
-            draw_time_balls(3, screen_width, screen_height)
+            draw_class_feedback_cues(
+                vis_style, 1, MI_fill, Rest_fill, screen_width, screen_height, 3,
+                accumulation=accum_bar,
+            )
             cue_color = config.blue
 
         # -------------------------------------------------

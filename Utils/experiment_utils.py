@@ -171,21 +171,79 @@ def display_multiple_messages_with_udp(
 
         pygame.time.Clock().tick(60)
 '''
-def save_transform(T, counter, save_path):
-    with open(save_path, 'wb') as f:
-        pickle.dump({"T": T, "counter": counter}, f)
-    print(f"✅ Saved adaptive transform and counter to: {save_path}")
+def save_transform(T, counter, save_path, T_beta=None, counter_beta=None):
+    """
+    Persist Riemannian adaptive recentering state for online runs.
+
+    File format v2 (preferred): only branches with a non-None reference matrix are stored.
+      {"version": 2, "mu": {"T": ndarray, "counter": int}, "beta": {...}}
+
+    Legacy v1 (still loaded): {"T": ndarray, "counter": int}  → μ only, β absent.
+
+    Args:
+        T: μ-band reference covariance (or None to omit μ from file).
+        counter: μ update counter.
+        save_path: Path to ``adaptive_T.pkl``.
+        T_beta: β-band reference (optional).
+        counter_beta: β update counter (optional, used only if T_beta is not None).
+    """
+    payload = {"version": 2}
+    if T is not None:
+        payload["mu"] = {"T": T, "counter": int(counter)}
+    if T_beta is not None:
+        payload["beta"] = {"T": T_beta, "counter": int(counter_beta if counter_beta is not None else 0)}
+    if "mu" not in payload and "beta" not in payload:
+        print(f"⚠️ save_transform: nothing to save (μ and β both None) → {save_path}")
+        return
+    with open(save_path, "wb") as f:
+        pickle.dump(payload, f)
+    branches = []
+    if "mu" in payload:
+        branches.append("μ")
+    if "beta" in payload:
+        branches.append("β")
+    print(f"✅ Saved adaptive transform ({'+'.join(branches)}) to: {save_path}")
+
 
 def load_transform(load_path):
-    if os.path.exists(load_path):
-        with open(load_path, 'rb') as f:
-            data = pickle.load(f)
-        if isinstance(data, dict) and "T" in data and "counter" in data:
-            print(f"✅ Loaded adaptive transform and counter from: {load_path}")
-            return data["T"], data["counter"]
-        else:
-            print(f"✅ Loaded legacy transform (no counter) from: {load_path}")
-            return data, 1  # assume already had 1 update
-    else:
+    """
+    Load adaptive recentering state.
+
+    Returns:
+        (Prev_T, counter, Prev_T_beta, counter_beta)
+        Missing branches use (None, 0).
+    """
+    if not os.path.exists(load_path):
         print(f"ℹ️ No saved adaptive transform found at: {load_path}")
-        return None, 0
+        return None, 0, None, 0
+
+    with open(load_path, "rb") as f:
+        data = pickle.load(f)
+
+    # --- Format v2: optional μ and/or β ---
+    if isinstance(data, dict) and data.get("version") == 2:
+        mu_T, mu_c = None, 0
+        if data.get("mu"):
+            mu = data["mu"]
+            mu_T = mu.get("T")
+            mu_c = int(mu.get("counter", 0))
+        beta_T, beta_c = None, 0
+        if data.get("beta"):
+            beta = data["beta"]
+            beta_T = beta.get("T")
+            beta_c = int(beta.get("counter", 0))
+        if mu_T is None:
+            mu_c = 0
+        if beta_T is None:
+            beta_c = 0
+        print(f"✅ Loaded adaptive transform v2 from: {load_path}")
+        return mu_T, mu_c, beta_T, beta_c
+
+    # --- Legacy v1: top-level T + counter (μ only) ---
+    if isinstance(data, dict) and "T" in data and "counter" in data:
+        print(f"✅ Loaded adaptive transform (legacy μ-only) from: {load_path}")
+        return data["T"], int(data["counter"]), None, 0
+
+    # --- Older pickle: whole object, no counter ---
+    print(f"✅ Loaded legacy transform (no counter) from: {load_path}")
+    return data, 1, None, 0

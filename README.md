@@ -99,7 +99,15 @@ Key folders and scripts (non-exhaustive):
     - `Visualize_offline_data_MNE.py`, `visualize_online_data.py`
     - **Obsolete (for now)**: `OBS/Visualize_offline_data.py`
 
-- **Configuration and data**  
+#### Artifact rejection (offline training vs QC plots)
+
+- **Sliding-window training** (`Generate_Riemannian_adaptive.py`, XGB pipelines via `Utils/xgb_feature_pipeline.py`) uses `Utils/artifact_rejection.py` with `config.py` knobs:
+  - `ARTIFACT_REJECT_ENABLE`, `ARTIFACT_REJECT_MODE` (`max_abs`, `peak_to_peak`, `zscore`)
+  - `ARTIFACT_MAX_ABS_UV`, `ARTIFACT_P2P_UV`, `ARTIFACT_ZSCORE_SD`
+  - `ARTIFACT_SEGMENT_AMPLITUDE_UNIT` (`microvolts` vs `volts`, must match your XDF/filter pipeline scale)
+- **`visualize_online_data.py`** applies **MNE epoch** peak-to-peak rejection on `Raw` in **volts**; thresholds are set in µV as `VISUALIZE_EPOCH_REJECT_P2P_UV` (and optional `VISUALIZE_EPOCH_FLAT_UV`) in `config.py`, converted to volts for `mne.Epochs`. That criterion is **not identical** to training-window `max_abs` unless you choose compatible `ARTIFACT_REJECT_MODE`/thresholds on purpose.
+
+- **Configuration and data**
   - `config.py`: central configuration module (EEG, robot, FES, networking, display, etc.).  
   - `environment.yml`: conda environment with scientific, MNE/LSL, Qt, and visualization dependencies.  
   - `Data/`, `telemetry_logs/` (if present): logged experiment data and robot telemetry.

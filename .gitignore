@@ -39,3 +39,9 @@ ENV/
 
 # macOS metadata
 .DS_Store
+
+# Local/offline exploration outputs (not needed for hardware validation)
+exploration_run_001/
+
+# Draft exploration documentation (generated/iterative)
+docs/REPO_EXPLORATION_REPORT.md

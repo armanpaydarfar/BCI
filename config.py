@@ -1,121 +1,164 @@
-# Configuration file for EEG experiments
+# Configuration file for EEG experiments — runtime and experiment defaults.
+# Section order is for human operators; all public names are kept stable for import compatibility.
 import os
 
-# Relevant Directories
+# =============================================================================
+# Paths and subject
+# =============================================================================
 WORKING_DIR = "/home/arman-admin/Projects/Harmony/"
 DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
-
 TRAINING_SUBJECT = "PILOT007"
-# EEG Settings
+# =============================================================================
+# EEG acquisition and channels
+# =============================================================================
 CAP_TYPE = 32
 LOWCUT = 8  # Hz
 HIGHCUT = 13  # Hz
-LOWCUT_ERRP = 1 #Hz
-HIGHCUT_ERRP = 10 #Hz
+LOWCUT_ERRP = 1  # Hz
+HIGHCUT_ERRP = 10  # Hz
 FS = 512  # Sampling frequency (Hz)
 MOTOR_CHANNEL_NAMES = ['FC1','FC2','C3', 'Cz', 'C4', 'CP5', 'CP1', 'CP2', 'CP6', 'P7','P3', 'Pz', 'P4', 'P8', 'POz']
 ERRP_CHANNEL_NAMES = ['F3', 'Fz', 'F4', 'FC1', 'FC2', 'Cz']
-EOG_CHANNEL_NAMES = ['AUX1'] # List of EOG channel names to use
-EOG_TOGGLE = 0  # Toggle to enable or disable EOG processing (1 = enabled, 0 = disabled)
-
-
-# Experiment Parameters
+EOG_CHANNEL_NAMES = ['AUX1']  # List of EOG channel names to use
+EOG_TOGGLE = 0  # 1 = enable EOG processing, 0 = disable
+# =============================================================================
+# Experiment design (trials, timing, trajectories)
+# =============================================================================
 ARM_SIDE = "Right"
-EXPERIMENT_TYPE = "BASE" # BIMANUAL or BASE
-TOTAL_TRIALS = 30  # Total number of trials
-TOTAL_TRIALS_ERRP = 45 # Total number of trials for ErrP experiment
-MAX_REPEATS = 3  # Maximum consecutive repeats of the same condition
-N_SPLITS = 5  # Number of splits for KFold cross-validation
-TIME_MI = 5 # time for motor imagery and rest
-TIME_ROB = 7 # time allocated for robot to move
-TIME_STATIONARY = 2 # time for stationary feedback after no movement/failed movement trial
-TIME_MASTER_MOVE = 5 # allowed timing for participant to position robot with master arm. Bimanual experiment.
-TIMING = True #obsolete
-SHAPE_MAX = 0.7 #maximum fill 
-SHAPE_MIN = 0.5 #minimum fill 
-ROBOT_TRAJECTORY = ["a"] # Not using
-BIG_BROTHER_MODE = True #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
-SEND_PROBS = False
+EXPERIMENT_TYPE = "BASE"  # BIMANUAL or BASE
+TOTAL_TRIALS = 10
+TOTAL_TRIALS_ERRP = 45
+MAX_REPEATS = 3
+N_SPLITS = 5  # KFold splits (training scripts)
+TIME_MI = 5  # Motor imagery / rest cue duration (s)
+TIME_ROB = 7  # Robot movement window (s)
+TIME_STATIONARY = 2  # Stationary feedback after failed/no movement (s)
+TIME_MASTER_MOVE = 5  # Bimanual: time to position master arm (s)
+# Segmentation: begin→end spans longer than TIME_MI + slack are dropped (mis-pairs / missing end).
+# Keep slack small but nonzero for clock/marker jitter; tighten slack to 0.0 if you want a hard cap at TIME_MI.
+MAX_EPOCH_MARKER_SLACK_SEC = 0.5
+MAX_EPOCH_MARKER_DURATION_SEC = float(TIME_MI) + float(MAX_EPOCH_MARKER_SLACK_SEC)
+TIMING = True  # If True, drivers use automatic countdown paths where implemented
+SHAPE_MAX = 0.7  # Upper bound for feedback fill mapping
+SHAPE_MIN = 0.5  # Lower bound for feedback fill mapping
+ROBOT_TRAJECTORY = ["a"]  # Opcode pool for random trajectory choice where used
+BIG_BROTHER_MODE = True  # If True, force pygame window to external display (0,0) at 1920x1080
+SEND_PROBS = False  # If True, stream classifier probs over UDP marker channel
+# Early-stop policy: "correct_only" or "either"
+EARLYSTOP_MODE = "correct_only"
 
-# Early-stop policy: "correct_only" (current behavior) or "either"
-EARLYSTOP_MODE = "either"
-
-# =========================
+# =============================================================================
 # Gaze / object-selection experiment
-# =========================
+# =============================================================================
 GAZE_UDP_IP = "127.0.0.1"
 GAZE_UDP_PORT = 5588
 GAZE_UDP_TIMEOUT = 0.15
-
 GAZE_SELECTION_WINDOW = 5.0
 GAZE_AVG_WINDOW = 2.0
 GAZE_MIN_DWELL_SEC = 0.75
 GO_NOGO_PROMPT_SEC = 1.25
-
 GAZE_SAMPLE_WIDTH = 1600.0
 GAZE_SAMPLE_HEIGHT = 1200.0
-
 POSE_LIBRARY_FILENAME = "poses_with_gaze_20251202_153040.npz"
 POSE_LIBRARY_PATH = os.path.join(WORKING_DIR, POSE_LIBRARY_FILENAME)
+ROBOT_MOVE_DUR = TIME_ROB  # Alias used by gaze experiment code
 
-ROBOT_MOVE_DUR = TIME_ROB
-
-# Classification Parameters
-CLASSIFY_WINDOW = 1000  # Duration of EEG data window for classification (milliseconds)
-FILTER_BUFFER_SIZE = 2048 #4s at 512 Hz
-BASELINE_DURATION = 1 #seconds
-ACCURACY_THRESHOLD = 0.6  # OBS Accuracy threshold to determine "Correct" (plan to obsolete)
-THRESHOLD_MI = 0.65 #Threshold for MI "correct"
-THRESHOLD_REST = 0.65 #Threshold for REST "Correct"
-RELAXATION_RATIO = 0.0 # relaxation ratio for sustained MI during movement
-MIN_PREDICTIONS = 8 # Min number of predictions during Online experiment before the decoder can end early
+# =============================================================================
+# Classification, decoder, and feedback parameters
+# =============================================================================
+CLASSIFY_WINDOW = 1000  # EEG window length for classification (ms)
+FILTER_BUFFER_SIZE = 2048  # ~4 s at 512 Hz
+BASELINE_DURATION = 1  # seconds
+ACCURACY_THRESHOLD = 0.6  # Legacy / logging only; see CONFIG_AUDIT.md — thresholds below drive decisions
+THRESHOLD_MI = 0.6
+THRESHOLD_REST = 0.6
+RELAXATION_RATIO = 0.5
+MIN_PREDICTIONS = 8
 STEP_SIZE = 1/16
-CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
-#CLASSIFICATION_SCHEME_OPT = "TIMESERIES"
-CLASSIFICATION_SCHEME_OPT = "FREQUENCY"
-SURFACE_LAPLACIAN_TOGGLE = 1 #apply the surface laplacian spatial filter during offline/online-compatible preprocessing
-SELECT_MOTOR_CHANNELS = 1 # toggle to select motor channels or not (can be used to select other channels too)
-SELECT_ERRP_CHANNELS = 0 #toggle to select ERRP channels
-INTEGRATOR_ALPHA = 0.96 # defines how fast the accumulated probability may change as new data comes in
-SHRINKAGE_PARAM = 0.1 # hyperparameter for shrinkage regularization
-LEDOITWOLF = 0 #Set to true to use ledoit wolf shrinkage regularization - otherwise pyreimannian will be used w/ shrinkage param shown above
+CLASSIFICATION_OFFSET = 0
+CLASSIFICATION_SCHEME_OPT = "FREQUENCY"  # or "TIMESERIES"
+SURFACE_LAPLACIAN_TOGGLE = 1
 
-# adaptive Recentering parameters for config
-RECENTERING = 1 # adaptive recentering toggle
-USE_CONFIDENCE_GATE = 0 #update Previous transform ONLY in the event of lean condition
-UPDATE_DURING_MOVE = 0 #this toggle defines whether or not the reimannian adaptive recentering scheme updates when the robot is moving. 0 = no, 1 = yes. The algo will update always during MI
-SAVE_ADAPTIVE_T = False #this toggle saves "Adaptive_T" to the EEG directory during an active session between runs - this way, we can continue w/ the current estimated whitening transform. Disabling this will start a fresh transform each time
+# =============================================================================
+# Dual-threshold ambiguity target (used for learned reject/decide thresholds)
+# =============================================================================
+# target_ambig is the desired ambiguity fraction U/N (ambiguous/rejected samples)
+# during threshold selection.
+TARGET_AMBIG = 0.20
+SELECT_MOTOR_CHANNELS = 1
+SELECT_ERRP_CHANNELS = 0
+INTEGRATOR_ALPHA = 0.96
+# Model-specific covariance shrinkage defaults.
+# - MDM path (runtime + MDM-centric analyses)
+SHRINKAGE_PARAM_MDM = 0.02
+# - XGB feature pipelines (covariance preprocessing before tangent features)
+SHRINKAGE_PARAM_XGB = 0.1
+# Backward-compatible alias (legacy code may still read SHRINKAGE_PARAM).
+SHRINKAGE_PARAM = SHRINKAGE_PARAM_MDM
+LEDOITWOLF = 0
 
-# XGBoost defaults for offline feature-branch models
+# =============================================================================
+# Offline artifact rejection (sliding-window training segments)
+# =============================================================================
+# Amplitude unit of segment arrays from XDF + streaming filters. Default "microvolts"
+# matches project XDF convention (see Utils.stream_utils.load_xdf docstring).
+ARTIFACT_REJECT_ENABLE = 1  # 0 = keep all windows
+ARTIFACT_REJECT_MODE = "max_abs"  # "max_abs" | "peak_to_peak" | "zscore"
+ARTIFACT_MAX_ABS_UV = 30.0  # used when MODE == max_abs (same default as legacy adaptive script)
+ARTIFACT_P2P_UV = 150.0  # used when MODE == peak_to_peak (order-of-magnitude match to visualize QC)
+ARTIFACT_ZSCORE_SD = 3.0  # used when MODE == zscore (|z| on per-window max |x|)
+ARTIFACT_SEGMENT_AMPLITUDE_UNIT = "microvolts"  # "microvolts" | "volts"
+ARTIFACT_REJECT_VERBOSE = 1  # print drop counts per file
+
+# =============================================================================
+# visualize_online_data.py — epoch QC (µV, same numeric scale as XDF / raw._data)
+# =============================================================================
+# max_abs: matches training artifact logic — mu-band (LOWCUT..HIGHCUT) after notch, then
+#   max|x| over channels×time per epoch; broadband-filtered epochs are subset to match.
+# peak_to_peak: MNE’s built-in epoch reject (P2P) on broadband raw used for plotting.
+VISUALIZE_EPOCH_REJECT_MODE = "max_abs"  # "max_abs" | "peak_to_peak"
+VISUALIZE_EPOCH_MAX_ABS_UV = 45.0  # align with ARTIFACT_MAX_ABS_UV when using max_abs
+VISUALIZE_EPOCH_REJECT_P2P_UV = 150.0  # used when MODE == peak_to_peak
+VISUALIZE_EPOCH_FLAT_UV = None  # e.g. 1.0 for 1 µV flat criterion; None disables
+
+# =============================================================================
+# Adaptive recentering (Riemannian)
+# =============================================================================
+RECENTERING = 1
+UPDATE_DURING_MOVE = 0
+SAVE_ADAPTIVE_T = False
+
+# =============================================================================
+# XGBoost defaults (offline feature pipelines)
+# =============================================================================
 XGB_MAX_DEPTH = 5
 XGB_USE_COV_MU = 1
-XGB_USE_COV_BETA = 1
+# Default XGB covariance branch is mu-only. Enable beta explicitly when needed.
+XGB_USE_COV_BETA = 0
+# Default ERD bands are also mu-only unless overridden (e.g., add beta bands explicitly).
+XGB_ERD_BANDS = [(float(LOWCUT), float(HIGHCUT))]
 XGB_IMPORTANCE_TOP_K = 20
 
-# Online decoder backend:
-# - "mdm" (legacy default)
-# - "xgb_cov"
-# - "xgb_cov_erd"
-DECODER_BACKEND = "mdm"
+# Online decoder backend: "mdm" | "xgb_cov" | "xgb_cov_erd"
+DECODER_BACKEND = "xgb_cov"
 
-
-# FES Parameters
+# =============================================================================
+# FES
+# =============================================================================
 FES_toggle = 0
 FES_CHANNEL = "red"
-FES_TIMING_OFFSET = 7 
-# above for motor FES, cut out X seconds before the full duration of movement. This should represent when the robot will naturally reach the end of motion (in successful case)
+FES_TIMING_OFFSET = 7  # Seconds before end of movement for motor FES cutoff (successful case)
 
-# Screen Dimensions
-#SCREEN_WIDTH = 3840
-#SCREEN_HEIGHT = 2160
-
+# =============================================================================
+# Display / pygame feedback
+# =============================================================================
 SCREEN_WIDTH = 1200
 SCREEN_HEIGHT = 800
+USE_PREVIOUS_ONLINE_STATS = False
+# Feedback geometry: "classic" (default) or "modern" (refined shapes + accumulation bar in driver)
+CLASS_VISUAL_STYLE = "classic"
 
-USE_PREVIOUS_ONLINE_STATS = False # for z-score normalization of data coming in - this defines the starting point, False = use the stats from the training session, true = use previous online stats
-
-
-# Colors
+# Colors (RGB)
 black = (0, 0, 0)
 white = (255, 255, 255)
 blue = (0, 0, 255)
@@ -123,15 +166,34 @@ red = (255, 0, 0)
 green = (0, 255, 0)
 orange = (255, 165, 0)
 
-# software triggers
+# =============================================================================
+# UDP endpoints
+# =============================================================================
+UDP_MARKER = {
+    "IP": "127.0.0.1",
+    "PORT": 12345
+}
+UDP_ROBOT = {
+    "IP": "192.168.2.1",
+    "PORT": 8080
+}
+UDP_FES = {
+    "IP": "127.0.0.1",
+    "PORT": 5005
+}
+UDP_CONTROL_BIND = {
+    "IP": "192.168.2.2",
+    "PORT": 8080
+}
+
+# =============================================================================
+# Marker and robot protocol strings
+# =============================================================================
 TRIGGERS = {
     "MI_BEGIN": "200",
     "MI_END": "220",
     "MI_EARLYSTOP": "240",
     "MI_PROBS": "2000",
-
-    #"TRAJECTORY_STAGE": "290",
-    #"ACK_TRAJECTORY_STAGE":"295",
     "ROBOT_BEGIN": "300",
     "ACK_ROBOT_BEGIN": "305",
     "ROBOT_END": "320",
@@ -139,79 +201,50 @@ TRIGGERS = {
     "ROBOT_EARLYSTOP": "340",
     "ACK_ROBOT_STOP": "345",
     "ROBOT_PROBS": "3000",
-    #"ROBOT_RESTART": "350",
     "ROBOT_PAUSE": "360",
     "ACK_ROBOT_PAUSE": "365",
     "ROBOT_RESUME": "370",
     "ACK_ROBOT_RESUME": "375",
     "ROBOT_HOME": "380",
     "ACK_ROBOT_HOME": "385",
-
-
     "ERRP_BEGIN": "400",
     "ERRP_END": "420",
-    
-    
     "REST_BEGIN": "100",
     "REST_END": "120",
     "REST_EARLYSTOP": "140",
     "REST_PROBS": "1000",
-
     "MASTER_UNLOCK": "500",
     "ACK_MASTER_UNLOCK": "505",
     "MASTER_LOCK": "520",
     "ACK_MASTER_LOCK": "525",
-
-
 }
 
-# Robot Opcodes (symbolic names → opcode character)
 ROBOT_OPCODES = {
-    "TRAJECTORY_A": "a",      # straight ahead motion
-    "TRAJECTORY_X": "x",      # Slightly raised motion
-    "TRAJECTORY_Y": "y",      # Accross side motion
-    "TRAJECTORY_Z": "z",      # Reach up motion
-    "GO": "g",                # Execute movement (after MI success)
-    "HOME": "h;dur=3",              # Home
-    "STOP": "s",              # Stop. Will return home automatically after several seconds
-    "PAUSE": "p",             # Pause (several window allowed for resume)
-    "RESUME": "r",            # Resume (resume trajectory if paused)
-    "MASTER_UNLOCK": "m",     # Unlock master arm
-    "MASTER_LOCK": "c",       # Lock master arm
-    "QUERY": "q",             # Query joint angles, torques, velocities, end effector positions.
-    "EXIT": "e"               # Exit / emergency stop
+    "TRAJECTORY_A": "a",
+    "TRAJECTORY_X": "x",
+    "TRAJECTORY_Y": "y",
+    "TRAJECTORY_Z": "z",
+    "GO": "g",
+    "HOME": "h;dur=3",
+    "STOP": "s",
+    "PAUSE": "p",
+    "RESUME": "r",
+    "MASTER_UNLOCK": "m",
+    "MASTER_LOCK": "c",
+    "QUERY": "q",
+    "EXIT": "e"
 }
 
-# UDP Settings
-UDP_MARKER = {
-    "IP": "127.0.0.1",
-    "PORT": 12345
-}
+# =============================================================================
+# Arduino actuator
+# =============================================================================
+USE_ARDUINO = True
+ARDUINO_PORT = "/dev/ttyACM0"
+ARDUINO_BAUD = 9600
+ARDUINO_CMD_MI   = b"1"
+ARDUINO_CMD_REST = b"0"
 
-UDP_ROBOT = {
-    "IP": "192.168.2.1",
-    "PORT": 8080
-}
-
-UDP_FES = {
-    "IP": "127.0.0.1",
-    "PORT": 5005
-}
-
-UDP_CONTROL_BIND = {
-    "IP":   "192.168.2.2",  # your control Control Modul's IP
-    "PORT": 8080
-}
-
-
-
-# === Arduino actuator ===
-USE_ARDUINO = True          # Enable or disable Arduino actuator
-ARDUINO_PORT = "/dev/ttyACM0"  # Windows: COMn / macOS: /dev/cu.usbmodemXXX
-ARDUINO_BAUD = 9600         # Arduino communication baud rate
-
-# Command mapping based on classifier output
-ARDUINO_CMD_MI   = b"1"     # Movement detected (label 200)
-ARDUINO_CMD_REST = b"0"     # Rest or ambiguous state detected
-
+# =============================================================================
+# Global runtime flags
+# =============================================================================
 SIMULATION_MODE = False

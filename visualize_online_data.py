@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # =========================================================
 # ERD/ERS Multi-session analysis with:
-#   ✅ Epoch rejection (peak-to-peak EEG amplitude)
+#   ✅ Epoch QC: default max|x| on mu-band data (matches training); optional MNE P2P on broadband
 #   ✅ Channel subset selection on import
 #   ✅ TFR padding + crop to fix edge artifacts
 #   ✅ CSD applied AFTER epoching (recommended w/ rejection)
@@ -13,9 +13,23 @@
 #          then re-epoch + re-run session (with safeguards)
 #
 # NOTE: Feature #3 (per-session start/stop indices) intentionally NOT added yet.
+#
+# EEG units (XDF / LSL vs MNE):
+#   MNE labels channels as "volts", but LSL/XDF EEG streams from typical amplifiers
+#   (e.g. EEGsports-style pipelines) are almost always microvolt-scale *numbers* in
+#   `time_series`. We keep that numeric scale in `raw._data` end-to-end: amplitude
+#   QC limits (see config VISUALIZE_EPOCH_*) are µV on
+#   the same scale as the array. We do not multiply the stream by 1e-6 unless upstream
+#   changes; true SI-volt files (~1e-4) would need an explicit scale fix first.
+#
+# Default epoch QC (VISUALIZE_EPOCH_REJECT_MODE=max_abs): notch → mu-band copy → max|x| per epoch
+#   (same idea as training ARTIFACT_MAX_ABS on mu-filtered windows); kept epochs are still the
+#   broadband-filtered Raw for TFR/plots. Set MODE=peak_to_peak for legacy MNE P2P on broadband.
 # =========================================================
 
 import os
+from typing import Optional
+
 import numpy as np
 import matplotlib.pyplot as plt
 import mne
@@ -30,10 +44,10 @@ from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 # User Config
 # =========================================================
 
-subject = "CLIN_SUBJ_003"
+subject = "CLIN_SUBJ_005"
 
 # ---- Single-session mode ----
-session = "S004ONLINE"
+session = "S002ONLINE"
 PROMPT_FOR_FILE_SELECTION = False
 
 # ---- Multi-session mode ----
@@ -74,7 +88,7 @@ PAD_TFR = 1.0  # seconds (epochs will be [-1-PAD, 4+PAD], then TFR cropped to [-
 # ------------------------------
 # OLD behavior (single focal set)
 # ------------------------------
-FOCAL_ELECTRODES = ["CP5"]
+FOCAL_ELECTRODES = ["C3"]
 
 # ------------------------------
 # NEW: per-session focal mapping
@@ -124,10 +138,10 @@ BAR_USE_NORMALIZATION = False
 BAR_NORM_METHOD = "ratio"  # "ratio" or "difference"
 BAR_YLIM = (-100, 100)  # or None
 
-# ---- Epoch rejection ----
+# ---- Epoch rejection (see config VISUALIZE_EPOCH_REJECT_MODE, VISUALIZE_EPOCH_MAX_ABS_UV) ----
 REJECT_EPOCHS = True
-REJECT_P2P_UV = 150  # typical: 100–250 µV
-FLAT_UV = None       # optional
+REJECT_P2P_UV = 200  # fallback when config VISUALIZE_EPOCH_REJECT_P2P_UV missing (peak_to_peak mode)
+FLAT_UV = None       # optional; overrides config VISUALIZE_EPOCH_FLAT_UV when not None
 
 # =========================================================
 # NEW: Auto-drop bad channels that dominate rejections
@@ -167,11 +181,6 @@ APPLY_CSD = True
 #   "logratio" -> plot metrics in logratio units
 PLOT_SPACE = "percent"  # "percent" or "logratio"
 
-# ---- Unit handling for XDF EEG stream ----
-# If your eeg_stream["time_series"] is already in VOLTS, set this False.
-# If it's in microvolts, set this True (we convert µV -> V).
-XDF_DATA_IN_UV = False
-
 # ---- Optional: limiting to specific index range (kept from your script) ----
 LIMIT_EPOCH_RANGE = False
 EPOCH_RANGE_START_IDX = 0
@@ -181,6 +190,63 @@ EPOCH_RANGE_END_IDX = 70
 # =========================================================
 # Helper functions
 # =========================================================
+
+def eeg_reject_threshold_from_uv(threshold_uv: float) -> float:
+    """
+    Threshold for mne.Epochs(reject=..., flat=...) in the same units as raw._data.
+
+    Used only for VISUALIZE_EPOCH_REJECT_MODE == peak_to_peak (MNE’s reject dict is P2P).
+    This script keeps XDF EEG as microvolt-scale amplitudes (see module docstring).
+    """
+    return float(threshold_uv)
+
+
+def _visualize_max_abs_keep_mask(
+    epochs_mu: mne.Epochs,
+    max_abs_uv: float,
+    *,
+    epochs_bb: Optional[mne.Epochs] = None,
+    flat_uv: float | None = None,
+) -> np.ndarray:
+    """
+    Per-epoch keep mask: max|x| over channels×time on mu-band epoched data <= max_abs_uv.
+    If flat_uv is set, also drop broadband epochs where any channel peak-to-peak < flat_uv (dead).
+    """
+    mu_data = epochs_mu.get_data()
+    mask = np.max(np.abs(mu_data), axis=(1, 2)) <= float(max_abs_uv)
+    if flat_uv is not None and epochs_bb is not None:
+        bb_data = epochs_bb.get_data()
+        ptp = np.ptp(bb_data, axis=2)
+        too_flat = np.any(ptp < float(flat_uv), axis=1)
+        mask &= ~too_flat
+    return mask
+
+
+def pick_dominant_bad_channel_max_abs(
+    mu_data: np.ndarray,
+    ch_names: list,
+    bad_epoch_indices: np.ndarray,
+    dominance_frac: float,
+):
+    """
+    Among rejected epochs, count which channel most often attains max|x| for that epoch.
+    Returns (channel_name, frac_of_bad_epochs) or (None, 0.0) if below dominance_frac.
+    """
+    if bad_epoch_indices.size == 0:
+        return None, 0.0
+    counts = {ch: 0 for ch in ch_names}
+    for ei in bad_epoch_indices:
+        d = mu_data[int(ei)]
+        per_ch_max = np.max(np.abs(d), axis=1)
+        worst = int(np.argmax(per_ch_max))
+        counts[ch_names[worst]] += 1
+    bad_ch = max(counts, key=lambda k: counts[k])
+    n_bad = int(bad_epoch_indices.size)
+    frac = counts[bad_ch] / n_bad if n_bad else 0.0
+    if counts[bad_ch] == 0 or frac < float(dominance_frac):
+        return None, frac
+    return bad_ch, frac
+
 
 def logratio_to_percent_change(x):
     """Convert log10 power ratio to % change from baseline."""
@@ -463,13 +529,8 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
     raw.rename_channels(rename_dict)
     raw.set_montage(montage, match_case=True, on_missing="warn")
 
-    # ---- Unit normalization ----
-    # MNE expects VOLTS. If your XDF is in µV, convert µV -> V.
-    if XDF_DATA_IN_UV:
-        raw._data *= 1e-6  # µV -> V
-        print("✅ Converted XDF EEG: µV -> V (raw in Volts).")
-    else:
-        print("✅ Assuming XDF EEG already in Volts (raw in Volts).")
+    # ---- EEG scale (see module docstring) ----
+    print("✅ XDF EEG kept as microvolt-scale amplitudes (reject/QC use same numeric scale).")
 
     # ---- Channel subset selection (after rename/montage) ----
     if USE_SUBSET_CHANNELS:
@@ -480,17 +541,24 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
         raw.pick_channels(keep)
         print(f"✅ Picked {len(raw.ch_names)} subset channels.")
 
-    # ---- Preprocessing on raw (broadband) ----
+    # ---- Preprocessing: notch → (optional mu copy for max_abs QC) → broadband for TFR/plots ----
     raw.notch_filter(60)
+    reject_mode = str(getattr(config, "VISUALIZE_EPOCH_REJECT_MODE", "max_abs")).lower().strip()
+    raw_mu_qc = None
+    if REJECT_EPOCHS and reject_mode == "max_abs":
+        raw_mu_qc = raw.copy()
+        raw_mu_qc.filter(
+            l_freq=float(config.LOWCUT),
+            h_freq=float(config.HIGHCUT),
+            method="iir",
+        )
     raw.filter(l_freq=BROADBAND_LOW, h_freq=BROADBAND_HIGH, method="iir")
 
-    data = raw.get_data()  # shape: (channels, samples)
-    uV = data  # NOTE: if raw is Volts, these are Volts (your original print kept as-is)
-
-    print("EEG amplitude percentiles (µV):")
-    print("  1% :", np.percentile(uV, 1))
-    print(" 50% :", np.percentile(uV, 50))
-    print(" 99% :", np.percentile(uV, 99))
+    data = raw.get_data()  # µV-scale numbers (same as XDF time_series)
+    print("EEG amplitude percentiles (µV, same numeric scale as raw._data / XDF):")
+    print("  1% :", np.percentile(data, 1))
+    print(" 50% :", np.percentile(data, 50))
+    print(" 99% :", np.percentile(data, 99))
 
     print("\n Final EEG Channels After Raw Processing:", raw.ch_names)
 
@@ -538,13 +606,10 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
         (event_samples, np.zeros(len(marker_data_valid), dtype=int), marker_data_valid)
     )
 
-    # ---- Epoching with padding + rejection ----
-    reject = None
-    flat = None
-    if REJECT_EPOCHS:
-        reject = dict(eeg=REJECT_P2P_UV)
-        if FLAT_UV is not None:
-            flat = dict(eeg=FLAT_UV)
+    # ---- Epoching with padding + QC ----
+    flat_uv_cfg = getattr(config, "VISUALIZE_EPOCH_FLAT_UV", None)
+    if FLAT_UV is not None:
+        flat_uv_cfg = FLAT_UV
 
     dropped_channels = []
     iters = 0
@@ -552,52 +617,120 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
     while True:
         iters += 1
 
-        epochs = mne.Epochs(
-            raw,
-            events,
+        epoch_kw = dict(
             event_id=event_dict,
             tmin=time_start - PAD_TFR,
             tmax=time_end + PAD_TFR,
             baseline=(time_start, time_start + baseline_period),
             detrend=1,
             preload=True,
-            reject=reject,
-            flat=flat,
         )
+
+        if REJECT_EPOCHS and reject_mode == "max_abs":
+            if raw_mu_qc is None:
+                raise RuntimeError("raw_mu_qc missing for VISUALIZE_EPOCH_REJECT_MODE=max_abs")
+            thr_m = float(
+                getattr(
+                    config,
+                    "VISUALIZE_EPOCH_MAX_ABS_UV",
+                    getattr(config, "ARTIFACT_MAX_ABS_UV", 30.0),
+                )
+            )
+            epochs_mu = mne.Epochs(
+                raw_mu_qc, events, reject=None, flat=None, **epoch_kw
+            )
+            epochs_bb = mne.Epochs(raw, events, reject=None, flat=None, **epoch_kw)
+            mask = _visualize_max_abs_keep_mask(
+                epochs_mu,
+                thr_m,
+                epochs_bb=epochs_bb if flat_uv_cfg is not None else None,
+                flat_uv=flat_uv_cfg,
+            )
+            good_ix = np.where(mask)[0].tolist()
+            epochs = epochs_bb[good_ix]
+            n_drop = int(len(events) - len(good_ix))
+            print(
+                f"✅ Epoch QC (max_abs ≤ {thr_m:g} µV on mu {config.LOWCUT}-{config.HIGHCUT} Hz; "
+                f"broadband epochs kept for TFR): dropped {n_drop} / {len(events)}"
+            )
+            del epochs_mu
+        elif REJECT_EPOCHS and reject_mode in ("peak_to_peak", "p2p", "ptp"):
+            p2p_uv = float(getattr(config, "VISUALIZE_EPOCH_REJECT_P2P_UV", REJECT_P2P_UV))
+            reject = dict(eeg=eeg_reject_threshold_from_uv(p2p_uv))
+            flat = None
+            if flat_uv_cfg is not None:
+                flat = dict(eeg=eeg_reject_threshold_from_uv(float(flat_uv_cfg)))
+            epochs = mne.Epochs(raw, events, reject=reject, flat=flat, **epoch_kw)
+        else:
+            if REJECT_EPOCHS:
+                print(
+                    f"⚠️ Unknown VISUALIZE_EPOCH_REJECT_MODE={reject_mode!r}; "
+                    f"epoching without rejection."
+                )
+            epochs = mne.Epochs(raw, events, reject=None, flat=None, **epoch_kw)
 
         # Epoch summary
         print(f"✅ Epochs created (padded): tmin={time_start-PAD_TFR:.2f}, tmax={time_end+PAD_TFR:.2f}")
         for code in ["100", "200"]:
             if code in epochs.event_id:
-                print(f"✅ Marker {code}: {len(epochs[code])} epochs (after rejection)")
+                print(f"✅ Marker {code}: {len(epochs[code])} epochs (after QC)")
 
         # Decide whether to auto-drop a dominant bad channel
         if not (AUTO_DROP_BAD_CHANNELS and REJECT_EPOCHS):
             break
 
-        # Total epochs originally attempted == len(events)
         total_attempted = len(events)
         kept = len(epochs)
         dropped = total_attempted - kept
         dropped_frac = dropped / total_attempted if total_attempted > 0 else 0.0
 
-        # If we are NOT in a pathological regime, stop.
         if dropped_frac < AUTO_DROP_REJECT_FRAC:
             break
 
-        # Guard: don’t drop too many channels
         if len(dropped_channels) >= AUTO_DROP_MAX_CHANNELS_TOTAL:
             print(f"⚠️ Auto-drop reached channel limit ({AUTO_DROP_MAX_CHANNELS_TOTAL}); stopping auto-drop.")
             break
 
-        # Guard: don’t loop too many times
         if iters > AUTO_DROP_MAX_ITERS:
             print(f"⚠️ Auto-drop reached max iterations ({AUTO_DROP_MAX_ITERS}); stopping auto-drop.")
             break
 
-        bad_ch, frac = pick_dominant_bad_channel(epochs, dominance_frac=AUTO_DROP_DOMINANCE_FRAC)
+        bad_ch = None
+        frac = 0.0
+        if reject_mode == "max_abs":
+            epochs_mu = mne.Epochs(
+                raw_mu_qc, events, reject=None, flat=None, **epoch_kw
+            )
+            mu_data = epochs_mu.get_data()
+            thr_m = float(
+                getattr(
+                    config,
+                    "VISUALIZE_EPOCH_MAX_ABS_UV",
+                    getattr(config, "ARTIFACT_MAX_ABS_UV", 30.0),
+                )
+            )
+            epochs_bb = mne.Epochs(raw, events, reject=None, flat=None, **epoch_kw)
+            mask = _visualize_max_abs_keep_mask(
+                epochs_mu,
+                thr_m,
+                epochs_bb=epochs_bb if flat_uv_cfg is not None else None,
+                flat_uv=flat_uv_cfg,
+            )
+            bad_ix = np.where(~mask)[0]
+            bad_ch, frac = pick_dominant_bad_channel_max_abs(
+                mu_data,
+                list(epochs_mu.ch_names),
+                bad_ix,
+                AUTO_DROP_DOMINANCE_FRAC,
+            )
+            del epochs_mu, epochs_bb
+        else:
+            bad_ch, frac = pick_dominant_bad_channel(epochs, dominance_frac=AUTO_DROP_DOMINANCE_FRAC)
+
         if bad_ch is None:
-            print("⚠️ >90% epochs dropped, but no single dominant channel found in drop_log; stopping auto-drop.")
+            print(
+                "⚠️ High epoch drop rate, but no single dominant channel met the threshold; stopping auto-drop."
+            )
             break
 
         if bad_ch not in raw.ch_names:
@@ -609,9 +742,9 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
             f"Dominant channel: {bad_ch} (in ~{frac*100:.1f}% of dropped epochs). Dropping + retrying..."
         )
         raw = raw.copy().drop_channels([bad_ch])
+        if raw_mu_qc is not None:
+            raw_mu_qc = raw_mu_qc.copy().drop_channels([bad_ch])
         dropped_channels.append(bad_ch)
-
-        # Loop continues to re-epoch with updated raw
 
     # ---- Apply CSD AFTER rejection (recommended) ----
     if APPLY_CSD:

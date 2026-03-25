@@ -6,7 +6,7 @@ EEG -> temporal filtering -> segmentation -> covariance ->
 trace normalization -> shrinkage -> whitening
 
 Classifier stage:
-- tangent-space vectorization at Identity (after whitening/alignment)
+- tangent-space vectorization at fitted reference (after whitening/alignment)
 - ERD log-ratio bandpower features
 - XGBoost + dual-threshold reject option (learned on fold-train scores)
 """
@@ -21,7 +21,7 @@ os.environ["MNE_USE_NUMBA"] = "false"
 
 import mne
 
-from pyriemann.utils.tangentspace import tangent_space
+from pyriemann.tangentspace import TangentSpace, tangent_space
 
 import config
 import Generate_Riemannian_adaptive as base
@@ -30,11 +30,15 @@ from Utils.xgb_feature_pipeline import segment_and_extract_cov_erd
 from Utils.xgb_train_eval import train_xgb_dual_thresholds
 
 
-def _cov_tangent_features(cov_matrices: np.ndarray) -> np.ndarray:
-    """Project (whitened/aligned) SPD covariances to tangent vectors at Identity."""
-    n_ch = cov_matrices.shape[1]
-    I = np.eye(n_ch)
-    return tangent_space(cov_matrices, I, metric="riemann")
+def _fit_tangent_ref(cov_matrices: np.ndarray) -> np.ndarray:
+    ts = TangentSpace(metric="riemann")
+    ts.fit(cov_matrices)
+    return ts.reference_
+
+
+def _cov_tangent_features(cov_matrices: np.ndarray, tangent_ref: np.ndarray) -> np.ndarray:
+    """Project (whitened/aligned) SPD covariances to tangent vectors at a fitted reference."""
+    return tangent_space(cov_matrices, tangent_ref, metric="riemann")
 
 
 def _report_xgb_importance(
@@ -169,9 +173,11 @@ def main():
         raise ValueError("At least one of XGB_USE_COV_MU or XGB_USE_COV_BETA must be enabled.")
     print(f"[cov+erd] covariance feature sets -> mu={use_cov_mu}, beta={use_cov_beta}")
 
-    all_feats = []
     all_labels = []
-    n_cov_mu = n_cov_beta = n_erd = None
+    all_erd = []
+    cov_mu_all = []
+    cov_beta_all = []
+    n_cov_mu = n_cov_beta = n_erd = 0
     channel_names = list(getattr(config, "MOTOR_CHANNEL_NAMES", [])) if getattr(config, "SELECT_MOTOR_CHANNELS", 0) else None
 
     for xdf_path in xdf_files:
@@ -186,48 +192,49 @@ def main():
             return_beta_segments=use_cov_beta,
         )
         if use_cov_beta:
-            segments, labels, erd_feats, beta_segments = out
+            segments, labels, erd_feats, beta_segments, _ch_names = out
         else:
-            segments, labels, erd_feats = out
+            segments, labels, erd_feats, _ch_names = out
             beta_segments = None
 
         if erd_feats is None:
             raise RuntimeError("Expected ERD features for combined branch.")
 
-        cov_blocks = []
         if use_cov_mu:
-            cov_matrices_mu = base.compute_processed_covariances(segments, labels)
-            cov_feats_mu = _cov_tangent_features(cov_matrices_mu)
-            cov_blocks.append(cov_feats_mu)
-            if n_cov_mu is None:
-                n_cov_mu = int(cov_feats_mu.shape[1])
-        else:
-            if n_cov_mu is None:
-                n_cov_mu = 0
+            cov_matrices_mu = base.compute_processed_covariances(segments, labels, model_type="xgb")
+            cov_mu_all.append(cov_matrices_mu)
 
         if use_cov_beta:
             if beta_segments is None:
                 raise RuntimeError("Expected beta segments but got None.")
-            cov_matrices_beta = base.compute_processed_covariances(beta_segments, labels)
-            cov_feats_beta = _cov_tangent_features(cov_matrices_beta)
-            cov_blocks.append(cov_feats_beta)
-            if n_cov_beta is None:
-                n_cov_beta = int(cov_feats_beta.shape[1])
-        else:
-            if n_cov_beta is None:
-                n_cov_beta = 0
-
-        cov_feats = np.hstack(cov_blocks)
-        feats = np.hstack([cov_feats, erd_feats])
-
-        if n_erd is None:
-            n_erd = int(erd_feats.shape[1])
-
-        all_feats.append(feats)
+            cov_matrices_beta = base.compute_processed_covariances(beta_segments, labels, model_type="xgb")
+            cov_beta_all.append(cov_matrices_beta)
+        all_erd.append(erd_feats)
         all_labels.append(labels)
 
-    X = np.concatenate(all_feats)
     y = np.concatenate(all_labels)
+    erd = np.concatenate(all_erd, axis=0)
+    n_erd = int(erd.shape[1])
+    feature_blocks = []
+    tangent_ref_mu = None
+    tangent_ref_beta = None
+
+    if use_cov_mu:
+        cov_mu = np.concatenate(cov_mu_all, axis=0)
+        tangent_ref_mu = _fit_tangent_ref(cov_mu)
+        cov_feats_mu = _cov_tangent_features(cov_mu, tangent_ref_mu)
+        n_cov_mu = int(cov_feats_mu.shape[1])
+        feature_blocks.append(cov_feats_mu)
+
+    if use_cov_beta:
+        cov_beta = np.concatenate(cov_beta_all, axis=0)
+        tangent_ref_beta = _fit_tangent_ref(cov_beta)
+        cov_feats_beta = _cov_tangent_features(cov_beta, tangent_ref_beta)
+        n_cov_beta = int(cov_feats_beta.shape[1])
+        feature_blocks.append(cov_feats_beta)
+
+    cov_feats = np.hstack(feature_blocks)
+    X = np.hstack([cov_feats, erd])
     print(
         f"Feature dimensions: cov_mu={int(n_cov_mu or 0)}, cov_beta={int(n_cov_beta or 0)}, "
         f"erd={int(n_erd or 0)}, total={X.shape[1]}"
@@ -236,18 +243,20 @@ def main():
     model_bundle = train_xgb_dual_thresholds(
         X=X,
         labels=y,
-        feature_tag="cov_tangent_plus_erd_logratio",
+        feature_tag="cov_tangent_fittedref_plus_erd_logratio",
         n_splits=int(getattr(config, "N_SPLITS", 8)),
-        target_ambig=0.3,
+        target_ambig=float(getattr(config, "TARGET_AMBIG", 0.20)),
     )
     model_bundle["decoder_backend"] = "xgb_cov_erd"
+    model_bundle["tangent_ref_mu"] = tangent_ref_mu
+    model_bundle["tangent_ref_beta"] = tangent_ref_beta
     model_bundle["feature_spec"] = {
         "type": "cov_erd",
         "use_cov_mu": bool(use_cov_mu),
         "use_cov_beta": bool(use_cov_beta),
-        "n_cov_mu": int(n_cov_mu or 0),
-        "n_cov_beta": int(n_cov_beta or 0),
-        "n_erd": int(n_erd or 0),
+        "n_cov_mu": int(n_cov_mu),
+        "n_cov_beta": int(n_cov_beta),
+        "n_erd": int(n_erd),
         "erd_bands": [tuple(map(float, b)) for b in getattr(config, "XGB_ERD_BANDS", [(float(config.LOWCUT), float(config.HIGHCUT)), (float(config.HIGHCUT), float(getattr(config, "XGB_ERD_BETA_HIGH", 30.0)))])],
         "channel_names": list(channel_names) if channel_names is not None else None,
         "apply_csd_erd_only": bool(apply_csd),

@@ -50,7 +50,7 @@ def main():
     for xdf_path in xdf_files:
         print(f"\n📂 Processing file: {xdf_path}")
         eeg_stream, marker_stream = load_xdf(xdf_path, report=False)
-        segments, labels, erd_feats = segment_and_extract_cov_erd(
+        segments, labels, erd_feats, _ch_names = segment_and_extract_cov_erd(
             eeg_stream,
             marker_stream,
             compute_erd=compute_erd,
@@ -69,7 +69,7 @@ def main():
         labels=y,
         feature_tag="erd_bands_logratio",
         n_splits=int(getattr(config, "N_SPLITS", 8)),
-        target_ambig=0.3,
+        target_ambig=float(getattr(config, "TARGET_AMBIG", 0.20)),
     )
 
     subject_model_dir = os.path.join(config.DATA_DIR, f"sub-{config.TRAINING_SUBJECT}", "models")

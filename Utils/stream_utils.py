@@ -50,6 +50,11 @@ def load_xdf(file_path, dejitter=False, sync=False, report=True):
 
     The function also optionally prints EEG sampling interval statistics when
     `report=True`.
+
+    Amplitude convention (Harmony): `eeg_stream["time_series"]` is treated throughout
+    the repo as **microvolt-scale** numbers (typical LSL/amplifier exports), not SI volts.
+    Do not multiply or divide by 1e-6 unless you have a file-specific reason. See
+    `visualize_online_data.py` module docstring and `config.ARTIFACT_*` / training pipelines.
     """
     streams, _ = pyxdf.load_xdf(
         file_path,

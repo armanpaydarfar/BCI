@@ -56,12 +56,20 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QCheckBox, QGridLayout, QLineEdit,
     QTextEdit, QGroupBox, QMessageBox, QSplitter, QToolBar, QStyle,
-    QFileDialog
+    QScrollArea, QFormLayout, QDoubleSpinBox, QSpinBox,
+    QListWidget,
 )
 
 # ----------------- Paths & constants -----------------
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PY = os.path.join(ROOT, "config.py")
+
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+try:
+    import config as _HCFG  # noqa: E402
+except Exception:
+    _HCFG = None
 
 MARKER_PY = os.path.join(ROOT, "UTIL_marker_stream.py")
 DRIVER_ONLINE_PY = os.path.join(ROOT, "ExperimentDriver_Online.py")
@@ -81,12 +89,15 @@ HARMONY_ONLINE_CONTROL_PY   = os.path.join(ROOT, "harmony_online_control.py")
 GAZE_RUNNER_PY = os.path.join(ROOT, "gaze_runner.py")
 GAZE_SERVICE_PY = os.path.join(ROOT, "gaze_runner.py")
 
-# Telemetry (UDP) config for service
-GAZE_SERVICE_HOST = "127.0.0.1"
-GAZE_SERVICE_PORT = 5588
+GAZE_SERVICE_HOST = getattr(_HCFG, "GAZE_UDP_IP", "127.0.0.1") if _HCFG else "127.0.0.1"
+GAZE_SERVICE_PORT = int(getattr(_HCFG, "GAZE_UDP_PORT", 5588)) if _HCFG else 5588
 GAZE_QUERY_TIMEOUT_S = 0.8
 
-UDP_MARKER = ("127.0.0.1", 15000)  # readiness check (port-in-use)
+
+def _marker_udp_port() -> int:
+    if _HCFG is not None:
+        return int(_HCFG.UDP_MARKER["PORT"])
+    return 12345
 
 # Modes choose which robot tool to launch remotely
 MODES = ["Gaze_Tracking", "MI_Bimanual", "Simulation"]
@@ -206,6 +217,116 @@ def write_fes_toggle(val: int):
         new = txt + f"{sep}FES_toggle = {val}\n"
     write_atomic(CONFIG_PY, new)
 
+
+def _assign_line_re(name: str) -> re.Pattern:
+    return re.compile(rf"^(\s*{re.escape(name)}\s*=\s*)([^#\n]+?)(\s*(#.*)?)\s*$", re.M)
+
+
+def _read_float_key(name: str, default: float) -> float:
+    txt = read_text(CONFIG_PY)
+    m = _assign_line_re(name).search(txt)
+    if not m:
+        return default
+    try:
+        return float(m.group(2).strip())
+    except ValueError:
+        return default
+
+
+def _read_int_key(name: str, default: int) -> int:
+    txt = read_text(CONFIG_PY)
+    m = _assign_line_re(name).search(txt)
+    if not m:
+        return default
+    try:
+        return int(float(m.group(2).strip()))
+    except ValueError:
+        return default
+
+
+def _read_bool_key(name: str, default: bool) -> bool:
+    txt = read_text(CONFIG_PY)
+    m = _assign_line_re(name).search(txt)
+    if not m:
+        return default
+    v = m.group(2).strip()
+    if v == "True":
+        return True
+    if v == "False":
+        return False
+    return default
+
+
+def _read_quoted_str_key(name: str, default: str) -> str:
+    txt = read_text(CONFIG_PY)
+    m = _assign_line_re(name).search(txt)
+    if not m:
+        return default
+    raw = m.group(2).strip()
+    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+        return raw[1:-1]
+    return raw
+
+
+def _write_assign_rhs(name: str, rhs: str):
+    txt = read_text(CONFIG_PY)
+    pat = _assign_line_re(name)
+    if not pat.search(txt):
+        raise ValueError(f"config.py: assignment for {name} not found")
+    new = pat.sub(rf"\g<1>{rhs}\3", txt, count=1)
+    write_atomic(CONFIG_PY, new)
+
+
+def _read_01_key(name: str, default: int) -> int:
+    v = _read_int_key(name, default)
+    return 1 if v else 0
+
+
+ARDUINO_PORT_RE = re.compile(
+    r"^(\s*ARDUINO_PORT\s*=\s*)([\"'])([^\"']*)\2(\s*(#.*)?)\s*$", re.M
+)
+ARDUINO_BAUD_RE = re.compile(
+    r"^(\s*ARDUINO_BAUD\s*=\s*)(\d+)(\s*(#.*)?)\s*$", re.M
+)
+
+
+def read_arduino_baud_from_config(default: int = 9600) -> int:
+    txt = read_text(CONFIG_PY)
+    m = ARDUINO_BAUD_RE.search(txt)
+    try:
+        return int(m.group(2)) if m else default
+    except Exception:
+        return default
+
+
+def write_arduino_port_to_config(port: str):
+    txt = read_text(CONFIG_PY)
+    if ARDUINO_PORT_RE.search(txt):
+        new = ARDUINO_PORT_RE.sub(rf'\g<1>"{port}"\3', txt, count=1)
+    else:
+        sep = "" if (txt.endswith("\n") or txt == "") else "\n"
+        new = txt + f'{sep}ARDUINO_PORT = "{port}"\n'
+    write_atomic(CONFIG_PY, new)
+
+
+def write_arduino_baud_to_config(baud: int):
+    txt = read_text(CONFIG_PY)
+    b = int(baud)
+    if ARDUINO_BAUD_RE.search(txt):
+        new = ARDUINO_BAUD_RE.sub(rf"\g<1>{b}\3", txt, count=1)
+    else:
+        sep = "" if (txt.endswith("\n") or txt == "") else "\n"
+        new = txt + f"{sep}ARDUINO_BAUD = {b}\n"
+    write_atomic(CONFIG_PY, new)
+
+
+TRAINING_SCRIPT_ENTRIES = [
+    ("Riemannian adaptive → sub-*_model.pkl", "Generate_Riemannian_adaptive.py"),
+    ("XGBoost covariance features", "generate_xgboost_cov_features.py"),
+    ("XGBoost cov + ERD features", "generate_xgboost_cov_erd_features.py"),
+    ("XGBoost ERD features", "generate_xgboost_erd_features.py"),
+]
+
 # ----------------- UDP readiness probe -----------------
 def _is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
     """
@@ -255,10 +376,11 @@ class ControlPanel(QMainWindow):
         self.fes_enabled_pref = read_fes_toggle()
 
         # Arduino / BCI online config
-        self.arduino_enabled = False
         self.serial_port_name = ""
-        self.serial_baudrate = "9600"
-        self.classifier_model_path = ""
+        try:
+            self.serial_baudrate = str(read_arduino_baud_from_config(9600))
+        except Exception:
+            self.serial_baudrate = "9600"
 
         # Procs (QProcess-managed)
         self.marker = Proc("Marker Stream", f'python -u "{MARKER_PY}"', ROOT)
@@ -480,50 +602,58 @@ class ControlPanel(QMainWindow):
         grid.addWidget(QLabel("<i>External Apps:</i> eegoSports, LabRecorder (use Initialize / buttons)"), row, 0, 1, 5)
         row += 1
 
-        # ===== Arduino / Online BCI =====
+        # ===== Arduino / Online BCI (grouped) =====
         arduino_group = QGroupBox("Arduino / Online BCI")
-        ag_layout = QGridLayout(arduino_group)
+        ag_outer = QVBoxLayout(arduino_group)
 
-        ag_layout.addWidget(QLabel("Serial port:"), 0, 0)
+        conn_box = QGroupBox("Serial connection")
+        conn_grid = QGridLayout(conn_box)
+        conn_grid.addWidget(QLabel("Device:"), 0, 0)
         self.cmb_serial_port = QComboBox()
-        ag_layout.addWidget(self.cmb_serial_port, 0, 1)
+        self.cmb_serial_port.currentIndexChanged.connect(self.on_serial_port_changed)
+        conn_grid.addWidget(self.cmb_serial_port, 0, 1)
         self.btn_serial_refresh = QPushButton("Refresh")
+        self.btn_serial_refresh.setMaximumWidth(100)
         self.btn_serial_refresh.clicked.connect(self.on_serial_refresh)
-        ag_layout.addWidget(self.btn_serial_refresh, 0, 2)
+        conn_grid.addWidget(self.btn_serial_refresh, 0, 2)
 
-        ag_layout.addWidget(QLabel("Baudrate:"), 1, 0)
+        conn_grid.addWidget(QLabel("Baud:"), 1, 0)
         self.le_serial_baud = QLineEdit(self.serial_baudrate)
-        ag_layout.addWidget(self.le_serial_baud, 1, 1)
+        self.le_serial_baud.setMaximumWidth(120)
+        conn_grid.addWidget(self.le_serial_baud, 1, 1)
         self.le_serial_baud.editingFinished.connect(self.on_serial_baud_changed)
 
+        row_conn = QHBoxLayout()
         self.btn_serial_test = QPushButton("Test connection")
+        self.btn_serial_test.setMaximumWidth(160)
         self.btn_serial_test.clicked.connect(self.on_serial_test)
-        ag_layout.addWidget(self.btn_serial_test, 2, 0)
+        self.btn_save_serial_to_config = QPushButton("Save port/baud → config.py")
+        self.btn_save_serial_to_config.setToolTip(
+            "Writes ARDUINO_PORT and ARDUINO_BAUD in config.py (e.g. for Online Glove driver)."
+        )
+        self.btn_save_serial_to_config.clicked.connect(self.on_save_serial_to_config)
+        row_conn.addWidget(self.btn_serial_test)
+        row_conn.addWidget(self.btn_save_serial_to_config)
+        row_conn.addStretch(1)
+        conn_grid.addLayout(row_conn, 2, 0, 1, 3)
+
         self.lbl_serial_status = QLabel("Status: Not tested")
-        ag_layout.addWidget(self.lbl_serial_status, 2, 1, 1, 2)
+        self.lbl_serial_status.setWordWrap(True)
+        conn_grid.addWidget(self.lbl_serial_status, 3, 0, 1, 3)
+        ag_outer.addWidget(conn_box)
 
-        self.chk_enable_arduino = QCheckBox("Enable Arduino control")
-        self.chk_enable_arduino.setChecked(self.arduino_enabled)
-        self.chk_enable_arduino.toggled.connect(self.on_arduino_toggled)
-        ag_layout.addWidget(self.chk_enable_arduino, 3, 0, 1, 3)
-
-        ag_layout.addWidget(QLabel("Classifier model (.pkl):"), 4, 0)
-        self.le_model_path = QLineEdit(self.classifier_model_path)
-        self.le_model_path.setReadOnly(True)
-        ag_layout.addWidget(self.le_model_path, 4, 1)
-        self.btn_browse_model = QPushButton("Browse...")
-        self.btn_browse_model.clicked.connect(self.on_browse_model)
-        ag_layout.addWidget(self.btn_browse_model, 4, 2)
-
-        # MANUAL TEST BUTTONS
-        ag_layout.addWidget(QLabel("Manual test:"), 5, 0)
-        self.btn_send_1 = QPushButton("Send '1' (close exo)")
+        manual_box = QGroupBox("Manual exo / actuator test")
+        man_row = QHBoxLayout(manual_box)
+        self.btn_send_1 = QPushButton("Send '1' (close)")
+        self.btn_send_1.setMaximumWidth(140)
         self.btn_send_1.clicked.connect(self.on_send_arduino_one)
-        ag_layout.addWidget(self.btn_send_1, 5, 1)
-
-        self.btn_send_0 = QPushButton("Send '0' (open exo)")
+        self.btn_send_0 = QPushButton("Send '0' (open)")
+        self.btn_send_0.setMaximumWidth(140)
         self.btn_send_0.clicked.connect(self.on_send_arduino_zero)
-        ag_layout.addWidget(self.btn_send_0, 5, 2)
+        man_row.addWidget(self.btn_send_1)
+        man_row.addWidget(self.btn_send_0)
+        man_row.addStretch(1)
+        ag_outer.addWidget(manual_box)
 
         grid.addWidget(arduino_group, row, 0, 1, 5)
         row += 1
@@ -548,53 +678,330 @@ class ControlPanel(QMainWindow):
         vl.addLayout(pick_row)
         vl.addWidget(self.txt_logs, 1)
 
-        # Robot Test tab
-        robot_tab = QWidget(); tabs.addTab(robot_tab, "Robot Test")
+        robot_tab = QWidget()
+        tabs.addTab(robot_tab, "Robot Test")
         rt = QVBoxLayout(robot_tab)
 
+        udp_row = QHBoxLayout()
         btn_open_udp_robot = QPushButton("Open UDPRobot.py (terminal)")
+        btn_open_udp_robot.setMaximumWidth(280)
         btn_open_udp_robot.clicked.connect(
             lambda: self._spawn_external(f'python -u "{os.path.join(ROOT, "UDPRobot.py")}"')
         )
-        rt.addWidget(btn_open_udp_robot)
+        udp_row.addWidget(btn_open_udp_robot)
+        udp_row.addStretch(1)
+        rt.addLayout(udp_row)
 
-        # --- New Harmony controls on tab 2 ---
-        harmony_box = QGroupBox("Harmony Calibration / Online Control")
-        hb = QGridLayout(harmony_box)
-
-        hb.addWidget(QLabel("Calibration library:"), 0, 0)
-
+        harmony_box = QGroupBox("Harmony calibration / online control")
+        hb = QVBoxLayout(harmony_box)
+        lib_row = QHBoxLayout()
+        lib_row.addWidget(QLabel("Calibration library:"))
         self.cmb_calibration_lib = QComboBox()
-        hb.addWidget(self.cmb_calibration_lib, 0, 1)
-
+        lib_row.addWidget(self.cmb_calibration_lib, 1)
         self.btn_refresh_calibration_libs = QPushButton("Refresh")
+        self.btn_refresh_calibration_libs.setMaximumWidth(90)
         self.btn_refresh_calibration_libs.clicked.connect(self.on_refresh_calibration_libs)
-        hb.addWidget(self.btn_refresh_calibration_libs, 0, 2)
+        lib_row.addWidget(self.btn_refresh_calibration_libs)
+        hb.addLayout(lib_row)
 
+        hbtn_row = QHBoxLayout()
         self.btn_run_harmony_calibration = QPushButton("Run harmony_calibration_exec.py")
+        self.btn_run_harmony_calibration.setMaximumWidth(260)
         self.btn_run_harmony_calibration.clicked.connect(self.on_run_harmony_calibration)
-        hb.addWidget(self.btn_run_harmony_calibration, 1, 0, 1, 3)
-
         self.btn_run_harmony_online = QPushButton("Run harmony_online_control.py")
+        self.btn_run_harmony_online.setMaximumWidth(240)
         self.btn_run_harmony_online.clicked.connect(self.on_run_harmony_online_control)
-        hb.addWidget(self.btn_run_harmony_online, 2, 0, 1, 3)
-
+        hbtn_row.addWidget(self.btn_run_harmony_calibration)
+        hbtn_row.addWidget(self.btn_run_harmony_online)
+        hbtn_row.addStretch(1)
+        hb.addLayout(hbtn_row)
         rt.addWidget(harmony_box)
+
+        train_box = QGroupBox("Model training (uses config.py DATA_DIR + subject below)")
+        tv = QVBoxLayout(train_box)
+        self.lbl_training_subject_ctx = QLabel("")
+        self.lbl_training_subject_ctx.setWordWrap(True)
+        tv.addWidget(self.lbl_training_subject_ctx)
+        trow = QHBoxLayout()
+        trow.addWidget(QLabel("Script:"))
+        self.cmb_train_script = QComboBox()
+        trow.addWidget(self.cmb_train_script, 1)
+        self.btn_refresh_training_data = QPushButton("Refresh data list")
+        self.btn_refresh_training_data.setMaximumWidth(130)
+        self.btn_refresh_training_data.clicked.connect(self.on_refresh_training_data_list)
+        trow.addWidget(self.btn_refresh_training_data)
+        tv.addLayout(trow)
+        self.lst_training_files = QListWidget()
+        self.lst_training_files.setMaximumHeight(140)
+        tv.addWidget(self.lst_training_files)
+        self.lbl_train_cmd_preview = QLabel("")
+        self.lbl_train_cmd_preview.setWordWrap(True)
+        self.lbl_train_cmd_preview.setStyleSheet("color: #666; font-family: monospace;")
+        tv.addWidget(self.lbl_train_cmd_preview)
+        train_btn_row = QHBoxLayout()
+        self.btn_launch_training = QPushButton("Launch training (terminal)")
+        self.btn_launch_training.clicked.connect(self.on_launch_model_training)
+        self.btn_launch_training.setMaximumWidth(220)
+        train_btn_row.addWidget(self.btn_launch_training)
+        train_btn_row.addStretch(1)
+        tv.addLayout(train_btn_row)
+        rt.addWidget(train_box)
 
         self.txt_udp_log = QTextEdit()
         self.txt_udp_log.setReadOnly(True)
-        self.txt_udp_log.setMaximumHeight(180)
+        self.txt_udp_log.setMaximumHeight(140)
         rt.addWidget(QLabel("Notes:"))
         rt.addWidget(self.txt_udp_log)
+
+        self._populate_training_script_combo()
+        self._build_runtime_config_tab(tabs)
 
         # Initial serial refresh
         self.on_serial_refresh()
         self.on_refresh_calibration_libs()
+        self.on_refresh_training_data_list()
 
         self._building_ui = False
         self._refresh_log_view()
 
         self._update_robot_buttons_for_mode()
+
+    def _build_runtime_config_tab(self, tabs: QTabWidget):
+        rtc = QWidget()
+        tabs.addTab(rtc, "Runtime config")
+        outer = QVBoxLayout(rtc)
+        outer.addWidget(QLabel(
+            "<b>Edits config.py on disk.</b> Restart Marker/Driver/FES after changing simulation "
+            "or network flags (<code>Utils/networking</code> caches SIMULATION_MODE at import)."
+        ))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        form = QFormLayout(inner)
+        self.rc_decoder = QComboBox()
+        self.rc_decoder.addItems(["mdm", "xgb_cov", "xgb_cov_erd"])
+        self.rc_earlystop = QComboBox()
+        self.rc_earlystop.addItems(["either", "correct_only"])
+        self.rc_visual = QComboBox()
+        self.rc_visual.addItems(["classic", "modern"])
+        self.rc_th_mi = QDoubleSpinBox()
+        self.rc_th_mi.setRange(0.0, 1.0)
+        self.rc_th_mi.setSingleStep(0.01)
+        self.rc_th_mi.setDecimals(3)
+        self.rc_th_rest = QDoubleSpinBox()
+        self.rc_th_rest.setRange(0.0, 1.0)
+        self.rc_th_rest.setSingleStep(0.01)
+        self.rc_th_rest.setDecimals(3)
+        self.rc_int_alpha = QDoubleSpinBox()
+        self.rc_int_alpha.setRange(0.0, 1.0)
+        self.rc_int_alpha.setSingleStep(0.01)
+        self.rc_int_alpha.setDecimals(3)
+        self.rc_classify_ms = QSpinBox()
+        self.rc_classify_ms.setRange(100, 8000)
+        self.rc_min_pred = QSpinBox()
+        self.rc_min_pred.setRange(1, 500)
+        self.rc_time_mi = QSpinBox()
+        self.rc_time_mi.setRange(1, 300)
+        self.rc_time_rob = QSpinBox()
+        self.rc_time_rob.setRange(1, 300)
+        self.rc_big_brother = QCheckBox("BIG_BROTHER_MODE (second display layout)")
+        self.rc_send_probs = QCheckBox("SEND_PROBS (extra UDP probability traffic)")
+        self.rc_use_prev = QCheckBox("USE_PREVIOUS_ONLINE_STATS")
+        self.rc_eog = QCheckBox("EOG_TOGGLE")
+        self.rc_recentering = QCheckBox("RECENTERING")
+        self.rc_update_move = QCheckBox("UPDATE_DURING_MOVE")
+        self.rc_laplacian = QCheckBox("SURFACE_LAPLACIAN_TOGGLE")
+        self.rc_sel_motor = QCheckBox("SELECT_MOTOR_CHANNELS")
+        self.rc_sel_errp = QCheckBox("SELECT_ERRP_CHANNELS")
+        form.addRow("DECODER_BACKEND", self.rc_decoder)
+        form.addRow("EARLYSTOP_MODE", self.rc_earlystop)
+        form.addRow("CLASS_VISUAL_STYLE", self.rc_visual)
+        form.addRow("THRESHOLD_MI", self.rc_th_mi)
+        form.addRow("THRESHOLD_REST", self.rc_th_rest)
+        form.addRow("INTEGRATOR_ALPHA", self.rc_int_alpha)
+        form.addRow("CLASSIFY_WINDOW (ms)", self.rc_classify_ms)
+        form.addRow("MIN_PREDICTIONS", self.rc_min_pred)
+        form.addRow("TIME_MI (s)", self.rc_time_mi)
+        form.addRow("TIME_ROB (s)", self.rc_time_rob)
+        form.addRow(self.rc_big_brother)
+        form.addRow(self.rc_send_probs)
+        form.addRow(self.rc_use_prev)
+        form.addRow(self.rc_eog)
+        form.addRow(self.rc_recentering)
+        form.addRow(self.rc_update_move)
+        form.addRow(self.rc_laplacian)
+        form.addRow(self.rc_sel_motor)
+        form.addRow(self.rc_sel_errp)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
+        btn_row = QHBoxLayout()
+        btn_reload = QPushButton("Reload from config.py")
+        btn_reload.clicked.connect(self.on_runtime_reload_config)
+        btn_apply = QPushButton("Apply to config.py")
+        btn_apply.clicked.connect(self.on_runtime_apply_config)
+        btn_row.addWidget(btn_reload)
+        btn_row.addWidget(btn_apply)
+        btn_row.addStretch(1)
+        outer.addLayout(btn_row)
+        self.on_runtime_reload_config()
+
+    def _rc_set_combo(self, cb: QComboBox, text: str, fallback_index: int = 0):
+        idx = cb.findText(text)
+        cb.setCurrentIndex(idx if idx >= 0 else fallback_index)
+
+    def on_runtime_reload_config(self):
+        if not hasattr(self, "rc_decoder"):
+            return
+        self._rc_set_combo(self.rc_decoder, _read_quoted_str_key("DECODER_BACKEND", "mdm"))
+        self._rc_set_combo(self.rc_earlystop, _read_quoted_str_key("EARLYSTOP_MODE", "either"))
+        vis = _read_quoted_str_key("CLASS_VISUAL_STYLE", "classic")
+        self._rc_set_combo(self.rc_visual, vis if vis in ("classic", "modern") else "classic")
+        self.rc_th_mi.setValue(_read_float_key("THRESHOLD_MI", 0.65))
+        self.rc_th_rest.setValue(_read_float_key("THRESHOLD_REST", 0.65))
+        self.rc_int_alpha.setValue(_read_float_key("INTEGRATOR_ALPHA", 0.96))
+        self.rc_classify_ms.setValue(_read_int_key("CLASSIFY_WINDOW", 1000))
+        self.rc_min_pred.setValue(_read_int_key("MIN_PREDICTIONS", 8))
+        self.rc_time_mi.setValue(_read_int_key("TIME_MI", 5))
+        self.rc_time_rob.setValue(_read_int_key("TIME_ROB", 7))
+        self.rc_big_brother.setChecked(_read_bool_key("BIG_BROTHER_MODE", True))
+        self.rc_send_probs.setChecked(_read_bool_key("SEND_PROBS", False))
+        self.rc_use_prev.setChecked(_read_bool_key("USE_PREVIOUS_ONLINE_STATS", False))
+        self.rc_eog.setChecked(bool(_read_01_key("EOG_TOGGLE", 0)))
+        self.rc_recentering.setChecked(bool(_read_01_key("RECENTERING", 1)))
+        self.rc_update_move.setChecked(bool(_read_01_key("UPDATE_DURING_MOVE", 0)))
+        self.rc_laplacian.setChecked(bool(_read_01_key("SURFACE_LAPLACIAN_TOGGLE", 1)))
+        self.rc_sel_motor.setChecked(bool(_read_01_key("SELECT_MOTOR_CHANNELS", 1)))
+        self.rc_sel_errp.setChecked(bool(_read_01_key("SELECT_ERRP_CHANNELS", 0)))
+        self._append_log("Panel", f"[{self._ts()}] Runtime config widgets reloaded from config.py\n")
+
+    def on_runtime_apply_config(self):
+        try:
+            def _fmtf(x: float) -> str:
+                t = f"{x:.6f}".rstrip("0").rstrip(".")
+                return t if t else "0"
+
+            _write_assign_rhs("DECODER_BACKEND", f'"{self.rc_decoder.currentText()}"')
+            _write_assign_rhs("EARLYSTOP_MODE", f'"{self.rc_earlystop.currentText()}"')
+            _write_assign_rhs("CLASS_VISUAL_STYLE", f'"{self.rc_visual.currentText()}"')
+            _write_assign_rhs("THRESHOLD_MI", _fmtf(self.rc_th_mi.value()))
+            _write_assign_rhs("THRESHOLD_REST", _fmtf(self.rc_th_rest.value()))
+            _write_assign_rhs("INTEGRATOR_ALPHA", _fmtf(self.rc_int_alpha.value()))
+            _write_assign_rhs("CLASSIFY_WINDOW", str(self.rc_classify_ms.value()))
+            _write_assign_rhs("MIN_PREDICTIONS", str(self.rc_min_pred.value()))
+            _write_assign_rhs("TIME_MI", str(self.rc_time_mi.value()))
+            _write_assign_rhs("TIME_ROB", str(self.rc_time_rob.value()))
+            _write_assign_rhs("BIG_BROTHER_MODE", "True" if self.rc_big_brother.isChecked() else "False")
+            _write_assign_rhs("SEND_PROBS", "True" if self.rc_send_probs.isChecked() else "False")
+            _write_assign_rhs("USE_PREVIOUS_ONLINE_STATS", "True" if self.rc_use_prev.isChecked() else "False")
+            _write_assign_rhs("EOG_TOGGLE", "1" if self.rc_eog.isChecked() else "0")
+            _write_assign_rhs("RECENTERING", "1" if self.rc_recentering.isChecked() else "0")
+            _write_assign_rhs("UPDATE_DURING_MOVE", "1" if self.rc_update_move.isChecked() else "0")
+            _write_assign_rhs("SURFACE_LAPLACIAN_TOGGLE", "1" if self.rc_laplacian.isChecked() else "0")
+            _write_assign_rhs("SELECT_MOTOR_CHANNELS", "1" if self.rc_sel_motor.isChecked() else "0")
+            _write_assign_rhs("SELECT_ERRP_CHANNELS", "1" if self.rc_sel_errp.isChecked() else "0")
+        except Exception as e:
+            QMessageBox.warning(self, "config.py", f"Failed to update config.py:\n{e}")
+            self._append_log("Panel", f"[{self._ts()}] Runtime config apply FAILED: {e}\n")
+            return
+        self._append_log("Panel", f"[{self._ts()}] Runtime config written to config.py\n")
+        QMessageBox.information(
+            self, "Runtime config",
+            "config.py updated. Restart experiment driver / marker stream if a process "
+            "was already running so it reloads settings.",
+        )
+
+    def _populate_training_script_combo(self):
+        if not hasattr(self, "cmb_train_script"):
+            return
+        self.cmb_train_script.blockSignals(True)
+        self.cmb_train_script.clear()
+        for label, fname in TRAINING_SCRIPT_ENTRIES:
+            path = os.path.join(ROOT, fname)
+            if os.path.isfile(path):
+                self.cmb_train_script.addItem(label, path)
+        if self.cmb_train_script.count() == 0:
+            self.cmb_train_script.addItem("No training scripts found", "")
+        self.cmb_train_script.blockSignals(False)
+        self.cmb_train_script.currentIndexChanged.connect(self._update_train_cmd_preview)
+
+    def _update_train_cmd_preview(self, *_args):
+        if not hasattr(self, "lbl_train_cmd_preview"):
+            return
+        script = self.cmb_train_script.currentData()
+        if script and os.path.isfile(script):
+            self.lbl_train_cmd_preview.setText(f'cd "{ROOT}" && python -u "{script}"')
+        else:
+            self.lbl_train_cmd_preview.setText("(no script selected)")
+
+    def on_refresh_training_data_list(self):
+        if not hasattr(self, "lst_training_files"):
+            return
+        sub = (self.cmb_subject.currentText().strip() if hasattr(self, "cmb_subject") else "") or self.training_subject
+        if _HCFG is None:
+            self.lbl_training_subject_ctx.setText("DATA_DIR not available (config import failed).")
+            self.btn_launch_training.setEnabled(False)
+            self._update_train_cmd_preview()
+            return
+        data_dir = os.path.expanduser(getattr(_HCFG, "DATA_DIR", "") or "")
+        tdir = os.path.join(data_dir, f"sub-{sub}", "training_data")
+        self.lbl_training_subject_ctx.setText(f"<b>Subject:</b> {sub}<br><b>training_data:</b> {tdir}")
+        self.lst_training_files.clear()
+        xdffc = []
+        if os.path.isdir(tdir):
+            for fn in sorted(os.listdir(tdir)):
+                if fn.lower().endswith(".xdf"):
+                    full = os.path.join(tdir, fn)
+                    try:
+                        mtime = os.path.getmtime(full)
+                        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+                    except OSError:
+                        ts = "?"
+                    self.lst_training_files.addItem(f"{fn}  ({ts})")
+                    xdffc.append(full)
+        script_ok = bool(self.cmb_train_script.currentData()) and os.path.isfile(self.cmb_train_script.currentData() or "")
+        self.btn_launch_training.setEnabled(len(xdffc) > 0 and script_ok)
+        self._update_train_cmd_preview()
+
+    def on_launch_model_training(self):
+        script = self.cmb_train_script.currentData()
+        if not script or not os.path.isfile(script):
+            QMessageBox.warning(self, "Training", "Select a valid training script.")
+            return
+        sub = (self.cmb_subject.currentText().strip() or self.training_subject)
+        if _HCFG is None:
+            QMessageBox.warning(self, "Training", "config module not loaded.")
+            return
+        data_dir = os.path.expanduser(getattr(_HCFG, "DATA_DIR", "") or "")
+        tdir = os.path.join(data_dir, f"sub-{sub}", "training_data")
+        if not os.path.isdir(tdir):
+            QMessageBox.warning(self, "Training", f"training_data folder not found:\n{tdir}")
+            return
+        xdffc = [f for f in os.listdir(tdir) if f.lower().endswith(".xdf")]
+        if not xdffc:
+            QMessageBox.warning(self, "Training", "No .xdf files in training_data.")
+            return
+        cmd = f'python -u "{script}"'
+        self._spawn_external(cmd)
+        self._append_log("Panel", f"[{self._ts()}] Launched training: {cmd}\n")
+
+    def on_save_serial_to_config(self):
+        port = (self.serial_port_name or self.cmb_serial_port.currentData() or "").strip()
+        if not port:
+            QMessageBox.warning(self, "Serial", "Select a serial port first.")
+            return
+        try:
+            baud = int(self.le_serial_baud.text().strip())
+        except ValueError:
+            QMessageBox.warning(self, "Serial", "Baud must be an integer.")
+            return
+        try:
+            write_arduino_port_to_config(port)
+            write_arduino_baud_to_config(baud)
+        except Exception as e:
+            QMessageBox.warning(self, "config.py", f"Failed to write Arduino settings:\n{e}")
+            return
+        self._append_log("Panel", f"[{self._ts()}] Saved ARDUINO_PORT={port} ARDUINO_BAUD={baud} to config.py\n")
+        QMessageBox.information(self, "Serial", "ARDUINO_PORT and ARDUINO_BAUD saved to config.py.")
 
     # ---------- LED helper ----------
     def _set_led(self, label: QLabel, state: str):
@@ -633,10 +1040,8 @@ class ControlPanel(QMainWindow):
         for p in (self.marker, self.driver, self.fes, self.gaze_runner, self.gaze_service):
             p.env["PYTHONUNBUFFERED"] = "1"
             p.env["TRAINING_SUBJECT"] = self.training_subject
-            p.env["ARDUINO_ENABLED"]   = "1" if getattr(self, "arduino_enabled", False) else "0"
             p.env["ARDUINO_PORT"]      = getattr(self, "serial_port_name", "") or ""
             p.env["ARDUINO_BAUD"]      = str(getattr(self, "serial_baudrate", "9600"))
-            p.env["BCI_MODEL_PATH"]    = getattr(self, "classifier_model_path", "") or ""
 
         self._update_robot_buttons_for_mode()
 
@@ -684,6 +1089,8 @@ class ControlPanel(QMainWindow):
         for p in (self.marker, self.driver, self.fes, self.gaze_runner, self.gaze_service):
             p.env["TRAINING_SUBJECT"] = self.training_subject
         self._append_log("Panel", f"[{self._ts()}] TRAINING_SUBJECT saved: {val}\n")
+        if hasattr(self, "on_refresh_training_data_list"):
+            self.on_refresh_training_data_list()
 
     def on_copy_subject(self):
         val = self.cmb_subject.currentText().strip()
@@ -1068,27 +1475,6 @@ class ControlPanel(QMainWindow):
 
     def on_send_arduino_zero(self):
         self._send_arduino_manual_value("0")
-
-    def on_arduino_toggled(self, checked: bool):
-        self.arduino_enabled = bool(checked)
-        state_txt = "ENABLED" if self.arduino_enabled else "DISABLED"
-        self._append_log("Panel", f"[{self._ts()}] Arduino control {state_txt}\n")
-        self._set_cmds_for_mode_and_driver()
-
-    def on_browse_model(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select classifier model (.pkl)",
-            ROOT,
-            "Pickle files (*.pkl);;All files (*.*)"
-        )
-        if not path:
-            return
-        self.classifier_model_path = path
-        self.le_model_path.setText(path)
-        self._append_log("Panel", f"[{self._ts()}] Classifier model selected:\n  {path}\n")
-        self._set_cmds_for_mode_and_driver()
-
 
     # ----- Harmony calibration / online control -----
     def on_refresh_calibration_libs(self):
