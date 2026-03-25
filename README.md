@@ -265,6 +265,12 @@ The drivers in this repo are “modular” in what they require:
 
 ## 8. Development Notes
 
+- **Changelog and project log**  
+  - **`CHANGELOG.md`**: notable integration changes, plus operational tables (config shadowing, hardware checklist, obsolete-script tombstones). Update **[Unreleased]** when behavior visible to operators or analysts changes.  
+  - **Optional Git hooks:** to get **reminders** (not auto-edits) when changing core paths without updating the changelog, enable hooks once per clone:
+    - `git config core.hooksPath .githooks`  
+    - See `.githooks/README.md` for details.
+
 - **Reuse utilities in `Utils/`**
   - Before adding new helpers, check for existing functions in `Utils/`, `Utils/gaze/`, `STM_interface/`, and `OBS/`.  
   - Extend or wrap existing utilities when possible instead of duplicating logic.
