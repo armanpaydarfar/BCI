@@ -181,10 +181,27 @@ APPLY_CSD = True
 #   "logratio" -> plot metrics in logratio units
 PLOT_SPACE = "percent"  # "percent" or "logratio"
 
-# ---- Optional: limiting to specific index range (kept from your script) ----
-LIMIT_EPOCH_RANGE = False
-EPOCH_RANGE_START_IDX = 0
-EPOCH_RANGE_END_IDX = 70
+# ---- Epoch / trial subset selection ----
+# This limits which epochs/trials get used in the downstream plots/metrics.
+# Applied AFTER channel rejection/drop and AFTER optional CSD.
+#
+# MODE:
+#   "none"       -> keep all epochs
+#   "range"      -> continuous slice [START, END) per marker
+#   "first_last" -> first FIRST_N + last LAST_N (non-contiguous) per marker
+#   "middle"     -> middle MIDDLE_N centered per marker
+EPOCH_SUBSET_MODE = "none"  # "none" | "range" | "first_last" | "middle"
+
+# ---- "range" mode ----
+EPOCH_SUBSET_RANGE_START_IDX = 0
+EPOCH_SUBSET_RANGE_END_IDX = 70
+
+# ---- "first_last" mode ----
+EPOCH_SUBSET_FIRST_N = 20
+EPOCH_SUBSET_LAST_N = 20
+
+# ---- "middle" mode ----
+EPOCH_SUBSET_MIDDLE_N = 60
 
 
 # =========================================================
@@ -751,25 +768,72 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
         epochs = mne.preprocessing.compute_current_source_density(epochs)
         print("✅ Applied CSD to epochs (after rejection).")
 
-    # ---- Optional: limiting to specific index range (kept from your script) ----
-    if LIMIT_EPOCH_RANGE:
-        start_idx, end_idx = EPOCH_RANGE_START_IDX, EPOCH_RANGE_END_IDX
+    # ---- Optional: select subset of epochs/trials ----
+    if str(EPOCH_SUBSET_MODE).lower() != "none":
+        mode = str(EPOCH_SUBSET_MODE).lower()
         subset = []
-        for code in ["100", "200"]:
-            if code in epochs.event_id:
-                ep = epochs[code]
-                total = len(ep)
-                if end_idx > total:
-                    print(f"⚠️ Requested {end_idx} epochs but only {total} available "
-                          f"for marker {code}; trimming.")
-                    end_local = total
-                else:
-                    end_local = end_idx
+
+        def _select_first_last(ep: mne.Epochs, first_n: int, last_n: int) -> Optional[mne.Epochs]:
+            total = len(ep)
+            first_n = int(max(0, min(first_n, total)))
+            last_n = int(max(0, min(last_n, total - first_n)))
+            if first_n == 0 and last_n == 0:
+                return None
+            parts = []
+            if first_n > 0:
+                parts.append(ep[:first_n])
+            if last_n > 0:
+                parts.append(ep[total - last_n :])
+            if not parts:
+                return None
+            if len(parts) == 1:
+                return parts[0]
+            return mne.concatenate_epochs(parts)
+
+        def _select_middle(ep: mne.Epochs, middle_n: int) -> Optional[mne.Epochs]:
+            total = len(ep)
+            middle_n = int(max(0, middle_n))
+            if middle_n == 0:
+                return None
+            if middle_n >= total:
+                return ep
+            start = (total - middle_n) // 2
+            end = start + middle_n
+            return ep[start:end]
+
+        for code in MARKERS_FOR_ANALYSIS:
+            if code not in epochs.event_id:
+                continue
+            ep = epochs[code]
+            total = len(ep)
+            if total == 0:
+                continue
+
+            if mode == "range":
+                start_idx = int(EPOCH_SUBSET_RANGE_START_IDX)
+                end_idx = int(EPOCH_SUBSET_RANGE_END_IDX)
+                start_idx = max(0, min(start_idx, total))
+                end_local = max(0, min(end_idx, total))
+                if end_local <= start_idx:
+                    print(f"⚠️ Empty selection for marker {code} in range mode; skipping.")
+                    continue
                 subset.append(ep[start_idx:end_local])
+            elif mode == "first_last":
+                part = _select_first_last(ep, EPOCH_SUBSET_FIRST_N, EPOCH_SUBSET_LAST_N)
+                if part is not None and len(part) > 0:
+                    subset.append(part)
+            elif mode == "middle":
+                part = _select_middle(ep, EPOCH_SUBSET_MIDDLE_N)
+                if part is not None and len(part) > 0:
+                    subset.append(part)
+            else:
+                raise ValueError(
+                    f"EPOCH_SUBSET_MODE must be one of none|range|first_last|middle; got {EPOCH_SUBSET_MODE!r}"
+                )
 
         if subset:
             epochs = mne.concatenate_epochs(subset)
-            print(f"✅ Final subset across markers has {len(epochs)} epochs.")
+            print(f"✅ Epoch subset mode={mode!s}: final epochs across markers has {len(epochs)} epochs.")
         else:
             print("⚠️ No epochs selected after subsetting.")
 
