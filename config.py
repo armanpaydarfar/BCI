@@ -227,6 +227,8 @@ TRIGGERS = {
     "ACK_ROBOT_HOME": "385",
     "ERRP_BEGIN": "400",
     "ERRP_END": "420",
+    "ERRP_STIM_ERROR": "430",      # Dedicated ErrP: unexpected robot stop (error condition)
+    "ERRP_STIM_CORRECT": "440",    # Dedicated ErrP: normal robot completion (correct condition)
     "REST_BEGIN": "100",
     "REST_END": "120",
     "REST_EARLYSTOP": "140",
@@ -261,6 +263,38 @@ ARDUINO_PORT = "/dev/ttyACM0"
 ARDUINO_BAUD = 9600
 ARDUINO_CMD_MI   = b"1"
 ARDUINO_CMD_REST = b"0"
+
+# =============================================================================
+# ErrP decoder
+# =============================================================================
+# Master toggle: 0 = ErrP pipeline disabled (MI pipeline unaffected), 1 = enabled
+ERRP_DECODER_ENABLE = 0
+# Classifier backend: "xdawn_mdm" (MDM on Riemannian manifold, simpler, zero hyperparams)
+#                  or "xdawn_lr"  (TangentSpace + LogisticRegression, slightly more flexible)
+ERRP_DECODER_BACKEND = "xdawn_mdm"
+# Epoch window anchored at the event marker (seconds post-event)
+# 0-800 ms captures ERN (~80-150 ms) and Pe (~200-400 ms)
+ERRP_EPOCH_TMIN = 0.0
+ERRP_EPOCH_TMAX = 0.8
+# xDAWN spatial filters per class (4 is the standard for P300/ErrP paradigms)
+ERRP_XDAWN_N_FILTERS = 4
+# Dual-threshold ambiguity target for ErrP (fraction of trials allowed to be ambiguous)
+ERRP_TARGET_AMBIG = 0.20
+# LogisticRegression regularization (xdawn_lr backend only)
+ERRP_LR_C = 1.0
+# Artifact rejection threshold for ErrP epochs (µV, max_abs on 1-10 Hz filtered signal)
+# More generous than MI (80 vs 30 µV) because ErrP epochs are wider-band and lower-freq
+ERRP_ARTIFACT_MAX_ABS_UV = 80.0
+
+# =============================================================================
+# ErrP experiment paradigm (ExperimentDriver_ErrP.py)
+# =============================================================================
+# Probability that the robot stops unexpectedly mid-trajectory (error condition)
+ERRP_P_STOP = 0.5
+# Minimum time into the robot trajectory before an unexpected stop can occur (s)
+ERRP_STOP_TMIN = 1.0
+# Maximum stop time as a fraction of TIME_ROB (e.g. 0.7 = stops within first 70% of move)
+ERRP_STOP_TMAX_FRACTION = 0.7
 
 # =============================================================================
 # Global runtime flags

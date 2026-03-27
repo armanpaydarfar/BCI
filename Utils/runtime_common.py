@@ -56,6 +56,9 @@ Prev_T_beta = None
 counter_beta = 0
 _decoder_checked = False
 
+# ErrP decoder state (loaded separately; gated on config.ERRP_DECODER_ENABLE)
+errp_model = None
+
 
 # ----------------- Common helpers -----------------
 
@@ -875,3 +878,119 @@ def show_feedback(duration=5, mode=0, eeg_state=None,
     send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_END" if mode==0 else "REST_END"], logger=logger)
     pygame.time.delay(300)  # ~300 ms delay to allow the visual feedback to complete rendering
     return final_class, running_avg_confidence, leaky_integrator, all_probabilities, earlystop_flag
+
+
+# =============================================================================
+# ErrP decoder — load and real-time classification
+# =============================================================================
+# These functions are gated on config.ERRP_DECODER_ENABLE and are fully
+# independent of the MI pipeline. Calling them when ERRP_DECODER_ENABLE == 0
+# is a no-op. The MI model, thresholds, and adaptive recentering state are
+# untouched by any ErrP function.
+# =============================================================================
+
+def load_errp_model(path: str) -> bool:
+    """
+    Load the ErrP model bundle from `path` into the module-level `errp_model` global.
+
+    The bundle is a dict produced by generate_errp_decoder.py:
+      {
+        "xdawn":        fitted XdawnCovariances,
+        "classifier":   fitted MDM or Pipeline(TangentSpace, LogisticRegression),
+        "backend":      "xdawn_mdm" | "xdawn_lr",
+        "tl_star":      float,   # lower decision threshold (below → correct / no-ErrP)
+        "th_star":      float,   # upper decision threshold (above → error / ErrP)
+        "feature_spec": { "tmin", "tmax", "epoch_samples", "n_filters", "ch_names", ... },
+        ...
+      }
+
+    Returns True on success, False on failure (logs the error).
+    """
+    global errp_model
+    import pickle
+    try:
+        with open(path, "rb") as fh:
+            errp_model = pickle.load(fh)
+        if logger:
+            logger.log_event(
+                f"✅ ErrP model loaded: {path}  "
+                f"backend={errp_model.get('backend','?')}  "
+                f"tl={errp_model.get('tl_star', float('nan')):.3f}  "
+                f"th={errp_model.get('th_star', float('nan')):.3f}"
+            )
+        return True
+    except FileNotFoundError:
+        if logger:
+            logger.log_event(f"❌ ErrP model not found: {path}", level="error")
+        return False
+    except Exception as exc:
+        if logger:
+            logger.log_event(f"❌ ErrP model load failed: {exc}", level="error")
+        return False
+
+
+def classify_errp_real_time(eeg_state) -> tuple[float, int | None]:
+    """
+    Classify a single ErrP epoch from the real-time EEG buffer.
+
+    This function is the ErrP equivalent of `classify_real_time`. It:
+      1. Extracts a fixed-length window from EEGStreamState (mode="errp")
+         equal to the epoch length used during training (ERRP_EPOCH_TMAX s).
+      2. Applies the fitted xDAWN spatial filter via XdawnCovariances.transform
+         (deterministic linear operation — fully causal, no lookahead).
+      3. Predicts P(error) via MDM.predict_proba or TangentSpace+LR.
+      4. Returns (prob_error, decision) where decision is:
+             1  → ErrP detected  (P(error) >= th_star)
+             0  → No ErrP        (P(error) <= tl_star)
+            None → Ambiguous      (between thresholds)
+
+    Args:
+        eeg_state: EEGStreamState initialised with mode="errp"
+
+    Returns:
+        (prob_error, decision)
+        prob_error: float in [0, 1] — probability of perceived error
+        decision:   1 / 0 / None
+    """
+    global errp_model
+
+    _errp_enable = bool(getattr(config, "ERRP_DECODER_ENABLE", 0))
+    if not _errp_enable or errp_model is None:
+        return 0.0, None
+
+    spec          = errp_model.get("feature_spec", {})
+    tmin          = float(spec.get("tmin", getattr(config, "ERRP_EPOCH_TMIN", 0.0)))
+    tmax          = float(spec.get("tmax", getattr(config, "ERRP_EPOCH_TMAX", 0.8)))
+    epoch_samples = int(spec.get("epoch_samples", int(round((tmax - tmin) * config.FS))))
+    tl            = float(errp_model.get("tl_star", 0.3))
+    th            = float(errp_model.get("th_star", 0.7))
+
+    try:
+        window, _ = eeg_state.get_baseline_corrected_window(epoch_samples)
+        # window: (n_channels, epoch_samples)
+    except ValueError:
+        # Buffer not yet full — not enough data
+        return 0.0, None
+
+    # xDAWN transform expects (n_trials, n_channels, n_times)
+    epoch_3d = window[np.newaxis]   # (1, n_ch, n_times)
+
+    try:
+        xdc       = errp_model["xdawn"]
+        clf       = errp_model["classifier"]
+        cov_aug   = xdc.transform(epoch_3d)        # (1, aug_size, aug_size)
+        prob_err  = float(clf.predict_proba(cov_aug)[0, 1])   # column 1 = P(error)
+    except Exception as exc:
+        if logger:
+            logger.log_event(f"⚠️ ErrP classification failed: {exc}")
+        return 0.0, None
+
+    # Dual-threshold decision
+    if prob_err >= th:
+        decision = 1      # ErrP — error perceived
+    elif prob_err <= tl:
+        decision = 0      # No ErrP — correct perceived
+    else:
+        decision = None   # Ambiguous
+
+    return prob_err, decision
