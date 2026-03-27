@@ -77,6 +77,7 @@ DRIVER_ONLINE_GAZE_PY = os.path.join(ROOT, "ExperimentDriver_Online_GazeTracking
 DRIVER_ONLINE_GLOVE_PY = os.path.join(ROOT, "ExperimentDriver_Online_Glove.py")
 DRIVER_BIMANUAL_PY = os.path.join(ROOT, "ExperimentDriver_Bimanual.py")
 DRIVER_OFFLINE_PY = os.path.join(ROOT, "ExperimentDriver_Offline.py")
+DRIVER_ERRP_ONLINE_PY = os.path.join(ROOT, "ExperimentDriver_ErrP_Online.py")
 FES_PY = os.path.join(ROOT, "FES_listener.py")
 STMSETUP_PY = os.path.join(ROOT, "STMsetup.py")
 INIT_SH = os.path.join(ROOT, "initialize_devices.sh")
@@ -105,6 +106,7 @@ MODES = ["Gaze_Tracking", "MI_Bimanual", "Simulation"]
 # Driver choices
 DRIVERS = [
     "ExperimentDriver_Online",
+    "ExperimentDriver_ErrP_Online",
     "ExperimentDriver_Bimanual",
     "ExperimentDriver_Offline",
     "ExperimentDriver_Online_GazeTracking",
@@ -1044,6 +1046,8 @@ class ControlPanel(QMainWindow):
 
         if self.driver_choice == "ExperimentDriver_Online":
             driver_path = DRIVER_ONLINE_PY
+        elif self.driver_choice == "ExperimentDriver_ErrP_Online":
+            driver_path = DRIVER_ERRP_ONLINE_PY
         elif self.driver_choice == "ExperimentDriver_Bimanual":
             driver_path = DRIVER_BIMANUAL_PY
         elif self.driver_choice == "ExperimentDriver_Offline":

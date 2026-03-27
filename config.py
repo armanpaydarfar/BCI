@@ -295,6 +295,9 @@ ERRP_P_STOP = 0.5
 ERRP_STOP_TMIN = 1.0
 # Maximum stop time as a fraction of TIME_ROB (e.g. 0.7 = stops within first 70% of move)
 ERRP_STOP_TMAX_FRACTION = 0.7
+# Online driver (ExperimentDriver_ErrP_Online): seconds the robot stays paused if
+# no ErrP is detected before abandoning the trial and homing
+ERRP_NO_RESUME_TIMEOUT = 3.0
 
 # =============================================================================
 # Global runtime flags
