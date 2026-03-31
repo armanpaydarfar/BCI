@@ -760,7 +760,7 @@ def main():
         print(f"Retained {len(segments)} segments after artifact rejection.")
 
         
-        cov_matrices = compute_processed_covariances(segments, labels)
+        cov_matrices = compute_processed_covariances(segments, labels, model_type="mdm")
         
         #print(mean_riemann(cov_matrices))
         all_cov_matrices.append(cov_matrices)
