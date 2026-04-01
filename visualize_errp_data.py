@@ -43,8 +43,6 @@ import mne
 
 import config
 from Utils.errp_feature_pipeline import (
-    load_and_preprocess_errp_xdf,
-    load_errp_training_data,
     _default_error_codes,
     _default_correct_codes,
 )
@@ -65,6 +63,212 @@ TOPO_LATENCIES_MS = [100, 200, 300, 400, 600]
 COL_ERROR   = "#d62728"    # red
 COL_CORRECT = "#1f77b4"    # blue
 COL_DIFF    = "#2ca02c"    # green
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Visualization-specific preprocessing constants
+# (separate from the decoder pipeline — do NOT change the decoder path)
+# ──────────────────────────────────────────────────────────────────────────────
+# Pre-stimulus window: -200 to 0 ms is the standard baseline window for ErrP
+# (Widmann et al. 2015; Iturrate et al. 2010; Chavarriaga & Millán 2014).
+# The -200 ms onset captures any slow anticipatory activity and gives a stable
+# amplitude reference uncontaminated by the ErrP itself.
+VIZ_TMIN_S     = -0.2
+VIZ_TMAX_S     = float(getattr(config, "ERRP_EPOCH_TMAX", 0.8))
+VIZ_BASELINE_S = (-0.2, 0.0)   # correction window (seconds)
+
+# Frontal EEG channels used as surrogate EOG for blink regression.
+# No dedicated EOG channel was recorded; Fp1/Fpz/Fp2 are the closest scalp
+# proxies for the vertical blink dipole (Gratton et al. 1983 regression method).
+# These channels are loaded from the full 32-ch recording, used for regression
+# against each analysis channel, then discarded before epoching.
+BLINK_SURROGATE_CHS = ["Fp1", "Fpz", "Fp2"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Visualization loading pipeline (MNE-based, zero-phase FIR + baseline)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _load_viz_epochs_mne(
+    xdf_path: str,
+    error_codes: list,
+    correct_codes: list,
+) -> tuple:
+    """
+    Load one XDF file and return baseline-corrected ErrP epochs.
+
+    Pipeline:
+      1. Load full recording (all valid channels)
+      2. Zero-phase FIR bandpass 1-10 Hz + 60 Hz notch (no phase distortion)
+      3. Gratton et al. (1983) surrogate blink regression — average of
+         available Fp1/Fpz/Fp2 channels used as reference; per-channel
+         least-squares coefficient subtracted before channel selection
+      4. Select ERRP channels (config.ERRP_CHANNEL_NAMES)
+      5. Epoch tmin=VIZ_TMIN_S to tmax=VIZ_TMAX_S with baseline=VIZ_BASELINE_S
+      6. Reject epochs with P2P > 150 µV
+
+    Returns:
+        X: (n_epochs, n_ch, n_times) in µV, baseline-corrected
+        y: (n_epochs,) — 1=error, 0=correct
+        ch_names: list of channel names
+    """
+    from Utils.stream_utils import load_xdf, get_channel_names_from_xdf
+    from Utils.preprocessing import get_valid_channel_mask_and_metadata
+
+    eeg_stream, marker_stream = load_xdf(xdf_path)
+
+    eeg_data = np.array(eeg_stream["time_series"]).T      # (n_ch, n_samp)
+    eeg_ts   = np.array(eeg_stream["time_stamps"])
+    all_ch   = get_channel_names_from_xdf(eeg_stream)
+
+    # Drop mastoids and obviously bad channels
+    valid_ch_names, _, valid_indices = get_valid_channel_mask_and_metadata(
+        eeg_data, all_ch, fs=config.FS, drop_mastoids=True
+    )
+    eeg_data   = eeg_data[valid_indices, :]
+    current_ch = list(valid_ch_names)
+
+    # Build MNE Raw (µV → V for MNE conventions)
+    info = mne.create_info(ch_names=current_ch, sfreq=config.FS, ch_types="eeg")
+    raw  = mne.io.RawArray(eeg_data * 1e-6, info, verbose=False)
+    try:
+        montage = mne.channels.make_standard_montage("standard_1020")
+        raw.set_montage(montage, match_case=False, on_missing="warn", verbose=False)
+    except Exception:
+        pass
+
+    # Zero-phase FIR bandpass + 60 Hz notch
+    raw.filter(
+        l_freq=float(getattr(config, "LOWCUT_ERRP",  1.0)),
+        h_freq=float(getattr(config, "HIGHCUT_ERRP", 10.0)),
+        method="fir", phase="zero", fir_window="hamming",
+        verbose=False,
+    )
+    raw.notch_filter(freqs=60.0, verbose=False)
+
+    # Gratton surrogate blink regression on filtered continuous data
+    raw_v = raw.get_data()                                # (n_ch, n_samp) in V
+    available_fp = [ch for ch in BLINK_SURROGATE_CHS if ch in current_ch]
+    if available_fp:
+        fp_idx = [current_ch.index(ch) for ch in available_fp]
+        fp_ref = raw_v[fp_idx, :].mean(axis=0)           # surrogate blink ref
+        fp_var = np.var(fp_ref)
+        if fp_var > 1e-30:
+            for i in range(raw_v.shape[0]):
+                b = np.cov(raw_v[i], fp_ref)[0, 1] / fp_var
+                raw_v[i] -= b * fp_ref
+        raw._data[:] = raw_v
+
+    # Select ERRP channels; discard Fp surrogate channels
+    errp_ch = list(getattr(config, "ERRP_CHANNEL_NAMES", []))
+    if errp_ch:
+        available = [ch for ch in errp_ch if ch in current_ch]
+        if available:
+            raw.pick_channels(available, ordered=True)
+            current_ch = list(raw.ch_names)
+
+    # Build MNE events from marker timestamps
+    marker_ts   = np.array(marker_stream["time_stamps"], dtype=float)
+    raw_markers = marker_stream["time_series"]
+    marker_vals = np.array([int(float(m[0])) for m in raw_markers], dtype=int)
+
+    events_list, labels_list = [], []
+    for ts, code in zip(marker_ts, marker_vals):
+        if code in error_codes:
+            label = 1
+        elif code in correct_codes:
+            label = 0
+        else:
+            continue
+        samp = int(np.searchsorted(eeg_ts, ts))
+        samp = int(np.clip(samp, 0, raw.n_times - 1))
+        events_list.append([samp, 0, label])
+        labels_list.append(label)
+
+    if not events_list:
+        return np.empty((0, len(current_ch), 0)), np.empty(0, dtype=int), current_ch
+
+    events = np.array(events_list, dtype=int)
+    event_id = {}
+    if any(l == 1 for l in labels_list):
+        event_id["error"] = 1
+    if any(l == 0 for l in labels_list):
+        event_id["correct"] = 0
+
+    epochs = mne.Epochs(
+        raw, events, event_id=event_id,
+        tmin=VIZ_TMIN_S, tmax=VIZ_TMAX_S,
+        baseline=VIZ_BASELINE_S,
+        reject={"eeg": 150e-6},
+        preload=True, verbose=False,
+    )
+
+    if len(epochs) == 0:
+        return np.empty((0, len(current_ch), 0)), np.empty(0, dtype=int), current_ch
+
+    X = epochs.get_data() * 1e6          # V → µV
+    y = epochs.events[:, 2].astype(int)  # 1=error, 0=correct
+    return X, y, list(epochs.ch_names)
+
+
+def load_viz_data(
+    xdf_files: list,
+    error_codes: list,
+    correct_codes: list,
+    verbose: bool = True,
+) -> tuple:
+    """
+    Multi-file loader using the visualization pipeline (zero-phase FIR + baseline).
+
+    Returns:
+        X:        (n_epochs, n_ch, n_times) in µV, baseline-corrected
+        y:        (n_epochs,) labels
+        ch_names: list of channel names
+        times_ms: (n_times,) time axis in milliseconds
+    """
+    all_X, all_y = [], []
+    ref_ch = None
+
+    for path in xdf_files:
+        try:
+            X, y, ch_names = _load_viz_epochs_mne(path, error_codes, correct_codes)
+        except Exception as exc:
+            print(f"[ErrP viz] WARNING: skipping {os.path.basename(path)}: {exc}",
+                  file=sys.stderr)
+            continue
+
+        if X.shape[0] == 0:
+            if verbose:
+                print(f"[ErrP viz] {os.path.basename(path)}: no epochs found")
+            continue
+
+        if ref_ch is None:
+            ref_ch = ch_names
+        elif ch_names != ref_ch:
+            print(f"[ErrP viz] WARNING: channel mismatch in {os.path.basename(path)} — skipping",
+                  file=sys.stderr)
+            continue
+
+        all_X.append(X)
+        all_y.append(y)
+        if verbose:
+            n_e = int((y == 1).sum())
+            n_c = int((y == 0).sum())
+            print(f"[ErrP viz] {os.path.basename(path)}: error={n_e}, correct={n_c}")
+
+    if not all_X:
+        raise ValueError("No ErrP epochs found in any XDF file.")
+
+    X_all = np.concatenate(all_X, axis=0)
+    y_all = np.concatenate(all_y, axis=0)
+
+    n_times  = X_all.shape[2]
+    times_ms = np.linspace(VIZ_TMIN_S, VIZ_TMAX_S, n_times) * 1000
+
+    if verbose:
+        print(f"\n[ErrP viz] Total: {X_all.shape[0]} epochs "
+              f"(error={int((y_all==1).sum())}, correct={int((y_all==0).sum())})")
+
+    return X_all, y_all, ref_ch, times_ms
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -93,16 +297,19 @@ def _mean_ci(X: np.ndarray, ci: float = 0.95):
 def plot_erp_waveforms(
     X_err: np.ndarray,
     X_cor: np.ndarray,
-    ch_names: list[str],
+    ch_names: list,
     title_suffix: str = "",
+    times_ms: np.ndarray = None,
 ):
     """
     Plot mean ERP ± 95% CI for error vs correct, one subplot per channel.
 
     Args:
-        X_err: (n_error, n_ch, n_times)
-        X_cor: (n_correct, n_ch, n_times)
+        X_err:    (n_error, n_ch, n_times)
+        X_cor:    (n_correct, n_ch, n_times)
+        times_ms: (n_times,) time axis in ms; falls back to global TIMES if None
     """
+    _times = times_ms if times_ms is not None else TIMES
     n_ch = X_err.shape[1]
     ncols = min(n_ch, 3)
     nrows = int(np.ceil(n_ch / ncols))
@@ -121,10 +328,10 @@ def plot_erp_waveforms(
         mu_e, ci_e = _mean_ci(err_ts)
         mu_c, ci_c = _mean_ci(cor_ts)
 
-        ax.fill_between(TIMES, mu_e - ci_e, mu_e + ci_e, alpha=0.25, color=COL_ERROR)
-        ax.fill_between(TIMES, mu_c - ci_c, mu_c + ci_c, alpha=0.25, color=COL_CORRECT)
-        ax.plot(TIMES, mu_e, color=COL_ERROR,   lw=1.8, label=f"Error  (n={X_err.shape[0]})")
-        ax.plot(TIMES, mu_c, color=COL_CORRECT, lw=1.8, label=f"Correct (n={X_cor.shape[0]})")
+        ax.fill_between(_times, mu_e - ci_e, mu_e + ci_e, alpha=0.25, color=COL_ERROR)
+        ax.fill_between(_times, mu_c - ci_c, mu_c + ci_c, alpha=0.25, color=COL_CORRECT)
+        ax.plot(_times, mu_e, color=COL_ERROR,   lw=1.8, label=f"Error  (n={X_err.shape[0]})")
+        ax.plot(_times, mu_c, color=COL_CORRECT, lw=1.8, label=f"Correct (n={X_cor.shape[0]})")
         ax.axhline(0, color="k", lw=0.7, ls="--")
         ax.axvline(0, color="gray", lw=0.8, ls=":")
         for lat in [100, 200, 400]:
@@ -151,12 +358,16 @@ def plot_erp_waveforms(
 def plot_difference_wave(
     X_err: np.ndarray,
     X_cor: np.ndarray,
-    ch_names: list[str],
+    ch_names: list,
     title_suffix: str = "",
+    times_ms: np.ndarray = None,
 ):
     """
     Plot the difference wave (error − correct) per channel.
     """
+    _times  = times_ms if times_ms is not None else TIMES
+    _ntimes = len(_times)
+
     n_ch = X_err.shape[1]
     ncols = min(n_ch, 3)
     nrows = int(np.ceil(n_ch / ncols))
@@ -173,7 +384,7 @@ def plot_difference_wave(
         # Bootstrap CI on difference
         n_boot = 1000
         n_e, n_c = X_err.shape[0], X_cor.shape[0]
-        boot_diffs = np.empty((n_boot, N_TIMES))
+        boot_diffs = np.empty((n_boot, _ntimes))
         rng = np.random.default_rng(0)
         for b in range(n_boot):
             re = X_err[rng.integers(0, n_e, n_e), ch_idx, :].mean(axis=0)
@@ -182,8 +393,8 @@ def plot_difference_wave(
         ci_lo = np.percentile(boot_diffs, 2.5, axis=0)
         ci_hi = np.percentile(boot_diffs, 97.5, axis=0)
 
-        ax.fill_between(TIMES, ci_lo, ci_hi, alpha=0.3, color=COL_DIFF)
-        ax.plot(TIMES, diff_trials, color=COL_DIFF, lw=1.8)
+        ax.fill_between(_times, ci_lo, ci_hi, alpha=0.3, color=COL_DIFF)
+        ax.plot(_times, diff_trials, color=COL_DIFF, lw=1.8)
         ax.axhline(0, color="k", lw=0.8, ls="--")
         ax.axvline(0, color="gray", lw=0.8, ls=":")
         for lat in [100, 200, 400]:
@@ -207,10 +418,12 @@ def plot_difference_wave(
 def plot_butterfly(
     X_err: np.ndarray,
     X_cor: np.ndarray,
-    ch_names: list[str],
+    ch_names: list,
     title_suffix: str = "",
+    times_ms: np.ndarray = None,
 ):
     """Overlay all channels (butterfly) for both conditions."""
+    _times = times_ms if times_ms is not None else TIMES
     fig, axes = plt.subplots(1, 2, figsize=(14, 4), sharey=True)
     fig.suptitle(f"Butterfly Plot — All Channels{title_suffix}", fontsize=13)
 
@@ -220,7 +433,7 @@ def plot_butterfly(
     ]:
         mean_X = X.mean(axis=0)   # (n_ch, n_times)
         for ch_idx in range(mean_X.shape[0]):
-            ax.plot(TIMES, mean_X[ch_idx], lw=1.0, alpha=0.7,
+            ax.plot(_times, mean_X[ch_idx], lw=1.0, alpha=0.7,
                     label=ch_names[ch_idx] if ch_idx == 0 else "_nolegend_")
         ax.axhline(0, color="k", lw=0.7, ls="--")
         ax.axvline(0, color="gray", lw=0.8, ls=":")
@@ -232,7 +445,7 @@ def plot_butterfly(
         # Annotate channel names on the right margin
         for ch_idx, ch in enumerate(ch_names):
             y_pos = mean_X[ch_idx, -1]
-            ax.annotate(ch, xy=(TIMES[-1], y_pos), xytext=(3, 0),
+            ax.annotate(ch, xy=(_times[-1], y_pos), xytext=(3, 0),
                         textcoords="offset points", fontsize=7, va="center")
 
     plt.tight_layout()
@@ -245,20 +458,22 @@ def plot_butterfly(
 def plot_topomap(
     X_err: np.ndarray,
     X_cor: np.ndarray,
-    ch_names: list[str],
-    latencies_ms: list[int] = None,
+    ch_names: list,
+    latencies_ms: list = None,
     title_suffix: str = "",
+    times_ms: np.ndarray = None,
 ):
     """
     Scalp topography at key latencies using MNE.
 
     Shows error, correct, and difference (error−correct) maps.
     """
+    _times = times_ms if times_ms is not None else TIMES
     if latencies_ms is None:
         latencies_ms = TOPO_LATENCIES_MS
 
     # Filter to latencies within epoch window
-    latencies_ms = [l for l in latencies_ms if TMIN * 1000 <= l <= TMAX * 1000]
+    latencies_ms = [l for l in latencies_ms if _times[0] <= l <= _times[-1]]
     if not latencies_ms:
         print("[ErrP topo] No valid latencies within epoch window — skipping topomaps.")
         return
@@ -280,9 +495,9 @@ def plot_topomap(
     fig.suptitle(f"ErrP Topomaps{title_suffix}\n(rows: Error | Correct | Difference)", fontsize=12)
 
     for col_idx, lat_ms in enumerate(latencies_ms):
-        # Find sample index for this latency
-        t_idx = int(round((lat_ms / 1000 - TMIN) * FS))
-        t_idx = np.clip(t_idx, 0, N_TIMES - 1)
+        # Find sample index closest to requested latency
+        t_idx = int(np.argmin(np.abs(_times - lat_ms)))
+        t_idx = int(np.clip(t_idx, 0, len(_times) - 1))
 
         for row_idx, (data_2d, row_label) in enumerate([
             (mean_err, "Error"),
@@ -318,9 +533,10 @@ def plot_topomap(
 def plot_single_trial_heatmap(
     X_err: np.ndarray,
     X_cor: np.ndarray,
-    ch_names: list[str],
+    ch_names: list,
     max_trials: int = 80,
     title_suffix: str = "",
+    times_ms: np.ndarray = None,
 ):
     """
     Image plot: each row = one trial (amplitude over time), sorted by condition.
@@ -328,6 +544,8 @@ def plot_single_trial_heatmap(
     Shows error trials on top, correct trials below, with a separator.
     The channel with highest error–correct amplitude difference is selected.
     """
+    _times = times_ms if times_ms is not None else TIMES
+
     # Select "most informative" channel (max |mean_error - mean_correct|)
     diff_amp = np.abs(X_err.mean(axis=0) - X_cor.mean(axis=0))   # (n_ch, n_times)
     best_ch  = int(np.argmax(diff_amp.max(axis=1)))
@@ -359,7 +577,7 @@ def plot_single_trial_heatmap(
         cmap="RdBu_r",
         vmin=-vmax, vmax=vmax,
         interpolation="nearest",
-        extent=[TIMES[0], TIMES[-1], combined.shape[0], 0],
+        extent=[_times[0], _times[-1], combined.shape[0], 0],
     )
     ax.axhline(n_err_show - 0.5, color="k", lw=2.0, ls="--", label="Error | Correct boundary")
     ax.axvline(0, color="gray", lw=1.0, ls=":")
@@ -406,14 +624,16 @@ def plot_model_scores(
 # Print epoch summary
 # ──────────────────────────────────────────────────────────────────────────────
 
-def print_epoch_summary(X_err, X_cor, ch_names):
+def print_epoch_summary(X_err, X_cor, ch_names, times_ms=None):
     """Print amplitude statistics for error vs correct epochs."""
+    _times   = times_ms if times_ms is not None else TIMES
+    _ntimes  = len(_times)
     print(f"\n{'─'*55}")
     print(f"  ErrP Epoch Summary")
     print(f"{'─'*55}")
     print(f"  Error epochs:   {X_err.shape[0]}  |  Correct epochs: {X_cor.shape[0]}")
     print(f"  Channels:       {ch_names}")
-    print(f"  Epoch window:   {TMIN*1000:.0f} – {TMAX*1000:.0f} ms ({N_TIMES} samples @ {FS:.0f} Hz)")
+    print(f"  Epoch window:   {_times[0]:.0f} – {_times[-1]:.0f} ms ({_ntimes} samples @ {FS:.0f} Hz)")
 
     print(f"\n  {'Channel':<8}  {'Error mean peak (µV)':>22}  {'Correct mean peak (µV)':>24}  {'Diff':>10}")
     print(f"  {'─'*7}  {'─'*22}  {'─'*24}  {'─'*10}")
@@ -447,12 +667,16 @@ def main(args=None):
         if not xdf_files:
             raise FileNotFoundError(f"No XDF files found in: {training_dir}")
 
-    print(f"[ErrP viz] Loading {len(xdf_files)} file(s)...")
+    print(f"[ErrP viz] Loading {len(xdf_files)} file(s) "
+          f"(zero-phase FIR, Gratton blink regression, baseline {int(VIZ_TMIN_S*1000)}–0 ms)...")
 
-    X, y, ch_names = load_errp_training_data(
+    error_codes   = _default_error_codes()
+    correct_codes = _default_correct_codes()
+
+    X, y, ch_names, times_ms = load_viz_data(
         xdf_files,
-        error_codes=_default_error_codes(),
-        correct_codes=_default_correct_codes(),
+        error_codes=error_codes,
+        correct_codes=correct_codes,
         verbose=True,
     )
 
@@ -463,19 +687,27 @@ def main(args=None):
     X_err = X[y == 1]
     X_cor = X[y == 0]
 
-    suffix = f"  (sub-{config.TRAINING_SUBJECT})"
-    print_epoch_summary(X_err, X_cor, ch_names)
+    if ns.xdf:
+        basenames = [os.path.splitext(os.path.basename(f))[0] for f in xdf_files]
+        if len(basenames) == 1:
+            suffix = f"  ({basenames[0]})"
+        else:
+            suffix = f"  ({len(xdf_files)} files pooled)"
+    else:
+        suffix = f"  (sub-{config.TRAINING_SUBJECT})"
+
+    print_epoch_summary(X_err, X_cor, ch_names, times_ms=times_ms)
 
     # --- Generate all plots ---
-    plot_erp_waveforms(X_err, X_cor, ch_names, title_suffix=suffix)
-    plot_difference_wave(X_err, X_cor, ch_names, title_suffix=suffix)
-    plot_butterfly(X_err, X_cor, ch_names, title_suffix=suffix)
+    plot_erp_waveforms(X_err, X_cor, ch_names, title_suffix=suffix, times_ms=times_ms)
+    plot_difference_wave(X_err, X_cor, ch_names, title_suffix=suffix, times_ms=times_ms)
+    plot_butterfly(X_err, X_cor, ch_names, title_suffix=suffix, times_ms=times_ms)
 
     if not ns.no_topo:
-        plot_topomap(X_err, X_cor, ch_names, title_suffix=suffix)
+        plot_topomap(X_err, X_cor, ch_names, title_suffix=suffix, times_ms=times_ms)
 
     if not ns.no_heatmap:
-        plot_single_trial_heatmap(X_err, X_cor, ch_names, title_suffix=suffix)
+        plot_single_trial_heatmap(X_err, X_cor, ch_names, title_suffix=suffix, times_ms=times_ms)
 
     if ns.model:
         try:
