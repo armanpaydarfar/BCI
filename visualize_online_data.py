@@ -133,6 +133,27 @@ DO_MULTISESSION_TIMECOURSE_OVERLAY = True
 OVERLAY_SHOW_SHADING = True
 LINE_YLIM = None  # or None
 
+# =========================================================
+# Cross-subject / cross-session grand average topomaps
+# =========================================================
+# Independent of MULTI_SESSION_MODE and single-session mode.
+# When GRAND_AVG_TOPO_MODE=True, sessions are loaded for each subject in
+# GRAND_AVG_SUBJECT_LIST, TFR averages are computed per session, then
+# grand-averaged across all subject/session entries into a single topo plot.
+#
+# Line plots (focal timecourses) are always per-session and are NOT affected.
+# Existing per-session topos (DO_TOPO_MAPS) are also unaffected.
+#
+# GRAND_AVG_SESSION_MAP allows per-subject session overrides:
+#   {"PILOT007": ["S003ONLINE", "S004ONLINE"], "CLIN_SUBJ_003": ["S001ONLINE"]}
+# If a subject is absent from the map, GRAND_AVG_SESSION_LIST is used.
+GRAND_AVG_TOPO_MODE = False
+DO_GRAND_AVG_TOPO = True
+
+GRAND_AVG_SUBJECT_LIST = ["PILOT007"]
+GRAND_AVG_SESSION_LIST = ["S001ONLINE", "S002ONLINE"]
+GRAND_AVG_SESSION_MAP: dict = {}  # per-subject session override; empty = use GRAND_AVG_SESSION_LIST
+
 # ---- Bar plot normalization toggle ----
 BAR_USE_NORMALIZATION = False
 BAR_NORM_METHOD = "ratio"  # "ratio" or "difference"
@@ -1289,6 +1310,146 @@ def compare_sessions_cached(session_cache):
 
 
 # =========================================================
+# Grand average topomaps (cross-session / cross-subject)
+# =========================================================
+
+def compute_grand_avg_topo():
+    """
+    Load every subject/session in GRAND_AVG_SUBJECT_LIST, compute a per-session
+    TFR average, align to a common channel set, then grand-average across all
+    collected averages per marker.
+
+    Returns dict: {marker_str: mne.time_frequency.AverageTFR}
+    Empty dict is returned if nothing could be loaded.
+    """
+    per_marker_avgs: dict = {}  # marker -> list[AverageTFR]
+
+    for subj in GRAND_AVG_SUBJECT_LIST:
+        sessions = GRAND_AVG_SESSION_MAP.get(subj, GRAND_AVG_SESSION_LIST)
+        for sess in sessions:
+            print(f"\n{'='*60}")
+            print(f"Grand avg: loading {subj} / {sess}")
+            print("=" * 60)
+            try:
+                epochs, raw, event_dict, meta = load_and_preprocess_session(
+                    subj, sess, prompt_selection=False
+                )
+            except Exception as e:
+                print(f"⚠️ Skipping {subj}/{sess}: {e}")
+                continue
+
+            tfr_data = compute_tfr_epochs(epochs)
+            for marker, tfr in tfr_data.items():
+                per_marker_avgs.setdefault(marker, []).append(tfr.average())
+
+    if not per_marker_avgs:
+        print("⚠️ No TFR data collected for grand average.")
+        return {}
+
+    grand_avg = {}
+    for marker, avgs in per_marker_avgs.items():
+        if not avgs:
+            continue
+
+        # Align to the common channel set across all session averages
+        common_chs = sorted(set(avgs[0].ch_names).intersection(
+            *(set(a.ch_names) for a in avgs[1:])
+        ) if len(avgs) > 1 else set(avgs[0].ch_names))
+
+        if len(common_chs) < len(avgs[0].ch_names):
+            print(
+                f"⚠️ Marker {marker}: channel mismatch across sessions; "
+                f"grand averaging over {len(common_chs)} common channels."
+            )
+            avgs = [a.pick(common_chs, verbose=False) for a in avgs]
+
+        grand_data = np.mean([a.data for a in avgs], axis=0)
+        template = avgs[0]
+        grand_tfr = mne.time_frequency.AverageTFR(
+            info=template.info,
+            data=grand_data,
+            times=template.times,
+            freqs=template.freqs,
+            nave=len(avgs),
+        )
+        grand_avg[marker] = grand_tfr
+        print(f"✅ Grand average TFR — marker {marker}: {len(avgs)} session(s) averaged.")
+
+    return grand_avg
+
+
+def plot_grand_avg_topomaps(grand_avg_tfr_data):
+    """
+    Plot grand-averaged topomaps from the output of compute_grand_avg_topo().
+
+    Accepts {marker_str: AverageTFR}. Layout mirrors plot_topomaps() so the
+    two sets of plots are visually comparable.
+    """
+    if not DO_GRAND_AVG_TOPO or not grand_avg_tfr_data:
+        return
+
+    all_vals = [a.data.flatten() for a in grand_avg_tfr_data.values()]
+    if not all_vals:
+        print("⚠️ No data for grand average topomaps.")
+        return
+
+    vmin, vmax = np.percentile(np.concatenate(all_vals), [2, 98])
+    print(f"Grand avg topomap color scale (logratio): vmin={vmin:.2f}, vmax={vmax:.2f}")
+
+    window_size = 0.5
+    time_windows = np.arange(0, 3, window_size)
+    skip_factor = 1
+
+    label_map = {"100": "Rest", "200": "Right Arm MI", "300": "Robot Move"}
+
+    n_sess_total = sum(
+        len(GRAND_AVG_SESSION_MAP.get(s, GRAND_AVG_SESSION_LIST))
+        for s in GRAND_AVG_SUBJECT_LIST
+    )
+    nave_label = f"{len(GRAND_AVG_SUBJECT_LIST)} subject(s), {n_sess_total} session(s)"
+
+    for marker, tfr_avg in grand_avg_tfr_data.items():
+        selected_indices = range(0, len(time_windows), skip_factor)
+        fig, axes = plt.subplots(
+            1, len(selected_indices), figsize=(15, 4), constrained_layout=True
+        )
+
+        mappable = None
+        for ax, i in zip(axes, selected_indices):
+            t_start = time_windows[i]
+            t_end = t_start + window_size
+
+            tfr_avg.plot_topomap(
+                tmin=t_start,
+                tmax=t_end,
+                axes=ax,
+                cmap="viridis",
+                show=False,
+                vlim=(vmin, vmax),
+                colorbar=False,
+                show_names=True,
+            )
+            if hasattr(ax, "collections") and ax.collections:
+                mappable = ax.collections[0]
+            ax.set_title(f"{t_start:.1f}–{t_end:.1f}s")
+
+        if mappable is not None:
+            norm = plt.Normalize(vmin, vmax)
+            sm = plt.cm.ScalarMappable(norm=norm, cmap="viridis")
+            sm.set_array([])
+            cbar = fig.colorbar(
+                sm, ax=axes, orientation="horizontal", fraction=0.05, pad=0.1
+            )
+            cbar.set_label("ERD/ERS (logratio)", fontsize=12)
+
+        marker_label = label_map.get(marker, f"Marker {marker}")
+        fig.suptitle(
+            f"Grand Avg ERD/ERS Topomaps – {marker_label} [{nave_label}]",
+            fontsize=13,
+        )
+
+
+# =========================================================
 # Main entry
 # =========================================================
 
@@ -1320,6 +1481,12 @@ def main():
             focal_electrodes = meta.get("focal_electrodes_used", [])
             tcs = compute_focal_timecourses(tfr_data, focal_electrodes)
             plot_focal_timecourses(tcs, session_label=f"{session} ({','.join(focal_electrodes)})")
+
+    # Grand average topomaps — independent of session mode above.
+    # Runs whenever GRAND_AVG_TOPO_MODE=True, alongside any other mode.
+    if GRAND_AVG_TOPO_MODE and DO_GRAND_AVG_TOPO:
+        grand_avg_tfr = compute_grand_avg_topo()
+        plot_grand_avg_topomaps(grand_avg_tfr)
 
     plt.show()
 

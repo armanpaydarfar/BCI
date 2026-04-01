@@ -20,13 +20,12 @@ FS = 512  # Sampling frequency (Hz)
 MOTOR_CHANNEL_NAMES = ['FC1','FC2','C3', 'Cz', 'C4', 'CP5', 'CP1', 'CP2', 'CP6', 'P7','P3', 'Pz', 'P4', 'P8', 'POz']
 ERRP_CHANNEL_NAMES = ['F3', 'Fz', 'F4', 'FC1', 'FC2', 'Cz']
 EOG_CHANNEL_NAMES = ['AUX1']  # List of EOG channel names to use
-EOG_TOGGLE = 0  # 1 = enable EOG processing, 0 = disable
 # =============================================================================
 # Experiment design (trials, timing, trajectories)
 # =============================================================================
 ARM_SIDE = "Right"
 EXPERIMENT_TYPE = "BASE"  # BIMANUAL or BASE
-TOTAL_TRIALS = 10
+TOTAL_TRIALS = 20
 TOTAL_TRIALS_ERRP = 45
 MAX_REPEATS = 3
 N_SPLITS = 5  # KFold splits (training scripts)
@@ -39,13 +38,13 @@ TIME_MASTER_MOVE = 5  # Bimanual: time to position master arm (s)
 MAX_EPOCH_MARKER_SLACK_SEC = 0.5
 MAX_EPOCH_MARKER_DURATION_SEC = float(TIME_MI) + float(MAX_EPOCH_MARKER_SLACK_SEC)
 TIMING = True  # If True, drivers use automatic countdown paths where implemented
-SHAPE_MAX = 0.7  # Upper bound for feedback fill mapping
+SHAPE_MAX = 0.8  # Upper bound for feedback fill mapping
 SHAPE_MIN = 0.5  # Lower bound for feedback fill mapping
 ROBOT_TRAJECTORY = ["a"]  # Opcode pool for random trajectory choice where used
 BIG_BROTHER_MODE = True  # If True, force pygame window to external display (0,0) at 1920x1080
 SEND_PROBS = False  # If True, stream classifier probs over UDP marker channel
 # Early-stop policy: "correct_only" or "either"
-EARLYSTOP_MODE = "correct_only"
+EARLYSTOP_MODE = "either"
 
 # =============================================================================
 # Gaze / object-selection experiment
@@ -70,14 +69,14 @@ CLASSIFY_WINDOW = 1000  # EEG window length for classification (ms)
 FILTER_BUFFER_SIZE = 2048  # ~4 s at 512 Hz
 BASELINE_DURATION = 1  # seconds
 ACCURACY_THRESHOLD = 0.6  # Legacy / logging only; see CHANGELOG.md — thresholds below drive decisions
-THRESHOLD_MI = 0.6
-THRESHOLD_REST = 0.6
+THRESHOLD_MI = 0.65
+THRESHOLD_REST = 0.65
 RELAXATION_RATIO = 0.5
-MIN_PREDICTIONS = 8
+MIN_PREDICTIONS = 32
 STEP_SIZE = 1/16
 CLASSIFICATION_OFFSET = 0
 CLASSIFICATION_SCHEME_OPT = "FREQUENCY"  # or "TIMESERIES"
-SURFACE_LAPLACIAN_TOGGLE = 1
+SURFACE_LAPLACIAN_TOGGLE = 0
 
 # =============================================================================
 # Dual-threshold ambiguity target (used for learned reject/decide thresholds)
@@ -87,7 +86,7 @@ SURFACE_LAPLACIAN_TOGGLE = 1
 TARGET_AMBIG = 0.20
 SELECT_MOTOR_CHANNELS = 1
 SELECT_ERRP_CHANNELS = 0
-INTEGRATOR_ALPHA = 0.96
+INTEGRATOR_ALPHA = 0.94
 # Model-specific covariance shrinkage defaults.
 # - MDM path (runtime + MDM-centric analyses)
 SHRINKAGE_PARAM_MDM = 0.02
@@ -134,7 +133,7 @@ SAVE_ADAPTIVE_T = False
 XGB_MAX_DEPTH = 5
 XGB_USE_COV_MU = 1
 # Default XGB covariance branch is mu-only. Enable beta explicitly when needed.
-XGB_USE_COV_BETA = 0
+XGB_USE_COV_BETA = 1
 # Default ERD bands are also mu-only unless overridden (e.g., add beta bands explicitly).
 XGB_ERD_BANDS = [(float(LOWCUT), float(HIGHCUT))]
 XGB_IMPORTANCE_TOP_K = 20
@@ -154,7 +153,6 @@ FES_TIMING_OFFSET = 7  # Seconds before end of movement for motor FES cutoff (su
 # =============================================================================
 SCREEN_WIDTH = 1200
 SCREEN_HEIGHT = 800
-USE_PREVIOUS_ONLINE_STATS = False
 # Feedback geometry: "classic" (default) or "modern" (refined shapes + accumulation bar in driver)
 CLASS_VISUAL_STYLE = "classic"
 
