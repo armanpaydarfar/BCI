@@ -344,16 +344,17 @@ def main():
         print(f"  Band: {config.LOWCUT}-{config.HIGHCUT} Hz (single)")
     print(f"{'='*60}\n")
 
-    # --- Locate XDF files ---
-    xdf_files = sorted(glob.glob(os.path.join(data_dir, "**", "*.xdf"), recursive=True))
-    if not xdf_files:
-        xdf_files = sorted(glob.glob(os.path.join(data_dir, "*.xdf")))
+    # --- Locate XDF files (non-recursive, matching XGB convention) ---
+    xdf_files = sorted([
+        os.path.join(data_dir, f) for f in os.listdir(data_dir)
+        if f.endswith(".xdf") and "OBS" not in f
+    ])
     if not xdf_files:
         print(f"[ERROR] No XDF files found in {data_dir}")
         sys.exit(1)
     print(f"Found {len(xdf_files)} XDF file(s):")
     for f in xdf_files:
-        print(f"  {f}")
+        print(f"  {os.path.basename(f)}")
 
     # --- Segment all files ---
     all_segments, all_labels = [], []
