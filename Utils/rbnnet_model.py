@@ -3,15 +3,26 @@ rbnnet_model.py
 ---------------
 PyTorch implementation of RBNNet for EEG Motor Imagery classification.
 
-RBNNet is a deep network on the SPD (Symmetric Positive Definite) manifold,
-combining SPDNet (Huang & Van Gool, AAAI 2017) with Riemannian Batch
-Normalization (Brooks et al., NeurIPS 2019).
+Two architectures are provided:
 
-Architecture (from Liu et al., NER 2023):
-    {BiMap - RBN - ReEig} x2  →  {BiMap - RBN}  →  {LogEig}  →  FC → output
+  RBNNet (single-band) — faithful to Liu et al. NER 2023:
+    EEG (1 band) → covariance → {BiMap-RBN-ReEig}×n_blocks → {BiMap-RBN}
+                             → LogEig → Linear(n_features, 2)
 
-Reference: Liu, Kumar, Alawieh, Carnahan & Millán, NER 2023.
-           "On Transfer Learning for Naive Brain Computer Interface Users."
+  DualBandRBNNet — extension for independent mu + beta processing:
+    C_mu   → RBNNetEncoder → LogEig → LayerNorm ] concat → Linear(2*n_features, 2)
+    C_beta → RBNNetEncoder → LogEig → LayerNorm ]
+
+    Per-stream LayerNorm addresses inter-band scale differences that arise from
+    mu and beta covariances having different eigenvalue magnitudes. It is applied
+    after LogEig (in Euclidean space), so it does not violate SPD manifold geometry.
+    Single-band RBNNet omits LayerNorm, remaining faithful to the paper.
+
+References:
+  Liu, Kumar, Alawieh, Carnahan & Millan. NER 2023.
+    "On Transfer Learning for Naive Brain Computer Interface Users."
+  Huang & Van Gool. AAAI 2017. "A Riemannian Network for SPD Matrix Learning."
+  Brooks et al. NeurIPS 2019. "Riemannian Batch Normalization for SPD Neural Networks."
 """
 
 import numpy as np
@@ -26,42 +37,41 @@ import torch.nn.functional as F
 
 def _sym_eigh(A):
     """Eigendecompose a symmetric matrix; return (eigenvalues, eigenvectors).
-    Uses torch.linalg.eigh which assumes symmetric/Hermitian input and is
-    numerically more stable than torch.eig for SPD matrices.
+    torch.linalg.eigh assumes symmetric input — more stable than torch.eig for SPD.
     """
     return torch.linalg.eigh(A)
 
 
 def _mat_pow(A, p):
-    """Compute A^p for a symmetric positive definite matrix via eigendecomposition."""
+    """A^p for SPD matrix via eigendecomposition."""
     vals, vecs = _sym_eigh(A)
     vals_p = vals.clamp(min=1e-10).pow(p)
     return vecs @ torch.diag_embed(vals_p) @ vecs.transpose(-2, -1)
 
 
 def _mat_log(A):
-    """Compute matrix logarithm of a symmetric positive definite matrix."""
+    """Matrix logarithm for SPD matrix via eigendecomposition."""
     vals, vecs = _sym_eigh(A)
     vals_log = vals.clamp(min=1e-10).log()
     return vecs @ torch.diag_embed(vals_log) @ vecs.transpose(-2, -1)
 
 
 def _mat_exp(A):
-    """Compute matrix exponential of a symmetric matrix via eigendecomposition."""
+    """Matrix exponential for symmetric matrix via eigendecomposition."""
     vals, vecs = _sym_eigh(A)
     vals_exp = vals.exp()
     return vecs @ torch.diag_embed(vals_exp) @ vecs.transpose(-2, -1)
 
 
 # ---------------------------------------------------------------------------
-# Utility: flatten / unflatten upper triangle (for LogEig output)
+# Utility: flatten upper triangle (LogEig output -> Euclidean vector)
 # ---------------------------------------------------------------------------
 
 def flatten_upper_triangle(X):
     """
-    Flatten the upper triangle (including diagonal) of a batch of symmetric matrices.
-    Input:  (batch, n, n)
-    Output: (batch, n*(n+1)//2)
+    Flatten upper triangle (including diagonal) of a batch of symmetric matrices.
+    Input:  (..., n, n)
+    Output: (..., n*(n+1)//2)
     """
     n = X.shape[-1]
     idx = torch.triu_indices(n, n, offset=0, device=X.device)
@@ -69,44 +79,37 @@ def flatten_upper_triangle(X):
 
 
 # ---------------------------------------------------------------------------
-# Epsilon threshold for ReEig
+# Epsilon threshold for ReEig (derived from calibration data)
 # ---------------------------------------------------------------------------
 
 def compute_epsilon_threshold(cov_matrices_np, variance_retained=0.995):
     """
-    Determine the ReEig rectification threshold epsilon from calibration data.
-    Following the paper: evaluate eigenvalues of every trial covariance, and
-    find the threshold at which `variance_retained` (default 99.5%) of the
-    variance is retained across all subjects/trials.
+    Determine ReEig rectification threshold epsilon from calibration covariances.
+    Following Liu et al.: for each trial covariance find the eigenvalue at which
+    cumulative variance >= variance_retained, then average across trials.
 
     Parameters
     ----------
-    cov_matrices_np : np.ndarray, shape (n_trials, n_ch, n_ch)
-        Shrinkage-regularized covariance matrices from calibration data.
-    variance_retained : float
-        Fraction of variance to retain (default 0.995 from paper).
+    cov_matrices_np : np.ndarray (n_trials, n_ch, n_ch)
+    variance_retained : float, default 0.995
 
     Returns
     -------
     epsilon : float
-        The rectification threshold to use in all ReEig layers.
     """
     thresholds = []
     for cov in cov_matrices_np:
         eigvals = np.linalg.eigvalsh(cov)
-        eigvals = np.sort(eigvals)[::-1]  # descending
+        eigvals = np.sort(eigvals)[::-1]
         total_var = eigvals.sum()
         if total_var <= 0:
             thresholds.append(1e-4)
             continue
         cumulative = np.cumsum(eigvals) / total_var
-        # Find the smallest eigenvalue that still keeps >= variance_retained
         idx = np.searchsorted(cumulative, variance_retained)
         idx = min(idx, len(eigvals) - 1)
         thresholds.append(float(eigvals[idx]))
-
-    eps = float(np.mean(thresholds))
-    return max(eps, 1e-6)  # safety floor
+    return max(float(np.mean(thresholds)), 1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -114,68 +117,28 @@ def compute_epsilon_threshold(cov_matrices_np, variance_retained=0.995):
 # ---------------------------------------------------------------------------
 
 class BiMapLayer(nn.Module):
-    """
-    Bilinear Mapping on the SPD manifold.
-    C_out = W @ C_in @ W^T
-
-    W is initialized via QR decomposition of a random Gaussian matrix to
-    start orthogonal (full row-rank), ensuring SPD output from SPD input.
-
-    Parameters
-    ----------
-    d_in  : input SPD matrix dimension
-    d_out : output SPD matrix dimension (d_out <= d_in to reduce; == d_in to preserve)
-    """
+    """Bilinear Mapping: C_out = W @ C_in @ W^T. W QR-initialized for full row-rank."""
     def __init__(self, d_in, d_out):
         super().__init__()
-        self.d_in = d_in
+        self.d_in  = d_in
         self.d_out = d_out
-        # Initialize W as a semi-orthogonal matrix
         W_init = torch.randn(d_out, d_in)
-        W_init, _ = torch.linalg.qr(W_init.T)  # QR of (d_in, d_out)
-        W_init = W_init.T                        # Back to (d_out, d_in)
+        W_init, _ = torch.linalg.qr(W_init.T)
+        W_init = W_init.T
         self.W = nn.Parameter(W_init)
 
     def forward(self, X):
-        """
-        Parameters
-        ----------
-        X : (batch, d_in, d_in)  SPD matrices
-
-        Returns
-        -------
-        (batch, d_out, d_out)  SPD matrices
-        """
-        # C_out = W @ C_in @ W^T
+        # X: (batch, d_in, d_in) -> (batch, d_out, d_out)
         return self.W @ X @ self.W.T
 
 
 class ReEigLayer(nn.Module):
-    """
-    Eigenvalue Rectification on the SPD manifold.
-    C_out = U @ max(eps*I, Sigma) @ U^T
-
-    Provides nonlinearity analogous to ReLU: clips small eigenvalues at eps,
-    preventing degeneracy of the SPD structure.
-
-    Parameters
-    ----------
-    epsilon : float  — rectification threshold (computed from calibration data)
-    """
+    """Eigenvalue Rectification: C_out = U @ max(eps*I, Sigma) @ U^T."""
     def __init__(self, epsilon=1e-4):
         super().__init__()
         self.epsilon = epsilon
 
     def forward(self, X):
-        """
-        Parameters
-        ----------
-        X : (batch, n, n)  SPD matrices
-
-        Returns
-        -------
-        (batch, n, n)  SPD matrices with rectified eigenvalues
-        """
         vals, vecs = _sym_eigh(X)
         vals_rect = vals.clamp(min=self.epsilon)
         return vecs @ torch.diag_embed(vals_rect) @ vecs.transpose(-2, -1)
@@ -183,84 +146,38 @@ class ReEigLayer(nn.Module):
 
 class LogEigLayer(nn.Module):
     """
-    Eigenvalue Logarithm: maps the SPD manifold to its tangent space at I,
-    then flattens to a Euclidean feature vector.
-
-    X = U @ log(Sigma) @ U^T  (then flatten upper triangle)
-
-    Output size: n*(n+1)//2 per sample.
+    Eigenvalue Logarithm: maps SPD manifold to tangent space at I, then flattens.
+    X = U @ log(Sigma) @ U^T  ->  flatten upper triangle
+    Output size: n*(n+1)//2
     """
     def forward(self, X):
-        """
-        Parameters
-        ----------
-        X : (batch, n, n)  SPD matrices (all eigenvalues strictly positive
-            after ReEig in the preceding layer)
-
-        Returns
-        -------
-        (batch, n*(n+1)//2)  flattened tangent-space vectors
-        """
-        log_X = _mat_log(X)
-        return flatten_upper_triangle(log_X)
+        return flatten_upper_triangle(_mat_log(X))
 
 
 class RBNLayer(nn.Module):
     """
-    Riemannian Batch Normalization on the SPD manifold.
-
-    Normalizes the Riemannian (geometric) mean of the batch to the identity
-    matrix. Only mean normalization — no variance normalization — as per
-    Brooks et al. (NeurIPS 2019) and the paper.
-
-    During training: Riemannian mean is estimated from the current batch via
-    Karcher flow (iterative gradient descent on the manifold).
-    During inference: uses an exponential moving average of the running mean.
-
-    Parameters
-    ----------
-    n        : SPD matrix dimension
-    momentum : EMA momentum for running mean update (default 0.1)
-    karcher_steps : iterations for Karcher flow convergence (default 10)
+    Riemannian Batch Normalization. Normalizes Riemannian mean toward I (mean-only).
+    Training: Karcher flow batch mean. Inference: EMA running mean.
     """
     def __init__(self, n, momentum=0.1, karcher_steps=10):
         super().__init__()
-        self.n = n
-        self.momentum = momentum
+        self.n             = n
+        self.momentum      = momentum
         self.karcher_steps = karcher_steps
-        # Running mean — initialized to identity (not a parameter, not saved with grad)
         self.register_buffer("running_mean", torch.eye(n))
 
     def _karcher_mean(self, X):
-        """
-        Estimate Riemannian mean of batch X via Karcher flow.
-        X: (batch, n, n)
-        Returns: (n, n)  Riemannian mean matrix G
-        """
-        # Initialize at the arithmetic mean (fast approximation)
         G = X.mean(dim=0)
         for _ in range(self.karcher_steps):
-            G_invsqrt = _mat_pow(G, -0.5)   # G^{-1/2}
-            G_sqrt = _mat_pow(G, 0.5)         # G^{1/2}
-            # Log map each X_i at G
-            S = _mat_log(G_invsqrt @ X @ G_invsqrt)   # (batch, n, n)
-            S_mean = S.mean(dim=0)                      # (n, n)
-            G = G_sqrt @ _mat_exp(S_mean) @ G_sqrt
+            G_invsqrt = _mat_pow(G, -0.5)
+            G_sqrt    = _mat_pow(G,  0.5)
+            S         = _mat_log(G_invsqrt @ X @ G_invsqrt)
+            G         = G_sqrt @ _mat_exp(S.mean(dim=0)) @ G_sqrt
         return G
 
     def forward(self, X):
-        """
-        Parameters
-        ----------
-        X : (batch, n, n)  SPD matrices
-
-        Returns
-        -------
-        (batch, n, n)  normalized SPD matrices
-        """
         if self.training:
             G = self._karcher_mean(X)
-            # Update running mean via geodesic interpolation
             with torch.no_grad():
                 self.running_mean.copy_(
                     _mat_pow(self.running_mean, 1.0 - self.momentum) @
@@ -268,174 +185,233 @@ class RBNLayer(nn.Module):
                 )
         else:
             G = self.running_mean
-
-        # Normalize: C_norm = G^{-1/2} @ C @ G^{-1/2}
         G_invsqrt = _mat_pow(G, -0.5)
         return G_invsqrt @ X @ G_invsqrt
 
 
 # ---------------------------------------------------------------------------
-# Full RBNNet
+# Shared encoder trunk (manifold processing, no classifier head)
 # ---------------------------------------------------------------------------
 
-class RBNNet(nn.Module):
+class RBNNetEncoder(nn.Module):
     """
-    Full RBNNet architecture for EEG Motor Imagery classification.
-
-    Architecture (following Liu et al., NER 2023):
-      {BiMap - RBN - ReEig} x n_blocks  →  {BiMap - RBN}  →  {LogEig}  →  FC
-
-    All BiMap layers preserve the SPD dimension (d_in == d_out == n_ch), as
-    the paper found dimension reduction below the channel count hurt performance.
-
-    Parameters
-    ----------
-    n_ch      : number of EEG channels = SPD matrix dimension
-    n_classes : number of output classes (default 2: REST / MI)
-    epsilon   : ReEig threshold (computed from calibration data)
-    n_blocks  : number of {BiMap-RBN-ReEig} blocks before the final {BiMap-RBN}
-                (default 2, matching the paper's architecture)
+    SPD manifold processing trunk: {BiMap-RBN-ReEig}×n_blocks -> {BiMap-RBN} -> LogEig.
+    Output: flat Euclidean vector of n_ch*(n_ch+1)//2 elements.
+    Used by both RBNNet and DualBandRBNNet.
     """
-    def __init__(self, n_ch, n_classes=2, epsilon=1e-4, n_blocks=2):
+    def __init__(self, n_ch, epsilon=1e-4, n_blocks=2):
         super().__init__()
-        self.n_ch = n_ch
-        self.n_classes = n_classes
-        self.epsilon = epsilon
-        self.n_blocks = n_blocks
+        self.n_ch      = n_ch
+        self.epsilon   = epsilon
+        self.n_blocks  = n_blocks
+        self.n_features = n_ch * (n_ch + 1) // 2
 
-        # Build {BiMap - RBN - ReEig} x n_blocks
         blocks = []
         for _ in range(n_blocks):
             blocks.append(BiMapLayer(n_ch, n_ch))
             blocks.append(RBNLayer(n_ch))
             blocks.append(ReEigLayer(epsilon))
-        self.spd_blocks = nn.ModuleList(blocks)
-
-        # Final {BiMap - RBN} (no ReEig before LogEig)
+        self.spd_blocks  = nn.ModuleList(blocks)
         self.final_bimap = BiMapLayer(n_ch, n_ch)
-        self.final_rbn = RBNLayer(n_ch)
-
-        # LogEig: SPD → flat Euclidean vector
-        self.logeig = LogEigLayer()
-
-        # Classification head
-        n_features = n_ch * (n_ch + 1) // 2
-        self.classifier = nn.Linear(n_features, n_classes)
+        self.final_rbn   = RBNLayer(n_ch)
+        self.logeig      = LogEigLayer()
 
     def forward(self, X):
-        """
-        Parameters
-        ----------
-        X : (batch, n_ch, n_ch)  SPD covariance matrices
-
-        Returns
-        -------
-        logits : (batch, n_classes)  — pass through softmax for probabilities
-        """
-        # {BiMap - RBN - ReEig} blocks
+        """X: (batch, n_ch, n_ch) -> (batch, n_features)"""
         out = X
         for layer in self.spd_blocks:
             out = layer(out)
-
-        # Final {BiMap - RBN}
         out = self.final_bimap(out)
         out = self.final_rbn(out)
-
-        # LogEig: manifold → Euclidean
-        out = self.logeig(out)   # (batch, n_features)
-
-        # Classification
-        logits = self.classifier(out)
-        return logits
-
-    def predict_proba(self, X):
-        """
-        Convenience method returning softmax probabilities.
-
-        Parameters
-        ----------
-        X : (batch, n_ch, n_ch)  SPD covariance matrices
-
-        Returns
-        -------
-        probs : (batch, n_classes)  — [P(REST), P(MI)]
-        """
-        logits = self.forward(X)
-        return F.softmax(logits, dim=-1)
+        return self.logeig(out)
 
 
 # ---------------------------------------------------------------------------
-# Model construction helpers
+# Single-band RBNNet  — faithful to Liu et al. NER 2023
 # ---------------------------------------------------------------------------
 
-def build_rbnnet(n_ch, epsilon, n_classes=2, n_blocks=2):
+class RBNNet(nn.Module):
     """
-    Construct an RBNNet instance from the given parameters.
+    Single-band RBNNet (paper-faithful). No LayerNorm.
+
+    Use with mu-only (8-13 Hz) or wide-band (8-30 Hz) covariances.
+    Matches the architecture in Liu et al. NER 2023 exactly.
 
     Parameters
     ----------
-    n_ch     : SPD matrix dimension (number of EEG channels used)
-    epsilon  : ReEig rectification threshold
-    n_classes: number of output classes (2 for binary MI/REST)
-    n_blocks : number of {BiMap-RBN-ReEig} blocks
-
-    Returns
-    -------
-    RBNNet instance (not yet trained)
+    n_ch      : SPD matrix dimension (number of EEG channels)
+    n_classes : output classes (default 2: REST / MI)
+    epsilon   : ReEig threshold (from compute_epsilon_threshold)
+    n_blocks  : {BiMap-RBN-ReEig} repetitions (default 2, per paper)
     """
+    def __init__(self, n_ch, n_classes=2, epsilon=1e-4, n_blocks=2):
+        super().__init__()
+        self.n_ch      = n_ch
+        self.n_classes = n_classes
+        self.epsilon   = epsilon
+        self.n_blocks  = n_blocks
+
+        self.encoder    = RBNNetEncoder(n_ch, epsilon, n_blocks)
+        self.classifier = nn.Linear(self.encoder.n_features, n_classes)
+
+    def forward(self, X):
+        """X: (batch, n_ch, n_ch) -> logits (batch, n_classes)"""
+        return self.classifier(self.encoder(X))
+
+    def predict_proba(self, X):
+        """Softmax probabilities (batch, n_classes) — [P(REST), P(MI)]"""
+        return F.softmax(self.forward(X), dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Dual-band RBNNet — independent mu + beta streams with per-stream LayerNorm
+# ---------------------------------------------------------------------------
+
+class DualBandRBNNet(nn.Module):
+    """
+    Dual-band extension: independent mu and beta encoders, merged at the classifier.
+
+    Each band has its own RBNNetEncoder with separate weights, separate epsilon,
+    and separate RBN running means. After LogEig, each stream's flat vector is
+    normalized by an independent LayerNorm (per-sample, safe at batch size 1)
+    to address inter-band scale differences. Concatenated output feeds a shared
+    Linear classifier.
+
+    Architecture:
+      C_mu   -> RBNNetEncoder(eps_mu)   -> LayerNorm(n_features) ]
+                                                                   cat -> Linear(2*n_features, 2)
+      C_beta -> RBNNetEncoder(eps_beta) -> LayerNorm(n_features) ]
+
+    Parameters
+    ----------
+    n_ch         : SPD matrix dimension (same for both bands)
+    epsilon_mu   : ReEig threshold for mu encoder
+    epsilon_beta : ReEig threshold for beta encoder
+    n_classes    : output classes (default 2)
+    n_blocks     : {BiMap-RBN-ReEig} repetitions per encoder (default 2)
+    """
+    def __init__(self, n_ch, epsilon_mu=1e-4, epsilon_beta=1e-4,
+                 n_classes=2, n_blocks=2):
+        super().__init__()
+        self.n_ch         = n_ch
+        self.n_classes    = n_classes
+        self.epsilon_mu   = epsilon_mu
+        self.epsilon_beta = epsilon_beta
+        self.n_blocks     = n_blocks
+
+        self.mu_encoder   = RBNNetEncoder(n_ch, epsilon_mu,   n_blocks)
+        self.beta_encoder = RBNNetEncoder(n_ch, epsilon_beta, n_blocks)
+
+        n_features = self.mu_encoder.n_features  # same for both (same n_ch)
+
+        # Per-stream LayerNorm: normalizes across feature dim per sample.
+        # elementwise_affine=True adds learned scale+shift (default).
+        self.mu_norm   = nn.LayerNorm(n_features)
+        self.beta_norm = nn.LayerNorm(n_features)
+
+        self.classifier = nn.Linear(2 * n_features, n_classes)
+
+    def forward(self, C_mu, C_beta):
+        """
+        C_mu  : (batch, n_ch, n_ch) mu-band SPD matrices
+        C_beta: (batch, n_ch, n_ch) beta-band SPD matrices
+        Returns: logits (batch, n_classes)
+        """
+        feat_mu   = self.mu_norm(self.mu_encoder(C_mu))
+        feat_beta = self.beta_norm(self.beta_encoder(C_beta))
+        return self.classifier(torch.cat([feat_mu, feat_beta], dim=-1))
+
+    def predict_proba(self, C_mu, C_beta):
+        """Softmax probabilities (batch, n_classes) — [P(REST), P(MI)]"""
+        return F.softmax(self.forward(C_mu, C_beta), dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Construction helpers
+# ---------------------------------------------------------------------------
+
+def build_rbnnet(n_ch, epsilon, n_classes=2, n_blocks=2):
+    """Construct a single-band RBNNet (paper-faithful)."""
     return RBNNet(n_ch=n_ch, n_classes=n_classes, epsilon=epsilon, n_blocks=n_blocks)
 
+
+def build_dual_band_rbnnet(n_ch, epsilon_mu, epsilon_beta, n_classes=2, n_blocks=2):
+    """Construct a DualBandRBNNet."""
+    return DualBandRBNNet(
+        n_ch=n_ch, epsilon_mu=epsilon_mu, epsilon_beta=epsilon_beta,
+        n_classes=n_classes, n_blocks=n_blocks,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bundle serialization / deserialization
+# ---------------------------------------------------------------------------
 
 def save_rbnnet_bundle(model, label_to_bin, bin_to_label, tl_star, th_star,
                        roc_auc, channel_names, training_meta, path):
     """
-    Serialize the trained RBNNet model bundle to a pickle file.
-
-    The bundle format mirrors XGBoost and MDM bundles for compatibility
-    with the existing runtime_common.py dispatch logic.
+    Serialize a trained RBNNet or DualBandRBNNet bundle to pickle.
+    Compatible with runtime_common.py dispatch logic.
     """
     import pickle
+    use_beta = isinstance(model, DualBandRBNNet)
+    model_config = {
+        "n_ch":      model.n_ch,
+        "n_blocks":  model.n_blocks,
+        "n_classes": model.n_classes,
+        "use_beta":  use_beta,
+    }
+    if use_beta:
+        model_config["epsilon_mu"]   = model.epsilon_mu
+        model_config["epsilon_beta"] = model.epsilon_beta
+    else:
+        model_config["epsilon"] = model.epsilon
+
     bundle = {
-        "type": "rbnnet",
+        "type":             "rbnnet",
         "model_state_dict": model.state_dict(),
-        "model_config": {
-            "n_ch": model.n_ch,
-            "n_blocks": model.n_blocks,
-            "epsilon": model.epsilon,
-            "n_classes": model.n_classes,
-        },
-        "label_to_bin": label_to_bin,
-        "bin_to_label": bin_to_label,
-        "tl_star": float(tl_star),
-        "th_star": float(th_star),
-        "roc_auc": float(roc_auc),
-        "channel_names": list(channel_names),
-        "training_meta": training_meta,
+        "model_config":     model_config,
+        "label_to_bin":     label_to_bin,
+        "bin_to_label":     bin_to_label,
+        "tl_star":          float(tl_star),
+        "th_star":          float(th_star),
+        "roc_auc":          float(roc_auc),
+        "channel_names":    list(channel_names),
+        "training_meta":    training_meta,
     }
     with open(path, "wb") as f:
         pickle.dump(bundle, f)
-    print(f"[RBNNet] Model bundle saved to {path}")
+    print(f"[RBNNet] Bundle saved -> {path}")
 
 
 def load_rbnnet_bundle(path):
     """
-    Load a serialized RBNNet bundle and reconstruct the model.
-
-    Returns
-    -------
-    bundle : dict  with "model" key holding a ready-to-use RBNNet in eval mode
+    Load a serialized bundle and reconstruct the model in eval mode.
+    Adds a 'model' key with the ready-to-use network.
     """
     import pickle
     with open(path, "rb") as f:
         bundle = pickle.load(f)
 
-    cfg = bundle["model_config"]
-    model = RBNNet(
-        n_ch=cfg["n_ch"],
-        n_classes=cfg.get("n_classes", 2),
-        epsilon=cfg["epsilon"],
-        n_blocks=cfg.get("n_blocks", 2),
-    )
+    cfg      = bundle["model_config"]
+    use_beta = cfg.get("use_beta", False)
+
+    if use_beta:
+        model = DualBandRBNNet(
+            n_ch=cfg["n_ch"],
+            epsilon_mu=cfg["epsilon_mu"],
+            epsilon_beta=cfg["epsilon_beta"],
+            n_classes=cfg.get("n_classes", 2),
+            n_blocks=cfg.get("n_blocks", 2),
+        )
+    else:
+        model = RBNNet(
+            n_ch=cfg["n_ch"],
+            epsilon=cfg["epsilon"],
+            n_classes=cfg.get("n_classes", 2),
+            n_blocks=cfg.get("n_blocks", 2),
+        )
+
     model.load_state_dict(bundle["model_state_dict"])
     model.eval()
     bundle["model"] = model

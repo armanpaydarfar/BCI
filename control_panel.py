@@ -325,6 +325,7 @@ TRAINING_SCRIPT_ENTRIES = [
     ("XGBoost covariance features", "generate_xgboost_cov_features.py"),
     ("XGBoost cov + ERD features", "generate_xgboost_cov_erd_features.py"),
     ("XGBoost ERD features", "generate_xgboost_erd_features.py"),
+    ("RBNNet decoder (single/dual band)", "generate_rbnnet_model.py"),
 ]
 
 # ----------------- UDP readiness probe -----------------
@@ -779,7 +780,7 @@ class ControlPanel(QMainWindow):
         inner = QWidget()
         form = QFormLayout(inner)
         self.rc_decoder = QComboBox()
-        self.rc_decoder.addItems(["mdm", "xgb_cov", "xgb_cov_erd"])
+        self.rc_decoder.addItems(["mdm", "xgb_cov", "xgb_cov_erd", "rbnnet"])
         self.rc_earlystop = QComboBox()
         self.rc_earlystop.addItems(["either", "correct_only"])
         self.rc_visual = QComboBox()

@@ -150,6 +150,9 @@ RBNNET_BATCH_SIZE = 32          # Mini-batch size
 RBNNET_WEIGHT_DECAY = 1e-4      # Adam L2 weight decay
 RBNNET_VARIANCE_RETAINED = 0.995  # Fraction of variance for epsilon (ReEig threshold)
 SHRINKAGE_PARAM_RBNNET = 0.02   # Covariance shrinkage lambda (same as MDM)
+RBNNET_USE_BETA = 0             # 0 = single-band mu only, 1 = dual-band mu+beta
+RBNNET_LOWCUT_BETA = 13         # Hz — beta band low edge
+RBNNET_HIGHCUT_BETA = 30        # Hz — beta band high edge
 
 # =============================================================================
 # FES

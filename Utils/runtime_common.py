@@ -275,32 +275,45 @@ def _is_rbnnet_bundle(obj):
     )
 
 
-def _build_rbnnet_cov(eeg_state, window_size_samples, *, update_recentering: bool = True):
+def _build_rbnnet_cov(eeg_state, window_size_samples, use_beta=False, *,
+                      update_recentering: bool = True):
     """
-    Build the (1, n_ch, n_ch) SPD covariance tensor for RBNNet inference.
+    Build covariance tensor(s) for RBNNet inference.
 
-    Steps:
+    Single-band (use_beta=False):
+      Returns (1, n_ch, n_ch) float32 tensor (mu covariance only).
+
+    Dual-band (use_beta=True):
+      Returns tuple ((1, n_ch, n_ch), (1, n_ch, n_ch)) — (C_mu, C_beta).
+
+    Steps per band:
       1. Get baseline-corrected window from EEGStreamState
       2. Compute trace-normalised covariance
       3. Apply shrinkage regularization
       4. Optionally apply Riemannian adaptive recentering
-      5. Return as a (1, n_ch, n_ch) float32 torch.Tensor
+      5. Wrap as (1, n_ch, n_ch) float32 torch.Tensor
     """
     torch, _ = _ensure_torch()
 
-    window, _ = eeg_state.get_baseline_corrected_window(window_size_samples)
-    cov = _covariance_from_window(window)
-    cov = _shrink_single_cov(cov)
-    cov = _adaptive_recenter_cov(cov, "mu", update_recentering=update_recentering)
+    def _build_one(window, band_name):
+        cov = _covariance_from_window(window)
+        cov = _shrink_single_cov(cov)
+        cov = _adaptive_recenter_cov(cov, band_name, update_recentering=update_recentering)
+        return torch.tensor(cov, dtype=torch.float32).unsqueeze(0)
 
-    # Shape: (1, n_ch, n_ch)
-    cov_tensor = torch.tensor(cov, dtype=torch.float32).unsqueeze(0)
-    return cov_tensor
+    if use_beta:
+        mu_win, beta_win, _ = eeg_state.get_multiband_baseline_corrected_window(window_size_samples)
+        return _build_one(mu_win, "mu"), _build_one(beta_win, "beta")
+    else:
+        window, _ = eeg_state.get_baseline_corrected_window(window_size_samples)
+        return _build_one(window, "mu")
 
 
 def _predict_with_rbnnet(eeg_state, window_size_samples, *, update_recentering: bool = True):
     """
-    Run RBNNet inference for one classification step.
+    Run RBNNet (single-band or dual-band) inference for one classification step.
+
+    Dispatches on model["model_config"]["use_beta"] to determine architecture.
 
     Returns
     -------
@@ -309,16 +322,23 @@ def _predict_with_rbnnet(eeg_state, window_size_samples, *, update_recentering: 
     """
     torch, _ = _ensure_torch()
 
+    use_beta = bool(model.get("model_config", {}).get("use_beta", False))
+
     try:
-        cov_tensor = _build_rbnnet_cov(
-            eeg_state, window_size_samples, update_recentering=update_recentering
+        cov_out = _build_rbnnet_cov(
+            eeg_state, window_size_samples,
+            use_beta=use_beta, update_recentering=update_recentering
         )
     except ValueError:
         return None, None
 
     rbnnet = model["model"]
     with torch.no_grad():
-        probs = rbnnet.predict_proba(cov_tensor)[0].cpu().numpy()  # [P(REST), P(MI)]
+        if use_beta:
+            C_mu, C_beta = cov_out
+            probs = rbnnet.predict_proba(C_mu, C_beta)[0].cpu().numpy()
+        else:
+            probs = rbnnet.predict_proba(cov_out)[0].cpu().numpy()
 
     rest_label = min(model["label_to_bin"], key=lambda k: model["label_to_bin"][k])
     mi_label   = max(model["label_to_bin"], key=lambda k: model["label_to_bin"][k])
