@@ -43,6 +43,7 @@ from sklearn.metrics import roc_auc_score, accuracy_score
 import config
 from Utils.stream_utils import load_xdf
 from Utils.preprocessing import initialize_filter_bank, apply_streaming_filters
+from Utils.artifact_rejection import apply_training_artifact_rejection
 from Utils.rbnnet_model import (
     build_rbnnet,
     build_dual_band_rbnnet,
@@ -326,7 +327,8 @@ def _plot_scores(scores, labels_bin, tl, th, subject_id, save_path=None):
 def main():
     use_beta   = bool(int(getattr(config, "RBNNET_USE_BETA", 0)))
     subject_id = config.TRAINING_SUBJECT
-    data_dir   = os.path.join(config.DATA_DIR, subject_id)
+    data_dir   = os.path.join(config.DATA_DIR, f"sub-{subject_id}", "training_data")
+    model_dir  = os.path.join(config.DATA_DIR, f"sub-{subject_id}", "models")
     arch_label = "dual_band" if use_beta else "single_band"
 
     print(f"\n{'='*60}")
@@ -369,6 +371,8 @@ def main():
             continue
         print(f"  Segments: {segs.shape[0]}  "
               f"Labels: {dict(zip(*np.unique(lbls, return_counts=True)))}")
+        segs, lbls, _ = apply_training_artifact_rejection(segs, lbls)
+        print(f"  Retained after artifact rejection: {segs.shape[0]}")
         all_segments.append(segs)
         all_labels.append(lbls)
 
@@ -448,8 +452,9 @@ def main():
     print(f"[Final train AUC] {final_auc:.3f}")
 
     # --- Save bundle ---
+    os.makedirs(model_dir, exist_ok=True)
     bundle_name = f"rbnnet_{arch_label}_{subject_id}.pkl"
-    bundle_path = os.path.join(data_dir, bundle_name)
+    bundle_path = os.path.join(model_dir, bundle_name)
 
     training_meta = {
         "subject":           subject_id,
@@ -490,9 +495,9 @@ def main():
 
     # --- Plots ---
     _plot_cv_auc(cv_results, subject_id,
-                 save_path=os.path.join(data_dir, f"rbnnet_{arch_label}_{subject_id}_cv_auc.png"))
+                 save_path=os.path.join(model_dir, f"rbnnet_{arch_label}_{subject_id}_cv_auc.png"))
     _plot_scores(scores_all, labels_bin, tl_star, th_star, subject_id,
-                 save_path=os.path.join(data_dir, f"rbnnet_{arch_label}_{subject_id}_scores.png"))
+                 save_path=os.path.join(model_dir, f"rbnnet_{arch_label}_{subject_id}_scores.png"))
 
     print(f"\n{'='*60}")
     print(f"  Training complete  [{arch_label}]")
