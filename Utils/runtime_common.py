@@ -13,6 +13,21 @@ from pyriemann.utils.base import invsqrtm
 from pyriemann.tangentspace import tangent_space
 import pandas as pd
 from sklearn.metrics import confusion_matrix
+
+# RBNNet (lazy import to keep PyTorch optional when not using rbnnet backend)
+_torch = None
+_rbnnet_module = None
+
+def _ensure_torch():
+    global _torch, _rbnnet_module
+    if _torch is None:
+        import torch as _torch_mod
+        import Utils.rbnnet_model as _rbnnet_mod
+        _torch = _torch_mod
+        _rbnnet_module = _rbnnet_mod
+    return _torch, _rbnnet_module
+
+
 # Visualization utils (UI draws)
 from Utils.visualization import (
     draw_class_feedback_cues,
@@ -250,6 +265,70 @@ def _is_xgb_bundle(obj):
     return isinstance(obj, dict) and "model" in obj and "scaler" in obj and "label_to_bin" in obj
 
 
+def _is_rbnnet_bundle(obj):
+    """Check whether `obj` is a loaded RBNNet model bundle."""
+    return (
+        isinstance(obj, dict)
+        and obj.get("type") == "rbnnet"
+        and "model" in obj          # reconstructed RBNNet instance
+        and "label_to_bin" in obj
+    )
+
+
+def _build_rbnnet_cov(eeg_state, window_size_samples, *, update_recentering: bool = True):
+    """
+    Build the (1, n_ch, n_ch) SPD covariance tensor for RBNNet inference.
+
+    Steps:
+      1. Get baseline-corrected window from EEGStreamState
+      2. Compute trace-normalised covariance
+      3. Apply shrinkage regularization
+      4. Optionally apply Riemannian adaptive recentering
+      5. Return as a (1, n_ch, n_ch) float32 torch.Tensor
+    """
+    torch, _ = _ensure_torch()
+
+    window, _ = eeg_state.get_baseline_corrected_window(window_size_samples)
+    cov = _covariance_from_window(window)
+    cov = _shrink_single_cov(cov)
+    cov = _adaptive_recenter_cov(cov, "mu", update_recentering=update_recentering)
+
+    # Shape: (1, n_ch, n_ch)
+    cov_tensor = torch.tensor(cov, dtype=torch.float32).unsqueeze(0)
+    return cov_tensor
+
+
+def _predict_with_rbnnet(eeg_state, window_size_samples, *, update_recentering: bool = True):
+    """
+    Run RBNNet inference for one classification step.
+
+    Returns
+    -------
+    probabilities : np.ndarray shape (2,)   — [P(REST), P(MI)]
+    predicted_label : int                   — REST_BEGIN (100) or MI_BEGIN (200)
+    """
+    torch, _ = _ensure_torch()
+
+    try:
+        cov_tensor = _build_rbnnet_cov(
+            eeg_state, window_size_samples, update_recentering=update_recentering
+        )
+    except ValueError:
+        return None, None
+
+    rbnnet = model["model"]
+    with torch.no_grad():
+        probs = rbnnet.predict_proba(cov_tensor)[0].cpu().numpy()  # [P(REST), P(MI)]
+
+    rest_label = min(model["label_to_bin"], key=lambda k: model["label_to_bin"][k])
+    mi_label   = max(model["label_to_bin"], key=lambda k: model["label_to_bin"][k])
+    prob_mi   = float(probs[model["label_to_bin"][mi_label]])
+    prob_rest = float(probs[model["label_to_bin"][rest_label]])
+    predicted_label = int(mi_label if prob_mi >= prob_rest else rest_label)
+
+    return np.array([prob_rest, prob_mi], dtype=float), predicted_label
+
+
 def _covariance_from_window(window_2d):
     cov = (window_2d @ window_2d.T)
     tr = np.trace(cov)
@@ -263,6 +342,8 @@ def _shrink_single_cov(cov):
         backend = str(getattr(config, "DECODER_BACKEND", "mdm")).strip().lower()
         if backend.startswith("xgb"):
             return float(getattr(config, "SHRINKAGE_PARAM_XGB", getattr(config, "SHRINKAGE_PARAM", 0.1)))
+        if backend == "rbnnet":
+            return float(getattr(config, "SHRINKAGE_PARAM_RBNNET", getattr(config, "SHRINKAGE_PARAM_MDM", 0.02)))
         return float(getattr(config, "SHRINKAGE_PARAM_MDM", getattr(config, "SHRINKAGE_PARAM", 0.02)))
 
     if config.LEDOITWOLF:
@@ -454,6 +535,34 @@ def classify_real_time(eeg_state, window_size_samples, all_probabilities, predic
 
     pygame.display.flip()
     pygame.event.get()  # Heartbeat to OS
+
+    # -------- RBNNet path --------
+    if _is_rbnnet_bundle(model):
+        try:
+            probabilities, predicted_label = _predict_with_rbnnet(
+                eeg_state, window_size_samples,
+                update_recentering=bool(update_recentering),
+            )
+        except ValueError:
+            return leaky_integrator.accumulated_probability, predictions, all_probabilities
+
+        if probabilities is None:
+            return leaky_integrator.accumulated_probability, predictions, all_probabilities
+
+        if not _decoder_checked:
+            logger.log_event(
+                f"RBNNet decoder initialized. "
+                f"n_ch={model['model_config']['n_ch']}  "
+                f"epsilon={model['model_config']['epsilon']:.6f}  "
+                f"tl={model['tl_star']:.3f}  th={model['th_star']:.3f}"
+            )
+            _decoder_checked = True
+
+        correct_label = 200 if mode == 0 else 100
+        current_confidence = float(probabilities[1] if correct_label == 200 else probabilities[0])
+        predictions.append(int(predicted_label))
+        all_probabilities.append([time.time(), float(probabilities[0]), float(probabilities[1])])
+        return current_confidence, predictions, all_probabilities
 
     if _is_xgb_bundle(model):
         try:

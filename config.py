@@ -138,8 +138,18 @@ XGB_USE_COV_BETA = 1
 XGB_ERD_BANDS = [(float(LOWCUT), float(HIGHCUT))]
 XGB_IMPORTANCE_TOP_K = 20
 
-# Online decoder backend: "mdm" | "xgb_cov" | "xgb_cov_erd"
+# Online decoder backend: "mdm" | "xgb_cov" | "xgb_cov_erd" | "rbnnet"
 DECODER_BACKEND = "xgb_cov"
+
+# =============================================================================
+# RBNNet hyperparameters (generate_rbnnet_model.py)
+# =============================================================================
+RBNNET_EPOCHS = 200             # Training epochs
+RBNNET_LR = 1e-3                # Adam learning rate
+RBNNET_BATCH_SIZE = 32          # Mini-batch size
+RBNNET_WEIGHT_DECAY = 1e-4      # Adam L2 weight decay
+RBNNET_VARIANCE_RETAINED = 0.995  # Fraction of variance for epsilon (ReEig threshold)
+SHRINKAGE_PARAM_RBNNET = 0.02   # Covariance shrinkage lambda (same as MDM)
 
 # =============================================================================
 # FES
