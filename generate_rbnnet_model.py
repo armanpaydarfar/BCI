@@ -29,6 +29,8 @@ import sys
 import glob
 import pickle
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend — plots save to file, never block
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -301,7 +303,7 @@ def _plot_cv_auc(results, subject_id, save_path=None):
     if save_path:
         plt.savefig(save_path, dpi=120)
         print(f"[plot] {save_path}")
-    plt.show()
+    plt.close()
 
 
 def _plot_scores(scores, labels_bin, tl, th, subject_id, save_path=None):
@@ -317,7 +319,7 @@ def _plot_scores(scores, labels_bin, tl, th, subject_id, save_path=None):
     if save_path:
         plt.savefig(save_path, dpi=120)
         print(f"[plot] {save_path}")
-    plt.show()
+    plt.close()
 
 
 # ---------------------------------------------------------------------------
