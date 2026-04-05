@@ -243,9 +243,23 @@ def _build_and_train(use_beta, n_ch, epsilon_mu, epsilon_beta,
 
     model = model.to(device)
     try:
-        model = torch.compile(model)
+        # inductor (default) requires Triton which is Linux-only.
+        # On Windows+CUDA use cudagraphs: captures and replays the CUDA kernel
+        # sequence, eliminating kernel launch overhead for fixed-shape inputs.
+        # On Linux, inductor provides full kernel fusion via Triton.
+        # Falls back silently on CPU or if compilation fails.
+        if sys.platform == "win32" and device.type == "cuda":
+            compile_backend = "cudagraphs"
+        elif device.type == "cuda":
+            compile_backend = "inductor"
+        else:
+            compile_backend = None
+
+        if compile_backend:
+            model = torch.compile(model, backend=compile_backend)
+            print(f"[Compile] torch.compile backend='{compile_backend}'")
     except Exception:
-        pass  # torch.compile unavailable (older PyTorch or CPU-only build)
+        print("[Compile] torch.compile unavailable, running eager.")
 
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=False)
     criterion = nn.CrossEntropyLoss()
