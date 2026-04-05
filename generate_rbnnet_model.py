@@ -26,6 +26,12 @@ Usage:
 
 import os
 import sys
+
+# Prevent Intel Fortran/MKL runtime from intercepting Ctrl+C on Windows,
+# ensuring Python's signal handler and try/finally blocks run on interrupt.
+if sys.platform == "win32":
+    os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "1"
+
 import glob
 import pickle
 import random
@@ -51,6 +57,7 @@ torch.manual_seed(_SEED)
 torch.cuda.manual_seed_all(_SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
+torch.set_float32_matmul_precision("high")  # enable TF32 Tensor Cores (no-op on CPU)
 
 # ---------------------------------------------------------------------------
 # Sleep inhibitor (Windows only — silently skipped on Linux/Mac)
