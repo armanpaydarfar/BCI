@@ -28,6 +28,7 @@ import os
 import sys
 import glob
 import pickle
+import random
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend — plots save to file, never block
@@ -38,6 +39,17 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+
+# ---------------------------------------------------------------------------
+# Global seed for reproducibility
+# ---------------------------------------------------------------------------
+_SEED = 42
+random.seed(_SEED)
+np.random.seed(_SEED)
+torch.manual_seed(_SEED)
+torch.cuda.manual_seed_all(_SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, accuracy_score
