@@ -29,6 +29,7 @@ import sys
 import glob
 import pickle
 import random
+import time
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend — plots save to file, never block
@@ -158,25 +159,28 @@ def compute_beta_covariances(segments_np, labels_np, lam):
 # Training helpers
 # ---------------------------------------------------------------------------
 
-def _single_band_dataset(cov_mu_np, labels_bin_np):
+def _single_band_dataset(cov_mu_np, labels_bin_np, device=None):
     X = torch.tensor(cov_mu_np, dtype=torch.float32)
     y = torch.tensor(labels_bin_np, dtype=torch.long)
+    if device is not None:
+        X, y = X.to(device), y.to(device)
     return TensorDataset(X, y)
 
 
-def _dual_band_dataset(cov_mu_np, cov_beta_np, labels_bin_np):
+def _dual_band_dataset(cov_mu_np, cov_beta_np, labels_bin_np, device=None):
     X_mu   = torch.tensor(cov_mu_np,   dtype=torch.float32)
     X_beta = torch.tensor(cov_beta_np, dtype=torch.float32)
     y      = torch.tensor(labels_bin_np, dtype=torch.long)
+    if device is not None:
+        X_mu, X_beta, y = X_mu.to(device), X_beta.to(device), y.to(device)
     return TensorDataset(X_mu, X_beta, y)
 
 
-def _train_one_epoch_single(model, loader, criterion, optimizer, device):
+def _train_one_epoch_single(model, loader, criterion, optimizer):
     model.train()
     total_loss = 0.0
     for (X_batch, y_batch) in loader:
-        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss = criterion(model(X_batch), y_batch)
         loss.backward()
         optimizer.step()
@@ -184,12 +188,11 @@ def _train_one_epoch_single(model, loader, criterion, optimizer, device):
     return total_loss / len(loader.dataset)
 
 
-def _train_one_epoch_dual(model, loader, criterion, optimizer, device):
+def _train_one_epoch_dual(model, loader, criterion, optimizer):
     model.train()
     total_loss = 0.0
     for (X_mu, X_beta, y_batch) in loader:
-        X_mu, X_beta, y_batch = X_mu.to(device), X_beta.to(device), y_batch.to(device)
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss = criterion(model(X_mu, X_beta), y_batch)
         loss.backward()
         optimizer.step()
@@ -200,27 +203,23 @@ def _train_one_epoch_dual(model, loader, criterion, optimizer, device):
 @torch.no_grad()
 def _predict_proba_single(model, cov_mu_np, device, batch_size=128):
     model.eval()
-    ds     = TensorDataset(torch.tensor(cov_mu_np, dtype=torch.float32))
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+    X      = torch.tensor(cov_mu_np, dtype=torch.float32).to(device)
+    loader = DataLoader(TensorDataset(X), batch_size=batch_size, shuffle=False)
     probs  = []
     for (batch,) in loader:
-        probs.append(torch.softmax(model(batch.to(device)), dim=-1).cpu().numpy())
+        probs.append(torch.softmax(model(batch), dim=-1).cpu().numpy())
     return np.concatenate(probs, axis=0)
 
 
 @torch.no_grad()
 def _predict_proba_dual(model, cov_mu_np, cov_beta_np, device, batch_size=128):
     model.eval()
-    ds     = TensorDataset(
-        torch.tensor(cov_mu_np,   dtype=torch.float32),
-        torch.tensor(cov_beta_np, dtype=torch.float32),
-    )
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+    X_mu   = torch.tensor(cov_mu_np,   dtype=torch.float32).to(device)
+    X_beta = torch.tensor(cov_beta_np, dtype=torch.float32).to(device)
+    loader = DataLoader(TensorDataset(X_mu, X_beta), batch_size=batch_size, shuffle=False)
     probs  = []
     for (bmu, bbeta) in loader:
-        probs.append(
-            torch.softmax(model(bmu.to(device), bbeta.to(device)), dim=-1).cpu().numpy()
-        )
+        probs.append(torch.softmax(model(bmu, bbeta), dim=-1).cpu().numpy())
     return np.concatenate(probs, axis=0)
 
 
@@ -230,25 +229,34 @@ def _build_and_train(use_beta, n_ch, epsilon_mu, epsilon_beta,
     """Construct, train, and return a fresh model."""
     if use_beta:
         model = build_dual_band_rbnnet(n_ch, epsilon_mu, epsilon_beta)
-        ds    = _dual_band_dataset(cov_mu_tr, cov_beta_tr, y_tr)
+        ds    = _dual_band_dataset(cov_mu_tr, cov_beta_tr, y_tr, device=device)
     else:
         model = build_rbnnet(n_ch, epsilon_mu)
-        ds    = _single_band_dataset(cov_mu_tr, y_tr)
+        ds    = _single_band_dataset(cov_mu_tr, y_tr, device=device)
 
     model = model.to(device)
+    try:
+        model = torch.compile(model)
+    except Exception:
+        pass  # torch.compile unavailable (older PyTorch or CPU-only build)
+
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=False)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=max(1, epochs // 3), gamma=0.5)
 
+    t_start = time.time()
     for epoch in range(1, epochs + 1):
         if use_beta:
-            loss = _train_one_epoch_dual(model, loader, criterion, optimizer, device)
+            loss = _train_one_epoch_dual(model, loader, criterion, optimizer)
         else:
-            loss = _train_one_epoch_single(model, loader, criterion, optimizer, device)
+            loss = _train_one_epoch_single(model, loader, criterion, optimizer)
         scheduler.step()
         if epoch % 20 == 0 or epoch == 1:
-            print(f"  [RBNNet] Epoch {epoch:3d}/{epochs}  loss={loss:.4f}")
+            elapsed   = time.time() - t_start
+            remaining = elapsed / epoch * (epochs - epoch)
+            print(f"  [RBNNet] Epoch {epoch:3d}/{epochs}  loss={loss:.4f}"
+                  f"  elapsed={elapsed:.0f}s  remaining~{remaining:.0f}s")
 
     model.eval()
     return model
