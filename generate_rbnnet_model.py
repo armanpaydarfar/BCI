@@ -51,6 +51,33 @@ torch.cuda.manual_seed_all(_SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
+# ---------------------------------------------------------------------------
+# Sleep inhibitor (Windows only — silently skipped on Linux/Mac)
+# ---------------------------------------------------------------------------
+def _inhibit_sleep():
+    """Disable standby sleep on Windows. No-op on other platforms."""
+    if sys.platform != "win32":
+        return
+    try:
+        import subprocess
+        subprocess.run(["powercfg", "/change", "standby-timeout-ac", "0"],
+                       check=True, capture_output=True)
+        print("[Sleep] Sleep disabled for training run.")
+    except Exception:
+        pass
+
+def _restore_sleep():
+    """Restore standby sleep to 30 min on Windows. No-op on other platforms."""
+    if sys.platform != "win32":
+        return
+    try:
+        import subprocess
+        subprocess.run(["powercfg", "/change", "standby-timeout-ac", "30"],
+                       check=True, capture_output=True)
+        print("[Sleep] Sleep restored.")
+    except Exception:
+        pass
+
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, accuracy_score
 
@@ -523,4 +550,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    _inhibit_sleep()
+    try:
+        main()
+    finally:
+        _restore_sleep()
