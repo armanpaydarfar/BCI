@@ -347,29 +347,52 @@ def build_dual_band_rbnnet(n_ch, epsilon_mu, epsilon_beta, n_classes=2, n_blocks
 # Bundle serialization / deserialization
 # ---------------------------------------------------------------------------
 
+def _unwrap_compiled(model):
+    """
+    Return the underlying nn.Module from a torch.compile-wrapped OptimizedModule,
+    or the model itself if it is not compiled.
+
+    torch.compile wraps the model in torch._dynamo.eval_frame.OptimizedModule and
+    stores the original module as _orig_mod in nn.Module._modules.  This means
+    compiled_model.state_dict() produces keys prefixed with "_orig_mod." which are
+    incompatible with the fresh (uncompiled) model used in load_rbnnet_bundle.
+    Unwrapping before serialisation avoids this mismatch entirely.
+    """
+    orig = getattr(model, "_orig_mod", None)
+    if orig is not None and isinstance(orig, torch.nn.Module):
+        return orig
+    return model
+
+
 def save_rbnnet_bundle(model, label_to_bin, bin_to_label, tl_star, th_star,
                        roc_auc, channel_names, training_meta, path):
     """
     Serialize a trained RBNNet or DualBandRBNNet bundle to pickle.
     Compatible with runtime_common.py dispatch logic.
+
+    If *model* is a torch.compile-wrapped OptimizedModule the underlying
+    nn.Module is extracted before serialisation so that state_dict keys are
+    not prefixed with "_orig_mod." (which would break load_rbnnet_bundle).
     """
     import pickle
-    use_beta = isinstance(model, DualBandRBNNet)
+    # Unwrap torch.compile wrapper so state_dict keys are clean.
+    raw_model = _unwrap_compiled(model)
+    use_beta = isinstance(raw_model, DualBandRBNNet)
     model_config = {
-        "n_ch":      model.n_ch,
-        "n_blocks":  model.n_blocks,
-        "n_classes": model.n_classes,
+        "n_ch":      raw_model.n_ch,
+        "n_blocks":  raw_model.n_blocks,
+        "n_classes": raw_model.n_classes,
         "use_beta":  use_beta,
     }
     if use_beta:
-        model_config["epsilon_mu"]   = model.epsilon_mu
-        model_config["epsilon_beta"] = model.epsilon_beta
+        model_config["epsilon_mu"]   = raw_model.epsilon_mu
+        model_config["epsilon_beta"] = raw_model.epsilon_beta
     else:
-        model_config["epsilon"] = model.epsilon
+        model_config["epsilon"] = raw_model.epsilon
 
     bundle = {
         "type":             "rbnnet",
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": raw_model.state_dict(),
         "model_config":     model_config,
         "label_to_bin":     label_to_bin,
         "bin_to_label":     bin_to_label,

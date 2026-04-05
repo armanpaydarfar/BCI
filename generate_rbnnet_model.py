@@ -48,6 +48,40 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 # ---------------------------------------------------------------------------
+# Environment diagnostics (printed once at startup)
+# ---------------------------------------------------------------------------
+
+def _print_env_diagnostics():
+    """Print torch/CUDA/Triton environment summary at startup."""
+    print("\n[Env] torch version  :", torch.__version__)
+    print("[Env] CUDA version   :", torch.version.cuda)
+    print("[Env] CUDA available :", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        print("[Env] GPU            :", torch.cuda.get_device_name(0))
+    else:
+        print("[Env] GPU            : N/A")
+
+    # Triton availability check
+    try:
+        import triton  # noqa: F401
+        print("[Env] Triton         : INSTALLED —", getattr(triton, "__version__", "unknown version"))
+        print("[Env] inductor backend: available (Triton present)")
+    except ImportError:
+        print("[Env] Triton         : NOT installed")
+        if sys.platform == "win32":
+            print("[Env] inductor backend: UNAVAILABLE on Windows without Triton")
+            print("[Env]   To enable inductor on Windows+CUDA+PyTorch 2.6, run:")
+            print('[Env]     pip install "triton-windows<3.3"')
+            print("[Env]   cudagraphs backend will be used instead (no Triton needed)")
+        else:
+            print("[Env] inductor backend: unavailable (install triton)")
+
+    # torch.compile availability
+    has_compile = hasattr(torch, "compile")
+    print("[Env] torch.compile  :", "available" if has_compile else "NOT available (torch < 2.0)")
+    print()
+
+# ---------------------------------------------------------------------------
 # Global seed for reproducibility
 # ---------------------------------------------------------------------------
 _SEED = 42
@@ -242,44 +276,82 @@ def _build_and_train(use_beta, n_ch, epsilon_mu, epsilon_beta,
         ds    = _single_band_dataset(cov_mu_tr, y_tr, device=device)
 
     model = model.to(device)
+
+    # --- Diagnostics: confirm device placement ---
+    param_device = next(model.parameters()).device
+    print(f"[Diag] Model parameters on device: {param_device}")
+
+    # --- torch.compile ---
+    # inductor requires Triton (not available on Windows without triton-windows).
+    # On Windows+CUDA: cudagraphs captures and replays the static CUDA kernel
+    # sequence, eliminating per-kernel launch overhead without needing Triton.
+    # On Linux+CUDA: inductor does full kernel fusion via Triton.
+    # On CPU: compilation overhead exceeds benefit for this small model; skip.
+    #
+    # NOTE: triton-windows (pip install "triton-windows<3.3") would enable the
+    # full inductor backend on Windows+CUDA with PyTorch 2.6+cu124. With it you
+    # could use compile_backend = "inductor" unconditionally on CUDA. Without it,
+    # cudagraphs is the correct Windows fallback.
+    compile_backend = None
+    _compile_attempted = False
     try:
-        # inductor (default) requires Triton which is Linux-only.
-        # On Windows+CUDA use cudagraphs: captures and replays the CUDA kernel
-        # sequence, eliminating kernel launch overhead for fixed-shape inputs.
-        # On Linux, inductor provides full kernel fusion via Triton.
-        # Falls back silently on CPU or if compilation fails.
-        if sys.platform == "win32" and device.type == "cuda":
-            compile_backend = "cudagraphs"
-        elif device.type == "cuda":
+        if device.type == "cuda":
             compile_backend = "inductor"
-        else:
-            compile_backend = None
+        # else: CPU — skip compilation; overhead outweighs benefit for this model size
 
         if compile_backend:
+            _compile_attempted = True
             model = torch.compile(model, backend=compile_backend)
-            print(f"[Compile] torch.compile backend='{compile_backend}'")
-    except Exception:
-        print("[Compile] torch.compile unavailable, running eager.")
+            print(f"[Compile] torch.compile registered with backend='{compile_backend}'")
+            print(f"[Compile] Compilation is LAZY — actual JIT compilation happens on "
+                  f"first forward pass (epoch 1). Expect epoch 1 to be slower.")
+    except Exception as exc:
+        print(f"[Compile] torch.compile FAILED ({exc!r}), running eager.")
+        compile_backend = None
+
+    if not compile_backend and not _compile_attempted:
+        print("[Compile] torch.compile skipped (CPU device — eager mode).")
 
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=False)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=max(1, epochs // 3), gamma=0.5)
 
+    # --- Timing diagnostics: track per-epoch time to detect compile warmup ---
+    _epoch_times = []
     t_start = time.time()
     for epoch in range(1, epochs + 1):
+        t_epoch = time.time()
         if use_beta:
             loss = _train_one_epoch_dual(model, loader, criterion, optimizer)
         else:
             loss = _train_one_epoch_single(model, loader, criterion, optimizer)
         scheduler.step()
+        _epoch_times.append(time.time() - t_epoch)
+
         if epoch % 20 == 0 or epoch == 1:
             elapsed   = time.time() - t_start
             remaining = elapsed / epoch * (epochs - epoch)
+            epoch_ms  = _epoch_times[-1] * 1000
             print(f"  [RBNNet] Epoch {epoch:3d}/{epochs}  loss={loss:.4f}"
-                  f"  elapsed={elapsed:.0f}s  remaining~{remaining:.0f}s")
+                  f"  elapsed={elapsed:.0f}s  remaining~{remaining:.0f}s"
+                  f"  epoch_time={epoch_ms:.1f}ms")
+
+        # After warmup (epoch 3): report if compile is paying off
+        if epoch == 3 and compile_backend and len(_epoch_times) >= 3:
+            t_first  = _epoch_times[0] * 1000
+            t_warmup = _epoch_times[2] * 1000
+            print(f"[Diag] Epoch 1 (compile+run): {t_first:.1f}ms  "
+                  f"Epoch 3 (post-warmup): {t_warmup:.1f}ms  "
+                  f"({'faster' if t_warmup < t_first else 'no speedup yet — normal for small models'})")
 
     model.eval()
+
+    if compile_backend and _epoch_times:
+        avg_after_warmup = sum(_epoch_times[3:]) / max(len(_epoch_times[3:]), 1) * 1000
+        print(f"[Diag] Avg epoch time after warmup: {avg_after_warmup:.1f}ms  "
+              f"(backend='{compile_backend}')")
+
     return model
 
 
@@ -396,6 +468,8 @@ def _plot_scores(scores, labels_bin, tl, th, subject_id, save_path=None):
 # ---------------------------------------------------------------------------
 
 def main():
+    _print_env_diagnostics()
+
     use_beta   = bool(int(getattr(config, "RBNNET_USE_BETA", 0)))
     subject_id = config.TRAINING_SUBJECT
     data_dir   = os.path.join(config.DATA_DIR, f"sub-{subject_id}", "training_data")
