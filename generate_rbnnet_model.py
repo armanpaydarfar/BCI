@@ -72,7 +72,7 @@ def _restore_sleep():
         return
     try:
         import subprocess
-        subprocess.run(["powercfg", "/change", "standby-timeout-ac", "30"],
+        subprocess.run(["powercfg", "/change", "standby-timeout-ac", "15"],
                        check=True, capture_output=True)
         print("[Sleep] Sleep restored.")
     except Exception:
