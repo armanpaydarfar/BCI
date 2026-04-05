@@ -177,9 +177,10 @@ def _train_one_epoch_single(model, loader, criterion, optimizer, device):
     for (X_batch, y_batch) in loader:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
         optimizer.zero_grad()
-        criterion(model(X_batch), y_batch).backward()
+        loss = criterion(model(X_batch), y_batch)
+        loss.backward()
         optimizer.step()
-        total_loss += criterion(model(X_batch.detach()), y_batch).item() * len(y_batch)
+        total_loss += loss.item() * len(y_batch)
     return total_loss / len(loader.dataset)
 
 
