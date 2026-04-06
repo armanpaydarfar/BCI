@@ -153,14 +153,21 @@ if decoder_backend == "xgb_cov":
     model_filename = f"sub-{config.TRAINING_SUBJECT}_xgb_cov_features.pkl"
 elif decoder_backend == "xgb_cov_erd":
     model_filename = f"sub-{config.TRAINING_SUBJECT}_xgb_cov_erd_features.pkl"
+elif decoder_backend == "rbnnet":
+    arch_label = "dual_band" if getattr(config, "RBNNET_USE_BETA", 0) else "single_band"
+    model_filename = f"rbnnet_{arch_label}_{config.TRAINING_SUBJECT}.pkl"
 else:
     model_filename = f"sub-{config.TRAINING_SUBJECT}_model.pkl"
 subject_model_path = os.path.join(subject_model_dir, model_filename)
 
 # Load the trained model from the subject directory
 try:
-    with open(subject_model_path, 'rb') as f:
-        model = pickle.load(f)
+    if decoder_backend == "rbnnet":
+        from Utils.rbnnet_model import load_rbnnet_bundle
+        model = load_rbnnet_bundle(subject_model_path)
+    else:
+        with open(subject_model_path, 'rb') as f:
+            model = pickle.load(f)
     logger.log_event(f"✅ Model successfully loaded from: {subject_model_path}")
 except FileNotFoundError:
     logger.log_event(f"❌ Error: Model file '{subject_model_path}' not found. Ensure the model has been trained.", level="error")

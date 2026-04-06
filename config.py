@@ -44,7 +44,7 @@ ROBOT_TRAJECTORY = ["a"]  # Opcode pool for random trajectory choice where used
 BIG_BROTHER_MODE = True  # If True, force pygame window to external display (0,0) at 1920x1080
 SEND_PROBS = False  # If True, stream classifier probs over UDP marker channel
 # Early-stop policy: "correct_only" or "either"
-EARLYSTOP_MODE = "either"
+EARLYSTOP_MODE = "correct_only"
 
 # =============================================================================
 # Gaze / object-selection experiment
@@ -69,8 +69,8 @@ CLASSIFY_WINDOW = 1000  # EEG window length for classification (ms)
 FILTER_BUFFER_SIZE = 2048  # ~4 s at 512 Hz
 BASELINE_DURATION = 1  # seconds
 ACCURACY_THRESHOLD = 0.6  # Legacy / logging only; see CHANGELOG.md — thresholds below drive decisions
-THRESHOLD_MI = 0.65
-THRESHOLD_REST = 0.65
+THRESHOLD_MI = 0.6
+THRESHOLD_REST = 0.6
 RELAXATION_RATIO = 0.5
 MIN_PREDICTIONS = 32
 STEP_SIZE = 1/16
@@ -86,7 +86,7 @@ SURFACE_LAPLACIAN_TOGGLE = 0
 TARGET_AMBIG = 0.20
 SELECT_MOTOR_CHANNELS = 1
 SELECT_ERRP_CHANNELS = 0
-INTEGRATOR_ALPHA = 0.94
+INTEGRATOR_ALPHA = 0.96
 # Model-specific covariance shrinkage defaults.
 # - MDM path (runtime + MDM-centric analyses)
 SHRINKAGE_PARAM_MDM = 0.02
@@ -139,7 +139,7 @@ XGB_ERD_BANDS = [(float(LOWCUT), float(HIGHCUT))]
 XGB_IMPORTANCE_TOP_K = 20
 
 # Online decoder backend: "mdm" | "xgb_cov" | "xgb_cov_erd" | "rbnnet"
-DECODER_BACKEND = "xgb_cov"
+DECODER_BACKEND = "rbnnet"
 
 # =============================================================================
 # RBNNet hyperparameters (generate_rbnnet_model.py)
@@ -258,4 +258,4 @@ ARDUINO_CMD_REST = b"0"
 # =============================================================================
 # Global runtime flags
 # =============================================================================
-SIMULATION_MODE = False
+SIMULATION_MODE = True

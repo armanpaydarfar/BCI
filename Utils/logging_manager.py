@@ -100,11 +100,15 @@ class LoggerManager:
     @classmethod
     def auto_detect_from_subject(cls, subject: str, base_path: Path, mode: str = "offline"):
         subject_path = base_path / f"sub-{subject}"
-        eeg_dirs = list(subject_path.glob("ses-*/eeg"))
+        # Only search the most recently modified session directory so stale
+        # files from older sessions don't interfere with the growing-file check.
+        eeg_dirs = sorted(
+            subject_path.glob("ses-*/eeg"),
+            key=lambda d: d.stat().st_mtime,
+            reverse=True,
+        )
 
-        all_xdfs = []
-        for eeg_dir in eeg_dirs:
-            all_xdfs.extend(eeg_dir.glob("*.xdf"))
+        all_xdfs = list(eeg_dirs[0].glob("*.xdf")) if eeg_dirs else []
 
         if not all_xdfs:
             fallback_dir = subject_path / "ses-Debug"
