@@ -213,6 +213,19 @@ realtime but not in the critical path.
 
 ---
 
+## External System Dependencies
+
+These are standalone applications that are not managed by conda. They must
+be installed and running before any realtime session can function. They will
+not appear in `environment.yml`.
+
+| Application | Role | Notes |
+|---|---|---|
+| **eegoSports** (ANT Neuro, Linux) | Publishes EEG data as an LSL stream | Without it, `Utils/EEGStreamState.py` has no stream to connect to and all realtime drivers fail silently at startup |
+| **LabRecorder** | Records all active LSL streams to `.xdf` | All training `.xdf` files were produced by this tool; required before and during data collection sessions |
+
+---
+
 ## Dependency and Environment
 
 - The conda environment is named `lsl`, Python 3.12.

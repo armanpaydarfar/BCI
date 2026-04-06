@@ -140,10 +140,16 @@ Typical layout per subject (`sub-<SUBJECT_ID>`):
   - `environment.yml` pins `python=3.12.x`. New development should target this version (or a compatible minor release) unless the environment is updated.
 
 - **External dependencies (non-exhaustive)**  
-  - **EEG / LSL tools**:
-    - **eegoSports** (Linux build; used instead of antNeuro software) streaming EEG over **LSL**.
-    - **LabRecorder** to record all related LSL streams (EEG, markers, and any other LSL streams used in your setup) into `.xdf`.
-    - **mne-lsl** / `mne-lsl viewer` for inspecting/debugging available LSL streams.
+  - **EEG / LSL tools** — these are standalone applications, not conda packages. They must be
+    installed and running independently before launching any realtime session:
+    - **eegoSports** (ANT Neuro; Linux build) — EEG acquisition software that publishes the EEG
+      data stream over LSL. Without it running, no EEG stream is available and all realtime
+      experiment drivers will fail to connect. Available from ANT Neuro support.
+    - **LabRecorder** — LSL-native recording application that writes all active LSL streams
+      (EEG, markers, gaze, etc.) to `.xdf` files. All `.xdf` training data in this repo was
+      produced by LabRecorder. Available at https://github.com/labstreaminglayer/App-LabRecorder.
+    - **mne-lsl** / `mne-lsl viewer` — for inspecting/debugging available LSL streams
+      (conda-managed; included in `environment.yml`).
   - **Gaze / video**:
     - Pupil Labs / Neon APIs (e.g., `pupil_labs.realtime_api`) if using Neon-based gaze tracking.  
     - OBS Studio (only if you intentionally run legacy scripts under `OBS/`).  
