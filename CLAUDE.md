@@ -221,7 +221,7 @@ not appear in `environment.yml`.
 
 | Application | Role | Notes |
 |---|---|---|
-| **eegoSports** (ANT Neuro, Linux) | Publishes EEG data as an LSL stream | Without it, `Utils/EEGStreamState.py` has no stream to connect to and all realtime drivers fail silently at startup |
+| **eegoSports** (ANT Neuro, Linux) | Publishes EEG data as an LSL stream | Without it, `Utils/EEGStreamState.py` has no stream to connect to and realtime drivers will fail at startup |
 | **LabRecorder** | Records all active LSL streams to `.xdf` | All training `.xdf` files were produced by this tool; required before and during data collection sessions |
 
 ---
