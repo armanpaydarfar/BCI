@@ -123,7 +123,7 @@ def _restore_sleep():
         pass
 
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.metrics import roc_auc_score, accuracy_score, roc_curve
 
 import config
 from Utils.stream_utils import load_xdf
@@ -378,8 +378,9 @@ def cross_validate_rbnnet(use_beta, cov_mu_np, cov_beta_np, labels_bin_np,
     weight_decay = float(getattr(config, "RBNNET_WEIGHT_DECAY", 1e-4))
     n_ch         = cov_mu_np.shape[1]
 
-    skf     = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-    results = []
+    skf           = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    results       = []
+    oof_posterior = {0: [], 1: []}  # P(true class) per held-out sample, keyed by true label
 
     for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(cov_mu_np, labels_bin_np)):
         print(f"\n--- Fold {fold_idx + 1}/{n_splits} ---")
@@ -402,6 +403,9 @@ def cross_validate_rbnnet(use_beta, cov_mu_np, cov_beta_np, labels_bin_np,
             probs_val = _predict_proba_single(model, cov_mu_val, device)
 
         scores_val = probs_val[:, 1]
+
+        for i, true_lbl in enumerate(y_val):
+            oof_posterior[true_lbl].append(probs_val[i, true_lbl])
 
         try:
             auc = roc_auc_score(y_val, scores_val)
@@ -433,7 +437,8 @@ def cross_validate_rbnnet(use_beta, cov_mu_np, cov_beta_np, labels_bin_np,
     mean_auc   = float(np.nanmean([r["roc_auc"] for r in results]))
     print(f"\n[CV Summary] mean_AUC={mean_auc:.3f}  "
           f"median_tl={tl_median:.3f}  median_th={th_median:.3f}")
-    return results, tl_median, th_median, mean_auc
+    oof_posterior = {k: np.array(v) for k, v in oof_posterior.items()}
+    return results, tl_median, th_median, mean_auc, oof_posterior
 
 
 # ---------------------------------------------------------------------------
@@ -449,25 +454,139 @@ def _plot_cv_auc(results, subject_id, save_path=None):
                 label=f"Mean={np.nanmean(aucs):.3f}")
     plt.xlabel("Fold"); plt.ylabel("ROC-AUC")
     plt.title(f"RBNNet K-Fold CV — {subject_id}")
-    plt.legend(); plt.tight_layout()
+    plt.legend(fontsize=9); plt.grid(True, ls=":", alpha=0.6); plt.tight_layout()
     if save_path:
-        plt.savefig(save_path, dpi=120)
+        plt.savefig(save_path, dpi=160)
         print(f"[plot] {save_path}")
     plt.close()
 
 
 def _plot_scores(scores, labels_bin, tl, th, subject_id, save_path=None):
-    plt.figure(figsize=(8, 4))
-    for cls, name, color in [(1, "MI", "darkorange"), (0, "REST", "steelblue")]:
-        sns.histplot(scores[labels_bin == cls], bins=30, alpha=0.5,
-                     label=name, color=color, kde=True)
-    plt.axvline(tl, color="gray",  linestyle="--", label=f"t_low={tl:.3f}")
-    plt.axvline(th, color="black", linestyle="--", label=f"t_high={th:.3f}")
-    plt.xlabel("P(MI)"); plt.ylabel("Count")
-    plt.title(f"RBNNet Score Distribution — {subject_id}")
-    plt.legend(); plt.tight_layout()
+    s0 = scores[labels_bin == 0]
+    s1 = scores[labels_bin == 1]
+    plt.figure(figsize=(9, 5))
+    plt.hist(s0, bins=30, alpha=0.6, density=True, label="True REST")
+    plt.hist(s1, bins=30, alpha=0.6, density=True, label="True MI")
+    plt.axvline(tl, color="black", ls="--", lw=1.5, label=f"t_low={tl:.3f}")
+    plt.axvline(th, color="black", ls="--", lw=1.5, label=f"t_high={th:.3f}")
+    yl = plt.ylim()
+    plt.fill_betweenx(yl, tl, th, color="gray", alpha=0.12, label="Ambiguous")
+    plt.xlabel("Score (P[MI])"); plt.ylabel("Density")
+    plt.title(f"RBNNet Score Distributions — {subject_id}")
+    plt.legend(fontsize=9); plt.grid(True, ls=":", alpha=0.6); plt.tight_layout()
     if save_path:
-        plt.savefig(save_path, dpi=120)
+        plt.savefig(save_path, dpi=160)
+        print(f"[plot] {save_path}")
+    plt.close()
+
+
+def _plot_roc(scores, labels_bin, th, subject_id, save_path=None):
+    fpr, tpr, thr = roc_curve(labels_bin, scores)
+    auc = roc_auc_score(labels_bin, scores)
+    idx = np.argmin(np.abs(thr - th))
+    plt.figure(figsize=(6, 6))
+    plt.plot(fpr, tpr, label=f"ROC (AUC={auc:.3f})")
+    plt.plot([0, 1], [0, 1], ls="--", alpha=0.7, label="Chance")
+    plt.scatter(fpr[idx], tpr[idx], s=60, label=f"operating @ t_high={th:.3f}")
+    plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
+    plt.title(f"RBNNet ROC — {subject_id}")
+    plt.legend(fontsize=9); plt.grid(True, ls=":", alpha=0.6); plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=160)
+        print(f"[plot] {save_path}")
+    plt.close()
+
+
+def _plot_confusion_with_reject(scores, labels_bin, tl, th, subject_id, save_path=None):
+    pred = np.full_like(labels_bin, -1)
+    pred[scores >= th] = 1
+    pred[scores <= tl] = 0
+    mat = np.array([
+        np.sum((labels_bin == 0) & (pred == 0)),
+        np.sum((labels_bin == 0) & (pred == -1)),
+        np.sum((labels_bin == 0) & (pred == 1)),
+        np.sum((labels_bin == 1) & (pred == 0)),
+        np.sum((labels_bin == 1) & (pred == -1)),
+        np.sum((labels_bin == 1) & (pred == 1)),
+    ], dtype=int).reshape(2, 3)
+    plt.figure(figsize=(6.5, 4.8))
+    im = plt.imshow(mat, cmap="Blues")
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.xticks([0, 1, 2], ["REST", "AMB", "MI"])
+    plt.yticks([0, 1], ["REST (true)", "MI (true)"])
+    for i in range(2):
+        for j in range(3):
+            plt.text(j, i, str(mat[i, j]), ha="center", va="center", fontsize=11)
+    plt.title(f"RBNNet Confusion with Reject — {subject_id}")
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=160)
+        print(f"[plot] {save_path}")
+    plt.close()
+
+
+def _plot_risk_coverage(scores, labels_bin, tl, th, subject_id, save_path=None):
+    center = (tl + th) / 2.0
+    widths = np.linspace(0.0, 0.9, 35)
+    cov, acc, cost = [], [], []
+    for w in widths:
+        _tl = np.clip(center - w / 2, 0, 1)
+        _th = np.clip(center + w / 2, 0, 1)
+        pred = np.full_like(labels_bin, -1)
+        pred[scores >= _th] = 1
+        pred[scores <= _tl] = 0
+        TP = int(((pred == 1) & (labels_bin == 1)).sum())
+        TN = int(((pred == 0) & (labels_bin == 0)).sum())
+        FP = int(((pred == 1) & (labels_bin == 0)).sum())
+        FN = int(((pred == 0) & (labels_bin == 1)).sum())
+        U  = int((pred == -1).sum())
+        decided = TP + TN + FP + FN
+        cov.append(decided / len(labels_bin))
+        acc.append((TP + TN) / decided if decided else np.nan)
+        cost.append(1.0 * FP + 1.0 * FN + 0.3 * U)
+    cov  = np.array(cov)
+    acc  = np.array(acc)
+    cost = np.array(cost)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].plot(cov * 100, acc, marker="o")
+    axes[0].set_xlabel("Coverage (%)"); axes[0].set_ylabel("Decided-only Accuracy")
+    axes[0].set_title(f"RBNNet Risk–Coverage: Accuracy — {subject_id}")
+    axes[0].grid(True, ls=":", alpha=0.6)
+    axes[1].plot(cov * 100, cost, marker="o")
+    axes[1].set_xlabel("Coverage (%)"); axes[1].set_ylabel("Cost (c_fp=1, c_fn=1, c_rej=0.3)")
+    axes[1].set_title(f"RBNNet Risk–Coverage: Cost — {subject_id}")
+    axes[1].grid(True, ls=":", alpha=0.6)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=160)
+        print(f"[plot] {save_path}")
+    plt.close()
+
+
+def _plot_posterior_probabilities(oof_posterior, subject_id, save_path=None):
+    # oof_posterior: {0: P(REST) for REST trials, 1: P(MI) for MI trials} — held-out only.
+    # Matches the adaptive script: each value is P(true class) from the fold the sample was held out in.
+    rest_probs = oof_posterior[0]
+    mi_probs   = oof_posterior[1]
+    bins = np.linspace(0, 1, 20)
+    plt.figure(figsize=(10, 6))
+    sns.histplot(rest_probs, bins=bins, alpha=0.6, label="Rest Probability",
+                 kde=True, color="skyblue")
+    sns.histplot(mi_probs,   bins=bins, alpha=0.6, label="MI Probability",
+                 kde=True, color="darkorange")
+    plt.axvline(np.mean(rest_probs), color="skyblue",    linestyle="--", linewidth=1.5,
+                label=f"Rest Mean = {np.mean(rest_probs):.2f}")
+    plt.axvline(np.mean(mi_probs),   color="darkorange", linestyle="--", linewidth=1.5,
+                label=f"MI Mean = {np.mean(mi_probs):.2f}")
+    plt.xlabel("Predicted Probability")
+    plt.ylabel("Frequency")
+    plt.title(f"RBNNet Posterior Probability Distribution — {subject_id}")
+    plt.legend(title="True Class")
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=160)
         print(f"[plot] {save_path}")
     plt.close()
 
@@ -573,7 +692,7 @@ def main():
 
     # --- Cross-validation ---
     print("\n[CV] Starting K-Fold cross-validation...")
-    cv_results, tl_star, th_star, mean_auc = cross_validate_rbnnet(
+    cv_results, tl_star, th_star, mean_auc, oof_posterior = cross_validate_rbnnet(
         use_beta, cov_mu_np, cov_beta_np, labels_bin,
         epsilon_mu, epsilon_beta, device,
     )
@@ -653,6 +772,14 @@ def main():
                  save_path=os.path.join(model_dir, f"rbnnet_{arch_label}_{subject_id}_cv_auc.png"))
     _plot_scores(scores_all, labels_bin, tl_star, th_star, subject_id,
                  save_path=os.path.join(model_dir, f"rbnnet_{arch_label}_{subject_id}_scores.png"))
+    _plot_roc(scores_all, labels_bin, th_star, subject_id,
+              save_path=os.path.join(model_dir, f"rbnnet_{arch_label}_{subject_id}_roc.png"))
+    _plot_confusion_with_reject(scores_all, labels_bin, tl_star, th_star, subject_id,
+                                save_path=os.path.join(model_dir, f"rbnnet_{arch_label}_{subject_id}_confusion.png"))
+    _plot_risk_coverage(scores_all, labels_bin, tl_star, th_star, subject_id,
+                        save_path=os.path.join(model_dir, f"rbnnet_{arch_label}_{subject_id}_risk_coverage.png"))
+    _plot_posterior_probabilities(oof_posterior, subject_id,
+                                  save_path=os.path.join(model_dir, f"rbnnet_{arch_label}_{subject_id}_posterior_probs.png"))
 
     print(f"\n{'='*60}")
     print(f"  Training complete  [{arch_label}]")
