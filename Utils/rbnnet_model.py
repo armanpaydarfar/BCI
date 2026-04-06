@@ -174,8 +174,11 @@ class RBNLayer(nn.Module):
     def _karcher_mean(self, X):
         G = X.mean(dim=0)
         for _ in range(self.karcher_steps):
-            G_invsqrt = _mat_pow(G, -0.5)
-            G_sqrt    = _mat_pow(G,  0.5)
+            # Compute G^{±0.5} from a single eigendecomposition instead of two.
+            vals, vecs = _sym_eigh(G)
+            vals_c = vals.clamp(min=1e-10)
+            G_sqrt    = vecs @ torch.diag_embed(vals_c.pow( 0.5)) @ vecs.T
+            G_invsqrt = vecs @ torch.diag_embed(vals_c.pow(-0.5)) @ vecs.T
             S         = _mat_log(G_invsqrt @ X @ G_invsqrt)
             G         = G_sqrt @ _mat_exp(S.mean(dim=0)) @ G_sqrt
         return G
