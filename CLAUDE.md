@@ -175,6 +175,25 @@ realtime but not in the critical path.
 
 ---
 
+## Error Handling
+
+- **Surface real errors.** Do not silently suppress exceptions. If an
+  exception is caught, it must be re-raised, logged with enough context
+  to diagnose the failure, or suppressed with an explicit inline comment
+  explaining why suppression is safe in that specific case.
+
+- **`try/except` is acceptable when architecturally justified** — resource
+  cleanup, protocol-level recovery, or documented degradation paths (e.g.
+  GPU → CPU fallback). It is not a substitute for understanding a failure
+  mode, and it is not a way to make code "more robust" by default.
+
+- **Prefer fail-fast in realtime loops and Tier 1 hardware files.**
+  Silent recovery from an unexpected error can mask unsafe state. Unless
+  a specific recovery action is defined and safe, let the exception
+  propagate and crash the process.
+
+---
+
 ## Software Development Practices
 
 - **Single responsibility.** Functions and modules should do one thing.
@@ -189,9 +208,21 @@ realtime but not in the critical path.
 - **No dead code.** Do not leave commented-out code, unused imports, or
   removed-feature stubs in committed files.
 
-- **Comments explain why, not what.** Only add comments where the logic
-  is non-obvious. Do not add docstrings or type annotations to code that
-  was not changed.
+- **Comments explain why, not what.** Inline comments should document
+  intent and non-obvious reasoning, not restate what the code does. Be
+  substantive enough to serve as documentation, but not padded — one
+  clear sentence beats three vague ones.
+
+- **Keep documentation current.** When modifying a function, update its
+  docstring to reflect the change. When adding a function, add a
+  docstring. When a change affects behaviour described in `README.md` or
+  another documentation file, update that file too. This applies only to
+  code and documentation directly touched by the task.
+
+- **Do not add comments to unrelated code.** Do not add or update
+  docstrings, inline comments, or documentation for code that is not
+  part of the current task — unless the task is explicitly a
+  documentation update.
 
 - **Numerical code warrants extra care.** This repo operates on SPD
   matrices where floating point drift compounds over training. Prefer
