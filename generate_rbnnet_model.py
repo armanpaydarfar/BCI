@@ -193,8 +193,15 @@ def compute_beta_covariances(segments_np, labels_np, lam):
     cov_beta_raw = np.stack(cov_list, axis=0)
 
     print(f"[Beta] Applying shrinkage (lambda={lam})...")
-    shrinker  = Shrinkage(shrinkage=lam)
-    cov_beta  = shrinker.fit_transform(cov_beta_raw)
+    shrinker = Shrinkage(shrinkage=lam)
+    cov_beta = shrinker.fit_transform(cov_beta_raw)
+
+    if config.RECENTERING:
+        from pyriemann.preprocessing import Whitening
+        print("[Beta] Applying Riemannian whitening (matching mu-band pipeline)...")
+        whitener = Whitening(metric="riemann")
+        cov_beta = whitener.fit_transform(cov_beta)
+
     return cov_beta
 
 
