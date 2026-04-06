@@ -570,10 +570,14 @@ def classify_real_time(eeg_state, window_size_samples, all_probabilities, predic
             return leaky_integrator.accumulated_probability, predictions, all_probabilities
 
         if not _decoder_checked:
+            cfg = model['model_config']
+            eps_str = (
+                f"eps_mu={cfg['epsilon_mu']:.6f} eps_beta={cfg['epsilon_beta']:.6f}"
+                if cfg.get("use_beta") else f"epsilon={cfg['epsilon']:.6f}"
+            )
             logger.log_event(
                 f"RBNNet decoder initialized. "
-                f"n_ch={model['model_config']['n_ch']}  "
-                f"epsilon={model['model_config']['epsilon']:.6f}  "
+                f"n_ch={cfg['n_ch']}  {eps_str}  "
                 f"tl={model['tl_star']:.3f}  th={model['th_star']:.3f}"
             )
             _decoder_checked = True

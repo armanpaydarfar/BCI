@@ -355,36 +355,18 @@ def build_dual_band_rbnnet(n_ch, epsilon_mu, epsilon_beta, n_classes=2, n_blocks
 # Bundle serialization / deserialization
 # ---------------------------------------------------------------------------
 
-def _unwrap_compiled(model):
-    """
-    Return the underlying nn.Module from a torch.compile-wrapped OptimizedModule,
-    or the model itself if it is not compiled.
-
-    torch.compile wraps the model in torch._dynamo.eval_frame.OptimizedModule and
-    stores the original module as _orig_mod in nn.Module._modules.  This means
-    compiled_model.state_dict() produces keys prefixed with "_orig_mod." which are
-    incompatible with the fresh (uncompiled) model used in load_rbnnet_bundle.
-    Unwrapping before serialisation avoids this mismatch entirely.
-    """
-    orig = getattr(model, "_orig_mod", None)
-    if orig is not None and isinstance(orig, torch.nn.Module):
-        return orig
-    return model
-
-
 def save_rbnnet_bundle(model, label_to_bin, bin_to_label, tl_star, th_star,
                        roc_auc, channel_names, training_meta, path):
     """
     Serialize a trained RBNNet or DualBandRBNNet bundle to pickle.
     Compatible with runtime_common.py dispatch logic.
-
-    If *model* is a torch.compile-wrapped OptimizedModule the underlying
-    nn.Module is extracted before serialisation so that state_dict keys are
-    not prefixed with "_orig_mod." (which would break load_rbnnet_bundle).
     """
     import pickle
-    # Unwrap torch.compile wrapper so state_dict keys are clean.
-    raw_model = _unwrap_compiled(model)
+    # torch.compile wraps the model in OptimizedModule and stores the original as
+    # _orig_mod. Unwrap before serialisation: compiled state_dict keys are prefixed
+    # with "_orig_mod." which breaks load_rbnnet_bundle's state_dict load.
+    orig = getattr(model, "_orig_mod", None)
+    raw_model = orig if (orig is not None and isinstance(orig, torch.nn.Module)) else model
     use_beta = isinstance(raw_model, DualBandRBNNet)
     model_config = {
         "n_ch":      raw_model.n_ch,

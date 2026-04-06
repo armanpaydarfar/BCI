@@ -108,7 +108,7 @@ def _inhibit_sleep():
                        check=True, capture_output=True)
         print("[Sleep] Sleep disabled for training run.")
     except Exception:
-        pass
+        pass  # powercfg is best-effort; training proceeds regardless
 
 def _restore_sleep():
     """Restore standby sleep to 30 min on Windows. No-op on other platforms."""
@@ -120,7 +120,7 @@ def _restore_sleep():
                        check=True, capture_output=True)
         print("[Sleep] Sleep restored.")
     except Exception:
-        pass
+        pass  # powercfg is best-effort; sleep policy is not critical to restore
 
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, accuracy_score, roc_curve
@@ -209,46 +209,6 @@ def compute_beta_covariances(segments_np, labels_np, lam):
 # Training helpers
 # ---------------------------------------------------------------------------
 
-def _single_band_dataset(cov_mu_np, labels_bin_np, device=None):
-    X = torch.tensor(cov_mu_np, dtype=torch.float32)
-    y = torch.tensor(labels_bin_np, dtype=torch.long)
-    if device is not None:
-        X, y = X.to(device), y.to(device)
-    return TensorDataset(X, y)
-
-
-def _dual_band_dataset(cov_mu_np, cov_beta_np, labels_bin_np, device=None):
-    X_mu   = torch.tensor(cov_mu_np,   dtype=torch.float32)
-    X_beta = torch.tensor(cov_beta_np, dtype=torch.float32)
-    y      = torch.tensor(labels_bin_np, dtype=torch.long)
-    if device is not None:
-        X_mu, X_beta, y = X_mu.to(device), X_beta.to(device), y.to(device)
-    return TensorDataset(X_mu, X_beta, y)
-
-
-def _train_one_epoch_single(model, loader, criterion, optimizer):
-    model.train()
-    total_loss = 0.0
-    for (X_batch, y_batch) in loader:
-        optimizer.zero_grad(set_to_none=True)
-        loss = criterion(model(X_batch), y_batch)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * len(y_batch)
-    return total_loss / len(loader.dataset)
-
-
-def _train_one_epoch_dual(model, loader, criterion, optimizer):
-    model.train()
-    total_loss = 0.0
-    for (X_mu, X_beta, y_batch) in loader:
-        optimizer.zero_grad(set_to_none=True)
-        loss = criterion(model(X_mu, X_beta), y_batch)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * len(y_batch)
-    return total_loss / len(loader.dataset)
-
 
 @torch.no_grad()
 def _predict_proba_single(model, cov_mu_np, device, batch_size=128):
@@ -279,10 +239,17 @@ def _build_and_train(use_beta, n_ch, epsilon_mu, epsilon_beta,
     """Construct, train, and return a fresh model."""
     if use_beta:
         model = build_dual_band_rbnnet(n_ch, epsilon_mu, epsilon_beta)
-        ds    = _dual_band_dataset(cov_mu_tr, cov_beta_tr, y_tr, device=device)
+        ds = TensorDataset(
+            torch.tensor(cov_mu_tr,   dtype=torch.float32).to(device),
+            torch.tensor(cov_beta_tr, dtype=torch.float32).to(device),
+            torch.tensor(y_tr,        dtype=torch.long).to(device),
+        )
     else:
         model = build_rbnnet(n_ch, epsilon_mu)
-        ds    = _single_band_dataset(cov_mu_tr, y_tr, device=device)
+        ds = TensorDataset(
+            torch.tensor(cov_mu_tr, dtype=torch.float32).to(device),
+            torch.tensor(y_tr,      dtype=torch.long).to(device),
+        )
 
     model = model.to(device)
 
@@ -331,10 +298,23 @@ def _build_and_train(use_beta, n_ch, epsilon_mu, epsilon_beta,
     t_start = time.time()
     for epoch in range(1, epochs + 1):
         t_epoch = time.time()
+        model.train()
+        epoch_loss = 0.0
         if use_beta:
-            loss = _train_one_epoch_dual(model, loader, criterion, optimizer)
+            for (X_mu, X_beta, y_batch) in loader:
+                optimizer.zero_grad(set_to_none=True)
+                batch_loss = criterion(model(X_mu, X_beta), y_batch)
+                batch_loss.backward()
+                optimizer.step()
+                epoch_loss += batch_loss.item() * len(y_batch)
         else:
-            loss = _train_one_epoch_single(model, loader, criterion, optimizer)
+            for (X_batch, y_batch) in loader:
+                optimizer.zero_grad(set_to_none=True)
+                batch_loss = criterion(model(X_batch), y_batch)
+                batch_loss.backward()
+                optimizer.step()
+                epoch_loss += batch_loss.item() * len(y_batch)
+        loss = epoch_loss / len(loader.dataset)
         scheduler.step()
         _epoch_times.append(time.time() - t_epoch)
 
