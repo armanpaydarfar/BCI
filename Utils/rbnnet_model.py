@@ -35,11 +35,16 @@ import torch.nn.functional as F
 # Utility: matrix functions via eigendecomposition
 # ---------------------------------------------------------------------------
 
+_JITTER = 1e-6
+
 def _sym_eigh(A):
     """Eigendecompose a symmetric matrix; return (eigenvalues, eigenvectors).
     torch.linalg.eigh assumes symmetric input — more stable than torch.eig for SPD.
+    A small jitter (1e-6 * I) is added before decomposition to prevent convergence
+    failures on ill-conditioned or near-singular matrices during training.
     """
-    return torch.linalg.eigh(A)
+    jitter = _JITTER * torch.eye(A.shape[-1], device=A.device, dtype=A.dtype)
+    return torch.linalg.eigh(A + jitter)
 
 
 def _mat_pow(A, p):

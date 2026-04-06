@@ -91,7 +91,9 @@ torch.manual_seed(_SEED)
 torch.cuda.manual_seed_all(_SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
-torch.set_float32_matmul_precision("high")  # enable TF32 Tensor Cores (no-op on CPU)
+# TF32 ('high') is NOT set — SPD matrix ops accumulate floating point error
+# over training epochs with reduced mantissa precision, risking ill-conditioned
+# matrices. Keep PyTorch default ('highest' / full float32) to match Linux.
 
 # ---------------------------------------------------------------------------
 # Sleep inhibitor (Windows only — silently skipped on Linux/Mac)
