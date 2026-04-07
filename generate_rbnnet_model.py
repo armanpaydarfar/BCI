@@ -253,94 +253,97 @@ def _build_and_train(use_beta, n_ch, epsilon_mu, epsilon_beta,
 
     model = model.to(device)
 
-    # --- Diagnostics: confirm device placement ---
-    param_device = next(model.parameters()).device
-    print(f"[Diag] Model parameters on device: {param_device}")
-
-    # --- torch.compile ---
-    # inductor requires Triton (not available on Windows without triton-windows).
-    # On Windows+CUDA: cudagraphs captures and replays the static CUDA kernel
-    # sequence, eliminating per-kernel launch overhead without needing Triton.
-    # On Linux+CUDA: inductor does full kernel fusion via Triton.
-    # On CPU: compilation overhead exceeds benefit for this small model; skip.
-    #
-    # NOTE: triton-windows (pip install "triton-windows<3.3") would enable the
-    # full inductor backend on Windows+CUDA with PyTorch 2.6+cu124. With it you
-    # could use compile_backend = "inductor" unconditionally on CUDA. Without it,
-    # cudagraphs is the correct Windows fallback.
-    compile_backend = None
-    _compile_attempted = False
-    try:
-        if device.type == "cuda":
-            compile_backend = "inductor"
-        # else: CPU — skip compilation; overhead outweighs benefit for this model size
-
-        if compile_backend:
-            _compile_attempted = True
-            model = torch.compile(model, backend=compile_backend)
-            print(f"[Compile] torch.compile registered with backend='{compile_backend}'")
-            print(f"[Compile] Compilation is LAZY — actual JIT compilation happens on "
-                  f"first forward pass (epoch 1). Expect epoch 1 to be slower.")
-    except Exception as exc:
-        print(f"[Compile] torch.compile FAILED ({exc!r}), running eager.")
-        compile_backend = None
-
-    if not compile_backend and not _compile_attempted:
-        print("[Compile] torch.compile skipped (CPU device — eager mode).")
+    # torch.compile is intentionally omitted. The RBNNet forward pass is dominated
+    # by eigh calls (Karcher flow, ReEig, LogEig) which route through cuSOLVER and
+    # cannot be fused or optimised by the inductor backend. compile adds ~40s of
+    # per-fold recompile overhead with no runtime benefit, and the cuSOLVER dispatch
+    # path it generates is less numerically robust than the eager path, causing
+    # convergence failures (linalg.eigh error code 2) on the full training dataset.
 
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=False)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=max(1, epochs // 3), gamma=0.5)
 
-    # --- Timing diagnostics: track per-epoch time to detect compile warmup ---
-    _epoch_times = []
-    t_start = time.time()
+    n_samples  = len(loader.dataset)
+    n_batches  = len(loader)
+    print(f"[RBNNet] Starting: {n_samples} samples  batch={batch_size}"
+          f"  {n_batches} batches/epoch  epochs={epochs}"
+          f"  lr={lr:.2e}  wd={weight_decay:.2e}  device={device}")
+
+    best_loss        = float('inf')
+    loss_at_last_log = None
+    last_improve_ep  = 0
+    t_start          = time.time()
+
     for epoch in range(1, epochs + 1):
         t_epoch = time.time()
         model.train()
-        epoch_loss = 0.0
+        epoch_loss    = 0.0
+        grad_norm_sum = 0.0
+
         if use_beta:
             for (X_mu, X_beta, y_batch) in loader:
                 optimizer.zero_grad(set_to_none=True)
                 batch_loss = criterion(model(X_mu, X_beta), y_batch)
+                if not torch.isfinite(batch_loss):
+                    raise RuntimeError(
+                        f"[RBNNet] Non-finite loss ({batch_loss.item()}) at epoch {epoch}.")
                 batch_loss.backward()
+                grad_norm_sum += torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), float('inf')).item()
                 optimizer.step()
                 epoch_loss += batch_loss.item() * len(y_batch)
         else:
             for (X_batch, y_batch) in loader:
                 optimizer.zero_grad(set_to_none=True)
                 batch_loss = criterion(model(X_batch), y_batch)
+                if not torch.isfinite(batch_loss):
+                    raise RuntimeError(
+                        f"[RBNNet] Non-finite loss ({batch_loss.item()}) at epoch {epoch}.")
                 batch_loss.backward()
+                grad_norm_sum += torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), float('inf')).item()
                 optimizer.step()
                 epoch_loss += batch_loss.item() * len(y_batch)
-        loss = epoch_loss / len(loader.dataset)
+
+        loss       = epoch_loss / n_samples
+        epoch_time = time.time() - t_epoch
+        current_lr = optimizer.param_groups[0]['lr']
         scheduler.step()
-        _epoch_times.append(time.time() - t_epoch)
+
+        if loss < best_loss:
+            best_loss       = loss
+            last_improve_ep = epoch
 
         if epoch % 20 == 0 or epoch == 1:
-            elapsed   = time.time() - t_start
-            remaining = elapsed / epoch * (epochs - epoch)
-            epoch_ms  = _epoch_times[-1] * 1000
-            print(f"  [RBNNet] Epoch {epoch:3d}/{epochs}  loss={loss:.4f}"
-                  f"  elapsed={elapsed:.0f}s  remaining~{remaining:.0f}s"
-                  f"  epoch_time={epoch_ms:.1f}ms")
+            elapsed       = time.time() - t_start
+            eta           = elapsed / epoch * (epochs - epoch)
+            avg_grad_norm = grad_norm_sum / n_batches
+            throughput    = n_samples / epoch_time
+            delta         = (f"{loss - loss_at_last_log:+.4f}"
+                             if loss_at_last_log is not None else "   n/a")
 
-        # After warmup (epoch 3): report if compile is paying off
-        if epoch == 3 and compile_backend and len(_epoch_times) >= 3:
-            t_first  = _epoch_times[0] * 1000
-            t_warmup = _epoch_times[2] * 1000
-            print(f"[Diag] Epoch 1 (compile+run): {t_first:.1f}ms  "
-                  f"Epoch 3 (post-warmup): {t_warmup:.1f}ms  "
-                  f"({'faster' if t_warmup < t_first else 'no speedup yet — normal for small models'})")
+            flags = ""
+            if epoch - last_improve_ep >= 40 and epoch > 40:
+                flags += f"  [PLATEAU {epoch - last_improve_ep} epochs]"
+            if avg_grad_norm > 10.0:
+                flags += f"  [GRAD LARGE: {avg_grad_norm:.1f}]"
+
+            print(f"  [RBNNet] Epoch {epoch:3d}/{epochs}"
+                  f"  loss={loss:.4f} ({delta}, best={best_loss:.4f})"
+                  f"  lr={current_lr:.2e}  |grad|={avg_grad_norm:.3f}"
+                  f"  {throughput:.0f} smp/s"
+                  f"  elapsed={elapsed:.0f}s  eta={eta:.0f}s"
+                  f"{flags}")
+
+            loss_at_last_log = loss
 
     model.eval()
-
-    if compile_backend and _epoch_times:
-        avg_after_warmup = sum(_epoch_times[3:]) / max(len(_epoch_times[3:]), 1) * 1000
-        print(f"[Diag] Avg epoch time after warmup: {avg_after_warmup:.1f}ms  "
-              f"(backend='{compile_backend}')")
-
+    total_time = time.time() - t_start
+    print(f"[RBNNet] Done: {epochs} epochs in {total_time:.0f}s"
+          f"  best_loss={best_loss:.4f} (ep {last_improve_ep})"
+          f"  final_loss={loss:.4f}")
     return model
 
 

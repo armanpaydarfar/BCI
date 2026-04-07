@@ -35,16 +35,16 @@ import torch.nn.functional as F
 # Utility: matrix functions via eigendecomposition
 # ---------------------------------------------------------------------------
 
-_JITTER = 1e-4
+_JITTER = 1e-3
 
 def _sym_eigh(A):
     """Eigendecompose a symmetric matrix; return (eigenvalues, eigenvectors).
     torch.linalg.eigh assumes symmetric input — more stable than torch.eig for SPD.
-    A jitter of 1e-4*I is added before decomposition to prevent convergence failures
-    on ill-conditioned matrices during long training runs. 1e-4 matches the ReEig
-    eigenvalue floor (epsilon), keeping the two regularisation scales consistent.
-    1e-6 was insufficient: fold-level ill-conditioning after ~120 epochs caused
-    convergence failures even with the smaller jitter.
+    A jitter of 1e-3*I is added to prevent cuSOLVER convergence failures (error
+    code 2) on ill-conditioned matrices. 1e-4 was insufficient: it survived CV folds
+    but failed on the full-dataset final training pass. The jitter is independent of
+    the ReEig epsilon (which is data-derived, ~0.2 in practice); the two serve
+    different purposes and need not be matched.
     """
     jitter = _JITTER * torch.eye(A.shape[-1], device=A.device, dtype=A.dtype)
     return torch.linalg.eigh(A + jitter)
@@ -166,8 +166,12 @@ class RBNLayer(nn.Module):
     """
     Riemannian Batch Normalization. Normalizes Riemannian mean toward I (mean-only).
     Training: Karcher flow batch mean. Inference: EMA running mean.
+
+    karcher_steps=1 per Brooks et al. NeurIPS 2019 (Section 2.2): one iteration with
+    unit step size corresponds to the Log-Euclidean barycenter, which is a sufficient
+    approximation since the batch barycenter is already a noisy estimate of the true mean.
     """
-    def __init__(self, n, momentum=0.1, karcher_steps=10):
+    def __init__(self, n, momentum=0.1, karcher_steps=1):
         super().__init__()
         self.n             = n
         self.momentum      = momentum
