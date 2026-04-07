@@ -323,8 +323,6 @@ def write_arduino_baud_to_config(baud: int):
 TRAINING_SCRIPT_ENTRIES = [
     ("Riemannian adaptive → sub-*_model.pkl", "Generate_Riemannian_adaptive.py"),
     ("XGBoost covariance features", "generate_xgboost_cov_features.py"),
-    ("XGBoost cov + ERD features", "generate_xgboost_cov_erd_features.py"),
-    ("XGBoost ERD features", "generate_xgboost_erd_features.py"),
 ]
 
 # ----------------- UDP readiness probe -----------------
