@@ -423,8 +423,8 @@ def _adaptive_recenter_cov(cov, state_name="mu", *, update_recentering: bool = T
 
 def _default_erd_bands_from_config():
     """
-    Match offline `generate_xgboost_cov_erd_features.py` / `xgb_feature_pipeline`
-    when a bundle has no `feature_spec["erd_bands"]` (legacy or hand-built pickle).
+    Match offline `xgb_feature_pipeline` convention when a bundle has no
+    `feature_spec["erd_bands"]` (legacy or hand-built pickle).
     """
     bands = getattr(config, "XGB_ERD_BANDS", None)
     if bands is not None:
