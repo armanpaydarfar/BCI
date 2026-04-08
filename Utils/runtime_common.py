@@ -297,7 +297,7 @@ def _build_rbnnet_cov(eeg_state, window_size_samples, use_beta=False, *,
 
     def _build_one(window, band_name):
         cov = _covariance_from_window(window)
-        cov = _shrink_single_cov(cov)
+        cov = _shrink_single_cov(cov, window)
         cov = _adaptive_recenter_cov(cov, band_name, update_recentering=update_recentering)
         return torch.tensor(cov, dtype=torch.float32).unsqueeze(0)
 
@@ -357,7 +357,7 @@ def _covariance_from_window(window_2d):
     return cov / tr
 
 
-def _shrink_single_cov(cov):
+def _shrink_single_cov(cov, raw_window=None):
     def _runtime_shrinkage_lambda() -> float:
         backend = str(getattr(config, "DECODER_BACKEND", "mdm")).strip().lower()
         if backend.startswith("xgb"):
@@ -367,7 +367,16 @@ def _shrink_single_cov(cov):
         return float(getattr(config, "SHRINKAGE_PARAM_MDM", getattr(config, "SHRINKAGE_PARAM", 0.02)))
 
     if config.LEDOITWOLF:
-        return LedoitWolf().fit(cov).covariance_
+        if raw_window is None:
+            raise RuntimeError(
+                "LEDOITWOLF requires the raw EEG window to be passed to _shrink_single_cov. "
+                "LedoitWolf must be fit to raw observations (n_timepoints x n_channels), not the precomputed covariance."
+            )
+        # Fit LW to raw data to estimate the optimal shrinkage coefficient, then apply it
+        # to the already trace-normalised covariance (raw_window is n_channels x n_timepoints).
+        lam = LedoitWolf().fit(raw_window.T).shrinkage_
+        n = cov.shape[0]
+        return (1 - lam) * cov + lam * (np.trace(cov) / n) * np.eye(n)
     lam = _runtime_shrinkage_lambda()
     return np.squeeze(
         Shrinkage(shrinkage=lam).fit_transform(np.expand_dims(cov, axis=0)),
@@ -470,14 +479,14 @@ def _build_xgb_features(eeg_state, window_size_samples, *, update_recentering: b
     feature_blocks = []
 
     if use_cov_mu:
-        cov_mu = _shrink_single_cov(_covariance_from_window(mu_win))
+        cov_mu = _shrink_single_cov(_covariance_from_window(mu_win), mu_win)
         cov_mu = _adaptive_recenter_cov(cov_mu, "mu", update_recentering=update_recentering)
         feature_blocks.append(_tangent_with_fitted_ref_single(cov_mu, "mu"))
 
     if use_cov_beta:
         if beta_win is None:
             raise RuntimeError("XGBoost model expects beta covariance features, but beta stream is unavailable.")
-        cov_beta = _shrink_single_cov(_covariance_from_window(beta_win))
+        cov_beta = _shrink_single_cov(_covariance_from_window(beta_win), beta_win)
         cov_beta = _adaptive_recenter_cov(cov_beta, "beta", update_recentering=update_recentering)
         feature_blocks.append(_tangent_with_fitted_ref_single(cov_beta, "beta"))
 
