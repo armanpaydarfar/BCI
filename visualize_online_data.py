@@ -44,10 +44,10 @@ from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 # User Config
 # =========================================================
 
-subject = "CLIN_SUBJ_005"
+subject = "PILOT001"
 
 # ---- Single-session mode ----
-session = "S004ONLINE"
+session = "S001ONLINE"
 PROMPT_FOR_FILE_SELECTION = False
 
 # ---- Multi-session mode ----
@@ -104,9 +104,7 @@ FOCAL_ELECTRODES_BY_SESSION = {
     "S004ONLINE": ["P3"],
     "S005ONLINE": ["C3"],
 }
-
-# If a session isn’t in the dict, fallback to this (or to FOCAL_ELECTRODES)
-DEFAULT_FOCAL_ELECTRODES = FOCAL_ELECTRODES
+# Sessions absent from the map fall back to FOCAL_ELECTRODES.
 
 MOTOR_NORM_ELECTRODES = [
     'FC1', 'FC2', 'C3', 'Cz', 'C4',
@@ -125,7 +123,7 @@ SCALAR_WINDOW = (1.0, 4.0)
 BAR_ERROR_METHOD = "sem"  # "sem" or "std"
 
 # ---- Toggles ----
-DO_TOPO_MAPS = True
+DO_TOPO_MAPS = False
 DO_FOCAL_TIMECOURSE = True
 
 # ---- Multi-session overlay timecourse plot ----
@@ -137,7 +135,7 @@ LINE_YLIM = None  # or None
 # Cross-subject / cross-session grand average topomaps
 # =========================================================
 # Independent of MULTI_SESSION_MODE and single-session mode.
-# When GRAND_AVG_TOPO_MODE=True, sessions are loaded for each subject in
+# When DO_GRAND_AVG_TOPO=True, sessions are loaded for each subject in
 # GRAND_AVG_SUBJECT_LIST, TFR averages are computed per session, then
 # grand-averaged across all subject/session entries into a single topo plot.
 #
@@ -147,11 +145,13 @@ LINE_YLIM = None  # or None
 # GRAND_AVG_SESSION_MAP allows per-subject session overrides:
 #   {"PILOT007": ["S003ONLINE", "S004ONLINE"], "CLIN_SUBJ_003": ["S001ONLINE"]}
 # If a subject is absent from the map, GRAND_AVG_SESSION_LIST is used.
-GRAND_AVG_TOPO_MODE = False
 DO_GRAND_AVG_TOPO = True
 
-GRAND_AVG_SUBJECT_LIST = ["PILOT007"]
-GRAND_AVG_SESSION_LIST = ["S001ONLINE", "S002ONLINE"]
+GRAND_AVG_SUBJECT_LIST = [
+    "PILOT001", "PILOT002", "PILOT003", "PILOT004",
+    "PILOT005", "PILOT006", "PILOT007", "PILOT008",
+]
+GRAND_AVG_SESSION_LIST = ["S001ONLINE"]
 GRAND_AVG_SESSION_MAP: dict = {}  # per-subject session override; empty = use GRAND_AVG_SESSION_LIST
 
 # ---- Bar plot normalization toggle ----
@@ -164,6 +164,9 @@ REJECT_EPOCHS = True
 REJECT_P2P_UV = 200  # fallback when config VISUALIZE_EPOCH_REJECT_P2P_UV missing (peak_to_peak mode)
 FLAT_UV = None       # optional; overrides config VISUALIZE_EPOCH_FLAT_UV when not None
 
+# Override for visualization max-abs rejection (µV)
+VISUALIZE_MAX_ABS_UV = 30.0
+
 # =========================================================
 # NEW: Auto-drop bad channels that dominate rejections
 # =========================================================
@@ -175,7 +178,7 @@ AUTO_DROP_MAX_ITERS = 4             # maximum drop-and-retry loops
 AUTO_DROP_MAX_CHANNELS_TOTAL = 4    # do not drop more than this many channels per session
 
 # What to do if the session’s focal channel gets dropped:
-#   "fallback" -> use DEFAULT_FOCAL_ELECTRODES (or old FOCAL_ELECTRODES) for that session
+#   "fallback" -> use FOCAL_ELECTRODES for that session
 #   "skip"     -> skip focal plots/metrics for that session if focal is missing
 FOCAL_IF_DROPPED_POLICY = "fallback"  # "fallback" or "skip"
 
@@ -194,8 +197,14 @@ CHANNEL_SUBSET = [
     "POz",
 ]
 
-# ---- CSD toggle ----
-APPLY_CSD = True
+# ---- Spatial filter applied to epochs after rejection ----
+# "none"   — no spatial filter
+# "car"    — common average reference (subtract mean across channels)
+# "csd"    — surface Laplacian via MNE's compute_current_source_density
+# "hjorth" — Hjorth Laplacian (subtract mean of HJORTH_NEIGHBORS nearest channels)
+# "rest"   — REST reference (sphere forward model fitted to electrode positions)
+SPATIAL_FILTER = "none"
+HJORTH_NEIGHBORS = 4  # nearest-neighbor count for Hjorth filter
 
 # ---- Plot/metric representation toggle ----
 #   "percent"  -> plot metrics as % change from baseline
@@ -330,13 +339,12 @@ def get_focal_for_session(sess: str, raw_or_tfr_ch_names=None):
     If raw_or_tfr_ch_names is provided, we filter to those present.
     """
     if USE_SESSION_SPECIFIC_FOCAL:
-        focals = FOCAL_ELECTRODES_BY_SESSION.get(sess, DEFAULT_FOCAL_ELECTRODES)
+        focals = FOCAL_ELECTRODES_BY_SESSION.get(sess, FOCAL_ELECTRODES)
     else:
         focals = FOCAL_ELECTRODES
 
-    # Fallback if someone accidentally sets empty list
     if not focals:
-        focals = DEFAULT_FOCAL_ELECTRODES if DEFAULT_FOCAL_ELECTRODES else FOCAL_ELECTRODES
+        focals = FOCAL_ELECTRODES
 
     if raw_or_tfr_ch_names is not None:
         focals_present = [ch for ch in focals if ch in raw_or_tfr_ch_names]
@@ -364,6 +372,106 @@ def summarize_drop_log_channel_counts(drop_log):
             chan_counts[reason] = chan_counts.get(reason, 0) + 1
 
     return chan_counts, dropped
+
+# Cache for REST forward solutions: keyed by frozenset of channel names so that
+# sessions with different channel sets (after auto-drop) each get their own model.
+_REST_FWD_CACHE: dict = {}
+
+
+def _apply_hjorth(epochs: mne.Epochs) -> mne.Epochs:
+    """
+    Hjorth Laplacian: subtract the mean of the HJORTH_NEIGHBORS nearest channels
+    (by 3-D Euclidean scalp distance) from each channel.
+
+    All neighbor means are computed from the original data before any channel is
+    modified, so the result is order-independent.
+    """
+    pos = np.array([ch["loc"][:3] for ch in epochs.info["chs"]])
+    if not np.any(pos):
+        raise RuntimeError(
+            "Hjorth filter requires channel positions; ensure a montage is set before filtering."
+        )
+
+    # Pairwise distances; diagonal set to inf so a channel is never its own neighbor
+    diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
+    dists = np.sqrt((diff ** 2).sum(axis=-1))
+    np.fill_diagonal(dists, np.inf)
+
+    k = min(int(HJORTH_NEIGHBORS), len(epochs.ch_names) - 1)
+    # (n_channels, k) — indices of k nearest neighbors per channel
+    neighbor_idxs = np.argsort(dists, axis=1)[:, :k]
+
+    # Compute neighbor means from the original data before modifying anything.
+    # epochs._data shape: (n_epochs, n_channels, n_times)
+    # Advanced indexing epochs._data[:, neighbor_idxs, :] produces a copy.
+    neighbor_means = epochs._data[:, neighbor_idxs, :].mean(axis=2)  # (n_epochs, n_ch, n_times)
+
+    epochs_out = epochs.copy()
+    epochs_out._data -= neighbor_means
+    print(f"Applied spatial filter: Hjorth Laplacian ({k} nearest neighbors).")
+    return epochs_out
+
+
+def _apply_rest(epochs: mne.Epochs) -> mne.Epochs:
+    """
+    REST (Reference Electrode Standardization Technique): estimates a reference-free
+    potential by projecting to a virtual electrode at infinity.
+
+    Uses an auto-fitted sphere forward model derived from the electrode montage, so
+    no subject MRI or external data download is required. The forward solution is
+    cached per unique channel set so multi-session runs only compute it once.
+    """
+    ch_key = frozenset(epochs.ch_names)
+
+    if ch_key not in _REST_FWD_CACHE:
+        print(f"Computing REST sphere forward model for {len(epochs.ch_names)} channels ...")
+        sphere = mne.make_sphere_model("auto", "auto", epochs.info, verbose=False)
+        src = mne.setup_volume_source_space(
+            sphere=sphere, exclude=30.0, pos=15.0, verbose=False
+        )
+        fwd = mne.make_forward_solution(
+            epochs.info, trans=None, src=src, bem=sphere,
+            eeg=True, meg=False, verbose=False
+        )
+        _REST_FWD_CACHE[ch_key] = fwd
+        print("REST forward model cached.")
+
+    epochs_out = epochs.copy()
+    epochs_out.set_eeg_reference("REST", forward=_REST_FWD_CACHE[ch_key], verbose=False)
+    print("Applied spatial filter: REST (sphere model approximation).")
+    return epochs_out
+
+
+def apply_spatial_filter(epochs: mne.Epochs) -> mne.Epochs:
+    """
+    Apply the spatial filter selected by SPATIAL_FILTER to epochs.
+    Called after epoch rejection so bad-channel removal precedes filtering.
+
+    "none"   — pass through unchanged
+    "car"    — common average reference: subtracts the instantaneous mean across channels
+    "csd"    — surface Laplacian via MNE's compute_current_source_density
+    "hjorth" — Hjorth Laplacian: subtracts mean of HJORTH_NEIGHBORS nearest channels
+    "rest"   — REST reference via sphere forward model (no MRI required)
+    """
+    if SPATIAL_FILTER == "none":
+        return epochs
+    if SPATIAL_FILTER == "car":
+        epochs.set_eeg_reference("average", projection=False, verbose=False)
+        print("Applied spatial filter: CAR (common average reference).")
+        return epochs
+    if SPATIAL_FILTER == "csd":
+        epochs = mne.preprocessing.compute_current_source_density(epochs)
+        print("Applied spatial filter: CSD (surface Laplacian).")
+        return epochs
+    if SPATIAL_FILTER == "hjorth":
+        return _apply_hjorth(epochs)
+    if SPATIAL_FILTER == "rest":
+        return _apply_rest(epochs)
+    raise ValueError(
+        f"Unknown SPATIAL_FILTER={SPATIAL_FILTER!r}. "
+        f"Choose 'none', 'car', 'csd', 'hjorth', or 'rest'."
+    )
+
 
 def pick_dominant_bad_channel(epochs: mne.Epochs, dominance_frac: float):
     """
@@ -667,13 +775,7 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
         if REJECT_EPOCHS and reject_mode == "max_abs":
             if raw_mu_qc is None:
                 raise RuntimeError("raw_mu_qc missing for VISUALIZE_EPOCH_REJECT_MODE=max_abs")
-            thr_m = float(
-                getattr(
-                    config,
-                    "VISUALIZE_EPOCH_MAX_ABS_UV",
-                    getattr(config, "ARTIFACT_MAX_ABS_UV", 30.0),
-                )
-            )
+            thr_m = float(VISUALIZE_MAX_ABS_UV)
             epochs_mu = mne.Epochs(
                 raw_mu_qc, events, reject=None, flat=None, **epoch_kw
             )
@@ -740,13 +842,7 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
                 raw_mu_qc, events, reject=None, flat=None, **epoch_kw
             )
             mu_data = epochs_mu.get_data()
-            thr_m = float(
-                getattr(
-                    config,
-                    "VISUALIZE_EPOCH_MAX_ABS_UV",
-                    getattr(config, "ARTIFACT_MAX_ABS_UV", 30.0),
-                )
-            )
+            thr_m = float(VISUALIZE_MAX_ABS_UV)
             epochs_bb = mne.Epochs(raw, events, reject=None, flat=None, **epoch_kw)
             mask = _visualize_max_abs_keep_mask(
                 epochs_mu,
@@ -784,10 +880,8 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
             raw_mu_qc = raw_mu_qc.copy().drop_channels([bad_ch])
         dropped_channels.append(bad_ch)
 
-    # ---- Apply CSD AFTER rejection (recommended) ----
-    if APPLY_CSD:
-        epochs = mne.preprocessing.compute_current_source_density(epochs)
-        print("✅ Applied CSD to epochs (after rejection).")
+    # ---- Apply spatial filter AFTER rejection (recommended ordering) ----
+    epochs = apply_spatial_filter(epochs)
 
     # ---- Optional: select subset of epochs/trials ----
     if str(EPOCH_SUBSET_MODE).lower() != "none":
@@ -863,19 +957,18 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
     focal_electrodes = get_focal_for_session(session, raw.ch_names)
 
     if USE_SESSION_SPECIFIC_FOCAL:
-        desired = FOCAL_ELECTRODES_BY_SESSION.get(session, DEFAULT_FOCAL_ELECTRODES)
+        desired = FOCAL_ELECTRODES_BY_SESSION.get(session, FOCAL_ELECTRODES)
     else:
         desired = FOCAL_ELECTRODES
 
-    desired = desired if desired else DEFAULT_FOCAL_ELECTRODES
+    desired = desired if desired else FOCAL_ELECTRODES
 
     missing_desired = [ch for ch in desired if ch not in raw.ch_names]
     if missing_desired:
         print(f"⚠️ Session {session}: desired focal electrodes missing after preprocessing: {missing_desired}")
 
         if FOCAL_IF_DROPPED_POLICY == "fallback":
-            fallback = DEFAULT_FOCAL_ELECTRODES if DEFAULT_FOCAL_ELECTRODES else FOCAL_ELECTRODES
-            focal_electrodes = [ch for ch in fallback if ch in raw.ch_names]
+            focal_electrodes = [ch for ch in FOCAL_ELECTRODES if ch in raw.ch_names]
             print(f"➡️ Using fallback focal electrodes: {focal_electrodes}")
         elif FOCAL_IF_DROPPED_POLICY == "skip":
             focal_electrodes = []
@@ -1053,7 +1146,7 @@ def plot_topomaps(tfr_data):
     print(f"Topomap ERD/ERS color scale (logratio): vmin={vmin:.2f}, vmax={vmax:.2f}")
 
     window_size = 0.5
-    time_windows = np.arange(0, 3, window_size)
+    time_windows = np.arange(0, 4, window_size)
     skip_factor = 1
 
     for marker, tfr in tfr_data.items():
@@ -1364,18 +1457,76 @@ def compute_grand_avg_topo():
             avgs = [a.pick(common_chs, verbose=False) for a in avgs]
 
         grand_data = np.mean([a.data for a in avgs], axis=0)
-        template = avgs[0]
-        grand_tfr = mne.time_frequency.AverageTFR(
-            info=template.info,
-            data=grand_data,
-            times=template.times,
-            freqs=template.freqs,
-            nave=len(avgs),
-        )
+        grand_tfr = avgs[0].copy()
+        grand_tfr.data = grand_data
+        grand_tfr.nave = len(avgs)
         grand_avg[marker] = grand_tfr
         print(f"✅ Grand average TFR — marker {marker}: {len(avgs)} session(s) averaged.")
 
     return grand_avg
+
+
+def compute_grand_avg_focal_timecourses(grand_avg_tfr_data, focal_electrodes):
+    """
+    Compute grand-averaged focal timecourses from grand_avg_tfr_data.
+    Uses the same band and baseline logic as single-session focal plots,
+    but operates on AverageTFR (no per-trial SEM).
+    """
+    timecourses = {}
+
+    if focal_electrodes is None:
+        focal_electrodes = []
+
+    for marker, tfr_avg in grand_avg_tfr_data.items():
+        times = tfr_avg.times
+        freqs = tfr_avg.freqs
+        data = tfr_avg.data  # (ch, freq, time) in logratio
+
+        freq_mask = (freqs >= lowband) & (freqs <= highband)
+        focal_idxs = [tfr_avg.ch_names.index(ch) for ch in focal_electrodes if ch in tfr_avg.ch_names]
+        if not focal_idxs:
+            print(f"⚠️ Grand avg marker {marker}: none of focal electrodes found in TFR channels. Skipping focal timecourse.")
+            continue
+
+        # average across focal channels and freq band -> (time,)
+        focal_log = data[focal_idxs][:, freq_mask, :].mean(axis=(0, 1))
+
+        # baseline-center in logratio domain
+        baseline_mask = (times >= time_start) & (times < 0.0)
+        if baseline_mask.any():
+            focal_log = focal_log - focal_log[baseline_mask].mean()
+
+        mean_tc = maybe_convert_for_plot(focal_log)
+        timecourses[marker] = (times, mean_tc)
+
+    return timecourses
+
+
+def plot_grand_avg_focal_timecourses(timecourses, focal_electrodes):
+    """Plot grand-averaged focal timecourses (no SEM) for each marker."""
+    if not timecourses:
+        return
+
+    plt.figure(figsize=(7, 4))
+    color_map = {"100": "tab:gray", "200": "tab:orange"}
+    label_map = {"100": "REST (100)", "200": "MI (200)"}
+
+    for marker, (times, mean_tc) in timecourses.items():
+        col = color_map.get(marker, None)
+        lab = label_map.get(marker, f"Marker {marker}")
+        plt.plot(times, mean_tc, label=lab, color=col)
+
+    plt.axhline(0, color="k", linewidth=0.8)
+    plt.axvline(0.0, color="k", linestyle="--", linewidth=0.8, label="Cue")
+    plt.axvline(feedback_time, color="k", linestyle=":", linewidth=0.8, label="Feedback")
+
+    plt.xlabel("Time (s)")
+    plt.ylabel(f"{ylabel_for_space()}")
+    foc_label = ",".join(focal_electrodes) if focal_electrodes else "NO_FOCAL"
+    title = f"Grand Avg Focal {FREQ_BAND.upper()} Timecourse ({PLOT_SPACE}) | {foc_label}"
+    plt.title(title)
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc="best")
 
 
 def plot_grand_avg_topomaps(grand_avg_tfr_data):
@@ -1397,7 +1548,7 @@ def plot_grand_avg_topomaps(grand_avg_tfr_data):
     print(f"Grand avg topomap color scale (logratio): vmin={vmin:.2f}, vmax={vmax:.2f}")
 
     window_size = 0.5
-    time_windows = np.arange(0, 3, window_size)
+    time_windows = np.arange(0, 4, window_size)
     skip_factor = 1
 
     label_map = {"100": "Rest", "200": "Right Arm MI", "300": "Robot Move"}
@@ -1483,10 +1634,18 @@ def main():
             plot_focal_timecourses(tcs, session_label=f"{session} ({','.join(focal_electrodes)})")
 
     # Grand average topomaps — independent of session mode above.
-    # Runs whenever GRAND_AVG_TOPO_MODE=True, alongside any other mode.
-    if GRAND_AVG_TOPO_MODE and DO_GRAND_AVG_TOPO:
+    if DO_GRAND_AVG_TOPO:
         grand_avg_tfr = compute_grand_avg_topo()
-        plot_grand_avg_topomaps(grand_avg_tfr)
+        if grand_avg_tfr:
+            first_marker = next(iter(grand_avg_tfr.keys()))
+            ch_names = grand_avg_tfr[first_marker].ch_names
+            grand_focal = [ch for ch in FOCAL_ELECTRODES if ch in ch_names]
+
+            plot_grand_avg_topomaps(grand_avg_tfr)
+
+            # Mirror the single-session focal line plots at the grand-average level.
+            ga_timecourses = compute_grand_avg_focal_timecourses(grand_avg_tfr, grand_focal)
+            plot_grand_avg_focal_timecourses(ga_timecourses, grand_focal)
 
     plt.show()
 

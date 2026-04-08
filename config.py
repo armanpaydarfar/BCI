@@ -38,7 +38,7 @@ TIME_MASTER_MOVE = 5  # Bimanual: time to position master arm (s)
 MAX_EPOCH_MARKER_SLACK_SEC = 0.5
 MAX_EPOCH_MARKER_DURATION_SEC = float(TIME_MI) + float(MAX_EPOCH_MARKER_SLACK_SEC)
 TIMING = True  # If True, drivers use automatic countdown paths where implemented
-SHAPE_MAX = 0.8  # Upper bound for feedback fill mapping
+SHAPE_MAX = 0.7  # Upper bound for feedback fill mapping
 SHAPE_MIN = 0.5  # Lower bound for feedback fill mapping
 ROBOT_TRAJECTORY = ["a"]  # Opcode pool for random trajectory choice where used
 BIG_BROTHER_MODE = True  # If True, force pygame window to external display (0,0) at 1920x1080
@@ -72,11 +72,11 @@ ACCURACY_THRESHOLD = 0.6  # Legacy / logging only; see CHANGELOG.md — threshol
 THRESHOLD_MI = 0.65
 THRESHOLD_REST = 0.65
 RELAXATION_RATIO = 0.5
-MIN_PREDICTIONS = 32
+MIN_PREDICTIONS = 16
 STEP_SIZE = 1/16
 CLASSIFICATION_OFFSET = 0
 CLASSIFICATION_SCHEME_OPT = "FREQUENCY"  # or "TIMESERIES"
-SURFACE_LAPLACIAN_TOGGLE = 0
+SURFACE_LAPLACIAN_TOGGLE = 1
 
 # =============================================================================
 # Dual-threshold ambiguity target (used for learned reject/decide thresholds)
