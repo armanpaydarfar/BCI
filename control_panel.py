@@ -484,6 +484,9 @@ class ControlPanel(QMainWindow):
         self.btn_mne = QPushButton("Open MNE-LSL Viewer")
         self.btn_mne.clicked.connect(self.on_open_mne_viewer)
         fu.addWidget(self.btn_mne)
+        self.btn_impedance = QPushButton("Impedance Monitor")
+        self.btn_impedance.clicked.connect(self.on_open_impedance_monitor)
+        fu.addWidget(self.btn_impedance)
         top.addWidget(gb_utils)
 
         # Middle: Controls + Logs
@@ -1129,6 +1132,18 @@ class ControlPanel(QMainWindow):
     def on_open_mne_viewer(self):
         self._spawn_external('mne-lsl viewer')
         self._append_log("Panel", f"[{self._ts()}] Opened mne-lsl viewer\n")
+
+    def on_open_impedance_monitor(self):
+        sub = (self.cmb_subject.currentText().strip() if hasattr(self, "cmb_subject") else "") or self.training_subject
+        data_dir = os.path.expanduser(getattr(_HCFG, "DATA_DIR", "") or "") if _HCFG else ""
+        if data_dir and sub:
+            cmd = f'impedance-monitor --mode live --cap ca209 --subject "{sub}" --data-dir "{data_dir}"'
+        else:
+            # Fall back — the tool will default to ~/impedance_logs/
+            cmd = 'impedance-monitor --mode live --cap ca209'
+        self._spawn_external(cmd)
+        log_dir = os.path.join(data_dir, f"sub-{sub}", "impedance_logs") if data_dir and sub else "~/impedance_logs"
+        self._append_log("Panel", f"[{self._ts()}] Opened impedance monitor (logs → {log_dir})\n")
 
     # ----- Marker -----
     def on_marker_start(self):
