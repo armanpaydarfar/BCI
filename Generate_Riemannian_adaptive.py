@@ -310,9 +310,16 @@ def compute_processed_covariances(segments, labels, *, model_type: str | None = 
 
     if config.LEDOITWOLF:
         print("Applying Ledoit-Wolf shrinkage...")
-        cov_matrices = np.array([
-            LedoitWolf().fit(cov).covariance_ for cov in cov_matrices
-        ])
+        # Fit LW to raw segment data (n_timepoints x n_channels) to estimate the optimal
+        # shrinkage coefficient, then apply it to the already trace-normalised covariance.
+        # Fitting to the precomputed covariance matrix was wrong: sklearn's LedoitWolf expects
+        # raw observations, not an SPD matrix.
+        regularized = []
+        for seg, cov in zip(segments, cov_matrices):
+            lam = LedoitWolf().fit(seg.T).shrinkage_
+            n = cov.shape[0]
+            regularized.append((1 - lam) * cov + lam * (np.trace(cov) / n) * np.eye(n))
+        cov_matrices = np.array(regularized)
     else:
         lam = _resolve_shrinkage_param(model_type=model_type, shrinkage_param=shrinkage_param)
         print(f"Applying shrinkage (λ={lam})...")
