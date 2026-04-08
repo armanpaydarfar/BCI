@@ -203,7 +203,7 @@ CHANNEL_SUBSET = [
 # "csd"    — surface Laplacian via MNE's compute_current_source_density
 # "hjorth" — Hjorth Laplacian (subtract mean of HJORTH_NEIGHBORS nearest channels)
 # "rest"   — REST reference (sphere forward model fitted to electrode positions)
-SPATIAL_FILTER = "none"
+SPATIAL_FILTER = "csd"
 HJORTH_NEIGHBORS = 4  # nearest-neighbor count for Hjorth filter
 
 # ---- Plot/metric representation toggle ----
