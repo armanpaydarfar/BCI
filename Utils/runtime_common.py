@@ -333,12 +333,19 @@ def _predict_with_rbnnet(eeg_state, window_size_samples, *, update_recentering: 
         return None, None
 
     rbnnet = model["model"]
+    online_adapt = bool(getattr(config, "RBNNET_ONLINE_ADAPT", False))
     with torch.no_grad():
+        if online_adapt:
+            # Train mode causes RBNLayer to update its running mean via EMA on this
+            # trial's covariance. No .backward() is called so BiMap weights are frozen.
+            rbnnet.train()
         if use_beta:
             C_mu, C_beta = cov_out
             probs = rbnnet.predict_proba(C_mu, C_beta)[0].cpu().numpy()
         else:
             probs = rbnnet.predict_proba(cov_out)[0].cpu().numpy()
+        if online_adapt:
+            rbnnet.eval()
 
     rest_label = min(model["label_to_bin"], key=lambda k: model["label_to_bin"][k])
     mi_label   = max(model["label_to_bin"], key=lambda k: model["label_to_bin"][k])
