@@ -122,7 +122,7 @@ def _restore_sleep():
     except Exception:
         pass  # powercfg is best-effort; sleep policy is not critical to restore
 
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold, LeaveOneGroupOut
 from sklearn.metrics import roc_auc_score, accuracy_score, roc_curve
 
 import config
@@ -352,7 +352,7 @@ def _build_and_train(use_beta, n_ch, epsilon_mu, epsilon_beta,
 # ---------------------------------------------------------------------------
 
 def cross_validate_rbnnet(use_beta, cov_mu_np, cov_beta_np, labels_bin_np,
-                           epsilon_mu, epsilon_beta, device):
+                           epsilon_mu, epsilon_beta, device, trial_ids=None, file_ids=None):
     n_splits     = int(getattr(config, "N_SPLITS", 5))
     target_ambig = float(getattr(config, "TARGET_AMBIG", 0.20))
     epochs       = int(getattr(config, "RBNNET_EPOCHS", 200))
@@ -361,12 +361,26 @@ def cross_validate_rbnnet(use_beta, cov_mu_np, cov_beta_np, labels_bin_np,
     weight_decay = float(getattr(config, "RBNNET_WEIGHT_DECAY", 1e-4))
     n_ch         = cov_mu_np.shape[1]
 
-    skf           = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    # Use leave-one-session-out CV when file_ids are provided (preferred: prevents
+    # session-level artifact leakage in addition to trial-level window leakage).
+    # Fall back to StratifiedGroupKFold on trial_ids when file_ids are absent.
+    if file_ids is not None:
+        skf = LeaveOneGroupOut()
+        split_groups = file_ids
+        n_folds = len(np.unique(file_ids))
+        print(f"\n[CV] Leave-One-Session-Out ({n_folds} sessions)")
+    else:
+        groups = trial_ids if trial_ids is not None else np.arange(len(labels_bin_np))
+        skf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        split_groups = groups
+        n_folds = n_splits
+        print(f"\n[CV] {n_splits}-Fold (trial-grouped)")
+
     results       = []
     oof_posterior = {0: [], 1: []}  # P(true class) per held-out sample, keyed by true label
 
-    for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(cov_mu_np, labels_bin_np)):
-        print(f"\n--- Fold {fold_idx + 1}/{n_splits} ---")
+    for fold_idx, (tr_idx, val_idx) in enumerate(skf.split(cov_mu_np, labels_bin_np, groups=split_groups)):
+        print(f"\n--- Fold {fold_idx + 1}/{n_folds} ---")
 
         cov_mu_tr  = cov_mu_np[tr_idx];   cov_mu_val  = cov_mu_np[val_idx]
         cov_b_tr   = cov_beta_np[tr_idx] if use_beta else None
@@ -613,8 +627,8 @@ def main():
         print(f"  {os.path.basename(f)}")
 
     # --- Segment all files ---
-    all_segments, all_labels = [], []
-    for xdf_path in xdf_files:
+    all_segments, all_labels, all_trial_ids, all_file_ids = [], [], [], []
+    for file_idx, xdf_path in enumerate(xdf_files):
         print(f"\n[Loading] {os.path.basename(xdf_path)}")
         try:
             eeg_stream, marker_stream = load_xdf(xdf_path)
@@ -622,14 +636,17 @@ def main():
             print(f"  [WARN] {e}")
             continue
         try:
-            segs, lbls = segment_and_label_one_run(eeg_stream, marker_stream)
+            segs, lbls, trial_ids = segment_and_label_one_run(eeg_stream, marker_stream)
         except Exception as e:
             print(f"  [WARN] Segmentation failed: {e}")
             continue
         print(f"  Segments: {segs.shape[0]}  "
               f"Labels: {dict(zip(*np.unique(lbls, return_counts=True)))}")
-        segs, lbls, _ = apply_training_artifact_rejection(segs, lbls)
+        segs, lbls, (trial_ids,) = apply_training_artifact_rejection(segs, lbls, trial_ids)
         print(f"  Retained after artifact rejection: {segs.shape[0]}")
+        offset = int(all_trial_ids[-1].max()) + 1 if all_trial_ids else 0
+        all_trial_ids.append(trial_ids + offset)
+        all_file_ids.append(np.full(len(lbls), file_idx, dtype=int))
         all_segments.append(segs)
         all_labels.append(lbls)
 
@@ -637,9 +654,11 @@ def main():
         print("[ERROR] No valid segments extracted.")
         sys.exit(1)
 
-    segments_np = np.concatenate(all_segments, axis=0)
-    labels_np   = np.concatenate(all_labels,   axis=0)
-    labels_bin  = np.array([LABEL_TO_BIN[int(l)] for l in labels_np])
+    segments_np    = np.concatenate(all_segments, axis=0)
+    labels_np      = np.concatenate(all_labels,   axis=0)
+    trial_ids_np   = np.concatenate(all_trial_ids, axis=0)
+    file_ids_np    = np.concatenate(all_file_ids,  axis=0)
+    labels_bin     = np.array([LABEL_TO_BIN[int(l)] for l in labels_np])
 
     print(f"\nTotal segments: {len(segments_np)}")
     print(f"Label counts:   {dict(zip(*np.unique(labels_np, return_counts=True)))}")
@@ -678,6 +697,8 @@ def main():
     cv_results, tl_star, th_star, mean_auc, oof_posterior = cross_validate_rbnnet(
         use_beta, cov_mu_np, cov_beta_np, labels_bin,
         epsilon_mu, epsilon_beta, device,
+        trial_ids=trial_ids_np,
+        file_ids=file_ids_np,
     )
 
     # --- Final model on all data ---

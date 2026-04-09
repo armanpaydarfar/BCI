@@ -103,9 +103,9 @@ def build_session_dataset(
             return_beta_segments=include_beta_cov,
         )
         if include_beta_cov:
-            segments, labels, erd, beta_segments, _channel_names = out
+            segments, labels, _, erd, beta_segments, _channel_names = out
         else:
-            segments, labels, erd, _channel_names = out
+            segments, labels, _, erd, _channel_names = out
             beta_segments = None
 
         if len(labels) == 0:

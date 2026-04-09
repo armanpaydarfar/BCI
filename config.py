@@ -5,8 +5,8 @@ import os
 # =============================================================================
 # Paths and subject
 # =============================================================================
-WORKING_DIR = "/home/arman-admin/Projects/Harmony/"
-DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
+WORKING_DIR = "C:/Users/arman/Projects/BCI/"
+DATA_DIR = "C:/Users/arman/Documents/CurrentStudy"
 TRAINING_SUBJECT = "PILOT007"
 # =============================================================================
 # EEG acquisition and channels
@@ -94,7 +94,7 @@ SHRINKAGE_PARAM_MDM = 0.02
 SHRINKAGE_PARAM_XGB = 0.1
 # Backward-compatible alias (legacy code may still read SHRINKAGE_PARAM).
 SHRINKAGE_PARAM = SHRINKAGE_PARAM_MDM
-LEDOITWOLF = 0
+LEDOITWOLF = 1
 
 # =============================================================================
 # Offline artifact rejection (sliding-window training segments)
@@ -123,7 +123,7 @@ VISUALIZE_EPOCH_FLAT_UV = None  # e.g. 1.0 for 1 µV flat criterion; None disabl
 # =============================================================================
 # Adaptive recentering (Riemannian)
 # =============================================================================
-RECENTERING = 1
+RECENTERING = 0
 UPDATE_DURING_MOVE = 0
 SAVE_ADAPTIVE_T = False
 
@@ -153,6 +153,7 @@ SHRINKAGE_PARAM_RBNNET = 0.02   # Covariance shrinkage lambda (same as MDM)
 RBNNET_USE_BETA = 0             # 0 = single-band mu only, 1 = dual-band mu+beta
 RBNNET_LOWCUT_BETA = 13         # Hz — beta band low edge
 RBNNET_HIGHCUT_BETA = 30        # Hz — beta band high edge
+RBNNET_ONLINE_ADAPT = 0         # 1 = update RBN running means online (train-mode forward pass, no weight update)
 
 # =============================================================================
 # FES
@@ -250,7 +251,7 @@ ROBOT_OPCODES = {
 # Arduino actuator
 # =============================================================================
 USE_ARDUINO = True
-ARDUINO_PORT = "/dev/ttyACM0"
+ARDUINO_PORT = "COM3"
 ARDUINO_BAUD = 9600
 ARDUINO_CMD_MI   = b"1"
 ARDUINO_CMD_REST = b"0"

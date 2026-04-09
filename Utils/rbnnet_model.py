@@ -194,10 +194,16 @@ class RBNLayer(nn.Module):
         if self.training:
             G = self._karcher_mean(X)
             with torch.no_grad():
-                self.running_mean.copy_(
-                    _mat_pow(self.running_mean, 1.0 - self.momentum) @
-                    _mat_pow(G, self.momentum)
-                )
+                # Geodesic weighted mean Bar_{(1-m, m)}(G_S, G_B) per Brooks et al. Eq. 5:
+                # G_B^{1/2} (G_B^{-1/2} G_S G_B^{-1/2})^{1-m} G_B^{1/2}
+                # G_B^{±1/2} share one eigendecomposition; interior power is the second.
+                # Same eigh count as the prior matrix-power formula, but exact on the manifold.
+                vals, vecs = _sym_eigh(G)
+                vals_c    = vals.clamp(min=1e-10)
+                G_sqrt    = vecs @ torch.diag_embed(vals_c.pow( 0.5)) @ vecs.T
+                G_invsqrt = vecs @ torch.diag_embed(vals_c.pow(-0.5)) @ vecs.T
+                interior  = _mat_pow(G_invsqrt @ self.running_mean @ G_invsqrt, 1.0 - self.momentum)
+                self.running_mean.copy_(G_sqrt @ interior @ G_sqrt)
         else:
             G = self.running_mean
         G_invsqrt = _mat_pow(G, -0.5)

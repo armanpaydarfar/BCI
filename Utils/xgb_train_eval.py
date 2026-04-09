@@ -13,7 +13,7 @@ os.environ["MNE_USE_NUMBA"] = "false"
 import config
 import Generate_Riemannian_adaptive as base
 
-from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedGroupKFold, LeaveOneGroupOut
 from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
@@ -24,6 +24,8 @@ def train_xgb_dual_thresholds(
     feature_tag: str,
     n_splits: int,
     target_ambig: float = float(getattr(config, "TARGET_AMBIG", 0.20)),
+    trial_ids: np.ndarray | None = None,
+    file_ids: np.ndarray | None = None,
 ):
     """
     Train/evaluate an XGBClassifier with the same dual-threshold selection logic
@@ -60,16 +62,26 @@ def train_xgb_dual_thresholds(
         random_state=42,
     )
 
-    print(f"\n🚀 Starting K-Fold CV ({feature_tag}) + XGBoost...\n")
-
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    # Use leave-one-session-out CV when file_ids are provided (preferred: prevents
+    # session-level artifact leakage in addition to trial-level window leakage).
+    # Fall back to StratifiedGroupKFold on trial_ids when file_ids are absent.
+    if file_ids is not None:
+        splitter = LeaveOneGroupOut()
+        split_groups = file_ids
+        n_folds = len(np.unique(file_ids))
+        print(f"\n🚀 Starting Leave-One-Session-Out CV ({n_folds} sessions, {feature_tag}) + XGBoost...\n")
+    else:
+        groups = trial_ids if trial_ids is not None else np.arange(len(y_bin))
+        splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        split_groups = groups
+        print(f"\n🚀 Starting {n_splits}-Fold CV (trial-grouped, {feature_tag}) + XGBoost...\n")
 
     acc_argmax = []
     t_lows, t_highs = [], []
     all_true, all_pred, all_scores, all_true_bin = [], [], [], []
     posterior_probs = {lbl: [] for lbl in classes}
 
-    for fold_idx, (tr, te) in enumerate(kf.split(X), 1):
+    for fold_idx, (tr, te) in enumerate(splitter.split(X, y_bin, groups=split_groups), 1):
         X_tr, X_te = X[tr], X[te]
         y_tr, y_te = labels[tr], labels[te]
         y_tr_bin = y_bin[tr]

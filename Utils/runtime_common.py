@@ -335,16 +335,26 @@ def _predict_with_rbnnet(eeg_state, window_size_samples, *, update_recentering: 
     rbnnet = model["model"]
     online_adapt = bool(getattr(config, "RBNNET_ONLINE_ADAPT", False))
     with torch.no_grad():
-        if online_adapt:
-            # Train mode causes RBNLayer to update its running mean via EMA on this
-            # trial's covariance. No .backward() is called so BiMap weights are frozen.
-            rbnnet.train()
+        # Inference always in eval mode: RBNLayer uses the accumulated running_mean
+        # for centering, producing meaningful predictions.
         if use_beta:
             C_mu, C_beta = cov_out
             probs = rbnnet.predict_proba(C_mu, C_beta)[0].cpu().numpy()
         else:
             probs = rbnnet.predict_proba(cov_out)[0].cpu().numpy()
+
         if online_adapt:
+            # Separate train-mode pass to update RBN running means. Output is
+            # discarded — with batch size 1 the Karcher mean equals the input
+            # itself, so centering produces I and the logits are meaningless.
+            # Only layer-1's running mean update is input-dependent; layers 2/3
+            # receive I from the previous RBN and are pushed toward W_i W_i^T,
+            # which matches their trained state (same geometry as training).
+            rbnnet.train()
+            if use_beta:
+                rbnnet(C_mu, C_beta)
+            else:
+                rbnnet(cov_out)
             rbnnet.eval()
 
     rest_label = min(model["label_to_bin"], key=lambda k: model["label_to_bin"][k])

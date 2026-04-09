@@ -193,6 +193,7 @@ def segment_and_extract_cov_erd(
 
     segments_all = []
     labels_all = []
+    trial_ids_all = []
     erd_feats_all = [] if compute_erd else None
     beta_segments_all = [] if return_beta_segments else None
 
@@ -286,7 +287,7 @@ def segment_and_extract_cov_erd(
         baseline_duration_sec = float(getattr(config, "BASELINE_DURATION", 1.0))
 
     # For each trial, extract and label segments
-    for (ts_start, ts_end, label) in trial_windows:
+    for trial_num, (ts_start, ts_end, label) in enumerate(trial_windows):
         rel_end = np.searchsorted(rel_timestamps, ts_end)
         baseline_end = np.searchsorted(rel_timestamps, ts_start)
         decision_start = np.searchsorted(rel_timestamps, ts_start + 1.0)
@@ -356,6 +357,7 @@ def segment_and_extract_cov_erd(
             if return_beta_segments:
                 beta_segments_all.append(segment_beta_cov)
             labels_all.append(label)
+            trial_ids_all.append(trial_num)
 
             if compute_erd:
                 win_bp_mu = (
@@ -382,9 +384,10 @@ def segment_and_extract_cov_erd(
                 erd = win_bp - base_bp
                 erd_feats_all.append(erd.reshape(-1))
 
-    segments_arr = np.array(segments_all)
-    labels_arr = np.array(labels_all)
-    erd_arr = np.array(erd_feats_all) if compute_erd else None
+    segments_arr  = np.array(segments_all)
+    labels_arr    = np.array(labels_all)
+    trial_ids_arr = np.array(trial_ids_all, dtype=int)
+    erd_arr  = np.array(erd_feats_all)    if compute_erd          else None
     beta_arr = np.array(beta_segments_all) if return_beta_segments else None
 
     n_seg = int(segments_arr.shape[0])
@@ -401,10 +404,11 @@ def segment_and_extract_cov_erd(
             f"internal ordering bug: beta_segments {int(beta_arr.shape[0])} vs segments {n_seg}"
         )
 
+    # trial_ids rides through artifact rejection as an optional parallel array.
     segments_arr, labels_arr, extras = apply_training_artifact_rejection(
-        segments_arr, labels_arr, erd_arr, beta_arr
+        segments_arr, labels_arr, trial_ids_arr, erd_arr, beta_arr
     )
-    erd_arr, beta_arr = extras[0], extras[1]
+    trial_ids_arr, erd_arr, beta_arr = extras[0], extras[1], extras[2]
 
     n_kept = int(segments_arr.shape[0])
     if n_kept != int(labels_arr.shape[0]) or (
@@ -415,7 +419,7 @@ def segment_and_extract_cov_erd(
     ch_out = list(current_channel_names)
 
     if return_beta_segments:
-        return segments_arr, labels_arr, erd_arr, beta_arr, ch_out
+        return segments_arr, labels_arr, trial_ids_arr, erd_arr, beta_arr, ch_out
 
-    return segments_arr, labels_arr, erd_arr, ch_out
+    return segments_arr, labels_arr, trial_ids_arr, erd_arr, ch_out
 

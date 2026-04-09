@@ -42,3 +42,4 @@ ENV/
 
 # Draft exploration documentation (generated/iterative)
 docs/REPO_EXPLORATION_REPORT.md
+.claude/ 

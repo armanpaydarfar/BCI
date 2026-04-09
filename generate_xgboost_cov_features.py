@@ -127,6 +127,8 @@ def main():
         raise FileNotFoundError(f"No XDF files found in: {eeg_dir}")
 
     all_labels = []
+    all_trial_ids = []
+    all_file_ids = []
     cov_mu_all = []
     cov_beta_all = []
     channel_names = list(getattr(config, "MOTOR_CHANNEL_NAMES", [])) if getattr(config, "SELECT_MOTOR_CHANNELS", 0) else None
@@ -139,7 +141,7 @@ def main():
 
     n_cov_mu = n_cov_beta = 0
 
-    for xdf_path in xdf_files:
+    for file_idx, xdf_path in enumerate(xdf_files):
         print(f"\n📂 Processing file: {xdf_path}")
         eeg_stream, marker_stream = load_xdf(xdf_path, report=False)
 
@@ -151,9 +153,9 @@ def main():
             return_beta_segments=use_cov_beta,
         )
         if use_cov_beta:
-            segments, labels, _, beta_segments, _ch_names = out
+            segments, labels, trial_ids, _, beta_segments, _ch_names = out
         else:
-            segments, labels, _, _ch_names = out
+            segments, labels, trial_ids, _, _ch_names = out
             beta_segments = None
 
         if use_cov_mu:
@@ -165,9 +167,14 @@ def main():
                 raise RuntimeError("Expected beta segments but got None.")
             cov_matrices_beta = base.compute_processed_covariances(beta_segments, labels, model_type="xgb")
             cov_beta_all.append(cov_matrices_beta)
+        offset = int(all_trial_ids[-1].max()) + 1 if all_trial_ids else 0
+        all_trial_ids.append(trial_ids + offset)
+        all_file_ids.append(np.full(len(labels), file_idx, dtype=int))
         all_labels.append(labels)
 
     y = np.concatenate(all_labels)
+    all_trial_ids_np = np.concatenate(all_trial_ids)
+    all_file_ids_np = np.concatenate(all_file_ids)
     feature_blocks = []
     tangent_ref_mu = None
     tangent_ref_beta = None
@@ -198,6 +205,8 @@ def main():
         feature_tag="cov_tangent_fittedref",
         n_splits=int(getattr(config, "N_SPLITS", 8)),
         target_ambig=float(getattr(config, "TARGET_AMBIG", 0.20)),
+        trial_ids=all_trial_ids_np,
+        file_ids=all_file_ids_np,
     )
     model_bundle["decoder_backend"] = "xgb_cov"
     model_bundle["tangent_ref_mu"] = tangent_ref_mu

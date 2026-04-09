@@ -107,9 +107,9 @@ def extract_features_for_file(
             return_beta_segments=include_beta_cov,
         )
         if include_beta_cov:
-            segments, labels, erd, beta_segments, channel_names = out
+            segments, labels, _, erd, beta_segments, channel_names = out
         else:
-            segments, labels, erd, channel_names = out
+            segments, labels, _, erd, channel_names = out
             beta_segments = None
     except Exception as e:
         return {"error": f"segment_failed: {e}"}

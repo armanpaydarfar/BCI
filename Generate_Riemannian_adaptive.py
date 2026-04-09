@@ -3,7 +3,7 @@ import sys
 import numpy as np
 import pickle
 import mne
-from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedGroupKFold, LeaveOneGroupOut
 from sklearn.metrics import accuracy_score
 from pyriemann.estimation import Shrinkage
 from pyriemann.classification import MDM, FgMDM
@@ -189,6 +189,7 @@ def segment_and_label_one_run(eeg_stream, marker_stream):
 
     segments_all = []
     labels_all = []
+    trial_ids_all = []
 
     # === Precompute all trial windows (chronological FIFO; avoids mis-paired k-th with k-th) ===
     epochs_int = {int(a): int(b) for a, b in EPOCHS_START_END.items()}
@@ -250,14 +251,16 @@ def segment_and_label_one_run(eeg_stream, marker_stream):
             segment = trial_data[:, i:i + window_samples]
             segments_all.append(segment)
             labels_all.append(label)
+            trial_ids_all.append(trial_num)
 
-    segments_arr = np.array(segments_all)
-    labels_arr = np.array(labels_all)
+    segments_arr  = np.array(segments_all)
+    labels_arr    = np.array(labels_all)
+    trial_ids_arr = np.array(trial_ids_all, dtype=int)
     if segments_arr.shape[0] != labels_arr.shape[0]:
         raise RuntimeError(
             f"internal ordering bug: segments {segments_arr.shape[0]} vs labels {labels_arr.shape[0]}"
         )
-    return segments_arr, labels_arr
+    return segments_arr, labels_arr, trial_ids_arr
 
 
 
@@ -555,6 +558,8 @@ def _dual_thresholds(y_true_bin, scores, c_fp=1.0, c_fn=1.0, c_reject=0.3,
 def train_riemannian_model(
     cov_matrices,
     labels,
+    trial_ids=None,
+    file_ids=None,
     n_splits=8,
     use_dual_thresholds=True,
     c_fp=1.0, c_fn=1.0, c_reject=0.3,
@@ -573,19 +578,31 @@ def train_riemannian_model(
     prints aggregated report, and generates diagnostic plots.
     """
 
-    print("\n🚀 Starting K-Fold Cross Validation with Riemannian MDM...\n")
-
-    # Informational note: when target_ambig is set, c_reject is ignored during selection
-    if target_ambig is not None and (c_reject not in (None, 0.0)):
-        print("[Note] target_ambig is set; c_reject is ignored for threshold SELECTION "
-              "(still used only in the reported overall cost below).")
-
     classes = np.sort(np.unique(labels))
     if len(classes) != 2:
         raise ValueError("Function expects binary classes.")
     rest_label, mi_label = classes[0], classes[1]
+    labels_bin_for_split = (labels == mi_label).astype(int)
 
-    kf  = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    # Informational note: when target_ambig is set, c_reject is ignored during selection
+    if target_ambig is not None and (c_reject not in (None, 0.0)):
+        print("[Note] target_ambig is set; c_reject is ignored for threshold SELECTION "
+              "(still used only in the reported overall cost below.")
+
+    # Use leave-one-session-out CV when file_ids are provided (preferred: prevents
+    # session-level artifact leakage in addition to trial-level window leakage).
+    # Fall back to StratifiedGroupKFold on trial_ids when file_ids are absent.
+    if file_ids is not None:
+        splitter = LeaveOneGroupOut()
+        split_groups = file_ids
+        n_folds = len(np.unique(file_ids))
+        print(f"\n🚀 Starting Leave-One-Session-Out CV ({n_folds} sessions) with Riemannian MDM...\n")
+    else:
+        groups = trial_ids if trial_ids is not None else np.arange(len(labels))
+        splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        split_groups = groups
+        print(f"\n🚀 Starting {n_splits}-Fold CV (trial-grouped) with Riemannian MDM...\n")
+
     mdm = MDM()
 
     # Aggregation containers
@@ -594,7 +611,7 @@ def train_riemannian_model(
     all_true, all_pred, all_scores, all_true_bin = [], [], [], []
     posterior_probs = {lbl: [] for lbl in classes}
 
-    for fold_idx, (tr, te) in enumerate(kf.split(cov_matrices), 1):
+    for fold_idx, (tr, te) in enumerate(splitter.split(cov_matrices, labels_bin_for_split, groups=split_groups), 1):
         X_tr, X_te = cov_matrices[tr], cov_matrices[te]
         y_tr, y_te = labels[tr], labels[te]
 
@@ -747,12 +764,14 @@ def main():
 
     all_cov_matrices = []
     all_labels = []
+    all_trial_ids = []
+    all_file_ids = []
 
-    for xdf_path in xdf_files:
+    for file_idx, xdf_path in enumerate(xdf_files):
         print(f"\n📂 Processing file: {xdf_path}")
         eeg_stream, marker_stream = load_xdf(xdf_path)
 
-        segments, labels = segment_and_label_one_run(eeg_stream, marker_stream)
+        segments, labels, trial_ids = segment_and_label_one_run(eeg_stream, marker_stream)
 
         # Print summary
         unique_labels, counts = np.unique(labels, return_counts=True)
@@ -762,21 +781,26 @@ def main():
         print(f"🔹 Segment shape: {segments.shape} (n_segments, n_channels, n_timepoints)")
         print(f"🔹 Class distribution: {label_summary}")
 
-
-        segments, labels, _ = apply_training_artifact_rejection(segments, labels)
+        segments, labels, (trial_ids,) = apply_training_artifact_rejection(segments, labels, trial_ids)
         print(f"Retained {len(segments)} segments after artifact rejection.")
 
-        
         cov_matrices = compute_processed_covariances(segments, labels, model_type="mdm")
-        
-        #print(mean_riemann(cov_matrices))
+
+        # Offset trial IDs so they are globally unique across files.
+        offset = int(all_trial_ids[-1].max()) + 1 if all_trial_ids else 0
         all_cov_matrices.append(cov_matrices)
         all_labels.append(labels)
+        all_trial_ids.append(trial_ids + offset)
+        all_file_ids.append(np.full(len(labels), file_idx, dtype=int))
 
     all_labels = np.concatenate(all_labels)
     all_cov_matrices = np.concatenate(all_cov_matrices)
+    all_trial_ids = np.concatenate(all_trial_ids)
+    all_file_ids = np.concatenate(all_file_ids)
     print("Training Riemannian Classifier...")
-    Reimans_model = train_riemannian_model(all_cov_matrices, all_labels)
+    Reimans_model = train_riemannian_model(
+        all_cov_matrices, all_labels, trial_ids=all_trial_ids, file_ids=all_file_ids
+    )
 
     #  Save the trained model
     # Define model save path (subject-level, not session-specific)
