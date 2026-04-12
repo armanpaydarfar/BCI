@@ -91,7 +91,7 @@ INTEGRATOR_ALPHA = 0.94
 # - MDM path (runtime + MDM-centric analyses)
 SHRINKAGE_PARAM_MDM = 0.02
 # - XGB feature pipelines (covariance preprocessing before tangent features)
-SHRINKAGE_PARAM_XGB = 0.1
+SHRINKAGE_PARAM_XGB = 0.02
 # Backward-compatible alias (legacy code may still read SHRINKAGE_PARAM).
 SHRINKAGE_PARAM = SHRINKAGE_PARAM_MDM
 LEDOITWOLF = 0

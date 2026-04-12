@@ -44,7 +44,7 @@ from Utils.EEGStreamState import EEGStreamState
 from Utils.networking import send_udp_message,display_multiple_messages_with_udp
 
 # Stream utilities (LSL channel names)
-from Utils.stream_utils import get_channel_names_from_lsl
+from Utils.stream_utils import get_channel_names_from_lsl, require_marker_stream
 
 # Configuration parameters
 import config
@@ -335,6 +335,9 @@ def main():
     - user/backdoor input handling and the end-of-run summary outputs
     """
     # === Main Game Loop Initialization ===
+
+    # Require both streams before any trial data is recorded.
+    require_marker_stream(logger=logger)
 
     # Connect to EEG stream
     logger.log_event("Resolving EEG data stream via LSL...")

@@ -11,9 +11,46 @@ Be mindful of sample layout:
   for real-time windows, and `(n_samples, ...)` for certain offline operations.
 """
 
+import sys
 from pylsl import resolve_stream, StreamInlet
 import numpy as np
 import pyxdf
+
+def require_marker_stream(logger=None, timeout=5.0):
+    """
+    Verify that the experiment MarkerStream LSL outlet is active.
+
+    This is a hard startup guard for online experiment drivers.  It ensures
+    UTIL_marker_stream.py is running and publishing before any trial data is
+    recorded.  If the stream is not found within `timeout` seconds, an error
+    is logged and the process exits.
+
+    Parameters
+    ----------
+    logger : LoggerManager, optional
+        If provided, errors are routed through logger.log_event(); otherwise
+        they go to stdout/stderr.
+    timeout : float
+        Seconds to wait for the stream before giving up (default 5.0).
+    """
+    def _log(msg):
+        if logger is not None:
+            logger.log_event(msg)
+        else:
+            print(msg)
+
+    _log("Checking for MarkerStream LSL outlet (UTIL_marker_stream.py)...")
+    found = resolve_stream('name', 'MarkerStream', minimum=1, timeout=timeout)
+    if not found:
+        msg = (
+            "STARTUP ERROR: MarkerStream not found on the LSL network. "
+            "UTIL_marker_stream.py must be running before the experiment starts. "
+            "Experiment markers will not be recorded — cannot proceed."
+        )
+        _log(msg)
+        sys.exit(1)
+    _log("✅ MarkerStream detected — marker recording is active.")
+
 
 def check_streams():
     """
@@ -45,8 +82,12 @@ def load_xdf(file_path, dejitter=False, sync=False, report=True):
     Load an XDF file and return `(eeg_stream, marker_stream)` dictionaries.
 
     This function searches stream metadata by type:
-    - EEG: typ == "eeg"
-    - markers: typ in {"markers", "marker"}
+    - EEG: typ == "eeg"  (must have nominal_srate > 0)
+    - markers: typ in {"markers", "marker"}, preferring name == "MarkerStream"
+      when multiple candidate streams share the markers type.  This preference
+      is needed when a file contains both a hardware amplifier marker channel
+      (e.g. 'eegoSports-000104_markers', 1 channel) and the experiment marker
+      stream produced by UTIL_marker_stream.py ('MarkerStream', 4 channels).
 
     The function also optionally prints EEG sampling interval statistics when
     `report=True`.
@@ -64,12 +105,22 @@ def load_xdf(file_path, dejitter=False, sync=False, report=True):
 
     eeg_stream = None
     marker_stream = None
+    marker_stream_fallback = None  # first markers-type stream that is not "MarkerStream"
     for s in streams:
-        typ = s["info"].get("type", [""])[0].lower()
+        typ  = s["info"].get("type", [""])[0].lower()
+        name = s["info"].get("name", [""])[0]
         if eeg_stream is None and typ == "eeg":
             eeg_stream = s
-        if marker_stream is None and (typ == "markers" or typ == "marker"):
-            marker_stream = s
+        if typ in ("markers", "marker"):
+            if name == "MarkerStream":
+                # Prefer the named experiment marker stream unconditionally.
+                marker_stream = s
+            elif marker_stream_fallback is None:
+                marker_stream_fallback = s
+
+    # Use fallback (e.g. hardware marker channel) only when no "MarkerStream" found.
+    if marker_stream is None:
+        marker_stream = marker_stream_fallback
 
     if eeg_stream is None or marker_stream is None:
         raise ValueError("Both EEG and Marker streams must be present in the XDF file.")

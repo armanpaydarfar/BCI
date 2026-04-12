@@ -66,6 +66,8 @@ from Utils.runtime_common import (
 # Also import the module itself for wiring globals
 import Utils.runtime_common as _RC
 
+from Utils.stream_utils import require_marker_stream
+
 # Initialize experiment logger (auto-detects active run or falls back to Debug)
 logger = LoggerManager.auto_detect_from_subject(
     subject=config.TRAINING_SUBJECT,
@@ -229,6 +231,9 @@ def main():
     - LSL EEG stream availability and UDP robot/FES endpoints
     """
     # === Main Game Loop Initialization ===
+
+    # Require both streams before any trial data is recorded.
+    require_marker_stream(logger=logger)
 
     # Connect to EEG stream
     logger.log_event("Resolving EEG data stream via LSL...")

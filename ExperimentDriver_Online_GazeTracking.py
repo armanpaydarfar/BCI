@@ -53,6 +53,8 @@ from Utils.runtime_common import (
 # Also import the module itself for wiring globals
 import Utils.runtime_common as _RC
 
+from Utils.stream_utils import require_marker_stream
+
 # =========================================================
 # Logger setup
 # =========================================================
@@ -773,6 +775,9 @@ def run_decision_attempt(selected_name, mode, eeg_state, trial_number, decision_
 # Main
 # =========================================================
 def main():
+    # Require both streams before any trial data is recorded.
+    require_marker_stream(logger=logger)
+
     logger.log_event("Resolving EEG data stream via LSL...")
     streams = resolve_stream('type', 'EEG')
     inlet = StreamInlet(streams[0])

@@ -338,7 +338,7 @@ def run_session_heldout_benchmark(
     if len(classes) != 2:
         raise ValueError("Binary labels required.")
     rest_label, mi_label = int(classes[0]), int(classes[1])
-    top_k = int(getattr(config, "XGB_IMPORTANCE_TOP_K", 20))
+    top_k = int(getattr(config, "XGB_IMPORTANCE_TOP_K", 30))
 
     results: Dict[str, dict] = {}
     for model_name in model_names:

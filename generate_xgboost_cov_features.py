@@ -67,6 +67,7 @@ def _report_xgb_importance_cov_only(
     print(f"Group contribution: cov_mu={g_cov_mu*100:.2f}% | cov_beta={g_cov_beta*100:.2f}%")
 
     order = np.argsort(imp)[::-1]
+    print_top_k = min(30, len(order))
     top_k = min(top_k, len(order))
     def _infer_n_ch_from_tangent_dim(d: int) -> int:
         n = int((np.sqrt(1 + 8 * d) - 1) / 2)
@@ -99,8 +100,8 @@ def _report_xgb_importance_cov_only(
             else:
                 decoded_names[idx] = f"cov_beta_{local_idx} [{kind}; ch{i}-ch{j}]"
 
-    print(f"\nTop {top_k} features by model.feature_importances_:")
-    for r, idx in enumerate(order[:top_k], 1):
+    print(f"\nTop {print_top_k} features by model.feature_importances_:")
+    for r, idx in enumerate(order[:print_top_k], 1):
         print(f"{r:>2}. {decoded_names[idx]:<45} {imp[idx]:.6f}")
 
     idxs = order[:top_k][::-1]
