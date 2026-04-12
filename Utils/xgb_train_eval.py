@@ -13,14 +13,17 @@ os.environ["MNE_USE_NUMBA"] = "false"
 import config
 import Generate_Riemannian_adaptive as base
 
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, GroupKFold
 from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
 
 def train_xgb_dual_thresholds(
-    X: np.ndarray,
+    cov_mu: np.ndarray | None,
+    cov_beta: np.ndarray | None,
+    tangent_fn: tuple,
     labels: np.ndarray,
+    session_ids: np.ndarray,
     feature_tag: str,
     n_splits: int,
     target_ambig: float = float(getattr(config, "TARGET_AMBIG", 0.20)),
@@ -29,6 +32,31 @@ def train_xgb_dual_thresholds(
     Train/evaluate an XGBClassifier with the same dual-threshold selection logic
     as the canonical Riemannian pipeline.
 
+    The tangent space reference is fitted inside each CV fold on the train split
+    only, eliminating the data leak that occurred when the reference was fitted
+    on the full dataset before splitting.
+
+    CV mode is controlled by config.CV_MODE:
+      "kfold"       — shuffled KFold(n_splits).
+      "session_loo" — GroupKFold respecting session boundaries; at most
+                      min(n_sessions, config.N_LOO_SPLITS) folds.
+
+    Args:
+        cov_mu:      Whitened SPD covariances for the mu band, shape (N, C, C),
+                     or None if mu features are disabled.
+        cov_beta:    Whitened SPD covariances for the beta band, shape (N, C, C),
+                     or None if beta features are disabled.
+        tangent_fn:  Tuple of (fit_ref_fn, project_fn) used to project covs to
+                     tangent space.  fit_ref_fn(covs) -> ref;
+                     project_fn(covs, ref) -> features.
+        labels:      Integer class labels, shape (N,).
+        session_ids: Integer session index per trial, shape (N,).  Used by
+                     session_loo to group trials.
+        feature_tag: String label printed in the CV report.
+        n_splits:    Number of KFold splits (ignored for session_loo when
+                     n_sessions <= N_LOO_SPLITS).
+        target_ambig: Target ambiguity fraction for dual-threshold selection.
+
     Returns:
         dict containing scaler, model, and label mapping.
     """
@@ -36,6 +64,14 @@ def train_xgb_dual_thresholds(
         from xgboost import XGBClassifier
     except ImportError as exc:
         raise ImportError("xgboost is required for XGB branches. Install with `pip install xgboost`.") from exc
+
+    if cov_mu is None and cov_beta is None:
+        raise ValueError("At least one of cov_mu or cov_beta must be provided.")
+
+    fit_ref, project = tangent_fn
+
+    cv_mode = str(getattr(config, "CV_MODE", "kfold")).lower()
+    n_loo_splits = int(getattr(config, "N_LOO_SPLITS", 5))
 
     classes = np.sort(np.unique(labels))
     if len(classes) != 2:
@@ -60,17 +96,44 @@ def train_xgb_dual_thresholds(
         random_state=42,
     )
 
-    print(f"\n🚀 Starting K-Fold CV ({feature_tag}) + XGBoost...\n")
+    # Build the CV splitter.
+    # Use the first available covariance array as the object passed to .split()
+    # (only its length matters for index generation).
+    _ref_arr = cov_mu if cov_mu is not None else cov_beta
 
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    if cv_mode == "session_loo":
+        n_sessions = len(np.unique(session_ids))
+        k = min(n_sessions, n_loo_splits)
+        splitter = GroupKFold(n_splits=k)
+        split_iter = splitter.split(_ref_arr, groups=session_ids)
+        print(
+            f"\n🚀 Starting Session-LOO CV ({feature_tag}) + XGBoost "
+            f"[{k} folds over {n_sessions} sessions]...\n"
+        )
+    else:
+        splitter = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        split_iter = splitter.split(_ref_arr)
+        print(f"\n🚀 Starting K-Fold CV ({feature_tag}) + XGBoost [{n_splits} folds]...\n")
 
     acc_argmax = []
     t_lows, t_highs = [], []
     all_true, all_pred, all_scores, all_true_bin = [], [], [], []
     posterior_probs = {lbl: [] for lbl in classes}
 
-    for fold_idx, (tr, te) in enumerate(kf.split(X), 1):
-        X_tr, X_te = X[tr], X[te]
+    for fold_idx, (tr, te) in enumerate(split_iter, 1):
+        # Project covs to tangent space using a reference fitted on train split only.
+        feature_blocks_tr, feature_blocks_te = [], []
+        if cov_mu is not None:
+            ref_mu = fit_ref(cov_mu[tr])
+            feature_blocks_tr.append(project(cov_mu[tr], ref_mu))
+            feature_blocks_te.append(project(cov_mu[te], ref_mu))
+        if cov_beta is not None:
+            ref_beta = fit_ref(cov_beta[tr])
+            feature_blocks_tr.append(project(cov_beta[tr], ref_beta))
+            feature_blocks_te.append(project(cov_beta[te], ref_beta))
+
+        X_tr = np.hstack(feature_blocks_tr)
+        X_te = np.hstack(feature_blocks_te)
         y_tr, y_te = labels[tr], labels[te]
         y_tr_bin = y_bin[tr]
 

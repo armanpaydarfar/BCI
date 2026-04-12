@@ -28,7 +28,12 @@ EXPERIMENT_TYPE = "BASE"  # BIMANUAL or BASE
 TOTAL_TRIALS = 20
 TOTAL_TRIALS_ERRP = 45
 MAX_REPEATS = 3
-N_SPLITS = 5  # KFold splits (training scripts)
+N_SPLITS = 5        # KFold splits — used when CV_MODE == "kfold"
+CV_MODE = "kfold"   # "kfold" | "session_loo"
+# session_loo: GroupKFold respecting session boundaries.  N_LOO_SPLITS caps the
+# number of folds so that large datasets (e.g. 21 sessions) don't explode.
+# When n_sessions <= N_LOO_SPLITS the split degenerates to true leave-one-session-out.
+N_LOO_SPLITS = 5
 TIME_MI = 5  # Motor imagery / rest cue duration (s)
 TIME_ROB = 7  # Robot movement window (s)
 TIME_STATIONARY = 2  # Stationary feedback after failed/no movement (s)

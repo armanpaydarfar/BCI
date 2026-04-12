@@ -130,6 +130,7 @@ def main():
     all_labels = []
     cov_mu_all = []
     cov_beta_all = []
+    session_ids = []  # integer session index per trial — used by session_loo CV
     channel_names = list(getattr(config, "MOTOR_CHANNEL_NAMES", [])) if getattr(config, "SELECT_MOTOR_CHANNELS", 0) else None
 
     use_cov_mu = bool(getattr(config, "XGB_USE_COV_MU", 1))
@@ -140,7 +141,7 @@ def main():
 
     n_cov_mu = n_cov_beta = 0
 
-    for xdf_path in xdf_files:
+    for sess_idx, xdf_path in enumerate(xdf_files):
         print(f"\n📂 Processing file: {xdf_path}")
         eeg_stream, marker_stream = load_xdf(xdf_path, report=False)
 
@@ -167,35 +168,35 @@ def main():
             cov_matrices_beta = base.compute_processed_covariances(beta_segments, labels, model_type="xgb")
             cov_beta_all.append(cov_matrices_beta)
         all_labels.append(labels)
+        session_ids.append(np.full(len(labels), sess_idx, dtype=int))
 
     y = np.concatenate(all_labels)
-    feature_blocks = []
-    tangent_ref_mu = None
-    tangent_ref_beta = None
+    session_ids_arr = np.concatenate(session_ids)
 
+    cov_mu   = np.concatenate(cov_mu_all,   axis=0) if use_cov_mu   else None
+    cov_beta = np.concatenate(cov_beta_all, axis=0) if use_cov_beta else None
+
+    # Fit the production tangent references on all data; these are saved with the
+    # model and used at online inference time — independent of the CV evaluation.
+    tangent_ref_mu = _fit_tangent_ref(cov_mu)       if use_cov_mu   else None
+    tangent_ref_beta = _fit_tangent_ref(cov_beta)   if use_cov_beta else None
+
+    # Report feature dimensions from the all-data projection (informational only).
     if use_cov_mu:
-        cov_mu = np.concatenate(cov_mu_all, axis=0)
-        tangent_ref_mu = _fit_tangent_ref(cov_mu)
-        cov_feats_mu = _cov_tangent_features(cov_mu, tangent_ref_mu)
-        n_cov_mu = int(cov_feats_mu.shape[1])
-        feature_blocks.append(cov_feats_mu)
-
+        n_cov_mu = int(_cov_tangent_features(cov_mu, tangent_ref_mu).shape[1])
     if use_cov_beta:
-        cov_beta = np.concatenate(cov_beta_all, axis=0)
-        tangent_ref_beta = _fit_tangent_ref(cov_beta)
-        cov_feats_beta = _cov_tangent_features(cov_beta, tangent_ref_beta)
-        n_cov_beta = int(cov_feats_beta.shape[1])
-        feature_blocks.append(cov_feats_beta)
-
-    X = np.hstack(feature_blocks)
+        n_cov_beta = int(_cov_tangent_features(cov_beta, tangent_ref_beta).shape[1])
     print(
         f"Feature dimensions: cov_mu={int(n_cov_mu or 0)}, cov_beta={int(n_cov_beta or 0)}, "
-        f"total={X.shape[1]}"
+        f"total={int(n_cov_mu or 0) + int(n_cov_beta or 0)}"
     )
 
     model_bundle = train_xgb_dual_thresholds(
-        X=X,
+        cov_mu=cov_mu,
+        cov_beta=cov_beta,
+        tangent_fn=(_fit_tangent_ref, _cov_tangent_features),
         labels=y,
+        session_ids=session_ids_arr,
         feature_tag="cov_tangent_fittedref",
         n_splits=int(getattr(config, "N_SPLITS", 8)),
         target_ambig=float(getattr(config, "TARGET_AMBIG", 0.20)),

@@ -3,7 +3,7 @@ import sys
 import numpy as np
 import pickle
 import mne
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, GroupKFold
 from sklearn.metrics import accuracy_score
 from pyriemann.estimation import Shrinkage
 from pyriemann.classification import MDM, FgMDM
@@ -555,13 +555,14 @@ def _dual_thresholds(y_true_bin, scores, c_fp=1.0, c_fn=1.0, c_reject=0.3,
 def train_riemannian_model(
     cov_matrices,
     labels,
+    session_ids=None,
     n_splits=8,
     use_dual_thresholds=True,
     c_fp=1.0, c_fn=1.0, c_reject=0.3,
     n_grid=201,
     min_gap=0.0,
     target_ambig=float(getattr(config, "TARGET_AMBIG", 0.20)),  # desired ambiguity fraction U/N
-    # --- NEW constraint knobs (decided-only metrics) ---
+    # --- constraint knobs (decided-only metrics) ---
     tpr_min=None,              # e.g., 0.85 for MI recall >= 85%
     fpr_max=None,              # e.g., 0.10 for false MI rate <= 10%
     ppv_min=None,              # e.g., 0.80 for MI precision >= 80%
@@ -571,9 +572,16 @@ def train_riemannian_model(
     """
     Trains MDM with k-fold CV, learns dual thresholds to mirror online driver,
     prints aggregated report, and generates diagnostic plots.
+
+    CV mode is controlled by config.CV_MODE:
+      "kfold"       — shuffled KFold(n_splits).
+      "session_loo" — GroupKFold respecting session boundaries; requires
+                      session_ids to be provided.  At most
+                      min(n_sessions, config.N_LOO_SPLITS) folds are used.
     """
 
-    print("\n🚀 Starting K-Fold Cross Validation with Riemannian MDM...\n")
+    cv_mode = str(getattr(config, "CV_MODE", "kfold")).lower()
+    n_loo_splits = int(getattr(config, "N_LOO_SPLITS", 5))
 
     # Informational note: when target_ambig is set, c_reject is ignored during selection
     if target_ambig is not None and (c_reject not in (None, 0.0)):
@@ -585,7 +593,22 @@ def train_riemannian_model(
         raise ValueError("Function expects binary classes.")
     rest_label, mi_label = classes[0], classes[1]
 
-    kf  = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    if cv_mode == "session_loo":
+        if session_ids is None:
+            raise ValueError("session_ids must be provided when CV_MODE == 'session_loo'.")
+        n_sessions = len(np.unique(session_ids))
+        k = min(n_sessions, n_loo_splits)
+        splitter = GroupKFold(n_splits=k)
+        split_iter = splitter.split(cov_matrices, groups=session_ids)
+        print(
+            f"\n🚀 Starting Session-LOO CV with Riemannian MDM "
+            f"[{k} folds over {n_sessions} sessions]...\n"
+        )
+    else:
+        splitter = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        split_iter = splitter.split(cov_matrices)
+        print(f"\n🚀 Starting K-Fold Cross Validation with Riemannian MDM [{n_splits} folds]...\n")
+
     mdm = MDM()
 
     # Aggregation containers
@@ -594,7 +617,7 @@ def train_riemannian_model(
     all_true, all_pred, all_scores, all_true_bin = [], [], [], []
     posterior_probs = {lbl: [] for lbl in classes}
 
-    for fold_idx, (tr, te) in enumerate(kf.split(cov_matrices), 1):
+    for fold_idx, (tr, te) in enumerate(split_iter, 1):
         X_tr, X_te = cov_matrices[tr], cov_matrices[te]
         y_tr, y_te = labels[tr], labels[te]
 
@@ -747,8 +770,9 @@ def main():
 
     all_cov_matrices = []
     all_labels = []
+    all_session_ids = []
 
-    for xdf_path in xdf_files:
+    for sess_idx, xdf_path in enumerate(xdf_files):
         print(f"\n📂 Processing file: {xdf_path}")
         eeg_stream, marker_stream = load_xdf(xdf_path)
 
@@ -772,11 +796,13 @@ def main():
         #print(mean_riemann(cov_matrices))
         all_cov_matrices.append(cov_matrices)
         all_labels.append(labels)
+        all_session_ids.append(np.full(len(labels), sess_idx, dtype=int))
 
     all_labels = np.concatenate(all_labels)
     all_cov_matrices = np.concatenate(all_cov_matrices)
+    all_session_ids = np.concatenate(all_session_ids)
     print("Training Riemannian Classifier...")
-    Reimans_model = train_riemannian_model(all_cov_matrices, all_labels)
+    Reimans_model = train_riemannian_model(all_cov_matrices, all_labels, session_ids=all_session_ids)
 
     #  Save the trained model
     # Define model save path (subject-level, not session-specific)
