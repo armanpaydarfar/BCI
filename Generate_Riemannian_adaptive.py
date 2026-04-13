@@ -337,7 +337,7 @@ def compute_processed_covariances(segments, labels, *, model_type: str | None = 
 
 
 # ---------- fixed-threshold sweep --------------------------------------------
-def _print_fixed_threshold_sweep(all_scores, all_true_bin, th_star,
+def _print_fixed_threshold_sweep(all_scores, all_true_bin, th_star=None,
                                   sweep=(0.55, 0.60, 0.65, 0.70)):
     """
     Report window-level TPR, TNR, PPV, and coverage at each fixed operational
@@ -369,7 +369,11 @@ def _print_fixed_threshold_sweep(all_scores, all_true_bin, th_star,
             ppv = TP / (TP + FP) if (TP + FP) else float("nan")
         else:
             tpr = tnr = ppv = float("nan")
-        note = "  <- model rec." if abs(t_high - th_star) == min(abs(t - th_star) for t in sweep) else ""
+        note = (
+            "  <- model rec."
+            if th_star is not None and abs(t_high - th_star) == min(abs(t - th_star) for t in sweep)
+            else ""
+        )
         print(
             f"  {t_high:>6.2f}  {t_low:>6.2f}  "
             f"{tpr:>6.3f}  {tnr:>6.3f}  {ppv:>6.3f}  "

@@ -29,7 +29,7 @@ TOTAL_TRIALS = 20
 TOTAL_TRIALS_ERRP = 45
 MAX_REPEATS = 3
 N_SPLITS = 5        # KFold splits — used when CV_MODE == "kfold"
-CV_MODE = "kfold"   # "kfold" | "session_loo"
+CV_MODE = "session_loo"   # "kfold" | "session_loo"
 # session_loo: GroupKFold respecting session boundaries.  N_LOO_SPLITS caps the
 # number of folds so that large datasets (e.g. 21 sessions) don't explode.
 # When n_sessions <= N_LOO_SPLITS the split degenerates to true leave-one-session-out.
@@ -142,6 +142,10 @@ XGB_USE_COV_BETA = 1
 # Default ERD bands are also mu-only unless overridden (e.g., add beta bands explicitly).
 XGB_ERD_BANDS = [(float(LOWCUT), float(HIGHCUT))]
 XGB_IMPORTANCE_TOP_K = 20
+# Hyperparameter search (tune_xgb_hyperparams.py)
+XGB_TUNE_N_ITER = 30         # random candidates evaluated per outer fold
+XGB_TUNE_INNER_SPLITS = 3    # inner KFold splits for candidate ranking
+XGB_TUNE_SEED = 42           # RNG seed for reproducibility
 
 # Online decoder backend: "mdm" | "xgb_cov" | "xgb_cov_erd"
 DECODER_BACKEND = "xgb_cov"
