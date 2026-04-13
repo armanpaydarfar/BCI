@@ -336,6 +336,47 @@ def compute_processed_covariances(segments, labels, *, model_type: str | None = 
 
 
 
+# ---------- fixed-threshold sweep --------------------------------------------
+def _print_fixed_threshold_sweep(all_scores, all_true_bin, th_star,
+                                  sweep=(0.55, 0.60, 0.65, 0.70)):
+    """
+    Report window-level TPR, TNR, PPV, and coverage at each fixed operational
+    threshold.  t_low is set symmetrically as (1 - t_high), mirroring the online
+    driver where REST triggers at (1 - THRESHOLD_REST).
+
+    This is a window-level proxy for integrator behaviour: a model that
+    consistently produces high P(MI) on MI windows will drive the leaky
+    integrator above the same threshold online.  The row nearest th_star
+    is marked as the model's recommendation.
+    """
+    print("\n====== Fixed-Threshold Sweep (window-level; proxy for online integrator) ======")
+    print(f"  {'t_high':>6}  {'t_low':>6}  {'TPR':>6}  {'TNR':>6}  {'PPV':>6}  {'Coverage':>9}")
+    for t_high in sweep:
+        t_low = 1.0 - t_high
+        pred = np.full_like(all_true_bin, -1)
+        pred[all_scores >= t_high] = 1
+        pred[all_scores <= t_low]  = 0
+        decided = pred != -1
+        coverage = decided.mean()
+        if decided.any():
+            yd, pd = all_true_bin[decided], pred[decided]
+            TP = int(((pd == 1) & (yd == 1)).sum())
+            TN = int(((pd == 0) & (yd == 0)).sum())
+            FP = int(((pd == 1) & (yd == 0)).sum())
+            FN = int(((pd == 0) & (yd == 1)).sum())
+            tpr = TP / (TP + FN) if (TP + FN) else float("nan")
+            tnr = TN / (TN + FP) if (TN + FP) else float("nan")
+            ppv = TP / (TP + FP) if (TP + FP) else float("nan")
+        else:
+            tpr = tnr = ppv = float("nan")
+        note = "  <- model rec." if abs(t_high - th_star) == min(abs(t - th_star) for t in sweep) else ""
+        print(
+            f"  {t_high:>6.2f}  {t_low:>6.2f}  "
+            f"{tpr:>6.3f}  {tnr:>6.3f}  {ppv:>6.3f}  "
+            f"{coverage:>8.1%}{note}"
+        )
+
+
 # ---------- plotting helpers -------------------------------------------------
 def _plot_scores_hist_with_thresholds(scores, y_bin, t_low, t_high, bins=30):
     s0 = scores[y_bin == 0]
@@ -702,9 +743,11 @@ def train_riemannian_model(
     NPV = TN / (TN + FN) if (TN + FN) else np.nan   # REST precision
 
     tl_star, th_star = float(np.median(t_lows)), float(np.median(t_highs))
+    roc_auc = float(roc_auc_score(all_true_bin, all_scores)) if np.unique(all_true_bin).size == 2 else float("nan")
 
     print("\n====== Aggregated Report ======")
     print(f"Argmax Accuracy (mean): {np.mean(acc_argmax):.4f}")
+    print(f"ROC AUC (fold-test aggregated): {roc_auc:.4f}")
     print(f"Learned thresholds (medians): t_low*={tl_star:.3f}, t_high*={th_star:.3f}")
     print(f"Coverage (decided %): {coverage*100:.2f}% (Ambiguity {(1.0-coverage)*100:.2f}%)")
     print(f"Decided-only Accuracy: {decided_acc:.4f}")
@@ -718,6 +761,8 @@ def train_riemannian_model(
     print(f"U_rest={(all_pred == -1)[all_true == rest_label].sum()}, "
           f"U_mi={(all_pred == -1)[all_true == mi_label].sum()}, "
           f"Total U={U}")
+
+    _print_fixed_threshold_sweep(all_scores, all_true_bin, th_star)
 
     # Mode B thresholds for your online config
     THRESHOLD_REST = 1.0 - tl_star  # compare to P(REST)

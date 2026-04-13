@@ -218,6 +218,8 @@ def train_xgb_dual_thresholds(
     print("\nConfusion (decided-only; rows=true [REST, MI], cols=pred [REST, MI]):")
     print(cm_decided)
 
+    base._print_fixed_threshold_sweep(all_scores, all_true_bin, th_star)
+
     base._plot_scores_hist_with_thresholds(all_scores, all_true_bin, tl_star, th_star)
     center = (tl_star + th_star) / 2.0
     widths = np.linspace(0.0, 0.9, 35)
@@ -228,9 +230,15 @@ def train_xgb_dual_thresholds(
         posterior_probs[lbl] = np.asarray(posterior_probs[lbl])
     base.plot_posterior_probabilities(posterior_probs)
 
-    # Final fit on full data
+    # Final fit on full data using a reference fitted on all covariances.
+    final_blocks = []
+    if cov_mu is not None:
+        final_blocks.append(project(cov_mu, fit_ref(cov_mu)))
+    if cov_beta is not None:
+        final_blocks.append(project(cov_beta, fit_ref(cov_beta)))
+    X_all = np.hstack(final_blocks)
     final_scaler = StandardScaler()
-    Xs = final_scaler.fit_transform(X)
+    Xs = final_scaler.fit_transform(X_all)
     final_clf = XGBClassifier(**xgb_params)
     final_clf.fit(Xs, y_bin)
 
