@@ -25,13 +25,10 @@ Search space (exhaustive grid):
   shrinkage_param : [0.01, 0.02, 0.05, 0.10, 0.20]
   Total           : 6 × 4 × 5 = 120 candidates
 
-Fixed parameters (not searched):
-  learning_rate    = 0.03
-  subsample        = 0.80
-  colsample_bytree = 0.80
-  reg_alpha        = 0.00
-  reg_lambda       = 2.00
-  min_child_weight = 3
+Optional config overrides (not searched):
+  XGB_LEARNING_RATE, XGB_SUBSAMPLE, XGB_COLSAMPLE_BYTREE,
+  XGB_REG_ALPHA, XGB_REG_LAMBDA, XGB_MIN_CHILD_WEIGHT.
+  If any of these are absent from config.py, XGBoost package defaults apply.
 
 Config keys consumed:
   CV_MODE, N_LOO_SPLITS, N_SPLITS,
@@ -76,16 +73,29 @@ from Utils.stream_utils import load_xdf
 from Utils.xgb_feature_pipeline import segment_and_extract_cov_erd
 
 
-# ── Fixed hyperparameters (not searched) ──────────────────────────────────────
+# ── Optional config overrides ──────────────────────────────────────────────────
+# These params are not searched. If present in config.py they override XGBoost
+# package defaults; if absent, XGBoost uses its own defaults automatically.
 
-_FIXED_SEARCH = dict(
-    learning_rate    = 0.03,
-    subsample        = 0.80,
-    colsample_bytree = 0.80,
-    reg_alpha        = 0.00,
-    reg_lambda       = 2.00,
-    min_child_weight = 3,
-)
+_OPTIONAL_CFG_KEYS = [
+    ("learning_rate",    "XGB_LEARNING_RATE",    float),
+    ("subsample",        "XGB_SUBSAMPLE",         float),
+    ("colsample_bytree", "XGB_COLSAMPLE_BYTREE",  float),
+    ("reg_alpha",        "XGB_REG_ALPHA",          float),
+    ("reg_lambda",       "XGB_REG_LAMBDA",         float),
+    ("min_child_weight", "XGB_MIN_CHILD_WEIGHT",   float),
+]
+
+
+def _config_overrides() -> dict:
+    """Return XGB params explicitly set in config.py; omitted params use XGBoost defaults."""
+    result = {}
+    for param, cfg_key, cast in _OPTIONAL_CFG_KEYS:
+        val = getattr(config, cfg_key, None)
+        if val is not None:
+            result[param] = cast(val)
+    return result
+
 
 _FIXED_XGB = dict(objective="binary:logistic", eval_metric="logloss", random_state=42)
 
@@ -188,7 +198,7 @@ def _evaluate_candidate(
     corresponding binary labels, concatenated across folds in split order.
     """
     xgb_params = {k: cand[k] for k in _XGB_CLASSIFIER_KEYS}
-    xgb_params.update(_FIXED_SEARCH)
+    xgb_params.update(_config_overrides())
 
     shrink       = cand["shrinkage_param"]
     all_scores   = []
@@ -243,12 +253,11 @@ def main():
     print(f"  Grid: max_depth={_SEARCH_GRID['max_depth']}")
     print(f"        n_estimators={_SEARCH_GRID['n_estimators']}")
     print(f"        shrinkage_param={_SEARCH_GRID['shrinkage_param']}")
-    print(f"  Fixed: lr={_FIXED_SEARCH['learning_rate']}  "
-          f"subsample={_FIXED_SEARCH['subsample']}  "
-          f"colsample_bytree={_FIXED_SEARCH['colsample_bytree']}  "
-          f"reg_alpha={_FIXED_SEARCH['reg_alpha']}  "
-          f"reg_lambda={_FIXED_SEARCH['reg_lambda']}  "
-          f"min_child_weight={_FIXED_SEARCH['min_child_weight']}")
+    overrides = _config_overrides()
+    if overrides:
+        print(f"  Config overrides: {overrides}")
+    else:
+        print(f"  Config overrides: none — XGBoost package defaults apply")
     print(f"  Criterion: KL(empirical ‖ Beta({beta_a:.0f},{beta_b:.0f})) "
           f"[{n_bins} bins, avg MI+REST]")
     print(f"  CV mode: {cv_mode}  |  feature sets: mu={use_mu}  beta={use_beta}\n")

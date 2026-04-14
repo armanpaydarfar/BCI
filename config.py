@@ -137,12 +137,14 @@ SAVE_ADAPTIVE_T = False
 # =============================================================================
 XGB_MAX_DEPTH        = 7
 XGB_N_ESTIMATORS     = 300
-XGB_LEARNING_RATE    = 0.03
-XGB_SUBSAMPLE        = 0.8
-XGB_COLSAMPLE_BYTREE = 0.8
-XGB_REG_ALPHA        = 0.0
-XGB_REG_LAMBDA       = 2.0
-XGB_MIN_CHILD_WEIGHT = 3
+# Optional overrides — uncomment and set to override XGBoost package defaults.
+# Absent keys cause XGBoost defaults to apply automatically.
+# XGB_LEARNING_RATE    = 0.3     # XGB default
+# XGB_SUBSAMPLE        = 1.0     # XGB default
+# XGB_COLSAMPLE_BYTREE = 1.0     # XGB default
+# XGB_REG_ALPHA        = 0.0     # XGB default
+# XGB_REG_LAMBDA       = 1.0     # XGB default
+# XGB_MIN_CHILD_WEIGHT = 1       # XGB default
 XGB_USE_COV_MU = 1
 # Default XGB covariance branch is mu-only. Enable beta explicitly when needed.
 XGB_USE_COV_BETA = 1

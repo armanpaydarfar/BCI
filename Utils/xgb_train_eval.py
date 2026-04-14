@@ -84,17 +84,23 @@ def train_xgb_dual_thresholds(
 
     xgb_params = dict(
         n_estimators=int(getattr(config, "XGB_N_ESTIMATORS", 300)),
-        max_depth=int(getattr(config, "XGB_MAX_DEPTH", 3)),
-        learning_rate=float(getattr(config, "XGB_LEARNING_RATE", 0.03)),
-        subsample=float(getattr(config, "XGB_SUBSAMPLE", 0.8)),
-        colsample_bytree=float(getattr(config, "XGB_COLSAMPLE_BYTREE", 0.8)),
-        reg_alpha=float(getattr(config, "XGB_REG_ALPHA", 0.0)),
-        reg_lambda=float(getattr(config, "XGB_REG_LAMBDA", 2.0)),
-        min_child_weight=float(getattr(config, "XGB_MIN_CHILD_WEIGHT", 3.0)),
+        max_depth=int(getattr(config, "XGB_MAX_DEPTH", 6)),
         objective="binary:logistic",
         eval_metric="logloss",
         random_state=42,
     )
+    # Apply optional overrides from config; params absent from config use XGBoost defaults.
+    for _param, _cfg_key, _cast in [
+        ("learning_rate",    "XGB_LEARNING_RATE",    float),
+        ("subsample",        "XGB_SUBSAMPLE",         float),
+        ("colsample_bytree", "XGB_COLSAMPLE_BYTREE",  float),
+        ("reg_alpha",        "XGB_REG_ALPHA",          float),
+        ("reg_lambda",       "XGB_REG_LAMBDA",         float),
+        ("min_child_weight", "XGB_MIN_CHILD_WEIGHT",   float),
+    ]:
+        _val = getattr(config, _cfg_key, None)
+        if _val is not None:
+            xgb_params[_param] = _cast(_val)
 
     # Build the CV splitter.
     # Use the first available covariance array as the object passed to .split()
