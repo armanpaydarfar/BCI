@@ -124,18 +124,31 @@ realtime but not in the critical path.
 
 ---
 
-## Reference Literature
+## Reference Literature and Documentation
 
-- `Documents/Studies/` contains papers describing methods implemented
-  or planned in this repo. Read the relevant paper before implementing
-  or critiquing a method that references it.
+Two directories serve as the canonical locations for papers and
+implementation references related to this project. On Linux the paths
+are absolute as shown; on Windows replace `/home/arman-admin` with the
+appropriate Windows home prefix — the subdirectory structure is the
+same on both machines.
 
-- Key file: `NER2023_Liu.pdf` — reference architecture for RBNNet.
-  Any change to `Utils/rbnnet_model.py` should be checked against this
-  paper.
+### `/home/arman-admin/Documents/studies/`
+Contains academic papers providing context for methods implemented or
+planned in this repo. Papers here are reference material — read them
+for background and motivation, but do not assume the implementation
+follows them exactly. Divergences from the paper are intentional and
+documented in the relevant implementation reference.
 
-- When a feature is derived from a paper in this folder, note the
-  reference in the commit message and relevant docstrings.
+### `/home/arman-admin/Documents/SoftwareDocs/`
+Contains implementation references, planning documents, and post-
+implementation technical records for features developed in this repo.
+These are the primary written records for features that may not have
+a separate planning document in the codebase. When working on a
+feature, check here first for an existing reference document before
+reading the code.
+
+When a feature is derived from a paper in `Documents/studies/`, note
+the reference in the commit message and relevant docstrings.
 
 ---
 

@@ -44,11 +44,11 @@ from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 # User Config
 # =========================================================
 
-subject = "PILOT001"
+subject = "CLIN_SUBJ_007"
 
 # ---- Single-session mode ----
-session = "S001ONLINE"
-PROMPT_FOR_FILE_SELECTION = False
+session = "S002ONLINE"
+PROMPT_FOR_FILE_SELECTION = True
 
 # ---- Multi-session mode ----
 MULTI_SESSION_MODE = False
@@ -123,7 +123,7 @@ SCALAR_WINDOW = (1.0, 4.0)
 BAR_ERROR_METHOD = "sem"  # "sem" or "std"
 
 # ---- Toggles ----
-DO_TOPO_MAPS = False
+DO_TOPO_MAPS = True
 DO_FOCAL_TIMECOURSE = True
 
 # ---- Multi-session overlay timecourse plot ----
@@ -145,7 +145,7 @@ LINE_YLIM = None  # or None
 # GRAND_AVG_SESSION_MAP allows per-subject session overrides:
 #   {"PILOT007": ["S003ONLINE", "S004ONLINE"], "CLIN_SUBJ_003": ["S001ONLINE"]}
 # If a subject is absent from the map, GRAND_AVG_SESSION_LIST is used.
-DO_GRAND_AVG_TOPO = True
+DO_GRAND_AVG_TOPO = False
 
 GRAND_AVG_SUBJECT_LIST = [
     "PILOT001", "PILOT002", "PILOT003", "PILOT004",
@@ -165,7 +165,7 @@ REJECT_P2P_UV = 200  # fallback when config VISUALIZE_EPOCH_REJECT_P2P_UV missin
 FLAT_UV = None       # optional; overrides config VISUALIZE_EPOCH_FLAT_UV when not None
 
 # Override for visualization max-abs rejection (µV)
-VISUALIZE_MAX_ABS_UV = 30.0
+VISUALIZE_MAX_ABS_UV = 50.0
 
 # =========================================================
 # NEW: Auto-drop bad channels that dominate rejections
