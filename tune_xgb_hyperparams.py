@@ -229,7 +229,7 @@ def main():
         )
 
     try:
-        from xgboost import XGBClassifier  # noqa: F401 — import check only
+        from xgboost import XGBClassifier
     except ImportError as exc:
         raise ImportError("xgboost required. Install with `pip install xgboost`.") from exc
 
