@@ -33,7 +33,7 @@ CV_MODE = "session_loo"   # "kfold" | "session_loo"
 # session_loo: GroupKFold respecting session boundaries.  N_LOO_SPLITS caps the
 # number of folds so that large datasets (e.g. 21 sessions) don't explode.
 # When n_sessions <= N_LOO_SPLITS the split degenerates to true leave-one-session-out.
-N_LOO_SPLITS = 5
+N_LOO_SPLITS = 100
 TIME_MI = 5  # Motor imagery / rest cue duration (s)
 TIME_ROB = 7  # Robot movement window (s)
 TIME_STATIONARY = 2  # Stationary feedback after failed/no movement (s)
@@ -96,7 +96,7 @@ INTEGRATOR_ALPHA = 0.94
 # - MDM path (runtime + MDM-centric analyses)
 SHRINKAGE_PARAM_MDM = 0.02
 # - XGB feature pipelines (covariance preprocessing before tangent features)
-SHRINKAGE_PARAM_XGB = 0.02
+SHRINKAGE_PARAM_XGB = 0.05
 # Backward-compatible alias (legacy code may still read SHRINKAGE_PARAM).
 SHRINKAGE_PARAM = SHRINKAGE_PARAM_MDM
 LEDOITWOLF = 0
@@ -135,7 +135,14 @@ SAVE_ADAPTIVE_T = False
 # =============================================================================
 # XGBoost defaults (offline feature pipelines)
 # =============================================================================
-XGB_MAX_DEPTH = 5
+XGB_MAX_DEPTH        = 7
+XGB_N_ESTIMATORS     = 300
+XGB_LEARNING_RATE    = 0.03
+XGB_SUBSAMPLE        = 0.8
+XGB_COLSAMPLE_BYTREE = 0.8
+XGB_REG_ALPHA        = 0.0
+XGB_REG_LAMBDA       = 2.0
+XGB_MIN_CHILD_WEIGHT = 3
 XGB_USE_COV_MU = 1
 # Default XGB covariance branch is mu-only. Enable beta explicitly when needed.
 XGB_USE_COV_BETA = 1
@@ -143,9 +150,11 @@ XGB_USE_COV_BETA = 1
 XGB_ERD_BANDS = [(float(LOWCUT), float(HIGHCUT))]
 XGB_IMPORTANCE_TOP_K = 20
 # Hyperparameter search (tune_xgb_hyperparams.py)
-XGB_TUNE_N_ITER = 30         # random candidates evaluated per outer fold
-XGB_TUNE_INNER_SPLITS = 3    # inner KFold splits for candidate ranking
-XGB_TUNE_SEED = 42           # RNG seed for reproducibility
+# KL divergence criterion parameters (tune_xgb_hyperparams.py)
+# Target: Beta(BETA_ALPHA, BETA_BETA) — mode ≈ (a-1)/(a+b-2).  Beta(18,5) → mode≈0.81, mean≈0.78.
+XGB_TUNE_BETA_ALPHA = 18
+XGB_TUNE_BETA_BETA  = 5
+XGB_TUNE_KL_BINS    = 15     # histogram bins for KL computation
 
 # Online decoder backend: "mdm" | "xgb_cov" | "xgb_cov_erd"
 DECODER_BACKEND = "xgb_cov"

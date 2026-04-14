@@ -14,7 +14,7 @@ from sklearn.preprocessing import StandardScaler
 from Utils.stream_utils import load_xdf, get_channel_names_from_xdf
 from Utils.preprocessing import select_channels
 import glob  # Required for multi-file loading
-from scipy.stats import zscore
+from scipy.stats import zscore, beta as scipy_beta
 from pyriemann.utils.mean import mean_riemann
 from scipy.linalg import sqrtm
 import seaborn as sns
@@ -379,6 +379,84 @@ def _print_fixed_threshold_sweep(all_scores, all_true_bin, th_star=None,
             f"{tpr:>6.3f}  {tnr:>6.3f}  {ppv:>6.3f}  "
             f"{coverage:>8.1%}{note}"
         )
+
+
+
+# ---------- KL divergence vs target Beta distribution ------------------------
+def _kl_vs_beta(
+    probs: np.ndarray,
+    beta_a: float,
+    beta_b: float,
+    n_bins: int,
+) -> float:
+    """
+    KL divergence KL(empirical ‖ Beta(beta_a, beta_b)) via an n_bins equal-width
+    histogram over [0, 1].
+
+    Empty empirical bins contribute 0 (convention: 0 * log(0) = 0).
+    Target bin mass is floored at 1e-12 to avoid division by zero.
+    """
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    counts, _ = np.histogram(probs, bins=bin_edges)
+    emp_p = counts / counts.sum()
+    target_p = np.maximum(np.diff(scipy_beta.cdf(bin_edges, beta_a, beta_b)), 1e-12)
+    kl = 0.0
+    for p, q in zip(emp_p, target_p):
+        if p > 0.0:
+            kl += p * np.log(p / q)
+    return float(kl)
+
+
+def _compute_kl_breakdown(
+    all_scores: np.ndarray,
+    all_true_bin: np.ndarray,
+    beta_a: float,
+    beta_b: float,
+    n_bins: int,
+) -> dict:
+    """
+    Compute per-class and combined KL divergence on held-out P(MI) scores.
+
+    Operates on P(correct class) per window:
+      - P(MI)   for windows where true label is MI
+      - P(REST) = 1 - P(MI) for windows where true label is REST
+
+    Args:
+        all_scores:   P(MI) for all held-out windows, shape (N,).
+        all_true_bin: Binary labels (0=REST, 1=MI), shape (N,).
+        beta_a, beta_b: Shape parameters of the target Beta distribution.
+        n_bins: Number of histogram bins for the empirical distribution.
+
+    Returns:
+        dict with keys kl_mi, kl_rest, kl_combined.
+    """
+    mi_probs   = all_scores[all_true_bin == 1]
+    rest_probs = 1.0 - all_scores[all_true_bin == 0]
+    kl_mi   = _kl_vs_beta(mi_probs,   beta_a, beta_b, n_bins) if len(mi_probs)   >= 2 else float("nan")
+    kl_rest = _kl_vs_beta(rest_probs, beta_a, beta_b, n_bins) if len(rest_probs) >= 2 else float("nan")
+    return {
+        "kl_mi":       kl_mi,
+        "kl_rest":     kl_rest,
+        "kl_combined": 0.5 * (kl_mi + kl_rest),
+    }
+
+
+def _print_kl_report(
+    all_scores: np.ndarray,
+    all_true_bin: np.ndarray,
+    beta_a: float,
+    beta_b: float,
+    n_bins: int,
+) -> None:
+    """Print a human-readable KL divergence breakdown vs the target Beta distribution."""
+    r = _compute_kl_breakdown(all_scores, all_true_bin, beta_a, beta_b, n_bins)
+    print(
+        f"\n====== KL Divergence vs Beta({beta_a:.0f}, {beta_b:.0f}) "
+        f"[{n_bins}-bin histogram] ======"
+    )
+    print(f"  KL(MI)       : {r['kl_mi']:.4f} nats")
+    print(f"  KL(REST)     : {r['kl_rest']:.4f} nats")
+    print(f"  KL(combined) : {r['kl_combined']:.4f} nats")
 
 
 # ---------- plotting helpers -------------------------------------------------

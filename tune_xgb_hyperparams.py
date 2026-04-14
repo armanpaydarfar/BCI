@@ -1,31 +1,61 @@
 """
 tune_xgb_hyperparams.py
 
-Nested cross-validation hyperparameter search for the XGBoost covariance
-feature decoder.
+Hyperparameter search for the XGBoost covariance feature decoder using the
+configured CV mode (session-LOO or KFold).
 
-Outer loop : session-LOO GroupKFold (respects config.N_LOO_SPLITS).
-Inner loop : KFold over the outer train split (config.XGB_TUNE_INNER_SPLITS).
-Criterion  : ROC-AUC — threshold-free, window-level, comparable across models.
+CV mode is controlled by config.CV_MODE:
+  "session_loo" — GroupKFold respecting session boundaries.
+                  k = min(n_sessions, N_LOO_SPLITS).  Set N_LOO_SPLITS=100
+                  to get true leave-one-session-out across all sessions.
+  "kfold"       — Shuffled KFold(N_SPLITS).
 
-The tangent space reference is fitted on the outer train split and shared
-across all inner candidates.  This makes absolute inner-AUC slightly optimistic
-but does not bias candidate ranking — sufficient for hyperparameter selection.
+The same CV split is applied uniformly to all candidates.  After all
+candidates are evaluated, the one with the lowest pooled KL divergence from
+the target Beta distribution is selected and its CV metrics are reported.
+
+Criterion  : KL(empirical ‖ Beta(a, b)) averaged symmetrically across MI
+             and REST classes, computed on pooled held-out P(correct class)
+             scores.  Beta(18, 5) encodes the desired distribution:
+             unimodal, mode ≈ 0.81, mean ≈ 0.78, negatively skewed.
+
+Search space (exhaustive grid):
+  max_depth       : [3, 4, 5, 6, 7, 8]
+  n_estimators    : [100, 200, 300, 500]
+  shrinkage_param : [0.01, 0.02, 0.05, 0.10, 0.20]
+  Total           : 6 × 4 × 5 = 120 candidates
+
+Fixed parameters (not searched):
+  learning_rate    = 0.03
+  subsample        = 0.80
+  colsample_bytree = 0.80
+  reg_alpha        = 0.00
+  reg_lambda       = 2.00
+  min_child_weight = 3
+
+Config keys consumed:
+  CV_MODE, N_LOO_SPLITS, N_SPLITS,
+  XGB_USE_COV_MU, XGB_USE_COV_BETA,
+  XGB_TUNE_BETA_ALPHA, XGB_TUNE_BETA_BETA, XGB_TUNE_KL_BINS,
+  RECENTERING, LEDOITWOLF.
+
+
+Requires LEDOITWOLF=0.
 
 Output:
-  - Per outer fold: winning params and outer-fold AUC.
-  - Aggregated: fixed-threshold sweep on pooled outer test scores.
-  - Recommended config values: mode across outer folds for each param.
+  - Per-candidate: KL score and a best-so-far marker.
+  - Winner: KL breakdown, AUC, fixed-threshold sweep.
+  - Recommended config values for the three searched parameters.
 
 Usage:
   python tune_xgb_hyperparams.py
 
-After reviewing the recommendations, copy the suggested XGB_* values into
-config.py and retrain with generate_xgboost_cov_features.py.
+After reviewing the recommendations, copy the suggested values into config.py
+and retrain with generate_xgboost_cov_features.py.
 """
 
+import itertools
 import os
-from collections import Counter
 
 import numpy as np
 
@@ -34,6 +64,8 @@ os.environ["MNE_USE_NUMBA"] = "false"
 
 import mne
 from pyriemann.tangentspace import TangentSpace, tangent_space
+from pyriemann.estimation import Shrinkage
+from pyriemann.preprocessing import Whitening
 from sklearn.model_selection import KFold, GroupKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score
@@ -44,7 +76,67 @@ from Utils.stream_utils import load_xdf
 from Utils.xgb_feature_pipeline import segment_and_extract_cov_erd
 
 
-# ── Tangent space helpers (match generate_xgboost_cov_features.py exactly) ────
+# ── Fixed hyperparameters (not searched) ──────────────────────────────────────
+
+_FIXED_SEARCH = dict(
+    learning_rate    = 0.03,
+    subsample        = 0.80,
+    colsample_bytree = 0.80,
+    reg_alpha        = 0.00,
+    reg_lambda       = 2.00,
+    min_child_weight = 3,
+)
+
+_FIXED_XGB = dict(objective="binary:logistic", eval_metric="logloss", random_state=42)
+
+# ── Exhaustive search grid ─────────────────────────────────────────────────────
+
+_SEARCH_GRID = {
+    "max_depth":       [3, 4, 5, 6, 7, 8],
+    "n_estimators":    [100, 200, 300, 500],
+    "shrinkage_param": [0.01, 0.02, 0.05, 0.10, 0.20],
+}
+
+_XGB_CLASSIFIER_KEYS = frozenset({"max_depth", "n_estimators"})
+
+
+def _build_candidates() -> list[dict]:
+    """Enumerate all combinations in _SEARCH_GRID as a flat list of dicts."""
+    keys = list(_SEARCH_GRID.keys())
+    combos = list(itertools.product(*[_SEARCH_GRID[k] for k in keys]))
+    return [{k: v for k, v in zip(keys, combo)} for combo in combos]
+
+
+# ── Covariance preprocessing ───────────────────────────────────────────────────
+
+def _trace_norm_covs(segments: np.ndarray) -> np.ndarray:
+    """Compute trace-normalized covariance matrices.  segments: (n_trials, C, T)."""
+    return np.array([(s @ s.T) / np.trace(s @ s.T) for s in segments])
+
+
+def _shrink_and_whiten_per_session(
+    raw_covs_per_session: list, shrinkage_param: float
+) -> np.ndarray:
+    """
+    Apply Shrinkage(lambda) then per-session Riemannian whitening to a list of
+    per-session trace-normalized covariance arrays.
+
+    Mirrors compute_processed_covariances with config.RECENTERING=1: whitening
+    is fitted independently per session so each session's distribution is
+    centred before cross-session concatenation.
+    """
+    result = []
+    for raw_covs in raw_covs_per_session:
+        shrunken = Shrinkage(shrinkage=shrinkage_param).fit_transform(raw_covs)
+        if config.RECENTERING:
+            whitened = Whitening(metric="riemann").fit_transform(shrunken)
+            result.append(whitened)
+        else:
+            result.append(shrunken)
+    return np.concatenate(result, axis=0)
+
+
+# ── Tangent space helpers ──────────────────────────────────────────────────────
 
 def _fit_tangent_ref(cov_matrices: np.ndarray) -> np.ndarray:
     ts = TangentSpace(metric="riemann")
@@ -56,91 +148,112 @@ def _cov_tangent_features(cov_matrices: np.ndarray, tangent_ref: np.ndarray) -> 
     return tangent_space(cov_matrices, tangent_ref, metric="riemann")
 
 
-def _project(cov_mu, cov_beta, use_mu, use_beta, tr_idx, te_idx):
+def _project_fold(
+    processed_mu, processed_beta, use_mu, use_beta, tr_idx, te_idx
+):
     """
-    Project covariances to tangent space using a reference fitted on tr_idx only.
-    Returns (X_tr, X_te) with features horizontally stacked across enabled bands.
+    Project covariances to tangent space fitting the reference on tr_idx only.
+    Returns (X_tr, X_te) with feature blocks horizontally stacked across bands.
     """
     blocks_tr, blocks_te = [], []
-    if use_mu and cov_mu is not None:
-        ref = _fit_tangent_ref(cov_mu[tr_idx])
-        blocks_tr.append(_cov_tangent_features(cov_mu[tr_idx], ref))
-        blocks_te.append(_cov_tangent_features(cov_mu[te_idx], ref))
-    if use_beta and cov_beta is not None:
-        ref = _fit_tangent_ref(cov_beta[tr_idx])
-        blocks_tr.append(_cov_tangent_features(cov_beta[tr_idx], ref))
-        blocks_te.append(_cov_tangent_features(cov_beta[te_idx], ref))
+    if use_mu and processed_mu is not None:
+        ref = _fit_tangent_ref(processed_mu[tr_idx])
+        blocks_tr.append(_cov_tangent_features(processed_mu[tr_idx], ref))
+        blocks_te.append(_cov_tangent_features(processed_mu[te_idx], ref))
+    if use_beta and processed_beta is not None:
+        ref = _fit_tangent_ref(processed_beta[tr_idx])
+        blocks_tr.append(_cov_tangent_features(processed_beta[tr_idx], ref))
+        blocks_te.append(_cov_tangent_features(processed_beta[te_idx], ref))
     return np.hstack(blocks_tr), np.hstack(blocks_te)
 
 
-# ── Search space ──────────────────────────────────────────────────────────────
+# ── Single candidate evaluation ────────────────────────────────────────────────
 
-_PARAM_GRID = {
-    "max_depth":        [2, 3, 4, 5],
-    "min_child_weight": [1, 3, 5, 10],
-    "reg_lambda":       [0.5, 1.0, 2.0, 5.0],
-    "reg_alpha":        [0.0, 0.1, 0.5],
-    "subsample":        [0.6, 0.8, 1.0],
-    "colsample_bytree": [0.6, 0.8, 1.0],
-    "learning_rate":    [0.01, 0.03, 0.05, 0.1],
-    "n_estimators":     [100, 200, 300, 500],
-}
-
-_FIXED_XGB = dict(objective="binary:logistic", eval_metric="logloss", random_state=42)
-
-
-def _sample_params(rng: np.random.Generator) -> dict:
-    return {k: rng.choice(v).item() for k, v in _PARAM_GRID.items()}
-
-
-# ── Inner-fold AUC for one candidate ─────────────────────────────────────────
-
-def _score_candidate(X_tr, y_tr_bin, params, n_inner_splits, XGBClassifier):
+def _evaluate_candidate(
+    cand: dict,
+    fold_projections: dict,
+    y_bin: np.ndarray,
+    splits: list,
+    XGBClassifier,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Mean ROC-AUC over n_inner_splits inner KFold on the outer-train features.
-    Returns nan if any inner fold is single-class (degenerate split).
+    Evaluate one candidate across all pre-computed CV splits.
+
+    fold_projections is keyed by (shrinkage_param, fold_idx) and was built
+    before the search loop so that candidates sharing the same shrinkage value
+    reuse the same tangent space projection — avoiding 120 × n_folds redundant
+    Riemannian mean fits.
+
+    Returns (pooled_scores, pooled_true_bin) — all held-out P(MI) values and
+    corresponding binary labels, concatenated across folds in split order.
     """
-    kf = KFold(n_splits=n_inner_splits, shuffle=True, random_state=0)
-    aucs = []
-    for itr, ival in kf.split(X_tr):
-        if len(np.unique(y_tr_bin[ival])) < 2:
-            continue
+    xgb_params = {k: cand[k] for k in _XGB_CLASSIFIER_KEYS}
+    xgb_params.update(_FIXED_SEARCH)
+
+    shrink       = cand["shrinkage_param"]
+    all_scores   = []
+    all_true_bin = []
+
+    for fi, (tr, te) in enumerate(splits):
+        X_tr, X_te = fold_projections[(shrink, fi)]
         scaler = StandardScaler()
-        Xts = scaler.fit_transform(X_tr[itr])
-        Xvs = scaler.transform(X_tr[ival])
-        clf = XGBClassifier(**params, **_FIXED_XGB)
-        clf.fit(Xts, y_tr_bin[itr], verbose=False)
-        aucs.append(roc_auc_score(y_tr_bin[ival], clf.predict_proba(Xvs)[:, 1]))
-    return float(np.mean(aucs)) if aucs else float("nan")
+        Xts = scaler.fit_transform(X_tr)
+        Xvs = scaler.transform(X_te)
+        clf = XGBClassifier(**xgb_params, **_FIXED_XGB)
+        clf.fit(Xts, y_bin[tr], verbose=False)
+        all_scores.extend(clf.predict_proba(Xvs)[:, 1])
+        all_true_bin.extend(y_bin[te])
+
+    return np.asarray(all_scores), np.asarray(all_true_bin)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     mne.set_log_level("WARNING")
 
+    if config.LEDOITWOLF:
+        raise RuntimeError(
+            "Shrinkage grid search requires LEDOITWOLF=0 in config.py. "
+            "Set LEDOITWOLF=0 and a baseline SHRINKAGE_PARAM_XGB, then re-run."
+        )
+
     try:
-        from xgboost import XGBClassifier
+        from xgboost import XGBClassifier  # noqa: F401 — import check only
     except ImportError as exc:
         raise ImportError("xgboost required. Install with `pip install xgboost`.") from exc
 
-    n_iter       = int(getattr(config, "XGB_TUNE_N_ITER",       30))
-    n_inner      = int(getattr(config, "XGB_TUNE_INNER_SPLITS", 3))
-    n_loo_splits = int(getattr(config, "N_LOO_SPLITS",          5))
-    seed         = int(getattr(config, "XGB_TUNE_SEED",         42))
-    use_mu       = bool(getattr(config, "XGB_USE_COV_MU",       1))
-    use_beta     = bool(getattr(config, "XGB_USE_COV_BETA",     0))
+    cv_mode      = str(getattr(config, "CV_MODE",        "session_loo")).lower()
+    n_loo_splits = int(getattr(config, "N_LOO_SPLITS",   5))
+    n_splits     = int(getattr(config, "N_SPLITS",       5))
+    use_mu       = bool(getattr(config, "XGB_USE_COV_MU",  1))
+    use_beta     = bool(getattr(config, "XGB_USE_COV_BETA", 0))
 
-    rng = np.random.default_rng(seed)
+    beta_a = float(getattr(config, "XGB_TUNE_BETA_ALPHA", 18))
+    beta_b = float(getattr(config, "XGB_TUNE_BETA_BETA",   5))
+    n_bins = int(getattr(config,   "XGB_TUNE_KL_BINS",    15))
+
+    candidates   = _build_candidates()
+    n_candidates = len(candidates)
 
     print("=" * 64)
     print("XGBoost Hyperparameter Search")
     print("=" * 64)
-    print(f"  n_iter={n_iter}  inner_splits={n_inner}  "
-          f"n_loo_splits={n_loo_splits}  seed={seed}")
-    print(f"  feature sets: mu={use_mu}  beta={use_beta}\n")
+    print(f"  Search: exhaustive grid  |  candidates: {n_candidates}")
+    print(f"  Grid: max_depth={_SEARCH_GRID['max_depth']}")
+    print(f"        n_estimators={_SEARCH_GRID['n_estimators']}")
+    print(f"        shrinkage_param={_SEARCH_GRID['shrinkage_param']}")
+    print(f"  Fixed: lr={_FIXED_SEARCH['learning_rate']}  "
+          f"subsample={_FIXED_SEARCH['subsample']}  "
+          f"colsample_bytree={_FIXED_SEARCH['colsample_bytree']}  "
+          f"reg_alpha={_FIXED_SEARCH['reg_alpha']}  "
+          f"reg_lambda={_FIXED_SEARCH['reg_lambda']}  "
+          f"min_child_weight={_FIXED_SEARCH['min_child_weight']}")
+    print(f"  Criterion: KL(empirical ‖ Beta({beta_a:.0f},{beta_b:.0f})) "
+          f"[{n_bins} bins, avg MI+REST]")
+    print(f"  CV mode: {cv_mode}  |  feature sets: mu={use_mu}  beta={use_beta}\n")
 
-    # ── Data loading ──────────────────────────────────────────────────────────
+    # ── Data loading ───────────────────────────────────────────────────────────
     eeg_dir = os.path.join(
         config.DATA_DIR, f"sub-{config.TRAINING_SUBJECT}", "training_data"
     )
@@ -152,11 +265,15 @@ def main():
         raise FileNotFoundError(f"No XDF files in: {eeg_dir}")
     print(f"Found {len(xdf_files)} session(s):")
 
-    all_labels, cov_mu_all, cov_beta_all, session_ids = [], [], [], []
+    all_labels        = []
+    session_ids       = []
+    raw_covs_mu_sess  = []
+    raw_covs_beta_sess = [] if use_beta else None
 
     for sess_idx, xdf_path in enumerate(xdf_files):
         print(f"  [{sess_idx}] {os.path.basename(xdf_path)}")
         eeg_stream, marker_stream = load_xdf(xdf_path, report=False)
+
         out = segment_and_extract_cov_erd(
             eeg_stream, marker_stream,
             compute_erd=False,
@@ -169,21 +286,15 @@ def main():
             segments, labels, _, _ = out
             beta_segments = None
 
-        if use_mu:
-            cov_mu_all.append(
-                base.compute_processed_covariances(segments, labels, model_type="xgb")
-            )
-        if use_beta:
-            cov_beta_all.append(
-                base.compute_processed_covariances(beta_segments, labels, model_type="xgb")
-            )
+        raw_covs_mu_sess.append(_trace_norm_covs(segments))
+        if use_beta and beta_segments is not None:
+            raw_covs_beta_sess.append(_trace_norm_covs(beta_segments))
+
         all_labels.append(labels)
         session_ids.append(np.full(len(labels), sess_idx, dtype=int))
 
     y      = np.concatenate(all_labels)
     groups = np.concatenate(session_ids)
-    cov_mu  = np.concatenate(cov_mu_all,   axis=0) if use_mu   else None
-    cov_beta = np.concatenate(cov_beta_all, axis=0) if use_beta else None
 
     classes = np.sort(np.unique(y))
     if len(classes) != 2:
@@ -191,112 +302,101 @@ def main():
     mi_label = classes[1]
     y_bin = (y == mi_label).astype(int)
 
-    ref_arr = cov_mu if cov_mu is not None else cov_beta
+    # ── Precompute processed covs for all shrinkage values ────────────────────
+    shrinkage_values = _SEARCH_GRID["shrinkage_param"]
+    print(f"\nPrecomputing processed covariances for "
+          f"{len(shrinkage_values)} shrinkage values: {shrinkage_values} ...")
 
-    # ── Pre-sample candidates (same set across all outer folds) ───────────────
-    candidates = [_sample_params(rng) for _ in range(n_iter)]
+    processed_mu   = {}
+    processed_beta = {}
+    for shrink in shrinkage_values:
+        processed_mu[shrink] = _shrink_and_whiten_per_session(raw_covs_mu_sess, shrink)
+        if use_beta:
+            processed_beta[shrink] = _shrink_and_whiten_per_session(
+                raw_covs_beta_sess, shrink
+            )
 
-    # ── Outer LOO loop ────────────────────────────────────────────────────────
-    n_sessions = len(xdf_files)
-    k_outer    = min(n_sessions, n_loo_splits)
-    outer_cv   = GroupKFold(n_splits=k_outer)
+    # ── Build CV splits (same for all candidates) ─────────────────────────────
+    ref_arr = processed_mu[shrinkage_values[0]]
 
-    all_outer_scores   = []
-    all_outer_true_bin = []
-    outer_aucs         = []
-    best_params_log    = []
+    if cv_mode == "session_loo":
+        n_sessions = len(xdf_files)
+        k = min(n_sessions, n_loo_splits)
+        splitter = GroupKFold(n_splits=k)
+        splits = list(splitter.split(ref_arr, groups=groups))
+        print(f"\nCV: session-LOO  |  folds: {k}  ({n_sessions} sessions)")
+    else:
+        splitter = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        splits = list(splitter.split(ref_arr))
+        print(f"\nCV: KFold  |  folds: {n_splits}")
 
-    print(f"\nOuter folds: {k_outer}  |  Inner folds: {n_inner}  |  Candidates: {n_iter}\n")
+    # ── Precompute tangent projections for all (shrinkage, fold) combinations ──
+    # Candidates sharing the same shrinkage_param reuse the same projection,
+    # reducing tangent fits from n_candidates × n_folds to n_shrinkage × n_folds.
+    n_unique_proj = len(shrinkage_values) * len(splits)
+    print(f"Precomputing {n_unique_proj} tangent projections "
+          f"({len(shrinkage_values)} shrinkage × {len(splits)} folds) ...\n")
 
-    for fold_idx, (tr_outer, te_outer) in enumerate(
-        outer_cv.split(ref_arr, groups=groups), 1
-    ):
-        y_tr_bin = y_bin[tr_outer]
-        y_te_bin = y_bin[te_outer]
-        held_sess = np.unique(groups[te_outer]).tolist()
+    fold_projections = {}  # (shrink, fold_idx) -> (X_tr, X_te)
+    for shrink in shrinkage_values:
+        cov_mu_k   = processed_mu[shrink]
+        cov_beta_k = processed_beta.get(shrink) if use_beta else None
+        for fi, (tr, te) in enumerate(splits):
+            fold_projections[(shrink, fi)] = _project_fold(
+                cov_mu_k, cov_beta_k, use_mu, use_beta, tr, te
+            )
 
-        print(f"── Outer fold {fold_idx}/{k_outer}  "
-              f"(train={len(tr_outer)} windows, test={len(te_outer)} windows, "
-              f"held-out session(s)={held_sess}) ──")
+    # ── Exhaustive search ──────────────────────────────────────────────────────
+    print(f"Evaluating {n_candidates} candidates ...\n")
 
-        # Project outer train and test to tangent space
-        X_tr, X_te = _project(cov_mu, cov_beta, use_mu, use_beta, tr_outer, te_outer)
+    best_kl     = np.inf
+    best_cand   = None
+    best_scores = None
+    best_true   = None
 
-        # Inner random search — rank candidates by mean inner AUC
-        best_auc  = -np.inf
-        best_cand = candidates[0]
-
-        for ci, cand in enumerate(candidates):
-            auc = _score_candidate(X_tr, y_tr_bin, cand, n_inner, XGBClassifier)
-            if auc > best_auc:
-                best_auc  = auc
-                best_cand = cand
-            if (ci + 1) % 10 == 0:
-                print(f"   [{ci+1:>3}/{n_iter}] best inner AUC so far: {best_auc:.4f}")
-
-        best_params_log.append(best_cand)
-        print(f"   Best inner AUC : {best_auc:.4f}")
-        print(f"   Best params    : {best_cand}")
-
-        # Refit on full outer train with winning params
-        scaler = StandardScaler()
-        Xts = scaler.fit_transform(X_tr)
-        Xvs = scaler.transform(X_te)
-        clf = XGBClassifier(**best_cand, **_FIXED_XGB)
-        clf.fit(Xts, y_tr_bin, verbose=False)
-
-        outer_scores = clf.predict_proba(Xvs)[:, 1]
-        outer_auc = (
-            float(roc_auc_score(y_te_bin, outer_scores))
-            if len(np.unique(y_te_bin)) == 2 else float("nan")
+    for ci, cand in enumerate(candidates):
+        scores, true_bin = _evaluate_candidate(
+            cand, fold_projections, y_bin, splits, XGBClassifier
         )
-        outer_aucs.append(outer_auc)
-        print(f"   Outer fold AUC : {outer_auc:.4f}\n")
+        kl_result = base._compute_kl_breakdown(scores, true_bin, beta_a, beta_b, n_bins)
+        kl_val = kl_result["kl_combined"]
 
-        all_outer_scores.extend(outer_scores)
-        all_outer_true_bin.extend(y_te_bin)
+        is_best = kl_val < best_kl
+        if is_best:
+            best_kl     = kl_val
+            best_cand   = cand
+            best_scores = scores
+            best_true   = true_bin
 
-    all_outer_scores   = np.asarray(all_outer_scores)
-    all_outer_true_bin = np.asarray(all_outer_true_bin)
+        marker = " *" if is_best else ""
+        print(
+            f"[{ci+1:>3}/{n_candidates}]  "
+            f"depth={cand['max_depth']}  n_est={cand['n_estimators']}  "
+            f"shrink={cand['shrinkage_param']:.2f}  "
+            f"KL={kl_val:.4f}{marker}"
+        )
 
-    # ── Aggregated results ────────────────────────────────────────────────────
+    # ── Report on winner ───────────────────────────────────────────────────────
     agg_auc = (
-        float(roc_auc_score(all_outer_true_bin, all_outer_scores))
-        if len(np.unique(all_outer_true_bin)) == 2 else float("nan")
+        float(roc_auc_score(best_true, best_scores))
+        if len(np.unique(best_true)) == 2 else float("nan")
     )
 
+    print("\n" + "=" * 64)
+    print("WINNER")
     print("=" * 64)
-    print("RESULTS")
-    print("=" * 64)
-    print(f"Per-fold outer AUC : {[f'{a:.4f}' for a in outer_aucs]}")
-    print(f"Mean outer AUC     : {np.nanmean(outer_aucs):.4f}")
-    print(f"Aggregated AUC     : {agg_auc:.4f}")
+    print(f"  max_depth       = {best_cand['max_depth']}")
+    print(f"  n_estimators    = {best_cand['n_estimators']}")
+    print(f"  shrinkage_param = {best_cand['shrinkage_param']}")
+    print(f"  AUC (pooled)    = {agg_auc:.4f}")
 
-    # Fixed-threshold sweep on pooled outer test scores (no annotation — no
-    # single th_star applies across folds with different best params)
-    base._print_fixed_threshold_sweep(all_outer_scores, all_outer_true_bin)
-
-    # ── Param recommendations ─────────────────────────────────────────────────
-    print("\n====== Recommended Config Values ======")
-    print("Mode across outer folds. Copy into config.py before retraining.\n")
-
-    recommendations = {}
-    for param in _PARAM_GRID:
-        values = [bp[param] for bp in best_params_log]
-        mode_val = Counter(values).most_common(1)[0][0]
-        recommendations[param] = mode_val
-        fold_str = "  ".join(str(v) for v in values)
-        print(f"  {param:<22} = {str(mode_val):<8}  (folds: {fold_str})")
+    base._print_kl_report(best_scores, best_true, beta_a, beta_b, n_bins)
+    base._print_fixed_threshold_sweep(best_scores, best_true)
 
     print("\n── Paste into config.py ──────────────────────────────────────────")
-    print(f"XGB_MAX_DEPTH        = {recommendations['max_depth']}")
-    print(f"XGB_N_ESTIMATORS     = {recommendations['n_estimators']}")
-    print(f"XGB_LEARNING_RATE    = {recommendations['learning_rate']}")
-    print(f"XGB_SUBSAMPLE        = {recommendations['subsample']}")
-    print(f"XGB_COLSAMPLE_BYTREE = {recommendations['colsample_bytree']}")
-    print(f"XGB_REG_ALPHA        = {recommendations['reg_alpha']}")
-    print(f"XGB_REG_LAMBDA       = {recommendations['reg_lambda']}")
-    print(f"XGB_MIN_CHILD_WEIGHT = {recommendations['min_child_weight']}")
+    print(f"XGB_MAX_DEPTH        = {best_cand['max_depth']}")
+    print(f"XGB_N_ESTIMATORS     = {best_cand['n_estimators']}")
+    print(f"SHRINKAGE_PARAM_XGB  = {best_cand['shrinkage_param']}")
     print("──────────────────────────────────────────────────────────────────")
 
 

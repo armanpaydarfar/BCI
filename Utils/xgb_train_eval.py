@@ -218,6 +218,12 @@ def train_xgb_dual_thresholds(
     print("\nConfusion (decided-only; rows=true [REST, MI], cols=pred [REST, MI]):")
     print(cm_decided)
 
+    base._print_kl_report(
+        all_scores, all_true_bin,
+        beta_a=float(getattr(config, "XGB_TUNE_BETA_ALPHA", 18)),
+        beta_b=float(getattr(config, "XGB_TUNE_BETA_BETA",   5)),
+        n_bins=int(getattr(config,   "XGB_TUNE_KL_BINS",    15)),
+    )
     base._print_fixed_threshold_sweep(all_scores, all_true_bin, th_star)
 
     base._plot_scores_hist_with_thresholds(all_scores, all_true_bin, tl_star, th_star)
