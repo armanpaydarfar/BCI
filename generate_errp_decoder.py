@@ -105,7 +105,7 @@ def _build_classifier(backend: str):
 
 def _fit_xdawn_covs(X_epochs: np.ndarray, y: np.ndarray, n_filters: int) -> XdawnCovariances:
     """Fit XdawnCovariances on training epochs."""
-    xdc = XdawnCovariances(nfilter=n_filters, estimator="lwf", xdawn_weights=None)
+    xdc = XdawnCovariances(nfilter=n_filters, estimator="lwf")
     xdc.fit(X_epochs, y)
     return xdc
 
