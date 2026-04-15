@@ -212,8 +212,11 @@ def train_loso(
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mat", required=True,
-                   help="Path to combinedEpochs_v2.mat")
+    p.add_argument("--mat", required=True, nargs="+",
+                   help="Path(s) to .mat file(s). Pass multiple paths to pool datasets. "
+                        "When pooling, epochs from the same subject ID across files are "
+                        "held out together in LOSO, so the generalisation estimate remains "
+                        "subject-level (not condition-level).")
     p.add_argument("--backend", default="xdawn_mdm",
                    choices=["xdawn_mdm", "xdawn_lr"],
                    help="Classifier backend (default: xdawn_mdm)")
@@ -251,20 +254,36 @@ def main():
     if args.subjects:
         subjects = [int(s.strip()) for s in args.subjects.split(",")]
 
-    print(f"\nLoading: {args.mat}")
-    print(f"Channels: {channel_names}")
+    print(f"\nChannels: {channel_names}")
 
-    X, y, mag, sub_id, time_s, loaded_subjects = load_liu_epochs(
-        args.mat,
-        subjects=subjects,
-        channel_names=channel_names,
-    )
+    # Load one or more .mat files and concatenate. When multiple files are given,
+    # subject IDs are shared (same 16 subjects across both BCI and control datasets),
+    # so LOSO holds out all epochs for a given subject ID regardless of which file
+    # they came from — no extra bookkeeping needed.
+    Xs, ys, mags, sub_ids = [], [], [], []
+    loaded_subjects = None
+    for mat_path in args.mat:
+        print(f"Loading: {mat_path}")
+        Xi, yi, magi, sub_id_i, time_s, subs_i = load_liu_epochs(
+            mat_path,
+            subjects=subjects,
+            channel_names=channel_names,
+        )
+        Xi = _baseline_correct(Xi, time_s)
+        Xi, epoch_samples = _crop_epoch_window(Xi, time_s, args.tmin, args.tmax)
+        Xs.append(Xi)
+        ys.append(yi)
+        mags.append(magi)
+        sub_ids.append(sub_id_i)
+        if loaded_subjects is None:
+            loaded_subjects = subs_i
+        print(f"  → {Xi.shape[0]} epochs after crop")
 
-    # Baseline-correct with pre-stimulus window, then crop to training window.
-    X = _baseline_correct(X, time_s)
-    X, epoch_samples = _crop_epoch_window(X, time_s, args.tmin, args.tmax)
+    X      = np.concatenate(Xs,      axis=0)
+    y      = np.concatenate(ys)
+    sub_id = np.concatenate(sub_ids)
 
-    print(f"After crop: shape={X.shape}  "
+    print(f"\nPooled: shape={X.shape}  "
           f"window=[{args.tmin}, {args.tmax}] s  "
           f"({epoch_samples} samples)")
 
