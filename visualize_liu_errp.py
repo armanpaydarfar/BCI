@@ -112,7 +112,8 @@ def _subject_averages(X, y, mag, sub_id, loaded_subjects, condition):
 # Plot 1 — Grand-average ERP: error vs correct
 # =============================================================================
 
-def plot_grand_average(X, y, sub_id, loaded_subjects, time_s, channel_names, out_dir):
+def plot_grand_average(X, y, sub_id, loaded_subjects, time_s, channel_names, out_dir,
+                       dataset_label: str = ""):
     n_ch = len(channel_names)
     ncols = min(n_ch, 3)
     nrows = int(np.ceil(n_ch / ncols))
@@ -151,8 +152,9 @@ def plot_grand_average(X, y, sub_id, loaded_subjects, time_s, channel_names, out
     for ci in range(n_ch, nrows * ncols):
         axes[ci // ncols][ci % ncols].set_visible(False)
 
+    prefix = f"[{dataset_label}]  " if dataset_label else ""
     fig.suptitle(
-        f"Grand-average ERP: Error vs Correct  (N={len(loaded_subjects)} subjects)\n"
+        f"{prefix}Grand-average ERP: Error vs Correct  (N={len(loaded_subjects)} subjects)\n"
         f"Shaded bands: ERN [{ERN_TMIN_MS}–{ERN_TMAX_MS} ms], Pe [{PE_TMIN_MS}–{PE_TMAX_MS} ms]",
         fontsize=12
     )
@@ -168,7 +170,8 @@ def plot_grand_average(X, y, sub_id, loaded_subjects, time_s, channel_names, out
 # =============================================================================
 
 def plot_magnitude_stratified(X, y, mag, sub_id, loaded_subjects, time_s,
-                               channel_names, focal_channel, out_dir):
+                               channel_names, focal_channel, out_dir,
+                               dataset_label: str = ""):
     if focal_channel not in channel_names:
         print(f"  [Plot 2] {focal_channel} not in selected channels — skipping.")
         return
@@ -195,8 +198,9 @@ def plot_magnitude_stratified(X, y, mag, sub_id, loaded_subjects, time_s,
     ax.set_ylabel("Amplitude (µV)")
     ax.set_xlim(-200, 900)
     ax.legend(title="Rotation magnitude", fontsize=9)
+    prefix = f"[{dataset_label}]  " if dataset_label else ""
     ax.set_title(
-        f"Magnitude-stratified ERP at {focal_channel}  (N={len(loaded_subjects)} subjects)\n"
+        f"{prefix}Magnitude-stratified ERP at {focal_channel}  (N={len(loaded_subjects)} subjects)\n"
         f"Pe region shaded [{PE_TMIN_MS}–{PE_TMAX_MS} ms]",
         fontsize=11
     )
@@ -211,7 +215,8 @@ def plot_magnitude_stratified(X, y, mag, sub_id, loaded_subjects, time_s,
 # Plot 3 — Difference waveform (error − correct) per channel
 # =============================================================================
 
-def plot_difference_waveform(X, y, sub_id, loaded_subjects, time_s, channel_names, out_dir):
+def plot_difference_waveform(X, y, sub_id, loaded_subjects, time_s, channel_names, out_dir,
+                             dataset_label: str = ""):
     n_ch  = len(channel_names)
     ncols = min(n_ch, 3)
     nrows = int(np.ceil(n_ch / ncols))
@@ -242,8 +247,9 @@ def plot_difference_waveform(X, y, sub_id, loaded_subjects, time_s, channel_name
     for ci in range(n_ch, nrows * ncols):
         axes[ci // ncols][ci % ncols].set_visible(False)
 
+    prefix = f"[{dataset_label}]  " if dataset_label else ""
     fig.suptitle(
-        f"Difference waveform: Error − Correct  (N={len(loaded_subjects)} subjects)\n"
+        f"{prefix}Difference waveform: Error − Correct  (N={len(loaded_subjects)} subjects)\n"
         f"ERN [{ERN_TMIN_MS}–{ERN_TMAX_MS} ms] blue, Pe [{PE_TMIN_MS}–{PE_TMAX_MS} ms] red",
         fontsize=12
     )
@@ -259,7 +265,8 @@ def plot_difference_waveform(X, y, sub_id, loaded_subjects, time_s, channel_name
 # =============================================================================
 
 def plot_subject_variability(X, y, sub_id, loaded_subjects, time_s,
-                              channel_names, focal_channel, out_dir):
+                              channel_names, focal_channel, out_dir,
+                              dataset_label: str = ""):
     if focal_channel not in channel_names:
         print(f"  [Plot 4] {focal_channel} not in selected channels — skipping.")
         return
@@ -287,8 +294,9 @@ def plot_subject_variability(X, y, sub_id, loaded_subjects, time_s,
     ax.set_ylabel("Amplitude (µV)")
     ax.set_xlim(-200, 900)
     ax.legend(fontsize=7, ncol=4, loc="upper right")
+    prefix = f"[{dataset_label}]  " if dataset_label else ""
     ax.set_title(
-        f"Per-subject error ERP at {focal_channel}  (N={len(loaded_subjects)} subjects)\n"
+        f"{prefix}Per-subject error ERP at {focal_channel}  (N={len(loaded_subjects)} subjects)\n"
         f"Pe region shaded [{PE_TMIN_MS}–{PE_TMAX_MS} ms]",
         fontsize=11
     )
@@ -304,7 +312,8 @@ def plot_subject_variability(X, y, sub_id, loaded_subjects, time_s,
 # =============================================================================
 
 def plot_pe_by_magnitude(X, y, mag, sub_id, loaded_subjects, time_s,
-                          channel_names, focal_channel, out_dir):
+                          channel_names, focal_channel, out_dir,
+                          dataset_label: str = ""):
     if focal_channel not in channel_names:
         print(f"  [Plot 5] {focal_channel} not in selected channels — skipping.")
         return
@@ -331,8 +340,9 @@ def plot_pe_by_magnitude(X, y, mag, sub_id, loaded_subjects, time_s,
     ax.set_xlabel("Rotation magnitude")
     ax.set_ylabel("Mean Pe amplitude (µV)")
     ax.axhline(0, color="k", linewidth=0.5)
+    prefix = f"[{dataset_label}]  " if dataset_label else ""
     ax.set_title(
-        f"Pe amplitude by rotation magnitude at {focal_channel}\n"
+        f"{prefix}Pe amplitude by rotation magnitude at {focal_channel}\n"
         f"Pe window: {PE_TMIN_MS}–{PE_TMAX_MS} ms  (N={len(loaded_subjects)} subjects, mean ± SEM)",
         fontsize=11
     )
@@ -354,7 +364,7 @@ def plot_pe_by_magnitude(X, y, mag, sub_id, loaded_subjects, time_s,
 
 def plot_single_trial_heatmap(X, y, mag, sub_id, loaded_subjects, time_s,
                                channel_names, focal_channel, out_dir,
-                               max_trials_per_class=200):
+                               max_trials_per_class=200, dataset_label: str = ""):
     if focal_channel not in channel_names:
         print(f"  [Plot 6] {focal_channel} not in selected channels — skipping.")
         return
@@ -406,8 +416,9 @@ def plot_single_trial_heatmap(X, y, mag, sub_id, loaded_subjects, time_s,
 
     ax.set_xlabel("Time (ms)")
     ax.set_ylabel("Trial")
+    prefix = f"[{dataset_label}]  " if dataset_label else ""
     ax.set_title(
-        f"Single-trial heatmap at {focal_channel}  (up to {max_trials_per_class} trials/magnitude)\n"
+        f"{prefix}Single-trial heatmap at {focal_channel}  (up to {max_trials_per_class} trials/magnitude)\n"
         f"Sorted by magnitude. Pe region [{PE_TMIN_MS}–{PE_TMAX_MS} ms] shaded.",
         fontsize=11
     )
@@ -422,8 +433,9 @@ def plot_single_trial_heatmap(X, y, mag, sub_id, loaded_subjects, time_s,
 # Summary statistics
 # =============================================================================
 
-def print_summary(X, y, mag, sub_id, loaded_subjects):
-    print("\n── Dataset summary ──────────────────────────────────────────────")
+def print_summary(X, y, mag, sub_id, loaded_subjects, dataset_label: str = ""):
+    label_str = f"  [{dataset_label}]" if dataset_label else ""
+    print(f"\n── Dataset summary{label_str} ──────────────────────────────────────────────")
     print(f"  Subjects loaded : {loaded_subjects}")
     print(f"  Total epochs    : {len(y)}")
     print(f"  Error epochs    : {(y == 1).sum()} ({100 * (y == 1).mean():.1f}%)")
@@ -456,8 +468,12 @@ def parse_args():
     p.add_argument("--harmony-channels-only", action="store_true",
                    help="Restrict to Harmony ErrP channels only: "
                         f"{HARMONY_ERRP_CHANNELS}")
-    p.add_argument("--out", default="plots",
-                   help="Output directory for PNG files. Default: ./plots/")
+    p.add_argument("--dataset-label", default="",
+                   help="Label embedded in every plot title to identify the dataset, "
+                        "e.g. 'BCI feedback' or 'Control (no BCI feedback)'.")
+    p.add_argument("--out", default=os.path.expanduser("~/Pictures/Liu_ErrP"),
+                   help="Output directory for PNG files. "
+                        "Default: ~/Pictures/Liu_ErrP")
     return p.parse_args()
 
 
@@ -494,7 +510,9 @@ def main():
     # Baseline-correct all epochs for visualization.
     X = baseline_correct(X, time_s)
 
-    print_summary(X, y, mag, sub_id, loaded_subjects)
+    label = args.dataset_label
+
+    print_summary(X, y, mag, sub_id, loaded_subjects, dataset_label=label)
 
     os.makedirs(args.out, exist_ok=True)
     print(f"Saving plots to: {os.path.abspath(args.out)}\n")
@@ -505,27 +523,27 @@ def main():
 
     print("Plot 1 — Grand-average ERP (error vs correct)")
     plot_grand_average(X, y, sub_id, loaded_subjects, time_s,
-                       display_in_X, args.out)
+                       display_in_X, args.out, dataset_label=label)
 
     print("Plot 2 — Magnitude-stratified ERP")
     plot_magnitude_stratified(X, y, mag, sub_id, loaded_subjects, time_s,
-                               load_channels, focal_channel, args.out)
+                               load_channels, focal_channel, args.out, dataset_label=label)
 
     print("Plot 3 — Difference waveform (error − correct)")
     plot_difference_waveform(X, y, sub_id, loaded_subjects, time_s,
-                              display_in_X, args.out)
+                              display_in_X, args.out, dataset_label=label)
 
     print("Plot 4 — Per-subject ERP variability")
     plot_subject_variability(X, y, sub_id, loaded_subjects, time_s,
-                              load_channels, focal_channel, args.out)
+                              load_channels, focal_channel, args.out, dataset_label=label)
 
     print("Plot 5 — Pe amplitude by magnitude")
     plot_pe_by_magnitude(X, y, mag, sub_id, loaded_subjects, time_s,
-                          load_channels, focal_channel, args.out)
+                          load_channels, focal_channel, args.out, dataset_label=label)
 
     print("Plot 6 — Single-trial heatmap")
     plot_single_trial_heatmap(X, y, mag, sub_id, loaded_subjects, time_s,
-                               load_channels, focal_channel, args.out)
+                               load_channels, focal_channel, args.out, dataset_label=label)
 
     print("\nDone.")
 
