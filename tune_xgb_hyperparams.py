@@ -102,9 +102,9 @@ _FIXED_XGB = dict(objective="binary:logistic", eval_metric="logloss", random_sta
 # ── Exhaustive search grid ─────────────────────────────────────────────────────
 
 _SEARCH_GRID = {
-    "max_depth":       [3, 4, 5, 6, 7, 8],
-    "n_estimators":    [100, 200, 300, 500],
-    "shrinkage_param": [0.01, 0.02, 0.05, 0.10, 0.20],
+    "max_depth":       [3, 4, 5, 6],
+    "n_estimators":    [50, 100, 200, 300],
+    "shrinkage_param": [0.01, 0.02, 0.05, 0.10],
 }
 
 _XGB_CLASSIFIER_KEYS = frozenset({"max_depth", "n_estimators"})

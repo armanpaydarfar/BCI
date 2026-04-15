@@ -153,9 +153,9 @@ XGB_ERD_BANDS = [(float(LOWCUT), float(HIGHCUT))]
 XGB_IMPORTANCE_TOP_K = 20
 # Hyperparameter search (tune_xgb_hyperparams.py)
 # KL divergence criterion parameters (tune_xgb_hyperparams.py)
-# Target: Beta(BETA_ALPHA, BETA_BETA) — mode ≈ (a-1)/(a+b-2).  Beta(18,5) → mode≈0.81, mean≈0.78.
-XGB_TUNE_BETA_ALPHA = 18
-XGB_TUNE_BETA_BETA  = 5
+# Target: Beta(BETA_ALPHA, BETA_BETA) — mode ≈ (a-1)/(a+b-2).  Beta(6.1,2.3) → mode≈0.80, mean≈0.73.
+XGB_TUNE_BETA_ALPHA = 6.1
+XGB_TUNE_BETA_BETA  = 2.3
 XGB_TUNE_KL_BINS    = 15     # histogram bins for KL computation
 
 # Online decoder backend: "mdm" | "xgb_cov" | "xgb_cov_erd"

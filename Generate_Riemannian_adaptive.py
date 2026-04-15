@@ -49,42 +49,112 @@ EPOCHS_START_END = {
 
 
 
-def plot_posterior_probabilities(posterior_probs):
+def plot_posterior_probabilities(
+    posterior_probs,
+    beta_a: float | None = None,
+    beta_b: float | None = None,
+    n_bins: int | None = None,
+):
     """
-    Plots the histogram of posterior probabilities for each class,
-    with a dotted vertical line at the class mean.
+    Histogram of P(correct class) per class with KL diagnostics.
+
+    Plots P(correct class) for each class: P(MI) for MI trials and
+    P(REST) = 1 - P(MI) for REST trials.  Both should be high for a
+    well-discriminating classifier; the target shape is Beta(beta_a, beta_b).
+
+    Overlays per-class:
+      - MLE-fitted Beta curve (support fixed to [0, 1])
+      - Reference Beta(beta_a, beta_b) curve showing the target shape
+    Annotation box shows KL(empirical ‖ reference) for MI, REST, and combined.
 
     Parameters:
-        posterior_probs (dict): Dictionary containing posterior probabilities for each class.
+        posterior_probs: dict of {label (100|200): array of P(correct class)}
+        beta_a:  Reference Beta alpha (default: config.XGB_TUNE_BETA_ALPHA or 18)
+        beta_b:  Reference Beta beta  (default: config.XGB_TUNE_BETA_BETA  or  5)
+        n_bins:  Histogram bins for KL computation (default: config.XGB_TUNE_KL_BINS or 15)
     """
-    plt.figure(figsize=(10, 6))
-    bins = np.linspace(0, 1, 20)  # Set bins for histogram
+    if beta_a is None:
+        beta_a = float(getattr(config, "XGB_TUNE_BETA_ALPHA", 18))
+    if beta_b is None:
+        beta_b = float(getattr(config, "XGB_TUNE_BETA_BETA", 5))
+    if n_bins is None:
+        n_bins = int(getattr(config, "XGB_TUNE_KL_BINS", 15))
 
-    # Convert numerical labels to "Rest" and "MI"
+    ref_mode = (beta_a - 1.0) / (beta_a + beta_b - 2.0)
+    ref_mean = beta_a / (beta_a + beta_b)
+
     label_map = {100: "Rest", 200: "MI"}
-    renamed_probs = {label_map.get(int(label), str(label)): probs
-                     for label, probs in posterior_probs.items()}
+    renamed_probs = {
+        label_map.get(int(lbl), str(lbl)): np.asarray(probs).flatten()
+        for lbl, probs in posterior_probs.items()
+    }
+    palette = {"Rest": "steelblue", "MI": "darkorange"}
 
-    # Define class colors (feel free to adjust)
-    palette = {"Rest": "skyblue", "MI": "darkorange"}
+    fig, ax = plt.subplots(figsize=(11, 7))
+    plot_bins = np.linspace(0.0, 1.0, 21)
+    x_curve = np.linspace(0.005, 0.995, 300)
 
+    kl_values = {}
     for label, probs in renamed_probs.items():
-        probs = np.array(probs).flatten()
-        color = palette.get(label, None)
+        color = palette.get(label, "gray")
+        sns.histplot(
+            probs, bins=plot_bins, alpha=0.45, color=color,
+            stat="density", ax=ax, label=f"{label} (n={len(probs)})",
+        )
+        mean_val = float(np.mean(probs))
+        ax.axvline(mean_val, color=color, linestyle="--", linewidth=1.5,
+                   label=f"{label} mean = {mean_val:.3f}")
+        # MLE Beta fit with support fixed to [0, 1]
+        try:
+            a_fit, b_fit, _loc, _scale = scipy_beta.fit(
+                np.clip(probs, 1e-4, 1 - 1e-4), floc=0, fscale=1
+            )
+            ax.plot(x_curve, scipy_beta.pdf(x_curve, a_fit, b_fit),
+                    color=color, linewidth=2.0, linestyle="-",
+                    label=f"{label} Beta fit: α={a_fit:.1f}, β={b_fit:.1f}")
+        except Exception:
+            pass
+        kl_values[label] = _kl_vs_beta(probs, beta_a, beta_b, n_bins)
 
-        sns.histplot(probs, bins=bins, alpha=0.6, label=f"{label} Probability",
-                     kde=True, color=color)
+    # Reference Beta curve (target shape)
+    ax.plot(
+        x_curve, scipy_beta.pdf(x_curve, beta_a, beta_b),
+        color="black", linewidth=2.0, linestyle=":",
+        label=(
+            f"Reference Beta({beta_a:.2g},{beta_b:.2g})"
+            f"  mode={ref_mode:.2f}  mean={ref_mean:.2f}"
+        ),
+    )
 
-        # Add mean line in same color
-        mean_val = np.mean(probs)
-        plt.axvline(mean_val, color=color, linestyle="--", linewidth=1.5,
-                    label=f"{label} Mean = {mean_val:.2f}")
+    kl_mi   = kl_values.get("MI",   float("nan"))
+    kl_rest = kl_values.get("Rest", float("nan"))
+    kl_comb = (
+        0.5 * (kl_mi + kl_rest)
+        if not (np.isnan(kl_mi) or np.isnan(kl_rest))
+        else float("nan")
+    )
+    kl_text = (
+        f"KL vs Beta({beta_a:.2g},{beta_b:.2g})  [{n_bins}-bin]\n"
+        f"  MI   : {kl_mi:.4f} nats\n"
+        f"  REST : {kl_rest:.4f} nats\n"
+        f"  Comb : {kl_comb:.4f} nats"
+    )
+    ax.text(
+        0.02, 0.97, kl_text,
+        transform=ax.transAxes, verticalalignment="top",
+        fontfamily="monospace", fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85),
+    )
 
-    plt.xlabel("Predicted Probability")
-    plt.ylabel("Frequency")
-    plt.title("Posterior Probability Distribution Across Classes")
-    plt.legend(title="True Class")
-    plt.grid(True, linestyle="--", alpha=0.6)
+    ax.set_xlabel("P(correct class)")
+    ax.set_ylabel("Density")
+    ax.set_title(
+        "Posterior Probability Distribution Across Classes\n"
+        "[P(MI) for MI trials  ·  P(REST) = 1−P(MI) for REST trials]"
+    )
+    ax.legend(loc="lower left", fontsize=9)
+    ax.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
     plt.show()
 
 def validate_trial_pairs(marker_values, marker_timestamps, eeg_timestamps, sfreq, EPOCHS_START_END, min_duration=1.0):
@@ -451,7 +521,7 @@ def _print_kl_report(
     """Print a human-readable KL divergence breakdown vs the target Beta distribution."""
     r = _compute_kl_breakdown(all_scores, all_true_bin, beta_a, beta_b, n_bins)
     print(
-        f"\n====== KL Divergence vs Beta({beta_a:.0f}, {beta_b:.0f}) "
+        f"\n====== KL Divergence vs Beta({beta_a:.2g}, {beta_b:.2g}) "
         f"[{n_bins}-bin histogram] ======"
     )
     print(f"  KL(MI)       : {r['kl_mi']:.4f} nats")
