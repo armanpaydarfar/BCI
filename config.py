@@ -29,7 +29,7 @@ TOTAL_TRIALS = 20
 TOTAL_TRIALS_ERRP = 45
 MAX_REPEATS = 3
 N_SPLITS = 5        # KFold splits — used when CV_MODE == "kfold"
-CV_MODE = "session_loo"   # "kfold" | "session_loo"
+CV_MODE = "kfold"   # "kfold" | "session_loo"
 # session_loo: GroupKFold respecting session boundaries.  N_LOO_SPLITS caps the
 # number of folds so that large datasets (e.g. 21 sessions) don't explode.
 # When n_sessions <= N_LOO_SPLITS the split degenerates to true leave-one-session-out.
@@ -96,7 +96,7 @@ INTEGRATOR_ALPHA = 0.94
 # - MDM path (runtime + MDM-centric analyses)
 SHRINKAGE_PARAM_MDM = 0.02
 # - XGB feature pipelines (covariance preprocessing before tangent features)
-SHRINKAGE_PARAM_XGB = 0.05
+SHRINKAGE_PARAM_XGB = 0.02
 # Backward-compatible alias (legacy code may still read SHRINKAGE_PARAM).
 SHRINKAGE_PARAM = SHRINKAGE_PARAM_MDM
 LEDOITWOLF = 0
@@ -135,11 +135,11 @@ SAVE_ADAPTIVE_T = False
 # =============================================================================
 # XGBoost defaults (offline feature pipelines)
 # =============================================================================
-XGB_MAX_DEPTH        = 7
+XGB_MAX_DEPTH        = 5
 XGB_N_ESTIMATORS     = 300
 # Optional overrides — uncomment and set to override XGBoost package defaults.
 # Absent keys cause XGBoost defaults to apply automatically.
-# XGB_LEARNING_RATE    = 0.3     # XGB default
+XGB_LEARNING_RATE    = 0.03
 # XGB_SUBSAMPLE        = 1.0     # XGB default
 # XGB_COLSAMPLE_BYTREE = 1.0     # XGB default
 # XGB_REG_ALPHA        = 0.0     # XGB default
@@ -152,7 +152,8 @@ XGB_USE_COV_BETA = 1
 XGB_ERD_BANDS = [(float(LOWCUT), float(HIGHCUT))]
 XGB_IMPORTANCE_TOP_K = 20
 # Hyperparameter search (tune_xgb_hyperparams.py)
-# KL divergence criterion parameters (tune_xgb_hyperparams.py)
+XGB_TUNE_CRITERION   = "kl"        # "kl" | "auc"
+# KL divergence criterion parameters — used when XGB_TUNE_CRITERION == "kl"
 # Target: Beta(BETA_ALPHA, BETA_BETA) — mode ≈ (a-1)/(a+b-2).  Beta(6.1,2.3) → mode≈0.80, mean≈0.73.
 XGB_TUNE_BETA_ALPHA = 6.1
 XGB_TUNE_BETA_BETA  = 2.3
