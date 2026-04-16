@@ -11,28 +11,34 @@ CV mode is controlled by config.CV_MODE:
   "kfold"       — Shuffled KFold(N_SPLITS).
 
 The same CV split is applied uniformly to all candidates.  After all
-candidates are evaluated, the one with the lowest pooled KL divergence from
-the target Beta distribution is selected and its CV metrics are reported.
+candidates are evaluated, the winner is selected by the configured criterion
+and its CV metrics are reported.
 
-Criterion  : KL(empirical ‖ Beta(a, b)) averaged symmetrically across MI
-             and REST classes, computed on pooled held-out P(correct class)
-             scores.  Beta(18, 5) encodes the desired distribution:
-             unimodal, mode ≈ 0.81, mean ≈ 0.78, negatively skewed.
+Criterion  : controlled by config.XGB_TUNE_CRITERION:
+  "kl"  — minimize KL(empirical ‖ Beta(a, b)) averaged symmetrically
+           across MI and REST classes, computed on pooled held-out
+           P(correct class) scores.
+  "auc" — maximize pooled ROC-AUC (MI vs REST) across held-out folds.
 
 Search space (exhaustive grid):
-  max_depth       : [3, 4, 5, 6, 7, 8]
-  n_estimators    : [100, 200, 300, 500]
-  shrinkage_param : [0.01, 0.02, 0.05, 0.10, 0.20]
-  Total           : 6 × 4 × 5 = 120 candidates
+  max_depth     : [3, 4, 5, 6]
+  n_estimators  : [50, 100, 200, 300]
+  learning_rate : [0.01, 0.03, 0.05, 0.10]
+  Total         : 4 × 4 × 4 = 64 candidates
+
+Fixed (not searched):
+  shrinkage_param : SHRINKAGE_PARAM_XGB from config.py
 
 Optional config overrides (not searched):
-  XGB_LEARNING_RATE, XGB_SUBSAMPLE, XGB_COLSAMPLE_BYTREE,
+  XGB_SUBSAMPLE, XGB_COLSAMPLE_BYTREE,
   XGB_REG_ALPHA, XGB_REG_LAMBDA, XGB_MIN_CHILD_WEIGHT.
   If any of these are absent from config.py, XGBoost package defaults apply.
+  XGB_LEARNING_RATE in config.py is ignored when learning_rate is searched.
 
 Config keys consumed:
   CV_MODE, N_LOO_SPLITS, N_SPLITS,
   XGB_USE_COV_MU, XGB_USE_COV_BETA,
+  XGB_TUNE_CRITERION,
   XGB_TUNE_BETA_ALPHA, XGB_TUNE_BETA_BETA, XGB_TUNE_KL_BINS,
   RECENTERING, LEDOITWOLF.
 
@@ -102,12 +108,12 @@ _FIXED_XGB = dict(objective="binary:logistic", eval_metric="logloss", random_sta
 # ── Exhaustive search grid ─────────────────────────────────────────────────────
 
 _SEARCH_GRID = {
-    "max_depth":       [3, 4, 5, 6],
-    "n_estimators":    [50, 100, 200, 300],
-    "shrinkage_param": [0.01, 0.02, 0.05, 0.10],
+    "max_depth":     [3, 4, 5, 6],
+    "n_estimators":  [50, 100, 200, 300],
+    "learning_rate": [0.01, 0.03, 0.05, 0.10],
 }
 
-_XGB_CLASSIFIER_KEYS = frozenset({"max_depth", "n_estimators"})
+_XGB_CLASSIFIER_KEYS = frozenset({"max_depth", "n_estimators", "learning_rate"})
 
 
 def _build_candidates() -> list[dict]:
@@ -185,22 +191,25 @@ def _evaluate_candidate(
     y_bin: np.ndarray,
     splits: list,
     XGBClassifier,
+    shrinkage: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Evaluate one candidate across all pre-computed CV splits.
 
     fold_projections is keyed by (shrinkage_param, fold_idx) and was built
-    before the search loop so that candidates sharing the same shrinkage value
-    reuse the same tangent space projection — avoiding 120 × n_folds redundant
-    Riemannian mean fits.
+    before the search loop so that all candidates share the same projection
+    (shrinkage is fixed, not searched).
+
+    Config overrides are applied first; candidate values take precedence so
+    that searched parameters cannot be stomped by config.
 
     Returns (pooled_scores, pooled_true_bin) — all held-out P(MI) values and
     corresponding binary labels, concatenated across folds in split order.
     """
-    xgb_params = {k: cand[k] for k in _XGB_CLASSIFIER_KEYS}
-    xgb_params.update(_config_overrides())
+    xgb_params = _config_overrides()
+    xgb_params.update({k: cand[k] for k in _XGB_CLASSIFIER_KEYS})
 
-    shrink       = cand["shrinkage_param"]
+    shrink = shrinkage
     all_scores   = []
     all_true_bin = []
 
@@ -239,9 +248,10 @@ def main():
     use_mu       = bool(getattr(config, "XGB_USE_COV_MU",  1))
     use_beta     = bool(getattr(config, "XGB_USE_COV_BETA", 0))
 
-    beta_a = float(getattr(config, "XGB_TUNE_BETA_ALPHA", 18))
-    beta_b = float(getattr(config, "XGB_TUNE_BETA_BETA",   5))
-    n_bins = int(getattr(config,   "XGB_TUNE_KL_BINS",    15))
+    criterion = str(getattr(config, "XGB_TUNE_CRITERION",   "kl")).lower()
+    beta_a    = float(getattr(config, "XGB_TUNE_BETA_ALPHA", 18))
+    beta_b    = float(getattr(config, "XGB_TUNE_BETA_BETA",   5))
+    n_bins    = int(getattr(config,   "XGB_TUNE_KL_BINS",    15))
 
     candidates   = _build_candidates()
     n_candidates = len(candidates)
@@ -250,16 +260,22 @@ def main():
     print("XGBoost Hyperparameter Search")
     print("=" * 64)
     print(f"  Search: exhaustive grid  |  candidates: {n_candidates}")
+    shrink_fixed = float(getattr(config, "SHRINKAGE_PARAM_XGB", 0.02))
+
     print(f"  Grid: max_depth={_SEARCH_GRID['max_depth']}")
     print(f"        n_estimators={_SEARCH_GRID['n_estimators']}")
-    print(f"        shrinkage_param={_SEARCH_GRID['shrinkage_param']}")
-    overrides = _config_overrides()
+    print(f"        learning_rate={_SEARCH_GRID['learning_rate']}")
+    print(f"  Fixed: shrinkage_param={shrink_fixed}")
+    overrides = {k: v for k, v in _config_overrides().items() if k != "learning_rate"}
     if overrides:
         print(f"  Config overrides: {overrides}")
     else:
         print(f"  Config overrides: none — XGBoost package defaults apply")
-    print(f"  Criterion: KL(empirical ‖ Beta({beta_a:.0f},{beta_b:.0f})) "
-          f"[{n_bins} bins, avg MI+REST]")
+    if criterion == "auc":
+        print(f"  Criterion: maximize ROC-AUC (pooled MI vs REST)")
+    else:
+        print(f"  Criterion: KL(empirical ‖ Beta({beta_a:.2g},{beta_b:.2g})) "
+              f"[{n_bins} bins, avg MI+REST]")
     print(f"  CV mode: {cv_mode}  |  feature sets: mu={use_mu}  beta={use_beta}\n")
 
     # ── Data loading ───────────────────────────────────────────────────────────
@@ -311,10 +327,9 @@ def main():
     mi_label = classes[1]
     y_bin = (y == mi_label).astype(int)
 
-    # ── Precompute processed covs for all shrinkage values ────────────────────
-    shrinkage_values = _SEARCH_GRID["shrinkage_param"]
-    print(f"\nPrecomputing processed covariances for "
-          f"{len(shrinkage_values)} shrinkage values: {shrinkage_values} ...")
+    # ── Precompute processed covs for fixed shrinkage ─────────────────────────
+    shrinkage_values = [shrink_fixed]
+    print(f"\nPrecomputing processed covariances (shrinkage={shrink_fixed}) ...")
 
     processed_mu   = {}
     processed_beta = {}
@@ -358,36 +373,47 @@ def main():
     # ── Exhaustive search ──────────────────────────────────────────────────────
     print(f"Evaluating {n_candidates} candidates ...\n")
 
-    best_kl     = np.inf
+    # best_score tracks the criterion value: minimised for "kl", maximised for "auc".
+    best_score  = -np.inf if criterion == "auc" else np.inf
     best_cand   = None
     best_scores = None
     best_true   = None
 
     for ci, cand in enumerate(candidates):
         scores, true_bin = _evaluate_candidate(
-            cand, fold_projections, y_bin, splits, XGBClassifier
+            cand, fold_projections, y_bin, splits, XGBClassifier, shrink_fixed
         )
-        kl_result = base._compute_kl_breakdown(scores, true_bin, beta_a, beta_b, n_bins)
-        kl_val = kl_result["kl_combined"]
 
-        is_best = kl_val < best_kl
+        if criterion == "auc":
+            crit_val = (
+                float(roc_auc_score(true_bin, scores))
+                if len(np.unique(true_bin)) == 2 else float("nan")
+            )
+            is_best = crit_val > best_score
+        else:
+            kl_result = base._compute_kl_breakdown(scores, true_bin, beta_a, beta_b, n_bins)
+            crit_val  = kl_result["kl_combined"]
+            is_best   = crit_val < best_score
+
         if is_best:
-            best_kl     = kl_val
+            best_score  = crit_val
             best_cand   = cand
             best_scores = scores
             best_true   = true_bin
 
+        label  = "AUC" if criterion == "auc" else "KL"
         marker = " *" if is_best else ""
         print(
             f"[{ci+1:>3}/{n_candidates}]  "
             f"depth={cand['max_depth']}  n_est={cand['n_estimators']}  "
-            f"shrink={cand['shrinkage_param']:.2f}  "
-            f"KL={kl_val:.4f}{marker}"
+            f"lr={cand['learning_rate']:.2f}  "
+            f"{label}={crit_val:.4f}{marker}"
         )
 
     # ── Report on winner ───────────────────────────────────────────────────────
     agg_auc = (
-        float(roc_auc_score(best_true, best_scores))
+        best_score if criterion == "auc"
+        else float(roc_auc_score(best_true, best_scores))
         if len(np.unique(best_true)) == 2 else float("nan")
     )
 
@@ -396,7 +422,8 @@ def main():
     print("=" * 64)
     print(f"  max_depth       = {best_cand['max_depth']}")
     print(f"  n_estimators    = {best_cand['n_estimators']}")
-    print(f"  shrinkage_param = {best_cand['shrinkage_param']}")
+    print(f"  learning_rate   = {best_cand['learning_rate']}")
+    print(f"  shrinkage_param = {shrink_fixed}  (fixed)")
     print(f"  AUC (pooled)    = {agg_auc:.4f}")
 
     base._print_kl_report(best_scores, best_true, beta_a, beta_b, n_bins)
@@ -405,7 +432,8 @@ def main():
     print("\n── Paste into config.py ──────────────────────────────────────────")
     print(f"XGB_MAX_DEPTH        = {best_cand['max_depth']}")
     print(f"XGB_N_ESTIMATORS     = {best_cand['n_estimators']}")
-    print(f"SHRINKAGE_PARAM_XGB  = {best_cand['shrinkage_param']}")
+    print(f"XGB_LEARNING_RATE    = {best_cand['learning_rate']}")
+    print(f"SHRINKAGE_PARAM_XGB  = {shrink_fixed}  # fixed during this search")
     print("──────────────────────────────────────────────────────────────────")
 
 

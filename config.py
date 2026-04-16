@@ -135,11 +135,11 @@ SAVE_ADAPTIVE_T = False
 # =============================================================================
 # XGBoost defaults (offline feature pipelines)
 # =============================================================================
-XGB_MAX_DEPTH        = 5
-XGB_N_ESTIMATORS     = 300
+XGB_MAX_DEPTH        = 6
+XGB_N_ESTIMATORS     = 100
 # Optional overrides — uncomment and set to override XGBoost package defaults.
 # Absent keys cause XGBoost defaults to apply automatically.
-XGB_LEARNING_RATE    = 0.03
+XGB_LEARNING_RATE    = 0.05
 # XGB_SUBSAMPLE        = 1.0     # XGB default
 # XGB_COLSAMPLE_BYTREE = 1.0     # XGB default
 # XGB_REG_ALPHA        = 0.0     # XGB default
