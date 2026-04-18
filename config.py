@@ -29,7 +29,7 @@ TOTAL_TRIALS = 20
 TOTAL_TRIALS_ERRP = 45
 MAX_REPEATS = 3
 N_SPLITS = 5        # KFold splits — used when CV_MODE == "kfold"
-CV_MODE = "kfold"   # "kfold" | "session_loo"
+CV_MODE = "session_loo"   # "kfold" | "session_loo"
 # session_loo: GroupKFold respecting session boundaries.  N_LOO_SPLITS caps the
 # number of folds so that large datasets (e.g. 21 sessions) don't explode.
 # When n_sessions <= N_LOO_SPLITS the split degenerates to true leave-one-session-out.
@@ -136,7 +136,7 @@ SAVE_ADAPTIVE_T = False
 # XGBoost defaults (offline feature pipelines)
 # =============================================================================
 XGB_MAX_DEPTH        = 6
-XGB_N_ESTIMATORS     = 100
+XGB_N_ESTIMATORS     = 300
 # Optional overrides — uncomment and set to override XGBoost package defaults.
 # Absent keys cause XGBoost defaults to apply automatically.
 XGB_LEARNING_RATE    = 0.05
