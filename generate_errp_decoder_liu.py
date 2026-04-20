@@ -33,21 +33,85 @@ perceptual skills to detect errors. bioRxiv. doi:10.1101/2025.04.26.650792
 """
 
 import argparse
+import ctypes
+import ctypes.util
+import gc
 import os
 import pickle
+import resource
 import sys
 
 import numpy as np
 from sklearn.metrics import roc_auc_score, accuracy_score
 
+
+# glibc malloc_trim(0) nudges malloc to return freed arenas to the OS.
+# gc.collect() alone frees Python objects but keeps the pages in the
+# glibc arena cache — on a 16 GiB box with 32 LOSO folds that cache can
+# grow past the swap ceiling and OOM mid-loop even though Python's live
+# working set is small. We call this between folds.
+_LIBC = None
+try:
+    _libc_path = ctypes.util.find_library("c")
+    if _libc_path:
+        _LIBC = ctypes.CDLL(_libc_path)
+except OSError:
+    _LIBC = None
+
+
+def _malloc_trim() -> None:
+    if _LIBC is not None and hasattr(_LIBC, "malloc_trim"):
+        try:
+            _LIBC.malloc_trim(0)
+        except Exception:
+            pass
+
+
+def _rss_gb() -> float:
+    """Current RSS in GiB via /proc/self/status (Linux-only; falls back to getrusage)."""
+    try:
+        with open("/proc/self/status", "r") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    kb = float(line.split()[1])
+                    return kb / (1024.0 * 1024.0)
+    except Exception:
+        pass
+    ru = resource.getrusage(resource.RUSAGE_SELF)
+    return ru.ru_maxrss / (1024.0 * 1024.0)
+
 import config
 import Generate_Riemannian_adaptive as base
 from generate_errp_decoder import _build_classifier, _fit_xdawn_covs
+from Utils.errp_alignment import apply_ea, fit_ea_reference
+from Utils.errp_liu_pipeline import LiuCCAFeaturizer
 from Utils.liu_data_loader import (
     HARMONY_ERRP_CHANNELS,
     LIU_FS,
     load_liu_epochs,
 )
+
+
+_XDAWN_BACKENDS = {"xdawn_mdm", "xdawn_lr", "xdawn_xgb"}
+_CCA_BACKENDS   = {"liu_cca_lda", "liu_cca_xgb"}
+
+
+def _fit_feature_extractor(backend: str, X: np.ndarray, y: np.ndarray, n_filters: int):
+    """Fit the spatial-filter/featurizer stage for the chosen backend."""
+    if backend in _XDAWN_BACKENDS:
+        return _fit_xdawn_covs(X, y, n_filters)
+    if backend in _CCA_BACKENDS:
+        return LiuCCAFeaturizer(n_components=3, fs=LIU_FS).fit(X, y)
+    raise ValueError(f"Unknown backend: {backend!r}")
+
+
+def _bundle_feature_key(backend: str) -> str:
+    """Top-level bundle key under which the fitted feature extractor is saved."""
+    if backend in _XDAWN_BACKENDS:
+        return "xdawn"
+    if backend in _CCA_BACKENDS:
+        return "cca_featurizer"
+    raise ValueError(f"Unknown backend: {backend!r}")
 
 # =============================================================================
 # Epoch window (matching config and our existing pipeline convention)
@@ -57,13 +121,13 @@ TMAX = float(getattr(config, "ERRP_EPOCH_TMAX", 0.8))   # 0.8 s
 N_FILTERS = int(getattr(config, "ERRP_XDAWN_N_FILTERS", 4))
 TARGET_AMBIG = float(getattr(config, "ERRP_TARGET_AMBIG", 0.20))
 
-# Pre-stimulus baseline window for offline correction.
-_BASELINE_TMIN = -0.200  # s
-_BASELINE_TMAX = 0.0     # s
+# Pre-stimulus baseline window for offline correction (sourced from config).
+_BASELINE_TMIN = float(getattr(config, "ERRP_BASELINE_TMIN", -0.200))  # s
+_BASELINE_TMAX = float(getattr(config, "ERRP_BASELINE_TMAX",  0.0))    # s
 
 
 def _baseline_correct(X: np.ndarray, time_s: np.ndarray) -> np.ndarray:
-    """Subtract per-epoch mean of [−200, 0] ms from every epoch."""
+    """Subtract per-epoch mean of [ERRP_BASELINE_TMIN, ERRP_BASELINE_TMAX] s."""
     mask = (time_s >= _BASELINE_TMIN) & (time_s <= _BASELINE_TMAX)
     return X - X[:, :, mask].mean(axis=2, keepdims=True)
 
@@ -94,6 +158,24 @@ def _crop_epoch_window(X: np.ndarray, time_s: np.ndarray,
 # LOSO cross-validation
 # =============================================================================
 
+def _apply_ea_per_subject(X: np.ndarray, sub_id: np.ndarray, subjects: list[int]) -> np.ndarray:
+    """
+    Per-subject Euclidean Alignment, in place by subject group.
+
+    Mutates X directly — callers pass either a fresh fancy-index copy
+    (X_tr/X_te inside the LOSO loop) or the pooled X at the final-fit
+    step (which is not reused afterwards). Avoiding an extra full-size
+    copy here saves several GiB at peak on 32-subject pools.
+    """
+    for s in subjects:
+        mask = (sub_id == s)
+        if not mask.any():
+            continue
+        ref = fit_ea_reference(X[mask])
+        X[mask] = apply_ea(X[mask], ref)
+    return X
+
+
 def train_loso(
     X: np.ndarray,
     y: np.ndarray,
@@ -102,6 +184,7 @@ def train_loso(
     backend: str,
     n_filters: int,
     target_ambig: float,
+    use_ea: bool = True,
 ) -> dict:
     """
     Leave-one-subject-out cross-validation.
@@ -113,13 +196,18 @@ def train_loso(
     Returns a complete model bundle ready for pickle serialisation.
     """
     n_epochs, n_ch, n_samples = X.shape
-    print(f"\n  ErrP Decoder — LOSO CV ({backend}, xDAWN n_filters={n_filters})")
+    print(f"\n  ErrP Decoder — LOSO CV ({backend}, xDAWN n_filters={n_filters}, EA={'on' if use_ea else 'off'})")
     print(f"  Epochs: {n_epochs}  error={int(y.sum())}  correct={int((y==0).sum())}")
     print(f"  Shape:  {n_ch} ch × {n_samples} samples  ({n_samples/LIU_FS*1000:.0f} ms)")
-    print(f"  Subjects: {subjects}\n")
+    print(f"  Subjects: {subjects}")
+    print(f"  RSS at LOSO start: {_rss_gb():.2f} GiB\n")
 
     accs, aucs, t_lows, t_highs = [], [], [], []
     subject_results = []
+    # Per-fold held-out predictions, keyed by held-out subject ID.  The
+    # ensemble in Phase 8 averages these across heads — saving them here
+    # removes the need to retrain three heads inside the ensemble script.
+    cv_predictions: dict[int, dict] = {}
 
     for held_out in subjects:
         te_mask = sub_id == held_out
@@ -127,19 +215,34 @@ def train_loso(
 
         X_tr, y_tr = X[tr_mask], y[tr_mask]
         X_te, y_te = X[te_mask], y[te_mask]
+        sub_id_tr  = sub_id[tr_mask]
+        train_subjects = [s for s in subjects if s != held_out]
 
-        # Fit xDAWN on training subjects only.
-        xdc = _fit_xdawn_covs(X_tr, y_tr, n_filters)
-        C_tr = xdc.transform(X_tr)
-        C_te = xdc.transform(X_te)
+        # Per-subject Euclidean Alignment.  Each training subject's epochs
+        # are whitened by their own mean covariance; the held-out subject is
+        # whitened from its unlabelled epochs (no use of y_te).  This is the
+        # exact LOSO simulation of the runtime EA bootstrap — at session
+        # start the new subject's reference comes from a 30–60 s neutral
+        # recording.
+        if use_ea:
+            X_tr = _apply_ea_per_subject(X_tr, sub_id_tr, train_subjects)
+            X_te = _apply_ea_per_subject(X_te, np.full(len(X_te), held_out), [held_out])
 
-        # Fit classifier.
-        clf = _build_classifier(backend)
-        clf.fit(C_tr, y_tr)
+        # Fit spatial-filter/featurizer stage on training subjects only.
+        # xdawn_* backends return an XdawnCovariances; liu_cca_* backends
+        # return a fitted LiuCCAFeaturizer.  Both expose .transform(X).
+        feat = _fit_feature_extractor(backend, X_tr, y_tr, n_filters)
+        F_tr = feat.transform(X_tr)
+        F_te = feat.transform(X_te)
+
+        # Fit classifier.  xgb-based backends need sub_id_tr for their
+        # grouped calibration inner CV; the other backends ignore the kwarg.
+        clf = _build_classifier(backend, sub_id_tr=sub_id_tr)
+        clf.fit(F_tr, y_tr)
 
         # Probabilities (column 1 = P(error)).
-        prob_tr = clf.predict_proba(C_tr)[:, 1]
-        prob_te = clf.predict_proba(C_te)[:, 1]
+        prob_tr = clf.predict_proba(F_tr)[:, 1]
+        prob_te = clf.predict_proba(F_te)[:, 1]
 
         # Argmax accuracy and AUC on held-out subject.
         y_pred = (prob_te >= 0.5).astype(int)
@@ -158,8 +261,24 @@ def train_loso(
         t_highs.append(th)
 
         subject_results.append((held_out, acc, auc, tl, th, te_mask.sum()))
+
+        # Persist held-out predictions for ensemble aggregation (Phase 8).
+        cv_predictions[int(held_out)] = {
+            "y_true":     y_te.astype(np.int8).copy(),
+            "prob_error": prob_te.astype(np.float32).copy(),
+        }
+
+        # Free per-fold arrays — without this the process OOMs around
+        # fold 10 of 16 at 14 channels due to non-returning malloc arenas
+        # in pyriemann's xDAWN+OAS path.
+        del feat, F_tr, F_te, clf, X_tr, X_te, y_tr, y_te, prob_tr, prob_te
+        del sub_id_tr, train_subjects
+        gc.collect()
+        _malloc_trim()
+
+        rss = _rss_gb()
         print(f"  LOSO sub {held_out:2d}: acc={acc:.4f}  AUC={auc:.4f}  "
-              f"tl={tl:.3f}  th={th:.3f}  n={te_mask.sum()}")
+              f"tl={tl:.3f}  th={th:.3f}  n={te_mask.sum():4d}  rss={rss:.2f}G")
 
     tl_median = float(np.median(t_lows))
     th_median = float(np.median(t_highs))
@@ -173,36 +292,53 @@ def train_loso(
     print(f"  Median th     : {th_median:.3f}")
     print(f"  ─────────────────────────────────────────────────────────\n")
 
-    # Final model: refit on ALL subjects.
+    # Final model: refit on ALL subjects.  EA is applied per training
+    # subject before the feature-extractor fit so the operator the runtime
+    # applies (per-session EA → spatial filter → classifier) is mirrored
+    # end-to-end.
     print("  Fitting final model on all subjects … ", end="", flush=True)
-    xdc_final = _fit_xdawn_covs(X, y, n_filters)
-    C_all     = xdc_final.transform(X)
-    clf_final = _build_classifier(backend)
-    clf_final.fit(C_all, y)
+    if use_ea:
+        X_final = _apply_ea_per_subject(X, sub_id, subjects)
+    else:
+        X_final = X
+    feat_final = _fit_feature_extractor(backend, X_final, y, n_filters)
+    F_all = feat_final.transform(X_final)
+    clf_final = _build_classifier(backend, sub_id_tr=sub_id)
+    clf_final.fit(F_all, y)
     print("done.")
 
-    return {
-        "xdawn":       xdc_final,
+    feature_spec = {
+        "tmin":          TMIN,
+        "tmax":          TMAX,
+        "n_filters":     n_filters,
+        "ea_alignment":  bool(use_ea),
+        "epoch_samples": n_samples,
+        # No XDF marker codes — this is an external dataset.
+        # The bundle is used as a generic decoder; error/correct codes
+        # are not needed by classify_errp_real_time().
+        "error_codes":   [],
+        "correct_codes": [],
+    }
+    if backend in _CCA_BACKENDS:
+        feature_spec["psd_bin_idx"] = feat_final.psd_bin_idx_.tolist()
+        feature_spec["psd_freqs"]   = list(feat_final.psd_freqs)
+        feature_spec["cca_n_components"] = feat_final.n_components
+        feature_spec["cca_temporal_samples"] = feat_final.n_temporal_
+
+    bundle = {
+        _bundle_feature_key(backend): feat_final,
         "classifier":  clf_final,
         "backend":     backend,
         "tl_star":     tl_median,
         "th_star":     th_median,
         "roc_auc":     mean_auc,
         "cv_mean_acc": mean_acc,
-        "feature_spec": {
-            "tmin":          TMIN,
-            "tmax":          TMAX,
-            "n_filters":     n_filters,
-            "epoch_samples": n_samples,
-            # No XDF marker codes — this is an external dataset.
-            # The bundle is used as a generic decoder; error/correct codes
-            # are not needed by classify_errp_real_time().
-            "error_codes":   [],
-            "correct_codes": [],
-        },
+        "feature_spec": feature_spec,
         "label_to_bin": {1: 1, 0: 0},
         "bin_to_label": {1: 1, 0: 0},
-    }, subject_results
+        "cv_predictions": cv_predictions,
+    }
+    return bundle, subject_results
 
 
 # =============================================================================
@@ -218,8 +354,12 @@ def parse_args():
                         "held out together in LOSO, so the generalisation estimate remains "
                         "subject-level (not condition-level).")
     p.add_argument("--backend", default="xdawn_mdm",
-                   choices=["xdawn_mdm", "xdawn_lr"],
-                   help="Classifier backend (default: xdawn_mdm)")
+                   choices=["xdawn_mdm", "xdawn_lr", "xdawn_xgb",
+                            "liu_cca_lda", "liu_cca_xgb"],
+                   help="Classifier backend (default: xdawn_mdm). "
+                        "xdawn_* runs xDAWN+classifier on augmented covariances; "
+                        "liu_cca_* runs Liu et al. 2025 CCA+handcrafted features "
+                        "with a diagonal LDA or calibrated XGB head.")
     p.add_argument("--channels", default=None,
                    help="Comma-separated channel names to use. "
                         f"Default: Harmony ErrP channels ({HARMONY_ERRP_CHANNELS})")
@@ -237,6 +377,18 @@ def parse_args():
     p.add_argument("--out", default="models/errp_liu_generic.pkl",
                    help="Output path for the model bundle pickle "
                         "(default: models/errp_liu_generic.pkl)")
+    p.add_argument("--car", dest="car", action="store_true", default=None,
+                   help="Apply Common Average Reference across the selected "
+                        "channels after loading and before baseline correction. "
+                        "Default: on (follow config.ERRP_CAR_REREFERENCE).")
+    p.add_argument("--no-car", dest="car", action="store_false",
+                   help="Disable CAR (for A/B testing against the raw-reference baseline).")
+    p.add_argument("--ea", dest="ea", action="store_true", default=True,
+                   help="Apply per-subject Euclidean Alignment inside the LOSO loop "
+                        "(default: on). The held-out subject is aligned from its own "
+                        "unlabelled epochs, simulating the runtime EA bootstrap.")
+    p.add_argument("--no-ea", dest="ea", action="store_false",
+                   help="Disable EA (for A/B testing against the un-aligned baseline).")
     return p.parse_args()
 
 
@@ -254,36 +406,70 @@ def main():
     if args.subjects:
         subjects = [int(s.strip()) for s in args.subjects.split(",")]
 
-    print(f"\nChannels: {channel_names}")
+    # Resolve CAR toggle: CLI wins, otherwise follow config.
+    if args.car is None:
+        car = bool(int(getattr(config, "ERRP_CAR_REREFERENCE", 1)))
+    else:
+        car = bool(args.car)
 
-    # Load one or more .mat files and concatenate. When multiple files are given,
-    # subject IDs are shared (same 16 subjects across both BCI and control datasets),
-    # so LOSO holds out all epochs for a given subject ID regardless of which file
-    # they came from — no extra bookkeeping needed.
+    print(f"\nChannels: {channel_names}")
+    print(f"CAR:      {'on' if car else 'off'}")
+    print(f"EA:       {'on' if args.ea else 'off'}")
+
+    # Load one or more .mat files and concatenate.  The two Liu .mat files
+    # contain non-overlapping cohorts (Experiment 1 / control: 16 subjects;
+    # Experiment 2 / BCI: 16 different subjects — Liu et al. 2025 p. 4).  To
+    # keep LOSO honest we must map per-file row indices to globally unique IDs
+    # so a single fold holds out exactly one person.  We do this by offsetting
+    # each file's sub_id by the cumulative max ID seen so far.  Result: 32
+    # distinct subjects (when both files are passed), 32-fold LOSO with no
+    # identity leak.
     Xs, ys, mags, sub_ids = [], [], [], []
-    loaded_subjects = None
+    loaded_subjects: list[int] = []
+    id_offset = 0
     for mat_path in args.mat:
         print(f"Loading: {mat_path}")
         Xi, yi, magi, sub_id_i, time_s, subs_i = load_liu_epochs(
             mat_path,
             subjects=subjects,
             channel_names=channel_names,
+            car=car,
         )
         Xi = _baseline_correct(Xi, time_s)
         Xi, epoch_samples = _crop_epoch_window(Xi, time_s, args.tmin, args.tmax)
+        # Detach the cropped slice from its (much larger) full-window parent
+        # so the pre-crop array can be garbage-collected before the next file.
+        # Downcast to float32 here — the signal is already 1–10 Hz bandpassed,
+        # the downstream xDAWN/Riemannian operators use eigendecompositions
+        # with shrinkage floors, and the 2× memory saving is the difference
+        # between the 32-subject pooled LOSO fitting in a 16 GiB box and
+        # tripping the OOM killer at fold 1 of 32.
+        Xi = np.ascontiguousarray(Xi, dtype=np.float32)
+
+        sub_id_i_global = sub_id_i + id_offset
+        subs_i_global   = [s + id_offset for s in subs_i]
+        loaded_subjects.extend(subs_i_global)
+        id_offset += max(subs_i)
+
         Xs.append(Xi)
         ys.append(yi)
         mags.append(magi)
-        sub_ids.append(sub_id_i)
-        if loaded_subjects is None:
-            loaded_subjects = subs_i
-        print(f"  → {Xi.shape[0]} epochs after crop")
+        sub_ids.append(sub_id_i_global)
+        print(f"  → {Xi.shape[0]} epochs after crop  "
+              f"(global subject IDs {subs_i_global[0]}-{subs_i_global[-1]})")
 
     X      = np.concatenate(Xs,      axis=0)
     y      = np.concatenate(ys)
     sub_id = np.concatenate(sub_ids)
 
-    print(f"\nPooled: shape={X.shape}  "
+    # Drop the per-file lists — after concatenation each one still holds a
+    # full copy of that cohort's epochs, doubling the pooled footprint.
+    Xs.clear(); ys.clear(); sub_ids.clear(); mags.clear()
+    del Xs, ys, sub_ids, mags
+    gc.collect()
+
+    print(f"\nPooled: shape={X.shape}  dtype={X.dtype}  "
+          f"subjects={len(loaded_subjects)}  "
           f"window=[{args.tmin}, {args.tmax}] s  "
           f"({epoch_samples} samples)")
 
@@ -292,6 +478,7 @@ def main():
         backend=args.backend,
         n_filters=args.n_filters,
         target_ambig=args.target_ambig,
+        use_ea=bool(args.ea),
     )
 
     # Per-backend comparison if both are requested is deferred — run twice with

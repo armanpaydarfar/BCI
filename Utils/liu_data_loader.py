@@ -21,6 +21,8 @@ from __future__ import annotations
 import numpy as np
 import h5py
 
+from Utils.preprocessing import car_rereference as _car_rereference
+
 # =============================================================================
 # Channel layout (Liu et al. Methods, ANT Neuro eego system, 10-20 positions).
 # Index 0 = rotation_data[:, 0, :] in the mat file.
@@ -41,7 +43,14 @@ _CH_IDX: dict[str, int] = {name: i for i, name in enumerate(LIU_CHANNEL_NAMES)}
 
 # Harmony ErrP channel names (from config.ERRP_CHANNEL_NAMES).
 # Hard-coded here so the loader can operate without importing config.
-HARMONY_ERRP_CHANNELS: list[str] = ["F3", "Fz", "F4", "FC1", "FC2", "Cz"]
+# Must be kept in sync with config.ERRP_CHANNEL_NAMES.
+HARMONY_ERRP_CHANNELS: list[str] = [
+    "F3", "Fz", "F4", "FC1", "FC2",
+    "C3", "Cz", "C4",
+    "CP1", "CP2",
+    "Pz", "POz",
+    "O1", "O2",
+]
 
 # Sampling rate (confirmed from params.fsamp in the mat file).
 LIU_FS: int = 512
@@ -54,6 +63,7 @@ def load_liu_epochs(
     mat_path: str,
     subjects: list[int] | None = None,
     channel_names: list[str] | None = None,
+    car: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[int]]:
     """
     Load epochs from a Liu et al. .mat file.
@@ -66,6 +76,10 @@ def load_liu_epochs(
         1-based subject indices to load (e.g. [1, 2, 3]).  None = all subjects.
     channel_names : list[str] | None
         Channel names to retain (must be in LIU_CHANNEL_NAMES).  None = all 32.
+    car : bool
+        If True (default), apply Common Average Reference across the retained
+        channels after selection.  Matches the online Harmony path, which
+        CAR-rereferences its 14-channel ErrP subset before spatial filtering.
 
     Returns
     -------
@@ -113,22 +127,36 @@ def load_liu_epochs(
                 )
             ch_idx = [_CH_IDX[c] for c in channel_names]
 
-        Xs, ys, mags, sids = [], [], [], []
-        for s in subjects:
+        # First pass: read per-subject epoch counts so we can preallocate a
+        # single contiguous output array.  Accumulating into a list of
+        # per-subject arrays and concatenating at the end doubles peak RAM,
+        # which OOMs a 16 GB box at 14 channels × 16 subjects.
+        sizes = [int(f[struct["label"][s - 1, 0]].size) for s in subjects]
+        total = int(sum(sizes))
+        n_ch = len(ch_idx)
+        n_samples = f[struct["rotation_data"][subjects[0] - 1, 0]].shape[-1]
+
+        X      = np.empty((total, n_ch, n_samples), dtype=np.float64)
+        y      = np.empty(total, dtype=int)
+        mag    = np.empty(total, dtype=np.float64)
+        sub_id = np.empty(total, dtype=int)
+
+        offset = 0
+        for s, n in zip(subjects, sizes):
             row = s - 1
             eeg = f[struct["rotation_data"][row, 0]][()]   # (epochs, 32, 768)
-            lbl = f[struct["label"][row, 0]][()].flatten().astype(int)
-            mgn = f[struct["magnitude"][row, 0]][()].flatten()
+            X[offset:offset + n] = eeg[:, ch_idx, :]
+            del eeg
+            y[offset:offset + n] = f[struct["label"][row, 0]][()].flatten().astype(int)
+            mag[offset:offset + n] = f[struct["magnitude"][row, 0]][()].flatten()
+            sub_id[offset:offset + n] = s
+            offset += n
 
-            Xs.append(eeg[:, ch_idx, :])
-            ys.append(lbl)
-            mags.append(mgn)
-            sids.append(np.full(len(lbl), s, dtype=int))
-
-    X      = np.concatenate(Xs,    axis=0).astype(np.float64)
-    y      = np.concatenate(ys)
-    mag    = np.concatenate(mags)
-    sub_id = np.concatenate(sids)
+    # Common Average Reference across the retained channels.  Applied after
+    # channel selection so the reference matches the online footprint rather
+    # than the full 32-channel cap.
+    if car:
+        X = _car_rereference(X)
 
     # Rebuild time axis for the returned channel count.
     time_s = np.arange(-255, 513) / LIU_FS

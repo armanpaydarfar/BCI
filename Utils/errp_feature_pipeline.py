@@ -40,6 +40,7 @@ from Utils.preprocessing import (
     select_channels,
     initialize_filter_bank,
     apply_streaming_filters,
+    car_rereference,
 )
 
 # ---------------------------------------------------------------------------
@@ -229,6 +230,13 @@ def load_and_preprocess_errp_xdf(
 
     ch_names = current_ch
 
+    # --- Common Average Reference across the ErrP subset ---
+    # Applied before the causal bandpass so that the offline path matches the
+    # online EEGStreamState exactly (both operate on the rereferenced subset).
+    # Gated on config.ERRP_CAR_REREFERENCE for A/B testing; on by default.
+    if int(getattr(config, "ERRP_CAR_REREFERENCE", 1)):
+        eeg_data = car_rereference(eeg_data)
+
     # --- Apply ErrP bandpass + notch (causal streaming filter) ---
     lowcut  = float(getattr(config, "LOWCUT_ERRP",  1.0))
     highcut = float(getattr(config, "HIGHCUT_ERRP", 10.0))
@@ -247,14 +255,37 @@ def load_and_preprocess_errp_xdf(
         chunk_f, filter_state = apply_streaming_filters(eeg_data[:, s:e], fb, filter_state)
         filtered[:, s:e] = chunk_f
 
-    # --- Segment epochs ---
-    X, y, stats = segment_errp_epochs(
+    # --- Segment epochs (extended to include the pre-event baseline window) ---
+    # We segment a wider window [baseline_tmin, tmax], use the pre-event slice
+    # for per-epoch baseline subtraction, then crop down to the user-requested
+    # [tmin, tmax].  Matches the classical ERP baseline used by the Liu offline
+    # path and the online causal helper, so all three pipelines see the same
+    # signal.  Artifact rejection is applied on the wide window so that
+    # baseline-only artifacts also reject the trial.
+    baseline_tmin = float(getattr(config, "ERRP_BASELINE_TMIN", -0.200))
+    baseline_tmax = float(getattr(config, "ERRP_BASELINE_TMAX",  0.0))
+    seg_tmin = min(tmin, baseline_tmin)
+
+    X_wide, y, stats = segment_errp_epochs(
         filtered, eeg_timestamps,
         marker_ts, marker_vals,
         error_codes, correct_codes,
-        tmin, tmax, config.FS,
+        seg_tmin, tmax, config.FS,
         artifact_thresh_uv=artifact_thresh_uv,
     )
+
+    if X_wide.shape[0] == 0:
+        return X_wide, y, ch_names, stats
+
+    # Time axis for the wide segment, then per-epoch baseline subtract + crop.
+    n_wide = X_wide.shape[2]
+    time_wide = seg_tmin + np.arange(n_wide) / float(config.FS)
+    base_mask = (time_wide >= baseline_tmin) & (time_wide <= baseline_tmax)
+    if base_mask.any():
+        X_wide = X_wide - X_wide[:, :, base_mask].mean(axis=2, keepdims=True)
+
+    crop_mask = (time_wide >= tmin) & (time_wide < tmin + (tmax - tmin))
+    X = X_wide[:, :, crop_mask]
 
     return X, y, ch_names, stats
 

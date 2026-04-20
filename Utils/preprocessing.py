@@ -56,6 +56,31 @@ def get_valid_channel_mask_and_metadata(eeg_data, channel_names, fs, drop_mastoi
 
 
 
+def car_rereference(X: np.ndarray) -> np.ndarray:
+    """Subtract the across-channel mean from every sample (Common Average Reference).
+
+    Brings recordings from different reference schemes (e.g. Liu data referenced
+    to Iz vs Harmony stream referenced to CPz) into a comparable frame before
+    spatial filtering.  CAR is linear and commutes with the downstream causal
+    bandpass; it is applied before filtering in the online path and is
+    equivalent when applied to already-filtered data offline.
+
+    Supports single-segment (n_channels, n_samples) and batched
+    (n_epochs, n_channels, n_samples) arrays.  Returns a new array with the
+    input dtype preserved; the input is not modified.
+    """
+    if X.ndim == 2:
+        ref = X.mean(axis=0, keepdims=True)
+    elif X.ndim == 3:
+        ref = X.mean(axis=1, keepdims=True)
+    else:
+        raise ValueError(
+            f"car_rereference expects 2-D (n_ch, n_samp) or 3-D "
+            f"(n_epochs, n_ch, n_samp) input, got shape {X.shape}"
+        )
+    return X - ref.astype(X.dtype, copy=False)
+
+
 def select_channels(raw, keep_channels=None):
     """
     Filters the MNE Raw object to keep only explicitly specified channels.

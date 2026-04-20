@@ -18,7 +18,7 @@ LOWCUT_ERRP = 1  # Hz
 HIGHCUT_ERRP = 10  # Hz
 FS = 512  # Sampling frequency (Hz)
 MOTOR_CHANNEL_NAMES = ['FC1','FC2','C3', 'Cz', 'C4', 'CP5', 'CP1', 'CP2', 'CP6', 'P7','P3', 'Pz', 'P4', 'P8', 'POz']
-ERRP_CHANNEL_NAMES = ['F3', 'Fz', 'F4', 'FC1', 'FC2', 'Cz']
+ERRP_CHANNEL_NAMES = ['F3', 'Fz', 'F4', 'FC1', 'FC2', 'C3', 'Cz', 'C4', 'CP1', 'CP2', 'Pz', 'POz', 'O1', 'O2']
 EOG_CHANNEL_NAMES = ['AUX1']  # List of EOG channel names to use
 # =============================================================================
 # Experiment design (trials, timing, trajectories)
@@ -285,6 +285,19 @@ ERRP_LR_C = 1.0
 # Artifact rejection threshold for ErrP epochs (µV, max_abs on 1-10 Hz filtered signal)
 # More generous than MI (80 vs 30 µV) because ErrP epochs are wider-band and lower-freq
 ERRP_ARTIFACT_MAX_ABS_UV = 80.0
+# Common Average Reference toggle for the ErrP path.  When enabled, the across-
+# channel mean of the ErrP subset is subtracted before the causal bandpass, both
+# offline (XDF + Liu loader) and online (EEGStreamState mode="errp").  Required
+# for cross-rig transfer because the Harmony and Liu caps use different physical
+# references (CPz vs Iz); CAR projects both into a common reference frame.
+ERRP_CAR_REREFERENCE = 1
+# Pre-event baseline correction window for the Riemannian head.  Per-epoch
+# mean over [ERRP_BASELINE_TMIN, ERRP_BASELINE_TMAX] s (relative to event
+# onset) is subtracted from each epoch before the post-event window is
+# cropped.  Matches the classical ERP baseline; applies offline (Liu loader
+# and Harmony XDF path) and online (EEGStreamState event-triggered helper).
+ERRP_BASELINE_TMIN = -0.200
+ERRP_BASELINE_TMAX = 0.0
 
 # =============================================================================
 # ErrP experiment paradigm (ExperimentDriver_ErrP.py)

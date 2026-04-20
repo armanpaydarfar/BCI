@@ -47,7 +47,7 @@ from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 subject = "CLIN_SUBJ_007"
 
 # ---- Single-session mode ----
-session = "S002ONLINE"
+session = "S003ONLINE"
 PROMPT_FOR_FILE_SELECTION = True
 
 # ---- Multi-session mode ----

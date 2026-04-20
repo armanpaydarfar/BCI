@@ -41,7 +41,7 @@ import seaborn as sns
 os.environ["NUMBA_DISABLE_CACHING"] = "1"
 os.environ["MNE_USE_NUMBA"] = "false"
 
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, GroupKFold
 from sklearn.metrics import (
     accuracy_score,
     roc_auc_score,
@@ -50,6 +50,7 @@ from sklearn.metrics import (
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
+from sklearn.calibration import CalibratedClassifierCV
 
 from pyriemann.estimation import XdawnCovariances
 from pyriemann.classification import MDM
@@ -86,8 +87,55 @@ CORRECT_LABEL  = 0   # binary: 0 = correct (no ErrP)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _build_classifier(backend: str):
-    """Return an unfitted classifier that operates on augmented covariance matrices."""
+def _build_xgb_classifier(sub_id_tr: np.ndarray | None = None):
+    """Calibrated XGB with subject-aware GroupKFold for the calibration inner CV.
+
+    Shared between `xdawn_xgb` (wraps in a TangentSpace pipeline) and
+    `liu_cca_xgb` (consumes the 72-dim CCA feature vector directly, no
+    TangentSpace).
+    """
+    from xgboost import XGBClassifier
+    cv_splits = None
+    if sub_id_tr is not None:
+        n_unique = len(np.unique(sub_id_tr))
+        n_splits = min(5, n_unique)
+        if n_splits >= 2:
+            cv_splits = list(GroupKFold(n_splits=n_splits).split(
+                np.zeros((len(sub_id_tr), 1)),
+                groups=sub_id_tr,
+            ))
+    base = XGBClassifier(
+        max_depth=int(getattr(config, "ERRP_XGB_MAX_DEPTH", 5)),
+        n_estimators=int(getattr(config, "ERRP_XGB_N_ESTIMATORS", 300)),
+        learning_rate=float(getattr(config, "ERRP_XGB_LEARNING_RATE", 0.05)),
+        subsample=float(getattr(config, "ERRP_XGB_SUBSAMPLE", 0.8)),
+        colsample_bytree=float(getattr(config, "ERRP_XGB_COLSAMPLE_BYTREE", 0.8)),
+        reg_lambda=float(getattr(config, "ERRP_XGB_REG_LAMBDA", 1.0)),
+        tree_method="hist",
+        n_jobs=1,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        random_state=42,
+    )
+    if cv_splits is not None:
+        return CalibratedClassifierCV(base, method="isotonic", cv=cv_splits)
+    # Too few subjects for grouped calibration — fall back to the raw XGB.
+    # Smoke-test affordance only; in real LOSO this branch is never taken.
+    return base
+
+
+def _build_classifier(backend: str, sub_id_tr: np.ndarray | None = None):
+    """Return an unfitted classifier for the chosen backend.
+
+    Input shape depends on backend family:
+      - xdawn_*   : augmented covariance matrices from XdawnCovariances.transform
+      - liu_cca_* : 72-dim feature vectors from LiuCCAFeaturizer.transform
+
+    For backends that need subject-aware calibration (xdawn_xgb, liu_cca_xgb),
+    pass `sub_id_tr` so the inner CalibratedClassifierCV uses GroupKFold
+    rather than StratifiedKFold — this keeps subjects from leaking into both
+    the model fit and the calibration fit. Other backends ignore the kwarg.
+    """
     if backend == "xdawn_mdm":
         return MDM(metric="riemann")
     if backend == "xdawn_lr":
@@ -100,12 +148,42 @@ def _build_classifier(backend: str):
                 random_state=42,
             )),
         ])
-    raise ValueError(f"Unknown ERRP_DECODER_BACKEND: {backend!r}. Choose 'xdawn_mdm' or 'xdawn_lr'.")
+    if backend == "xdawn_xgb":
+        return Pipeline([
+            ("ts", TangentSpace(metric="riemann")),
+            ("xgb", _build_xgb_classifier(sub_id_tr=sub_id_tr)),
+        ])
+    if backend == "liu_cca_lda":
+        from Utils.errp_liu_pipeline import DiagonalLDA
+        return DiagonalLDA()
+    if backend == "liu_cca_xgb":
+        # Already-flat 72-dim features; no TangentSpace wrapper.
+        return _build_xgb_classifier(sub_id_tr=sub_id_tr)
+    raise ValueError(
+        f"Unknown ERRP_DECODER_BACKEND: {backend!r}. "
+        f"Choose 'xdawn_mdm', 'xdawn_lr', 'xdawn_xgb', "
+        f"'liu_cca_lda', or 'liu_cca_xgb'."
+    )
 
 
 def _fit_xdawn_covs(X_epochs: np.ndarray, y: np.ndarray, n_filters: int) -> XdawnCovariances:
-    """Fit XdawnCovariances on training epochs."""
-    xdc = XdawnCovariances(nfilter=n_filters, estimator="lwf")
+    """Fit XdawnCovariances on training epochs.
+
+    Both the inner xDAWN covariance (used for the generalised eigenproblem)
+    and the outer augmented covariance are estimated with LedoitWolf
+    shrinkage.  LWF on the inner estimator is required whenever the epoch
+    channel covariance can be rank-deficient (e.g. after Common Average
+    Reference), since pyriemann's default "scm" fails `eigh(C, Cx)` with a
+    non-PD B.  OAS is not strong enough at float32 for the pooled Liu
+    cohort: without the per-subject Euclidean Alignment to implicitly
+    regularise the CAR null direction, the pooled Cx tripped `eigh` at
+    fold 5/32 of the --no-ea A/B run (2026-04-19).
+    """
+    xdc = XdawnCovariances(
+        nfilter=n_filters,
+        estimator="lwf",
+        xdawn_estimator="lwf",
+    )
     xdc.fit(X_epochs, y)
     return xdc
 
