@@ -1010,9 +1010,23 @@ def classify_errp_real_time(eeg_state, event_ts: float | None = None) -> tuple[f
     spec          = errp_model.get("feature_spec", {})
     backend       = str(errp_model.get("backend", "xdawn_mdm"))
     fs            = float(config.FS)
-    tmin          = float(spec.get("tmin", getattr(config, "ERRP_EPOCH_TMIN", 0.0)))
-    tmax          = float(spec.get("tmax", getattr(config, "ERRP_EPOCH_TMAX", 0.8)))
-    epoch_samples = int(spec.get("epoch_samples", int(round((tmax - tmin) * fs))))
+    # Config is the source of truth for the epoch window.  The bundle's
+    # feature_spec records the window it was trained with; we require them to
+    # agree so a bundle trained at one window cannot be silently deployed
+    # against a config at a different window.
+    tmin = float(getattr(config, "ERRP_EPOCH_TMIN"))
+    tmax = float(getattr(config, "ERRP_EPOCH_TMAX"))
+    if "tmin" in spec or "tmax" in spec:
+        spec_tmin = float(spec.get("tmin", tmin))
+        spec_tmax = float(spec.get("tmax", tmax))
+        if (spec_tmin, spec_tmax) != (tmin, tmax):
+            raise ValueError(
+                f"ErrP bundle feature_spec window ({spec_tmin}, {spec_tmax}) s "
+                f"disagrees with config ERRP_EPOCH_TMIN/TMAX ({tmin}, {tmax}) s. "
+                f"Either retrain the bundle at the config window or update config "
+                f"to match the bundle."
+            )
+    epoch_samples = int(round((tmax - tmin) * fs))
     tl            = float(errp_model.get("tl_star", 0.3))
     th            = float(errp_model.get("th_star", 0.7))
     ea_required   = bool(spec.get("ea_alignment", False))

@@ -758,6 +758,7 @@ class ControlPanel(QMainWindow):
 
         self._populate_training_script_combo()
         self._build_runtime_config_tab(tabs)
+        self._build_errp_config_tab(tabs)
 
         # Initial serial refresh
         self.on_serial_refresh()
@@ -814,7 +815,6 @@ class ControlPanel(QMainWindow):
         self.rc_update_move = QCheckBox("UPDATE_DURING_MOVE")
         self.rc_laplacian = QCheckBox("SURFACE_LAPLACIAN_TOGGLE")
         self.rc_sel_motor = QCheckBox("SELECT_MOTOR_CHANNELS")
-        self.rc_sel_errp = QCheckBox("SELECT_ERRP_CHANNELS")
         self.rc_xgb_beta = QCheckBox("XGB_USE_COV_BETA (enable beta-band covariance features)")
         self.rc_total_trials = QSpinBox()
         self.rc_total_trials.setRange(1, 500)
@@ -843,7 +843,6 @@ class ControlPanel(QMainWindow):
         form.addRow(self.rc_update_move)
         form.addRow(self.rc_laplacian)
         form.addRow(self.rc_sel_motor)
-        form.addRow(self.rc_sel_errp)
         form.addRow(self.rc_xgb_beta)
         form.addRow("TOTAL_TRIALS", self.rc_total_trials)
         form.addRow("SHAPE_MAX", self.rc_shape_max)
@@ -886,7 +885,6 @@ class ControlPanel(QMainWindow):
         self.rc_update_move.setChecked(bool(_read_01_key("UPDATE_DURING_MOVE", 0)))
         self.rc_laplacian.setChecked(bool(_read_01_key("SURFACE_LAPLACIAN_TOGGLE", 1)))
         self.rc_sel_motor.setChecked(bool(_read_01_key("SELECT_MOTOR_CHANNELS", 1)))
-        self.rc_sel_errp.setChecked(bool(_read_01_key("SELECT_ERRP_CHANNELS", 0)))
         self.rc_xgb_beta.setChecked(bool(_read_01_key("XGB_USE_COV_BETA", 0)))
         self.rc_total_trials.setValue(_read_int_key("TOTAL_TRIALS", 10))
         self.rc_shape_max.setValue(_read_float_key("SHAPE_MAX", 0.7))
@@ -916,7 +914,6 @@ class ControlPanel(QMainWindow):
             _write_assign_rhs("UPDATE_DURING_MOVE", "1" if self.rc_update_move.isChecked() else "0")
             _write_assign_rhs("SURFACE_LAPLACIAN_TOGGLE", "1" if self.rc_laplacian.isChecked() else "0")
             _write_assign_rhs("SELECT_MOTOR_CHANNELS", "1" if self.rc_sel_motor.isChecked() else "0")
-            _write_assign_rhs("SELECT_ERRP_CHANNELS", "1" if self.rc_sel_errp.isChecked() else "0")
             _write_assign_rhs("XGB_USE_COV_BETA", "1" if self.rc_xgb_beta.isChecked() else "0")
             _write_assign_rhs("TOTAL_TRIALS", str(self.rc_total_trials.value()))
             _write_assign_rhs("SHAPE_MAX", _fmtf(self.rc_shape_max.value()))
@@ -930,6 +927,91 @@ class ControlPanel(QMainWindow):
             self, "Runtime config",
             "config.py updated. Restart experiment driver / marker stream if a process "
             "was already running so it reloads settings.",
+        )
+
+    def _build_errp_config_tab(self, tabs: QTabWidget):
+        rtc = QWidget()
+        tabs.addTab(rtc, "ErrP config")
+        outer = QVBoxLayout(rtc)
+        outer.addWidget(QLabel(
+            "<b>Edits ErrP-specific keys in config.py.</b> The bundle on disk at "
+            "<code>DATA_DIR/sub-&lt;SUBJECT&gt;/models/sub-&lt;SUBJECT&gt;_errp_&lt;BACKEND&gt;.pkl</code> "
+            "must exist for the selected backend. Runtime asserts the bundle's "
+            "feature_spec matches config; mismatch raises."
+        ))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        form = QFormLayout(inner)
+
+        self.errp_enable = QCheckBox("ERRP_DECODER_ENABLE (ErrP gating active)")
+        self.errp_backend = QComboBox()
+        self.errp_backend.addItems(["liu_cca_xgb", "xdawn_xgb"])
+        self.errp_sel_channels = QCheckBox("SELECT_ERRP_CHANNELS")
+        self.errp_ea_bootstrap_sec = QDoubleSpinBox()
+        self.errp_ea_bootstrap_sec.setRange(1.0, 300.0)
+        self.errp_ea_bootstrap_sec.setSingleStep(1.0)
+        self.errp_ea_bootstrap_sec.setDecimals(1)
+        self.errp_ea_min_epochs = QSpinBox()
+        self.errp_ea_min_epochs.setRange(1, 500)
+        self.errp_p_stop = QDoubleSpinBox()
+        self.errp_p_stop.setRange(0.0, 1.0)
+        self.errp_p_stop.setSingleStep(0.05)
+        self.errp_p_stop.setDecimals(2)
+
+        form.addRow(self.errp_enable)
+        form.addRow("ERRP_DECODER_BACKEND", self.errp_backend)
+        form.addRow(self.errp_sel_channels)
+        form.addRow("ERRP_EA_BOOTSTRAP_SEC", self.errp_ea_bootstrap_sec)
+        form.addRow("ERRP_EA_MIN_EPOCHS", self.errp_ea_min_epochs)
+        form.addRow("ERRP_P_STOP", self.errp_p_stop)
+
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
+        btn_row = QHBoxLayout()
+        btn_reload = QPushButton("Reload from config.py")
+        btn_reload.clicked.connect(self.on_errp_config_reload)
+        btn_apply = QPushButton("Apply to config.py")
+        btn_apply.clicked.connect(self.on_errp_config_apply)
+        btn_row.addWidget(btn_reload)
+        btn_row.addWidget(btn_apply)
+        btn_row.addStretch(1)
+        outer.addLayout(btn_row)
+        self.on_errp_config_reload()
+
+    def on_errp_config_reload(self):
+        if not hasattr(self, "errp_backend"):
+            return
+        self.errp_enable.setChecked(bool(_read_01_key("ERRP_DECODER_ENABLE", 0)))
+        backend = _read_quoted_str_key("ERRP_DECODER_BACKEND", "liu_cca_xgb")
+        self._rc_set_combo(self.errp_backend, backend)
+        self.errp_sel_channels.setChecked(bool(_read_01_key("SELECT_ERRP_CHANNELS", 0)))
+        self.errp_ea_bootstrap_sec.setValue(_read_float_key("ERRP_EA_BOOTSTRAP_SEC", 45.0))
+        self.errp_ea_min_epochs.setValue(_read_int_key("ERRP_EA_MIN_EPOCHS", 20))
+        self.errp_p_stop.setValue(_read_float_key("ERRP_P_STOP", 0.5))
+        self._append_log("Panel", f"[{self._ts()}] ErrP config widgets reloaded from config.py\n")
+
+    def on_errp_config_apply(self):
+        try:
+            def _fmtf(x: float) -> str:
+                t = f"{x:.6f}".rstrip("0").rstrip(".")
+                return t if t else "0"
+
+            _write_assign_rhs("ERRP_DECODER_ENABLE", "1" if self.errp_enable.isChecked() else "0")
+            _write_assign_rhs("ERRP_DECODER_BACKEND", f'"{self.errp_backend.currentText()}"')
+            _write_assign_rhs("SELECT_ERRP_CHANNELS", "1" if self.errp_sel_channels.isChecked() else "0")
+            _write_assign_rhs("ERRP_EA_BOOTSTRAP_SEC", _fmtf(self.errp_ea_bootstrap_sec.value()))
+            _write_assign_rhs("ERRP_EA_MIN_EPOCHS", str(self.errp_ea_min_epochs.value()))
+            _write_assign_rhs("ERRP_P_STOP", _fmtf(self.errp_p_stop.value()))
+        except Exception as e:
+            QMessageBox.warning(self, "config.py", f"Failed to update config.py:\n{e}")
+            self._append_log("Panel", f"[{self._ts()}] ErrP config apply FAILED: {e}\n")
+            return
+        self._append_log("Panel", f"[{self._ts()}] ErrP config written to config.py\n")
+        QMessageBox.information(
+            self, "ErrP config",
+            "config.py updated. Restart ExperimentDriver_ErrP_Online if a session was "
+            "already running so it reloads the selected bundle.",
         )
 
     def _populate_training_script_combo(self):

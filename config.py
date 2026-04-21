@@ -268,13 +268,19 @@ ARDUINO_CMD_REST = b"0"
 # ErrP decoder
 # =============================================================================
 # Master toggle: 0 = ErrP pipeline disabled (MI pipeline unaffected), 1 = enabled
-ERRP_DECODER_ENABLE = 0
-# Classifier backend: "xdawn_mdm" (MDM on Riemannian manifold, simpler, zero hyperparams)
-#                  or "xdawn_lr"  (TangentSpace + LogisticRegression, slightly more flexible)
-ERRP_DECODER_BACKEND = "xdawn_mdm"
-# Epoch window anchored at the event marker (seconds post-event)
-# 0-800 ms captures ERN (~80-150 ms) and Pe (~200-400 ms)
-ERRP_EPOCH_TMIN = 0.0
+ERRP_DECODER_ENABLE = 1
+# Classifier backend.  Current best single head (Phase 7B, Mean LOSO AUC 0.7102)
+# is "liu_cca_xgb".  Alternatives: "xdawn_xgb" (0.7089), "liu_cca_lda" (0.6904),
+# "xdawn_mdm", "xdawn_lr".  The online driver resolves per-subject bundles at
+# DATA_DIR/sub-{SUBJECT}/models/sub-{SUBJECT}_errp_{ERRP_DECODER_BACKEND}.pkl.
+ERRP_DECODER_BACKEND = "liu_cca_xgb"
+# Epoch window anchored at the event marker (seconds post-event).
+# [200, 800] ms captures the Pe envelope and the ERN tail while excluding the
+# first 200 ms, which carries residual causal-filter transient and pre-ERN
+# stimulus-locked noise.  Bundles record this window in feature_spec and the
+# runtime asserts the bundle's values match this config — deploying a bundle
+# trained at a different window requires updating these keys to match.
+ERRP_EPOCH_TMIN = 0.2
 ERRP_EPOCH_TMAX = 0.8
 # xDAWN spatial filters per class (4 is the standard for P300/ErrP paradigms)
 ERRP_XDAWN_N_FILTERS = 4
