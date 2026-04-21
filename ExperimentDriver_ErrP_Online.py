@@ -48,7 +48,7 @@ import time
 from pathlib import Path
 
 import pygame
-from pylsl import StreamInlet, resolve_stream
+from pylsl import StreamInlet, resolve_stream, local_clock
 
 import mne
 mne.set_log_level("WARNING")
@@ -70,6 +70,7 @@ from Utils.runtime_common import (
     show_feedback,
     load_errp_model,
     classify_errp_real_time,
+    fit_errp_ea_bootstrap,
 )
 import Utils.runtime_common as _RC
 
@@ -291,9 +292,11 @@ def run_robot_movement_with_errp(
     else:
         t_pause = None   # no pause
 
-    state       = "MOVING"
-    move_start  = time.time()
-    pause_ts    = None   # wall-clock time when pause occurred
+    state        = "MOVING"
+    move_start   = time.time()
+    pause_ts     = None   # wall-clock time when pause occurred
+    pause_ts_lsl = None   # LSL local_clock at pause-marker send; drives
+                          # get_event_baseline_window in classify_errp_real_time
 
     while True:
         now     = time.time()
@@ -322,6 +325,13 @@ def run_robot_movement_with_errp(
 
             # Trigger pause
             if t_pause is not None and elapsed >= t_pause:
+                # Capture the LSL clock right before the marker send so the
+                # event timestamp matches (within sub-ms) the moment the
+                # EEG buffer saw the robot pause. This timestamp is what
+                # classify_errp_real_time passes to get_event_baseline_window
+                # so the [-200, 0] ms baseline is anchored at the same
+                # event the participant perceived.
+                pause_ts_lsl = local_clock()
                 # Send ROBOT_PAUSE marker + pause opcode (with ACK)
                 send_udp_message(
                     udp_socket_marker,
@@ -353,7 +363,9 @@ def run_robot_movement_with_errp(
         # STATE: DECIDING — single ErrP classification call
         # ─────────────────────────────────────────────────────────────────────
         elif state == "DECIDING":
-            prob_err, decision = classify_errp_real_time(errp_eeg_state)
+            prob_err, decision = classify_errp_real_time(
+                errp_eeg_state, event_ts=pause_ts_lsl,
+            )
             result["prob_error"]    = prob_err
             result["errp_detected"] = (decision == 1)
             logger.log_event(
@@ -473,6 +485,38 @@ def main():
     clock          = pygame.time.Clock()
     predictions_list  = []
     ground_truth_list = []
+
+    # Session-start EA bootstrap for the ErrP head.  Liu-trained bundles
+    # all carry feature_spec["ea_alignment"] == True — without a session
+    # reference the runtime falls back to an unaligned classify and logs
+    # a warning on every epoch.  The fixation loop below keeps both
+    # EEGStreamStates hot (MI baseline will be recomputed per trial, but
+    # we let its buffer fill here too).
+    if ERRP_ENABLE and errp_eeg_state is not None:
+        ea_seconds = float(getattr(config, "ERRP_EA_BOOTSTRAP_SEC", 45.0))
+        logger.log_event(
+            f"ErrP EA bootstrap: {ea_seconds:.0f}s of quiet fixation before first trial."
+        )
+        boot_start = time.time()
+        while time.time() - boot_start < ea_seconds:
+            eeg_state.update()
+            errp_eeg_state.update()
+            screen.fill(config.black)
+            draw_fixation_cross(screen_width, screen_height)
+            remaining = ea_seconds - (time.time() - boot_start)
+            font_sm = pygame.font.SysFont(None, 42)
+            surf = font_sm.render(f"EA bootstrap — relax and fixate  ({remaining:4.1f}s)",
+                                  True, (180, 180, 180))
+            screen.blit(surf, (screen_width // 2 - surf.get_width() // 2,
+                               screen_height // 2 + 140))
+            pygame.display.flip()
+            pygame.event.pump()
+            clock.tick(60)
+        if not fit_errp_ea_bootstrap(errp_eeg_state):
+            logger.log_event(
+                "⚠️ EA bootstrap failed — continuing unaligned. "
+                "Expect degraded ErrP AUC."
+            )
 
     display_fixation_period(duration=3, eeg_state=eeg_state)
 

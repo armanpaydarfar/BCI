@@ -298,6 +298,16 @@ ERRP_CAR_REREFERENCE = 1
 # and Harmony XDF path) and online (EEGStreamState event-triggered helper).
 ERRP_BASELINE_TMIN = -0.200
 ERRP_BASELINE_TMAX = 0.0
+# Euclidean Alignment bootstrap for the ErrP online path.  The driver calls
+# fit_errp_ea_bootstrap(eeg_state) after accumulating ~ERRP_EA_BOOTSTRAP_SEC
+# of idle EEG at session start; that helper takes the last
+# ERRP_EA_MIN_EPOCHS × (ERRP_EPOCH_TMAX × FS) samples from the filtered
+# buffer, slices them into back-to-back pseudo-epochs, and fits R^{-1/2}.
+# The reference is then applied to every subsequent event-triggered epoch.
+# Bundles with feature_spec["ea_alignment"] == True need this or the
+# online/offline distribution mismatch will collapse AUC.
+ERRP_EA_BOOTSTRAP_SEC = 45.0
+ERRP_EA_MIN_EPOCHS    = 20
 
 # =============================================================================
 # ErrP experiment paradigm (ExperimentDriver_ErrP.py)

@@ -184,6 +184,8 @@ def train_loso(
     backend: str,
     n_filters: int,
     target_ambig: float,
+    tmin: float,
+    tmax: float,
     use_ea: bool = True,
 ) -> dict:
     """
@@ -308,8 +310,8 @@ def train_loso(
     print("done.")
 
     feature_spec = {
-        "tmin":          TMIN,
-        "tmax":          TMAX,
+        "tmin":          float(tmin),
+        "tmax":          float(tmax),
         "n_filters":     n_filters,
         "ea_alignment":  bool(use_ea),
         "epoch_samples": n_samples,
@@ -478,6 +480,8 @@ def main():
         backend=args.backend,
         n_filters=args.n_filters,
         target_ambig=args.target_ambig,
+        tmin=args.tmin,
+        tmax=args.tmax,
         use_ea=bool(args.ea),
     )
 
