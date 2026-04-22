@@ -847,7 +847,7 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
                 raw_mu_qc, events, reject=None, flat=None, **epoch_kw
             )
             mu_data = epochs_mu.get_data()
-            thr_m = float(VISUALIZE_MAX_ABS_UV)
+            thr_m = float(EPOCH_MAX_ABS_UV)
             epochs_bb = mne.Epochs(raw, events, reject=None, flat=None, **epoch_kw)
             mask = _visualize_max_abs_keep_mask(
                 epochs_mu,
