@@ -338,12 +338,11 @@ def _resolve_shrinkage_param(model_type: str | None = None, shrinkage_param: flo
     Priority:
       1) explicit `shrinkage_param`
       2) model-specific defaults (mdm/xgb)
-      3) backward-compatible `config.SHRINKAGE_PARAM`
     """
     if shrinkage_param is not None:
         return float(shrinkage_param)
 
-    mdm_default = float(getattr(config, "SHRINKAGE_PARAM_MDM", getattr(config, "SHRINKAGE_PARAM", 0.02)))
+    mdm_default = float(getattr(config, "SHRINKAGE_PARAM_MDM", 0.02))
     xgb_default = float(getattr(config, "SHRINKAGE_PARAM_XGB", mdm_default))
 
     mt = (model_type or "").strip().lower()

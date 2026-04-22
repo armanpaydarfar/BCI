@@ -262,8 +262,8 @@ def _shrink_single_cov(cov, raw_window=None):
     def _runtime_shrinkage_lambda() -> float:
         backend = str(getattr(config, "DECODER_BACKEND", "mdm")).strip().lower()
         if backend.startswith("xgb"):
-            return float(getattr(config, "SHRINKAGE_PARAM_XGB", getattr(config, "SHRINKAGE_PARAM", 0.1)))
-        return float(getattr(config, "SHRINKAGE_PARAM_MDM", getattr(config, "SHRINKAGE_PARAM", 0.02)))
+            return float(getattr(config, "SHRINKAGE_PARAM_XGB", 0.1))
+        return float(getattr(config, "SHRINKAGE_PARAM_MDM", 0.02))
 
     if config.LEDOITWOLF:
         if raw_window is None:
@@ -499,7 +499,7 @@ def classify_real_time(eeg_state, window_size_samples, all_probabilities, predic
         cov_matrix = np.array([(1 - lam) * cov_matrix + lam * (np.trace(cov_matrix) / n) * np.eye(n)])
     else:
         cov_matrix = np.expand_dims(cov_matrix, axis=0)
-        lam = float(getattr(config, "SHRINKAGE_PARAM_MDM", getattr(config, "SHRINKAGE_PARAM", 0.02)))
+        lam = float(getattr(config, "SHRINKAGE_PARAM_MDM", 0.02))
         shrinkage = Shrinkage(shrinkage=lam)
         cov_matrix = shrinkage.fit_transform(cov_matrix)
 

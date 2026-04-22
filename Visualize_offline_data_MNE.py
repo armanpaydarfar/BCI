@@ -1,10 +1,10 @@
+import argparse
 import os
 import pyxdf
 import numpy as np
 import matplotlib.pyplot as plt
 import mne
 from scipy.signal import welch
-import config
 from scipy.stats import zscore
 # Custom utility functions
 from Utils.preprocessing import concatenate_streams
@@ -13,9 +13,22 @@ from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 # XDF EEG amplitudes: same convention as visualize_online_data.py — time_series is
 # microvolt-scale. Keep raw._data on that scale (no ×/÷ 1e6). MNE may still label
 # channels as V in metadata; we set unit=201 below for µV where applicable.
+#
+# This script is standalone: it does not read from config.py. Set defaults below
+# or override via CLI flags (--subject, --session, --fs).
 
 subject = "F25CLASS_SUBJ_008"
 session = "S001OFFLINE"
+FS = 512  # Hz, EEG sampling rate
+
+_parser = argparse.ArgumentParser(description="Standalone offline-XDF visualizer.")
+_parser.add_argument("--subject", type=str, default=None, help="override module-level `subject`")
+_parser.add_argument("--session", type=str, default=None, help="override module-level `session`")
+_parser.add_argument("--fs", type=float, default=None, help="override FS (Hz)")
+_args, _ = _parser.parse_known_args()
+if _args.subject is not None: subject = _args.subject
+if _args.session is not None: session = _args.session
+if _args.fs is not None:      FS = float(_args.fs)
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
@@ -109,7 +122,7 @@ valid_indices = [channel_names.index(ch) for ch in valid_eeg_channels]  # Get in
 eeg_data = eeg_data[valid_indices, :]  # Keep only valid EEG data
 
 # Create MNE Raw Object
-sfreq = config.FS
+sfreq = FS
 info = mne.create_info(ch_names=valid_eeg_channels, sfreq=sfreq, ch_types="eeg")
 raw = mne.io.RawArray(eeg_data, info)
 

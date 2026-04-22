@@ -18,15 +18,19 @@
 #   MNE labels channels as "volts", but LSL/XDF EEG streams from typical amplifiers
 #   (e.g. EEGsports-style pipelines) are almost always microvolt-scale *numbers* in
 #   `time_series`. We keep that numeric scale in `raw._data` end-to-end: amplitude
-#   QC limits (see config VISUALIZE_EPOCH_*) are µV on
+#   QC limits (EPOCH_REJECT_MODE / EPOCH_MAX_ABS_UV / EPOCH_P2P_UV below) are µV on
 #   the same scale as the array. We do not multiply the stream by 1e-6 unless upstream
 #   changes; true SI-volt files (~1e-4) would need an explicit scale fix first.
 #
-# Default epoch QC (VISUALIZE_EPOCH_REJECT_MODE=max_abs): notch → mu-band copy → max|x| per epoch
+# Default epoch QC (EPOCH_REJECT_MODE=max_abs): notch → mu-band copy → max|x| per epoch
 #   (same idea as training ARTIFACT_MAX_ABS on mu-filtered windows); kept epochs are still the
 #   broadband-filtered Raw for TFR/plots. Set MODE=peak_to_peak for legacy MNE P2P on broadband.
+#
+# This script is standalone: it does not read from config.py. Set defaults below
+# or override via CLI flags (--subject, --fs, --lowcut, --highcut, etc.).
 # =========================================================
 
+import argparse
 import os
 from typing import Optional
 
@@ -34,7 +38,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import mne
 from scipy import stats
-import config
 
 # Custom utility functions
 from Utils.preprocessing import concatenate_streams
@@ -45,6 +48,11 @@ from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 # =========================================================
 
 subject = "CLIN_SUBJ_007"
+
+# ---- Sampling rate and mu-band filter (independent of realtime config.py) ----
+FS = 512               # Hz, EEG sampling rate
+LOWCUT = 8             # Hz, mu-band low cutoff (used for max_abs QC)
+HIGHCUT = 13           # Hz, mu-band high cutoff
 
 # ---- Single-session mode ----
 session = "S002ONLINE"
@@ -159,13 +167,12 @@ BAR_USE_NORMALIZATION = False
 BAR_NORM_METHOD = "ratio"  # "ratio" or "difference"
 BAR_YLIM = (-100, 100)  # or None
 
-# ---- Epoch rejection (see config VISUALIZE_EPOCH_REJECT_MODE, VISUALIZE_EPOCH_MAX_ABS_UV) ----
+# ---- Epoch rejection ----
 REJECT_EPOCHS = True
-REJECT_P2P_UV = 200  # fallback when config VISUALIZE_EPOCH_REJECT_P2P_UV missing (peak_to_peak mode)
-FLAT_UV = None       # optional; overrides config VISUALIZE_EPOCH_FLAT_UV when not None
-
-# Override for visualization max-abs rejection (µV)
-VISUALIZE_MAX_ABS_UV = 50.0
+EPOCH_REJECT_MODE = "max_abs"   # "max_abs" | "peak_to_peak" | "p2p" | "ptp"
+EPOCH_MAX_ABS_UV = 50.0         # used when EPOCH_REJECT_MODE == max_abs
+EPOCH_P2P_UV = 150.0            # used when EPOCH_REJECT_MODE == peak_to_peak
+EPOCH_FLAT_UV = None            # optional µV flat-line rejection; None disables
 
 # =========================================================
 # NEW: Auto-drop bad channels that dominate rejections
@@ -657,7 +664,7 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
     valid_indices = [channel_names.index(ch) for ch in valid_eeg_channels]
     eeg_data = eeg_data[valid_indices, :]
 
-    sfreq = config.FS
+    sfreq = FS
     info = mne.create_info(
         ch_names=valid_eeg_channels,
         sfreq=sfreq,
@@ -689,13 +696,13 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
 
     # ---- Preprocessing: notch → (optional mu copy for max_abs QC) → broadband for TFR/plots ----
     raw.notch_filter(60)
-    reject_mode = str(getattr(config, "VISUALIZE_EPOCH_REJECT_MODE", "max_abs")).lower().strip()
+    reject_mode = str(EPOCH_REJECT_MODE).lower().strip()
     raw_mu_qc = None
     if REJECT_EPOCHS and reject_mode == "max_abs":
         raw_mu_qc = raw.copy()
         raw_mu_qc.filter(
-            l_freq=float(config.LOWCUT),
-            h_freq=float(config.HIGHCUT),
+            l_freq=float(LOWCUT),
+            h_freq=float(HIGHCUT),
             method="iir",
         )
     raw.filter(l_freq=BROADBAND_LOW, h_freq=BROADBAND_HIGH, method="iir")
@@ -753,9 +760,7 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
     )
 
     # ---- Epoching with padding + QC ----
-    flat_uv_cfg = getattr(config, "VISUALIZE_EPOCH_FLAT_UV", None)
-    if FLAT_UV is not None:
-        flat_uv_cfg = FLAT_UV
+    flat_uv_cfg = EPOCH_FLAT_UV
 
     dropped_channels = []
     iters = 0
@@ -774,8 +779,8 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
 
         if REJECT_EPOCHS and reject_mode == "max_abs":
             if raw_mu_qc is None:
-                raise RuntimeError("raw_mu_qc missing for VISUALIZE_EPOCH_REJECT_MODE=max_abs")
-            thr_m = float(VISUALIZE_MAX_ABS_UV)
+                raise RuntimeError("raw_mu_qc missing for EPOCH_REJECT_MODE=max_abs")
+            thr_m = float(EPOCH_MAX_ABS_UV)
             epochs_mu = mne.Epochs(
                 raw_mu_qc, events, reject=None, flat=None, **epoch_kw
             )
@@ -790,12 +795,12 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
             epochs = epochs_bb[good_ix]
             n_drop = int(len(events) - len(good_ix))
             print(
-                f"✅ Epoch QC (max_abs ≤ {thr_m:g} µV on mu {config.LOWCUT}-{config.HIGHCUT} Hz; "
+                f"✅ Epoch QC (max_abs ≤ {thr_m:g} µV on mu {LOWCUT}-{HIGHCUT} Hz; "
                 f"broadband epochs kept for TFR): dropped {n_drop} / {len(events)}"
             )
             del epochs_mu
         elif REJECT_EPOCHS and reject_mode in ("peak_to_peak", "p2p", "ptp"):
-            p2p_uv = float(getattr(config, "VISUALIZE_EPOCH_REJECT_P2P_UV", REJECT_P2P_UV))
+            p2p_uv = float(EPOCH_P2P_UV)
             reject = dict(eeg=eeg_reject_threshold_from_uv(p2p_uv))
             flat = None
             if flat_uv_cfg is not None:
@@ -804,7 +809,7 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
         else:
             if REJECT_EPOCHS:
                 print(
-                    f"⚠️ Unknown VISUALIZE_EPOCH_REJECT_MODE={reject_mode!r}; "
+                    f"⚠️ Unknown EPOCH_REJECT_MODE={reject_mode!r}; "
                     f"epoching without rejection."
                 )
             epochs = mne.Epochs(raw, events, reject=None, flat=None, **epoch_kw)
@@ -1650,5 +1655,34 @@ def main():
     plt.show()
 
 
+def _parse_cli_overrides():
+    """CLI overrides for the in-script defaults. Any flag left unset keeps the
+    module-level constant as authored at the top of this file."""
+    p = argparse.ArgumentParser(
+        description="Standalone ERD/ERS visualizer. Edit defaults at the top of the "
+                    "file, or override any of them via the flags below."
+    )
+    p.add_argument("--subject", type=str, default=None, help="override module-level `subject`")
+    p.add_argument("--session", type=str, default=None, help="override module-level `session`")
+    p.add_argument("--fs", type=float, default=None, help="override FS (Hz)")
+    p.add_argument("--lowcut", type=float, default=None, help="override LOWCUT (Hz)")
+    p.add_argument("--highcut", type=float, default=None, help="override HIGHCUT (Hz)")
+    p.add_argument("--reject-mode", type=str, default=None,
+                   choices=["max_abs", "peak_to_peak", "p2p", "ptp"],
+                   help="override EPOCH_REJECT_MODE")
+    p.add_argument("--max-abs-uv", type=float, default=None, help="override EPOCH_MAX_ABS_UV")
+    p.add_argument("--p2p-uv", type=float, default=None, help="override EPOCH_P2P_UV")
+    return p.parse_args()
+
+
 if __name__ == "__main__":
+    _args = _parse_cli_overrides()
+    if _args.subject is not None:    subject = _args.subject
+    if _args.session is not None:    session = _args.session
+    if _args.fs is not None:         FS = float(_args.fs)
+    if _args.lowcut is not None:     LOWCUT = float(_args.lowcut)
+    if _args.highcut is not None:    HIGHCUT = float(_args.highcut)
+    if _args.reject_mode is not None: EPOCH_REJECT_MODE = _args.reject_mode
+    if _args.max_abs_uv is not None: EPOCH_MAX_ABS_UV = float(_args.max_abs_uv)
+    if _args.p2p_uv is not None:     EPOCH_P2P_UV = float(_args.p2p_uv)
     main()
