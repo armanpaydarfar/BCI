@@ -83,6 +83,10 @@ ERRP_PAUSE_TMAX_FRAC = float(getattr(config, "ERRP_STOP_TMAX_FRACTION",  0.7))
 ERRP_PAUSE_TMAX      = ERRP_PAUSE_TMAX_FRAC * float(config.TIME_ROB)
 ERRP_EPOCH_SEC       = float(getattr(config, "ERRP_EPOCH_TMAX",          0.8))
 ERRP_NO_RESUME_HOLD  = float(getattr(config, "ERRP_NO_RESUME_TIMEOUT",   3.0))
+# Probability of pausing on a given successful-MI move.  A per-move Bernoulli
+# draw gates the pause; when the draw fails the robot runs to completion
+# without any ErrP elicitation attempt.
+ERRP_ONLINE_P_STOP   = float(getattr(config, "ERRP_ONLINE_P_STOP",       0.3))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Startup: logger, pygame, UDP, model loading
@@ -109,6 +113,7 @@ loggable_fields = [
     "ERRP_DECODER_ENABLE", "ERRP_DECODER_BACKEND",
     "ERRP_EPOCH_TMIN", "ERRP_EPOCH_TMAX",
     "ERRP_STOP_TMIN", "ERRP_STOP_TMAX_FRACTION",
+    "ERRP_ONLINE_P_STOP",
     "ERRP_XDAWN_N_FILTERS", "ERRP_CHANNEL_NAMES",
 ]
 logger.save_config_snapshot({k: getattr(config, k) for k in loggable_fields if hasattr(config, k)})
@@ -281,16 +286,21 @@ def run_robot_movement_with_errp(
     clock_fps      = pygame.time.Clock()
 
     # ── Choose random pause time ──────────────────────────────────────────────
-    if ERRP_ENABLE and errp_eeg_state is not None:
+    # Per-move Bernoulli draw: only ERRP_ONLINE_P_STOP fraction of successful-MI
+    # moves get interrupted.  Unpaused moves run straight through to ROBOT_END
+    # and record pause_time=None so trial summaries can distinguish them.
+    if ERRP_ENABLE and errp_eeg_state is not None and random.random() < ERRP_ONLINE_P_STOP:
         t_pause = random.uniform(
             max(ERRP_PAUSE_TMIN, 0.5),
             min(ERRP_PAUSE_TMAX, movement_total - 0.5),
         )
         result["pause_time"] = t_pause
         logger.log_event(f"ErrP pause planned at t={t_pause:.2f}s into trajectory "
-                         f"(total={movement_total:.1f}s)")
+                         f"(total={movement_total:.1f}s, p_stop={ERRP_ONLINE_P_STOP:.2f})")
     else:
-        t_pause = None   # no pause
+        t_pause = None   # no pause this move
+        if ERRP_ENABLE and errp_eeg_state is not None:
+            logger.log_event(f"ErrP pause skipped this move (p_stop={ERRP_ONLINE_P_STOP:.2f})")
 
     state        = "MOVING"
     move_start   = time.time()
