@@ -246,9 +246,17 @@ the reference in the commit message and relevant docstrings.
 
 ## Commit Hygiene
 
-- Do not commit unless explicitly asked.
-- Stage files individually — never `git add .` or `git add -A`.
-- Do not commit `WORKING_DIR` / `DATA_DIR` lines from `config.py`.
+- Commit proactively at clean logical boundaries: one coherent diff
+  (feature, bug fix, or refactor step) with no half-finished work.
+- Do not bundle unrelated changes into one commit — split them.
+- After every commit, push to origin immediately so remote stays
+  current. Exception: never auto-push `main` / `master` — confirm with
+  the user first. (A PostToolUse hook handles the push automatically on
+  feature branches.)
+- Stage files individually — never `git add .` or `git add -A`. (A
+  PreToolUse hook blocks the wildcard forms.)
+- Do not commit `WORKING_DIR` / `DATA_DIR` lines from `config.py`. (A
+  PreToolUse hook blocks `git commit` if these lines are staged.)
 - Commit messages should explain *why*, not just *what*.
 - All commits must be compatible with Linux (CPU) regardless of which
   machine they were developed on.
