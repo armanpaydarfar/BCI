@@ -141,6 +141,34 @@ GAZE_SAMPLE_HEIGHT = 1200.0
 POSE_LIBRARY_PATH = os.path.join(WORKING_DIR, "poses_with_gaze_20251202_153040.npz")
 
 # =============================================================================
+# VLM integration (harmony_vlm subprocess)
+# =============================================================================
+# Gaze/object-recognition backend selector:
+#   "legacy" — our gaze_runner service with YOLO + SORT tracker
+#   "vlm"    — harmony_vlm demo.py subprocess (FastSAM + Depth Pro + VLM)
+GAZE_OR_BACKEND = "vlm"
+
+# Sibling directory holding the harmony_vlm clone. Machine-local, same rule as
+# WORKING_DIR / DATA_DIR above — do not commit edits to this line.
+VLM_REPO_DIR = "/home/arman-admin/Projects/harmony_vlm"
+
+# Conda env used to launch demo.py. Separate from "lsl" because depth-pro pins
+# numpy<2, which is incompatible with pyriemann and opencv in the BCI stack.
+VLM_CONDA_ENV = "harmony_vlm"
+
+# Gemini model passed to demo.py --vlm-model. "gemini-2.5-flash" is free-tier
+# available; "gemini-2.5-pro" requires a paid Google AI account.
+VLM_MODEL = "gemini-2.5-flash"
+
+# Passed to demo.py --depth. Depth Pro on CPU is slow (~1-3 s per fixation
+# trigger). Disable to skip scene depth while testing VLM reasoning alone.
+VLM_ENABLE_DEPTH = True
+
+# Root directory for VLM session artifacts (session.jsonl decisions + .md log).
+# Each run creates a timestamped subdir here.
+VLM_SESSION_ROOT = os.path.join(DATA_DIR, "vlm_sessions")
+
+# =============================================================================
 # FES
 # =============================================================================
 FES_toggle = 0
