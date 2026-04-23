@@ -21,6 +21,12 @@ Supported commands (JSON `cmd` field, all lower-case):
     reason         — Gemini/OpenAI reasoning on latest frame+gaze
     decide         — full pipeline: segment + depth + reason + waypoints
                      (returns the same dict shape demo.py emits to JSONL)
+    capture_first  — snapshot current frame/gaze/detections/waypoints under a
+                     server-side token; used as the first fixation in a
+                     two-object sequential decide flow
+    decide_pair    — combine a previously-captured snapshot with the current
+                     frame/gaze and run reason_async_pair; returns object,
+                     second_object, paired candidates, and waypoints for both
     camera_matrix  — Neon intrinsics + distortion, for robot-calibration work
     stop           — shutdown the service
 
@@ -41,11 +47,54 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
+
+
+class SnapshotCache:
+    """
+    Bounded TTL cache of captured frame+gaze+detections+waypoints snapshots.
+
+    Used by the two-object (sequential-decide) flow: capture_first stores a
+    snapshot under a random id; decide_pair retrieves it to pair with the
+    current frame and run the VLM's reason_async_pair. Frames are large
+    (~5 MB each) so we keep the cache small and short-lived.
+    """
+
+    def __init__(self, ttl_s: float = 60.0, max_size: int = 4) -> None:
+        self._items: Dict[str, dict] = {}
+        self._lock = threading.Lock()
+        self._ttl = float(ttl_s)
+        self._max = int(max_size)
+
+    def put(self, data: dict) -> str:
+        snap_id = uuid.uuid4().hex[:8]
+        now = time.monotonic()
+        with self._lock:
+            self._prune_locked(now)
+            if len(self._items) >= self._max:
+                oldest = min(self._items.items(), key=lambda kv: kv[1]["_t"])[0]
+                self._items.pop(oldest, None)
+            self._items[snap_id] = {**data, "_t": now}
+        return snap_id
+
+    def get(self, snap_id: str) -> Optional[dict]:
+        with self._lock:
+            self._prune_locked(time.monotonic())
+            return self._items.get(snap_id)
+
+    def pop(self, snap_id: str) -> Optional[dict]:
+        with self._lock:
+            return self._items.pop(snap_id, None)
+
+    def _prune_locked(self, now: float) -> None:
+        dead = [k for k, v in self._items.items() if now - v["_t"] > self._ttl]
+        for k in dead:
+            self._items.pop(k, None)
 
 
 def parse_args():
@@ -86,6 +135,11 @@ class VLMService:
         self._stop_event = threading.Event()
         self._frame_thread: Optional[threading.Thread] = None
         self._sock: Optional[socket.socket] = None
+
+        # Two-object (sequential-decide) snapshot cache. TTL long enough for a
+        # user to look at A, think, then look at B; short enough that stale
+        # frames can't linger indefinitely.
+        self._snapshots = SnapshotCache(ttl_s=60.0, max_size=4)
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -186,6 +240,8 @@ class VLMService:
             "depth": lambda: self._cmd_depth(req),
             "reason": lambda: self._cmd_reason(req),
             "decide": lambda: self._cmd_decide(req),
+            "capture_first": lambda: self._cmd_capture_first(req),
+            "decide_pair": lambda: self._cmd_decide_pair(req),
             "camera_matrix": lambda: self._cmd_camera_matrix(),
             "stop": lambda: self._cmd_stop(),
         }
@@ -370,6 +426,147 @@ class VLMService:
             "hit_waypoint": hit_waypoint,
             "depth_at_gaze_m": depth_at_gaze_m,
             "gaze_px": list(gaze_xy),
+            **result,
+        }
+
+    def _process_frame_and_gaze(self, frame_bgr, gaze_xy: tuple[float, float]) -> dict:
+        """Segment + depth + waypoints + hit-test for an arbitrary frame.
+
+        Returns native Detection objects (for passing into reason_async_pair)
+        alongside JSON-safe waypoint dicts, so one call covers both the cache
+        payload and the UDP response payload.
+        """
+        from utils.object_detector import compute_3d_waypoints
+
+        dets = self.detector.detect(frame_bgr)
+
+        waypoints_out: list[dict] = []
+        depth_at_gaze: Optional[float] = None
+        if self.depth_estimator is not None:
+            depth_map, _ = self.depth_estimator.estimate(
+                frame_bgr, f_px=self._focal_px(), gaze_xy=gaze_xy,
+            )
+            wps = compute_3d_waypoints(dets, depth_map, self.reader.camera_matrix)
+            waypoints_out = [
+                {
+                    "label": wp.label,
+                    "position_cam": list(wp.position_cam),
+                    "pixel_center": list(wp.pixel_center),
+                    "depth_median_m": wp.depth_median_m,
+                }
+                for wp in wps
+            ]
+            h, w = depth_map.shape[:2]
+            gx = int(np.clip(round(gaze_xy[0]), 0, w - 1))
+            gy = int(np.clip(round(gaze_xy[1]), 0, h - 1))
+            depth_at_gaze = float(depth_map[gy, gx])
+
+        hit_waypoint: Optional[dict] = None
+        for d, wp in zip(dets, waypoints_out):
+            x1, y1, x2, y2 = d.box_xyxy
+            if x1 <= gaze_xy[0] <= x2 and y1 <= gaze_xy[1] <= y2:
+                hit_waypoint = wp
+                break
+
+        return {
+            "detections": dets,
+            "waypoints": waypoints_out,
+            "hit_waypoint": hit_waypoint,
+            "depth_at_gaze_m": depth_at_gaze,
+        }
+
+    def _cmd_capture_first(self, req: dict) -> dict:
+        bundle, fix, _ = self._latest()
+        if bundle is None:
+            return {"ok": False, "error": "no_frame"}
+
+        gaze_xy = (float(bundle.gaze.x), float(bundle.gaze.y))
+        t0 = time.time()
+        processed = self._process_frame_and_gaze(bundle.video.bgr, gaze_xy)
+        elapsed = time.time() - t0
+
+        # Copy the frame because NeonLiveReader.__iter__ reuses its buffer.
+        snap_id = self._snapshots.put({
+            "frame_bgr": bundle.video.bgr.copy(),
+            "gaze_xy": gaze_xy,
+            "fix_state": fix if fix is not None else self._FixationState(active=True),
+            "detections": processed["detections"],
+            "waypoints": processed["waypoints"],
+            "hit_waypoint": processed["hit_waypoint"],
+            "depth_at_gaze_m": processed["depth_at_gaze_m"],
+        })
+
+        return {
+            "ok": True,
+            "snapshot_id": snap_id,
+            "n_detections": len(processed["detections"]),
+            "waypoints": processed["waypoints"],
+            "hit_waypoint": processed["hit_waypoint"],
+            "depth_at_gaze_m": processed["depth_at_gaze_m"],
+            "gaze_px": list(gaze_xy),
+            "elapsed_s": elapsed,
+        }
+
+    def _cmd_decide_pair(self, req: dict) -> dict:
+        snap_id = req.get("snapshot_id")
+        if not snap_id:
+            return {"ok": False, "error": "missing_snapshot_id"}
+        first = self._snapshots.get(str(snap_id))
+        if first is None:
+            return {"ok": False, "error": "snapshot_not_found_or_expired"}
+
+        bundle, fix, _ = self._latest()
+        if bundle is None:
+            return {"ok": False, "error": "no_frame"}
+
+        second_gaze_xy = (float(bundle.gaze.x), float(bundle.gaze.y))
+        second_frame = bundle.video.bgr
+
+        t0 = time.time()
+        second = self._process_frame_and_gaze(second_frame, second_gaze_xy)
+
+        first_fix_state = first["fix_state"]
+        second_fix_state = fix if fix is not None else self._FixationState(active=True)
+        timeout_s = float(req.get("timeout", 45.0))
+
+        future = self.reasoner.reason_async_pair(
+            first["gaze_xy"],
+            second_gaze_xy,
+            first_fix_state,
+            second_fix_state,
+            first["frame_bgr"],
+            second_frame,
+            first["detections"],
+            second["detections"],
+            "",
+        )
+        try:
+            result = future.result(timeout=timeout_s)
+        except FutureTimeoutError:
+            return {
+                "ok": False,
+                "error": "vlm_timeout",
+                "snapshot_id": snap_id,
+                "first_waypoint": first["hit_waypoint"],
+                "second_waypoint": second["hit_waypoint"],
+            }
+        elapsed = time.time() - t0
+
+        if not isinstance(result, dict):
+            result = {}
+
+        return {
+            "ok": True,
+            "snapshot_id": snap_id,
+            "elapsed_s": elapsed,
+            "first_gaze_px": list(first["gaze_xy"]),
+            "second_gaze_px": list(second_gaze_xy),
+            "first_waypoints": first["waypoints"],
+            "second_waypoints": second["waypoints"],
+            "first_waypoint": first["hit_waypoint"],
+            "second_waypoint": second["hit_waypoint"],
+            "first_depth_at_gaze_m": first["depth_at_gaze_m"],
+            "second_depth_at_gaze_m": second["depth_at_gaze_m"],
             **result,
         }
 
