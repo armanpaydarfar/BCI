@@ -55,9 +55,6 @@ import Utils.runtime_common as _RC
 
 from Utils.stream_utils import require_marker_stream
 
-from vlm_bridge import VLMBridge
-from vlm_launcher import VLMLauncher
-
 # =========================================================
 # Logger setup
 # =========================================================
@@ -235,8 +232,6 @@ PRETRIAL_WHITE_ORB_SEC = float(getattr(config, "PRETRIAL_WHITE_ORB_SEC", 3.0))
 BASELINE_BEFORE_CUE_SEC = float(getattr(config, "BASELINE_BEFORE_CUE_SEC", 1.0))
 RETRY_RESET_SEC = float(getattr(config, "RETRY_RESET_SEC", 2.0))
 
-GAZE_OR_BACKEND = str(getattr(config, "GAZE_OR_BACKEND", "legacy")).lower()
-
 # =========================================================
 # Drawing helpers
 # =========================================================
@@ -400,7 +395,7 @@ def object_display_name(obj_key):
     return obj_key.split("#")[0]
 
 
-def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WINDOW, vlm_bridge=None):
+def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WINDOW):
     logger.log_event(f"Starting gaze selection window ({duration_s:.2f}s).")
 
     dwell_sec_by_obj = {}
@@ -409,10 +404,6 @@ def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WI
 
     selection_start = time.time()
     running_window = True
-
-    # In vlm mode we skip the gaze_runner's object tracker to save compute;
-    # object identity comes from the VLM decision stream instead.
-    include_objects = GAZE_OR_BACKEND != "vlm"
 
     while running_window:
         eeg_state.update()
@@ -433,7 +424,7 @@ def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WI
             gaze_sock,
             {
                 "cmd": "snapshot",
-                "include_objects": include_objects,
+                "include_objects": True,
                 "query_id": f"sel_{int(now * 1000)}"
             }
         )
@@ -441,34 +432,20 @@ def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WI
         leading_obj_name = None
 
         if snap and snap.get("ok", False):
+            hit = snap.get("gaze_hit", None)
             gaze_px = snap.get("gaze_px", None)
 
-            if GAZE_OR_BACKEND == "vlm":
-                # VLM provides object identity asynchronously via session.jsonl.
-                # A decision typically stays fresh for the duration of a fixation,
-                # so max_age covers the selection window plus a small pad.
-                decision = vlm_bridge.get_latest_decision(max_age_s=duration_s + 2.0) if vlm_bridge is not None else None
-                if decision is not None and gaze_px is not None and len(gaze_px) >= 2:
-                    obj_key = str(decision.get("object") or "unknown")
-                    x, y = float(gaze_px[0]), float(gaze_px[1])
-                    dwell_sec_by_obj[obj_key] = dwell_sec_by_obj.get(obj_key, 0.0) + dt
-                    valid_samples_by_obj.setdefault(obj_key, []).append((now, x, y))
-                if dwell_sec_by_obj:
-                    leading_obj_name = max(dwell_sec_by_obj, key=dwell_sec_by_obj.get)
-            else:
-                hit = snap.get("gaze_hit", None)
+            if hit is not None and gaze_px is not None and len(gaze_px) >= 2:
+                obj_key = make_object_key(hit)
+                # `gaze_px` are raw scene pixels; normalization happens later when mapping to the pose library.
+                x, y = float(gaze_px[0]), float(gaze_px[1])
 
-                if hit is not None and gaze_px is not None and len(gaze_px) >= 2:
-                    obj_key = make_object_key(hit)
-                    # `gaze_px` are raw scene pixels; normalization happens later when mapping to the pose library.
-                    x, y = float(gaze_px[0]), float(gaze_px[1])
+                dwell_sec_by_obj[obj_key] = dwell_sec_by_obj.get(obj_key, 0.0) + dt
+                valid_samples_by_obj.setdefault(obj_key, []).append((now, x, y))
 
-                    dwell_sec_by_obj[obj_key] = dwell_sec_by_obj.get(obj_key, 0.0) + dt
-                    valid_samples_by_obj.setdefault(obj_key, []).append((now, x, y))
-
-                if dwell_sec_by_obj:
-                    leading_key = max(dwell_sec_by_obj, key=dwell_sec_by_obj.get)
-                    leading_obj_name = object_display_name(leading_key)
+            if dwell_sec_by_obj:
+                leading_key = max(dwell_sec_by_obj, key=dwell_sec_by_obj.get)
+                leading_obj_name = object_display_name(leading_key)
 
         draw_selection_screen(progress=progress, leading_obj_name=leading_obj_name)
 
@@ -540,16 +517,12 @@ def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WI
     }
 
 
-def repeat_until_valid_selection(gaze_sock, eeg_state, vlm_bridge=None):
+def repeat_until_valid_selection(gaze_sock, eeg_state):
     attempt = 0
     while True:
         attempt += 1
         logger.log_event(f"Selection attempt #{attempt} starting.")
-        result = run_gaze_selection_window(
-            gaze_sock, eeg_state,
-            duration_s=GAZE_SELECTION_WINDOW,
-            vlm_bridge=vlm_bridge,
-        )
+        result = run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WINDOW)
 
         if result is None:
             return None
@@ -816,32 +789,6 @@ def main():
     gaze_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     logger.log_event(f"Gaze UDP client ready for {GAZE_UDP_IP}:{GAZE_UDP_PORT}")
 
-    # VLM backend: spawn harmony_vlm demo.py and tail its decisions. Started
-    # here (not in control_panel) so the driver owns its own lifecycle when
-    # launched standalone. Control panel will skip this if it has already
-    # started a VLM service in an outer shell.
-    vlm_launcher = None
-    vlm_bridge = None
-    if GAZE_OR_BACKEND == "vlm":
-        logger.log_event(f"GAZE_OR_BACKEND=vlm — spawning harmony_vlm subprocess.")
-        vlm_launcher = VLMLauncher(
-            repo_dir=config.VLM_REPO_DIR,
-            conda_env=config.VLM_CONDA_ENV,
-            model=config.VLM_MODEL,
-            enable_depth=config.VLM_ENABLE_DEPTH,
-            session_root=config.VLM_SESSION_ROOT,
-            logger=logger,
-        )
-        vlm_launcher.start()
-        vlm_bridge = VLMBridge(vlm_launcher.session_jsonl_path)
-        vlm_bridge.start()
-        logger.log_event(
-            f"VLM session dir: {vlm_launcher.session_dir} | "
-            f"pid={vlm_launcher.proc.pid if vlm_launcher.proc else '?'}"
-        )
-    else:
-        logger.log_event(f"GAZE_OR_BACKEND={GAZE_OR_BACKEND} — using legacy gaze_runner path.")
-
     X_lib, Q_lib, G_lib = load_pose_library(POSE_LIBRARY_PATH)
 
     trial_sequence = generate_trial_sequence(
@@ -868,7 +815,7 @@ def main():
         # ---------------------------------
         # 1. Gaze selection phase
         # ---------------------------------
-        selection_result = repeat_until_valid_selection(gaze_sock, eeg_state, vlm_bridge=vlm_bridge)
+        selection_result = repeat_until_valid_selection(gaze_sock, eeg_state)
         if selection_result is None:
             logger.log_event("Experiment terminated during selection phase.")
             running = False
@@ -1153,17 +1100,6 @@ def main():
         gaze_sock.close()
     except Exception:
         pass
-
-    if vlm_bridge is not None:
-        try:
-            vlm_bridge.stop()
-        except Exception as e:
-            logger.log_event(f"⚠️ VLMBridge stop failed: {e}")
-    if vlm_launcher is not None:
-        try:
-            vlm_launcher.stop()
-        except Exception as e:
-            logger.log_event(f"⚠️ VLMLauncher stop failed: {e}")
 
     pygame.quit()
 
