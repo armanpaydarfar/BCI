@@ -93,6 +93,20 @@ GAZE_SERVICE_HOST = getattr(_HCFG, "GAZE_UDP_IP", "127.0.0.1") if _HCFG else "12
 GAZE_SERVICE_PORT = int(getattr(_HCFG, "GAZE_UDP_PORT", 5588)) if _HCFG else 5588
 GAZE_QUERY_TIMEOUT_S = 0.8
 
+# ---- VLM service (harmony_vlm) ----
+VLM_SERVICE_PY      = os.path.join(ROOT, "vlm_service.py")
+VLM_SERVICE_HOST    = getattr(_HCFG, "VLM_SERVICE_HOST", "127.0.0.1") if _HCFG else "127.0.0.1"
+VLM_SERVICE_PORT    = int(getattr(_HCFG, "VLM_SERVICE_PORT", 5589)) if _HCFG else 5589
+VLM_REPO_DIR        = getattr(_HCFG, "VLM_REPO_DIR", None) if _HCFG else None
+VLM_CONDA_ENV       = getattr(_HCFG, "VLM_CONDA_ENV", "harmony_vlm") if _HCFG else "harmony_vlm"
+VLM_MODEL           = getattr(_HCFG, "VLM_MODEL", "gemini-2.5-flash") if _HCFG else "gemini-2.5-flash"
+VLM_ENABLE_DEPTH    = bool(getattr(_HCFG, "VLM_ENABLE_DEPTH", True)) if _HCFG else True
+VLM_SESSION_ROOT    = getattr(_HCFG, "VLM_SESSION_ROOT", None) if _HCFG else None
+# Reasoning commands can take tens of seconds; cheap status queries finish fast.
+VLM_QUERY_TIMEOUT_S = 2.0
+VLM_DECIDE_TIMEOUT_S = 40.0
+GAZE_OR_BACKEND     = str(getattr(_HCFG, "GAZE_OR_BACKEND", "legacy")).lower() if _HCFG else "legacy"
+
 
 def _marker_udp_port() -> int:
     if _HCFG is not None:
@@ -389,13 +403,16 @@ class ControlPanel(QMainWindow):
         self.gaze_runner = Proc("Gaze Runner", None, ROOT)
         self.gaze_service = Proc("Gaze Service", None, ROOT)
 
+        # ---- VLM service proc ----
+        self.vlm_service = Proc("VLM Service", None, ROOT)
+
         # Robot terminal
         self.robot_term: Optional[QProcess] = None
         self.labrec_term: Optional[QProcess] = None
         self.eego_term: Optional[QProcess] = None
 
         # Logs
-        self._log_buffers: Dict[str, str] = {"Marker": "", "FES": "", "Driver": "", "Gaze": "", "Robot": "", "Panel": ""}
+        self._log_buffers: Dict[str, str] = {"Marker": "", "FES": "", "Driver": "", "Gaze": "", "VLM": "", "Robot": "", "Panel": ""}
         self._current_log_target = "Panel"
 
         # Build UI
@@ -413,6 +430,7 @@ class ControlPanel(QMainWindow):
         self._set_led(self.lbl_eego, "stopped")
         self._set_led(self.lbl_labrec, "stopped")
         self._set_led(self.lbl_gaze_service, "stopped")
+        self._set_led(self.lbl_vlm_service, "stopped")
 
         self.ui_timer = QTimer(self)
         self.ui_timer.setInterval(400)
@@ -576,6 +594,37 @@ class ControlPanel(QMainWindow):
         grid.addWidget(self.btn_gaze_service_query, row, 2, 1, 3)
         row += 1
 
+        # ===== VLM Service (harmony_vlm subprocess — FastSAM + Depth Pro + Gemini) =====
+        self.lbl_vlm_service = QLabel("●"); self._set_led(self.lbl_vlm_service, "stopped")
+        grid.addWidget(QLabel("<b>VLM Service</b>"), row, 0)
+        grid.addWidget(self.lbl_vlm_service, row, 1)
+
+        self.btn_vlm_service_start = QPushButton("Start")
+        self.btn_vlm_service_stop = QPushButton("Stop")
+        self.btn_vlm_service_status = QPushButton("Status")
+        self.btn_vlm_service_decide = QPushButton("Decide Now")
+
+        self.btn_vlm_service_start.clicked.connect(self.on_vlm_service_start)
+        self.btn_vlm_service_stop.clicked.connect(self.on_vlm_service_stop)
+        self.btn_vlm_service_status.clicked.connect(self.on_vlm_service_status)
+        self.btn_vlm_service_decide.clicked.connect(self.on_vlm_service_decide)
+
+        grid.addWidget(self.btn_vlm_service_start, row, 2)
+        grid.addWidget(self.btn_vlm_service_stop, row, 3)
+        grid.addWidget(self.btn_vlm_service_status, row, 4)
+        row += 1
+
+        self.btn_vlm_service_segment = QPushButton("Segment Now")
+        self.btn_vlm_service_depth = QPushButton("Depth Now")
+        self.btn_vlm_service_segment.clicked.connect(self.on_vlm_service_segment)
+        self.btn_vlm_service_depth.clicked.connect(self.on_vlm_service_depth)
+
+        grid.addWidget(QLabel(f"<i>Backend:</i> {GAZE_OR_BACKEND}"), row, 0, 1, 2)
+        grid.addWidget(self.btn_vlm_service_decide, row, 2)
+        grid.addWidget(self.btn_vlm_service_segment, row, 3)
+        grid.addWidget(self.btn_vlm_service_depth, row, 4)
+        row += 1
+
         # Robot
         self.lbl_robot = QLabel("●"); self._set_led(self.lbl_robot, "stopped")
         grid.addWidget(QLabel("<b>Robot</b>"), row, 0)
@@ -666,7 +715,7 @@ class ControlPanel(QMainWindow):
         pick_row = QHBoxLayout()
         self.log_title = QLabel("Logs:")
         self.log_selector = QComboBox()
-        self.log_selector.addItems(["Marker", "FES", "Driver", "Gaze", "Robot", "Panel"])
+        self.log_selector.addItems(["Marker", "FES", "Driver", "Gaze", "VLM", "Robot", "Panel"])
         self.log_selector.setCurrentText(self._current_log_target)
         self.log_selector.currentTextChanged.connect(self._on_log_target_changed)
         pick_row.addWidget(self.log_title); pick_row.addStretch(1)
@@ -1057,7 +1106,7 @@ class ControlPanel(QMainWindow):
             return
         self.driver.cmd = f'python -u "{driver_path}" {mode_flag}'
 
-        for p in (self.marker, self.driver, self.fes, self.gaze_runner, self.gaze_service):
+        for p in (self.marker, self.driver, self.fes, self.gaze_runner, self.gaze_service, self.vlm_service):
             p.env["PYTHONUNBUFFERED"] = "1"
             p.env["TRAINING_SUBJECT"] = self.training_subject
             p.env["ARDUINO_PORT"]      = getattr(self, "serial_port_name", "") or ""
@@ -1106,7 +1155,7 @@ class ControlPanel(QMainWindow):
             return
         self.training_subject = val
         write_training_subject(val)
-        for p in (self.marker, self.driver, self.fes, self.gaze_runner, self.gaze_service):
+        for p in (self.marker, self.driver, self.fes, self.gaze_runner, self.gaze_service, self.vlm_service):
             p.env["TRAINING_SUBJECT"] = self.training_subject
         self._append_log("Panel", f"[{self._ts()}] TRAINING_SUBJECT saved: {val}\n")
         if hasattr(self, "on_refresh_training_data_list"):
@@ -1264,6 +1313,93 @@ class ControlPanel(QMainWindow):
                 self._append_log_ui("Gaze", err)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    # ----- VLM service handlers -----
+
+    def _vlm_udp_request(self, payload: dict, timeout_s: float = VLM_QUERY_TIMEOUT_S) -> dict:
+        """One-shot JSON request against vlm_service.py (same idiom as _gaze_udp_request)."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.settimeout(float(timeout_s))
+            sock.sendto(json.dumps(payload).encode("utf-8"), (VLM_SERVICE_HOST, VLM_SERVICE_PORT))
+            data, _ = sock.recvfrom(65535)
+            return json.loads(data.decode("utf-8", errors="replace"))
+        finally:
+            sock.close()
+
+    def on_vlm_service_start(self):
+        if not os.path.exists(VLM_SERVICE_PY):
+            QMessageBox.warning(self, "Missing", f"Not found:\n{VLM_SERVICE_PY}")
+            return
+        if not VLM_REPO_DIR or not os.path.isdir(VLM_REPO_DIR):
+            QMessageBox.warning(self, "VLM repo missing", f"VLM_REPO_DIR not a dir:\n{VLM_REPO_DIR}")
+            return
+
+        if _is_port_in_use(int(VLM_SERVICE_PORT), VLM_SERVICE_HOST):
+            QMessageBox.warning(
+                self,
+                "VLM service port in use",
+                f"UDP port {VLM_SERVICE_HOST}:{VLM_SERVICE_PORT} appears in use.\n"
+                f"Use Stop first or change VLM_SERVICE_PORT."
+            )
+
+        session_dir = ""
+        if VLM_SESSION_ROOT:
+            try:
+                os.makedirs(VLM_SESSION_ROOT, exist_ok=True)
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                session_dir = os.path.join(VLM_SESSION_ROOT, f"session_{ts}")
+                os.makedirs(session_dir, exist_ok=True)
+            except OSError as e:
+                self._append_log("VLM", f"[{self._ts()}] Failed to create session dir: {e}\n")
+
+        depth_flag = "--enable-depth" if VLM_ENABLE_DEPTH else ""
+        session_arg = f'--session-dir "{session_dir}"' if session_dir else ""
+        # --neon-host "" forces discover_one_device in harmony_vlm's NeonLiveReader
+        # (utils/neon/reader.py:224), matching our gaze_system.py:250 pattern.
+        self.vlm_service.cmd = (
+            f'conda run --no-capture-output -n {VLM_CONDA_ENV} '
+            f'python -u "{VLM_SERVICE_PY}" '
+            f'--repo-dir "{VLM_REPO_DIR}" '
+            f'--host {VLM_SERVICE_HOST} --port {int(VLM_SERVICE_PORT)} '
+            f'--neon-host "" '
+            f'--model {VLM_MODEL} '
+            f'{depth_flag} {session_arg}'
+        )
+        self._start_proc(self.vlm_service, self.lbl_vlm_service, "VLM")
+        self._append_log("VLM", f"[{self._ts()}] Service start requested (depth={VLM_ENABLE_DEPTH}, model={VLM_MODEL})\n")
+
+    def on_vlm_service_stop(self):
+        self._stop_proc(self.vlm_service, self.lbl_vlm_service, "VLM")
+
+    def _vlm_command_threaded(self, payload: dict, timeout_s: float, label: str) -> None:
+        import threading as _threading
+        self._append_log("VLM", f"[{self._ts()}] {label} TX -> {VLM_SERVICE_HOST}:{VLM_SERVICE_PORT}\n")
+
+        def worker():
+            t0 = time.time()
+            try:
+                resp = self._vlm_udp_request(payload, timeout_s=timeout_s)
+                dt_ms = (time.time() - t0) * 1000.0
+                pretty = json.dumps(resp, indent=2, sort_keys=True)
+                self._append_log_ui("VLM", f"[{self._ts()}] {label} RX OK ({dt_ms:.0f} ms)\n{pretty}\n")
+            except Exception as e:
+                dt_ms = (time.time() - t0) * 1000.0
+                self._append_log_ui("VLM", f"[{self._ts()}] {label} RX ERROR ({dt_ms:.0f} ms): {e}\n")
+
+        _threading.Thread(target=worker, daemon=True).start()
+
+    def on_vlm_service_status(self):
+        self._vlm_command_threaded({"cmd": "status"}, VLM_QUERY_TIMEOUT_S, "status")
+
+    def on_vlm_service_decide(self):
+        self._vlm_command_threaded({"cmd": "decide"}, VLM_DECIDE_TIMEOUT_S, "decide")
+
+    def on_vlm_service_segment(self):
+        self._vlm_command_threaded({"cmd": "segment"}, 5.0, "segment")
+
+    def on_vlm_service_depth(self):
+        self._vlm_command_threaded({"cmd": "depth", "at_gaze": True}, 15.0, "depth")
 
     def _format_gaze_telemetry_line(self, snap: dict) -> str:
         """
