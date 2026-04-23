@@ -405,6 +405,7 @@ class ControlPanel(QMainWindow):
 
         # ---- VLM service proc ----
         self.vlm_service = Proc("VLM Service", None, ROOT)
+        self._vlm_last_snapshot_id: Optional[str] = None
 
         # Robot terminal
         self.robot_term: Optional[QProcess] = None
@@ -623,6 +624,19 @@ class ControlPanel(QMainWindow):
         grid.addWidget(self.btn_vlm_service_decide, row, 2)
         grid.addWidget(self.btn_vlm_service_segment, row, 3)
         grid.addWidget(self.btn_vlm_service_depth, row, 4)
+        row += 1
+
+        # Sequential (two-object) decide — look at A, capture; look at B, decide pair.
+        self.btn_vlm_capture_first = QPushButton("Capture First")
+        self.btn_vlm_decide_pair = QPushButton("Decide Pair")
+        self.lbl_vlm_pair_token = QLabel("<i>snapshot:</i> (none)")
+        self.btn_vlm_capture_first.clicked.connect(self.on_vlm_capture_first)
+        self.btn_vlm_decide_pair.clicked.connect(self.on_vlm_decide_pair)
+
+        grid.addWidget(QLabel("<i>Sequential:</i>"), row, 0)
+        grid.addWidget(self.lbl_vlm_pair_token, row, 1, 1, 2)
+        grid.addWidget(self.btn_vlm_capture_first, row, 3)
+        grid.addWidget(self.btn_vlm_decide_pair, row, 4)
         row += 1
 
         # Robot
@@ -1400,6 +1414,59 @@ class ControlPanel(QMainWindow):
 
     def on_vlm_service_depth(self):
         self._vlm_command_threaded({"cmd": "depth", "at_gaze": True}, 15.0, "depth")
+
+    def on_vlm_capture_first(self):
+        import threading as _threading
+        self._append_log("VLM", f"[{self._ts()}] capture_first TX -> {VLM_SERVICE_HOST}:{VLM_SERVICE_PORT}\n")
+
+        def worker():
+            t0 = time.time()
+            try:
+                resp = self._vlm_udp_request({"cmd": "capture_first"}, timeout_s=12.0)
+                dt_ms = (time.time() - t0) * 1000.0
+                if isinstance(resp, dict) and resp.get("ok") and resp.get("snapshot_id"):
+                    self._vlm_last_snapshot_id = str(resp["snapshot_id"])
+                    hit = resp.get("hit_waypoint")
+                    hit_lbl = hit.get("label") if isinstance(hit, dict) else "—"
+                    self._append_log_ui(
+                        "VLM",
+                        f"[{self._ts()}] capture_first RX OK ({dt_ms:.0f} ms)\n"
+                        f"{json.dumps(resp, indent=2, sort_keys=True)}\n",
+                    )
+                    # Update token label on the main thread
+                    from PySide6.QtCore import QMetaObject, Qt, Q_ARG
+                    QMetaObject.invokeMethod(
+                        self.lbl_vlm_pair_token, "setText", Qt.QueuedConnection,
+                        Q_ARG(str, f"<i>snapshot:</i> {self._vlm_last_snapshot_id} ({hit_lbl})"),
+                    )
+                else:
+                    self._append_log_ui(
+                        "VLM",
+                        f"[{self._ts()}] capture_first RX (no snapshot_id) ({dt_ms:.0f} ms)\n"
+                        f"{json.dumps(resp, indent=2, sort_keys=True)}\n",
+                    )
+            except Exception as e:
+                dt_ms = (time.time() - t0) * 1000.0
+                self._append_log_ui("VLM", f"[{self._ts()}] capture_first RX ERROR ({dt_ms:.0f} ms): {e}\n")
+
+        _threading.Thread(target=worker, daemon=True).start()
+
+    def on_vlm_decide_pair(self):
+        if not self._vlm_last_snapshot_id:
+            QMessageBox.information(
+                self, "No snapshot",
+                "Click 'Capture First' on the source object before running 'Decide Pair'.",
+            )
+            return
+        snap_id = self._vlm_last_snapshot_id
+        self._vlm_command_threaded(
+            {"cmd": "decide_pair", "snapshot_id": snap_id, "timeout": 45.0},
+            60.0,
+            f"decide_pair(snapshot_id={snap_id})",
+        )
+        # Cleared after use so accidental re-presses don't replay a stale snapshot.
+        self._vlm_last_snapshot_id = None
+        self.lbl_vlm_pair_token.setText("<i>snapshot:</i> (consumed)")
 
     def _format_gaze_telemetry_line(self, snap: dict) -> str:
         """
