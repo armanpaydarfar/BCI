@@ -2,9 +2,10 @@
 vlm_launcher.py — spawn the harmony_vlm demo.py as a subprocess.
 
 The VLM runs in a separate conda env (depth-pro pins numpy<2, incompatible
-with the BCI stack's pyriemann/opencv in the `lsl` env). All lifecycle
-management is process-boundary only; stdout/stderr are kept as pipes so the
-control panel can capture them into a log buffer.
+with the BCI stack's pyriemann/opencv in the `lsl` env). stdout/stderr are
+redirected to files under the session directory so the child can't deadlock
+on a full pipe buffer when nothing is draining it, and so the control panel
+(or the user) can tail the logs independently.
 """
 
 from __future__ import annotations
@@ -38,6 +39,8 @@ class VLMLauncher:
 
         self._proc: Optional[subprocess.Popen] = None
         self._session_dir: Optional[Path] = None
+        self._stdout_fh = None
+        self._stderr_fh = None
 
         demo = self.repo_dir / "demo.py"
         if not demo.exists():
@@ -83,13 +86,16 @@ class VLMLauncher:
         cmd = self._build_cmd(session_dir)
         self._log(f"[vlm_launcher] starting: cwd={self.repo_dir} cmd={' '.join(cmd)}")
 
+        self._stdout_fh = open(session_dir / "vlm.stdout.log", "wb")
+        self._stderr_fh = open(session_dir / "vlm.stderr.log", "wb")
+
         # start_new_session=True puts the child in its own process group so
         # SIGTERM on the pgid reaches the python worker, not just `conda run`.
         self._proc = subprocess.Popen(
             cmd,
             cwd=str(self.repo_dir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=self._stdout_fh,
+            stderr=self._stderr_fh,
             start_new_session=True,
         )
         self._log(f"[vlm_launcher] pid={self._proc.pid} session_dir={session_dir}")
@@ -124,6 +130,14 @@ class VLMLauncher:
                 self._log(f"[vlm_launcher] pid={pid} still alive after SIGKILL")
         finally:
             self._proc = None
+            for fh in (self._stdout_fh, self._stderr_fh):
+                if fh is not None:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+            self._stdout_fh = None
+            self._stderr_fh = None
 
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
