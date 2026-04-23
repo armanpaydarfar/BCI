@@ -74,6 +74,21 @@ class VLMBridge:
     def decide(self, *, timeout: float = 30.0, recv_timeout_s: float = 40.0) -> Optional[dict]:
         return self._request("decide", {"timeout": timeout}, recv_timeout_s=recv_timeout_s)
 
+    def capture_first(self, *, recv_timeout_s: float = 10.0) -> Optional[dict]:
+        """Snapshot the current frame+gaze+detections+waypoints under a server-side
+        token. Pair with decide_pair(snapshot_id=...) after the user's second gaze."""
+        return self._request("capture_first", recv_timeout_s=recv_timeout_s)
+
+    def decide_pair(self, *, snapshot_id: str, timeout: float = 45.0, recv_timeout_s: float = 60.0) -> Optional[dict]:
+        """Combine the cached first snapshot with the current frame+gaze and run
+        reason_async_pair. Returns the paired decision including first_waypoint
+        and second_waypoint (both in Neon camera frame, metres)."""
+        return self._request(
+            "decide_pair",
+            {"snapshot_id": str(snapshot_id), "timeout": timeout},
+            recv_timeout_s=recv_timeout_s,
+        )
+
     def camera_matrix(self, recv_timeout_s: float = 0.3) -> Optional[dict]:
         return self._request("camera_matrix", recv_timeout_s=recv_timeout_s)
 
