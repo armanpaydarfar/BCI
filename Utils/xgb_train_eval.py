@@ -237,7 +237,7 @@ def train_xgb_dual_thresholds(
     widths = np.linspace(0.0, 0.9, 35)
     base._plot_risk_coverage(all_scores, all_true_bin, center, widths, 1.0, 1.0, 0.3)
     base._plot_roc_with_point(all_scores, all_true_bin, th_star)
-    base._plot_confusion_with_reject(all_true, all_pred, rest_label, mi_label)
+    base._plot_confusion_fixed_threshold(all_scores, all_true_bin, rest_label, mi_label, t_high=0.65)
     for lbl in posterior_probs:
         posterior_probs[lbl] = np.asarray(posterior_probs[lbl])
     base.plot_posterior_probabilities(posterior_probs)

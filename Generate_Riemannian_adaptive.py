@@ -629,6 +629,61 @@ def _plot_confusion_with_reject(true_all, pred_all, rest_label, mi_label):
     plt.show()
 
 
+def _plot_confusion_fixed_threshold(all_scores, all_true_bin, rest_label, mi_label, t_high=0.65):
+    """
+    Same 2×3 confusion-with-reject layout as _plot_confusion_with_reject, but
+    applies a fixed symmetric threshold instead of learned per-fold thresholds.
+
+    A window is classified as MI if P(MI) >= t_high, as REST if P(MI) <= (1 - t_high),
+    and as ambiguous otherwise.  This mirrors the symmetric scheme in
+    _print_fixed_threshold_sweep so the two are directly comparable.
+
+    t_high is a P(correct class) threshold — the same value applies to both
+    classes, which is why t_low = 1 - t_high.
+    """
+    import matplotlib.pyplot as plt
+
+    t_low = 1.0 - t_high
+    scores = np.asarray(all_scores, dtype=float)
+    y_bin  = np.asarray(all_true_bin, dtype=int)
+
+    pred = np.full(len(scores), -1, dtype=int)
+    pred[scores >= t_high] = 1
+    pred[scores <= t_low]  = 0
+
+    true_orig = np.where(y_bin == 1, mi_label, rest_label)
+    pred_orig = np.full(len(scores), -1, dtype=int)
+    pred_orig[pred == 1] = mi_label
+    pred_orig[pred == 0] = rest_label
+
+    REST, MI, AMB = rest_label, mi_label, -1
+    mat = np.array([
+        np.sum((true_orig == REST) & (pred_orig == REST)),
+        np.sum((true_orig == REST) & (pred_orig == AMB)),
+        np.sum((true_orig == REST) & (pred_orig == MI)),
+        np.sum((true_orig == MI)   & (pred_orig == REST)),
+        np.sum((true_orig == MI)   & (pred_orig == AMB)),
+        np.sum((true_orig == MI)   & (pred_orig == MI)),
+    ], dtype=int).reshape(2, 3)
+
+    coverage = (pred != -1).mean()
+
+    plt.figure(figsize=(6.5, 4.8))
+    im = plt.imshow(mat, cmap="Blues")
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.xticks([0, 1, 2], ["REST", "AMB", "MI"])
+    plt.yticks([0, 1], ["REST (true)", "MI (true)"])
+    for i in range(2):
+        for j in range(3):
+            plt.text(j, i, str(mat[i, j]), ha="center", va="center", fontsize=11)
+    plt.title(
+        f"Confusion — Fixed P(correct)≥{t_high:.2f}  "
+        f"(coverage {coverage:.1%}, ambig {1.0-coverage:.1%})"
+    )
+    plt.tight_layout()
+    plt.show()
+
+
 def pick_dual_thresholds_target_ambiguity(
     y_true_bin, pos_scores,
     target_ambig=0.20,
@@ -931,7 +986,7 @@ def train_riemannian_model(
 
     _plot_roc_with_point(all_scores, all_true_bin, th_star)
 
-    _plot_confusion_with_reject(all_true, all_pred, rest_label, mi_label)
+    _plot_confusion_fixed_threshold(all_scores, all_true_bin, rest_label, mi_label, t_high=0.65)
 
     # posterior histograms (your original helper)
     for lbl in posterior_probs:
