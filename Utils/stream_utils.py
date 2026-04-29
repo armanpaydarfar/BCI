@@ -12,7 +12,7 @@ Be mindful of sample layout:
 """
 
 import sys
-from pylsl import resolve_stream, StreamInlet
+from pylsl import resolve_stream, resolve_byprop, StreamInlet
 import numpy as np
 import pyxdf
 
@@ -40,7 +40,7 @@ def require_marker_stream(logger=None, timeout=5.0):
             print(msg)
 
     _log("Checking for MarkerStream LSL outlet (UTIL_marker_stream.py)...")
-    found = resolve_stream('name', 'MarkerStream', minimum=1, timeout=timeout)
+    found = resolve_byprop('name', 'MarkerStream', minimum=1, timeout=timeout)
     if not found:
         msg = (
             "STARTUP ERROR: MarkerStream not found on the LSL network. "
