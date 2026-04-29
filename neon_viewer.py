@@ -87,6 +87,7 @@ def main():
         # Workaround for https://github.com/opencv/opencv/issues/21952
         cv2.imshow("cv/av bug", np.zeros(1))
         cv2.destroyAllWindows()
+        cv2.namedWindow("Neon viewer — ESC to quit", cv2.WINDOW_NORMAL)
 
     if _NEON_HOST:
         from pupil_labs.realtime_api.simple import Device
