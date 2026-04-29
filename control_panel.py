@@ -37,7 +37,7 @@ IMPORTANT:
 - NO --telemetry flag is passed (that caused argparse errors).
 """
 
-import os, sys, shlex, time, re, tempfile, socket, subprocess, json, threading, glob
+import os, sys, shlex, time, re, tempfile, socket, subprocess, json, threading, glob, struct
 import serial
 import serial.tools.list_ports
 
@@ -50,8 +50,8 @@ except ImportError:
 from dataclasses import dataclass, field
 from typing import Optional, Dict
 
-from PySide6.QtCore import Qt, QTimer, QProcess, QByteArray, QSize
-from PySide6.QtGui import QAction, QClipboard, QTextCursor
+from PySide6.QtCore import Qt, QTimer, QProcess, QByteArray, QSize, QThread, Signal
+from PySide6.QtGui import QAction, QClipboard, QTextCursor, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QCheckBox, QGridLayout, QLineEdit,
@@ -106,6 +106,9 @@ VLM_SESSION_ROOT    = getattr(_HCFG, "VLM_SESSION_ROOT", None) if _HCFG else Non
 VLM_QUERY_TIMEOUT_S = 2.0
 VLM_DECIDE_TIMEOUT_S = 40.0
 GAZE_OR_BACKEND     = str(getattr(_HCFG, "GAZE_OR_BACKEND", "legacy")).lower() if _HCFG else "legacy"
+VLM_OVERLAY_PORT    = int(getattr(_HCFG, "VLM_OVERLAY_PORT", 5590)) if _HCFG else 5590
+VLM_ENABLE_OVERLAY  = bool(getattr(_HCFG, "VLM_ENABLE_OVERLAY", True)) if _HCFG else True
+NEON_COMPANION_HOST = str(getattr(_HCFG, "NEON_COMPANION_HOST", "")) if _HCFG else ""
 
 
 def _marker_udp_port() -> int:
@@ -369,6 +372,63 @@ class Proc:
     err: bytearray = field(default_factory=bytearray)
 
 # ----------------- Main Window -----------------
+class VLMVideoThread(QThread):
+    """
+    Connects to vlm_service.py's TCP overlay push server and emits JPEG frames.
+    Protocol: server sends 4-byte big-endian uint32 (frame length) followed by
+    that many bytes of JPEG, repeating at ~5 Hz. Reconnects automatically on
+    disconnect or connection failure.
+    """
+
+    frame_ready = Signal(bytes)
+
+    def __init__(self, host: str, port: int, parent=None) -> None:
+        super().__init__(parent)
+        self._host = host
+        self._port = port
+        self._running = False
+
+    def stop(self) -> None:
+        self._running = False
+
+    def run(self) -> None:
+        self._running = True
+        while self._running:
+            sock = None
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(3.0)
+                sock.connect((self._host, self._port))
+                sock.settimeout(5.0)
+                while self._running:
+                    # Read 4-byte length prefix
+                    header = b""
+                    while len(header) < 4:
+                        chunk = sock.recv(4 - len(header))
+                        if not chunk:
+                            raise ConnectionError("server closed connection")
+                        header += chunk
+                    n = struct.unpack(">I", header)[0]
+                    # Read exactly n bytes of JPEG
+                    jpg = b""
+                    while len(jpg) < n:
+                        chunk = sock.recv(min(n - len(jpg), 65536))
+                        if not chunk:
+                            raise ConnectionError("server closed connection")
+                        jpg += chunk
+                    self.frame_ready.emit(jpg)
+            except Exception:
+                pass
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+            if self._running:
+                self.msleep(1000)  # wait 1 s before reconnect attempt
+
+
 class ControlPanel(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -406,6 +466,7 @@ class ControlPanel(QMainWindow):
         # ---- VLM service proc ----
         self.vlm_service = Proc("VLM Service", None, ROOT)
         self._vlm_last_snapshot_id: Optional[str] = None
+        self._vlm_video_thread: Optional[VLMVideoThread] = None
 
         # Robot terminal
         self.robot_term: Optional[QProcess] = None
@@ -818,6 +879,7 @@ class ControlPanel(QMainWindow):
         rt.addWidget(self.txt_udp_log)
 
         self._populate_training_script_combo()
+        self._build_vlm_video_tab(tabs)
         self._build_runtime_config_tab(tabs)
 
         # Initial serial refresh
@@ -829,6 +891,72 @@ class ControlPanel(QMainWindow):
         self._refresh_log_view()
 
         self._update_robot_buttons_for_mode()
+
+    def _build_vlm_video_tab(self, tabs: QTabWidget) -> None:
+        vvt = QWidget()
+        tabs.addTab(vvt, "VLM Video")
+        vl = QVBoxLayout(vvt)
+
+        # Status / control row
+        ctrl = QHBoxLayout()
+        self.lbl_vlm_video_status = QLabel("Not connected — start VLM Service first")
+        btn_connect = QPushButton("Connect")
+        btn_connect.setMaximumWidth(90)
+        btn_connect.clicked.connect(self._on_vlm_video_connect)
+        btn_disconnect = QPushButton("Disconnect")
+        btn_disconnect.setMaximumWidth(100)
+        btn_disconnect.clicked.connect(self._on_vlm_video_disconnect)
+        ctrl.addWidget(self.lbl_vlm_video_status, 1)
+        ctrl.addWidget(btn_connect)
+        ctrl.addWidget(btn_disconnect)
+        vl.addLayout(ctrl)
+
+        # Video display label — scales incoming JPEG to fit available space
+        self.lbl_vlm_video = QLabel()
+        self.lbl_vlm_video.setAlignment(Qt.AlignCenter)
+        self.lbl_vlm_video.setMinimumSize(640, 360)
+        self.lbl_vlm_video.setStyleSheet("background: #111111; color: #666666;")
+        self.lbl_vlm_video.setText(
+            "VLM overlay not connected\n\n"
+            "Start the VLM Service then click Connect,\n"
+            "or enable VLM_ENABLE_OVERLAY in config.py"
+        )
+        vl.addWidget(self.lbl_vlm_video, 1)
+
+    def _on_vlm_frame(self, jpg_bytes: bytes) -> None:
+        """Slot: called on the main thread when a new overlay JPEG arrives."""
+        pixmap = QPixmap()
+        pixmap.loadFromData(jpg_bytes, "JPEG")
+        if pixmap.isNull():
+            return
+        scaled = pixmap.scaled(
+            self.lbl_vlm_video.width(),
+            self.lbl_vlm_video.height(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self.lbl_vlm_video.setPixmap(scaled)
+        self.lbl_vlm_video_status.setText(
+            f"Live  ·  {pixmap.width()}×{pixmap.height()}  ·  {len(jpg_bytes)//1024} KB/frame"
+        )
+
+    def _on_vlm_video_connect(self) -> None:
+        if self._vlm_video_thread is not None and self._vlm_video_thread.isRunning():
+            return
+        self._vlm_video_thread = VLMVideoThread(VLM_SERVICE_HOST, VLM_OVERLAY_PORT)
+        self._vlm_video_thread.frame_ready.connect(self._on_vlm_frame)
+        self._vlm_video_thread.start()
+        self.lbl_vlm_video_status.setText(
+            f"Connecting to {VLM_SERVICE_HOST}:{VLM_OVERLAY_PORT}…"
+        )
+
+    def _on_vlm_video_disconnect(self) -> None:
+        if self._vlm_video_thread is not None:
+            self._vlm_video_thread.stop()
+            self._vlm_video_thread.wait(2000)
+            self._vlm_video_thread = None
+        self.lbl_vlm_video.setText("Disconnected")
+        self.lbl_vlm_video_status.setText("Not connected")
 
     def _build_runtime_config_tab(self, tabs: QTabWidget):
         rtc = QWidget()
@@ -1245,7 +1373,8 @@ class ControlPanel(QMainWindow):
         if not self._ensure_gaze_paths("runner"):
             return
         # Runner: UI + prints for testing, but logs are captured into View: Gaze.
-        self.gaze_runner.cmd = f'python -u "{GAZE_RUNNER_PY}" --mode runner --display 1 --prints 1'
+        neon_arg = f'--neon-device-host "{NEON_COMPANION_HOST}"' if NEON_COMPANION_HOST else ""
+        self.gaze_runner.cmd = f'python -u "{GAZE_RUNNER_PY}" --mode runner --display 1 --prints 1 {neon_arg}'
         self._start_proc(self.gaze_runner, None, "Gaze")
         self._append_log("Gaze", f"[{self._ts()}] Runner start requested\n")
 
@@ -1273,11 +1402,12 @@ class ControlPanel(QMainWindow):
             )
 
         # Service: prints can be 0 (supressed) or 1 (verbose) — either way logs go to View: Gaze
+        neon_arg = f'--neon-device-host "{NEON_COMPANION_HOST}"' if NEON_COMPANION_HOST else ""
         self.gaze_service.cmd = (
             f'python -u "{GAZE_SERVICE_PY}" --mode service '
             f'--display {int(display)} --prints 1 '
             f'--host {GAZE_SERVICE_HOST} --port {int(GAZE_SERVICE_PORT)} '
-            f'--udp_log 1 --udp_log_hz 50'
+            f'--udp_log 1 --udp_log_hz 50 {neon_arg}'
         )
         self._start_proc(self.gaze_service, self.lbl_gaze_service, "Gaze")
         self._append_log("Gaze", f"[{self._ts()}] Service start requested (display={display})\n")
@@ -1349,6 +1479,10 @@ class ControlPanel(QMainWindow):
             QMessageBox.warning(self, "VLM repo missing", f"VLM_REPO_DIR not a dir:\n{VLM_REPO_DIR}")
             return
 
+        # Reap any orphaned vlm_service.py left over from a previous crash or
+        # incomplete stop (conda run does not forward SIGTERM to child processes).
+        subprocess.run(["pkill", "-f", "vlm_service.py"], capture_output=True)
+
         if _is_port_in_use(int(VLM_SERVICE_PORT), VLM_SERVICE_HOST):
             QMessageBox.warning(
                 self,
@@ -1368,6 +1502,7 @@ class ControlPanel(QMainWindow):
                 self._append_log("VLM", f"[{self._ts()}] Failed to create session dir: {e}\n")
 
         depth_flag = "--enable-depth" if VLM_ENABLE_DEPTH else ""
+        overlay_flag = f"--enable-overlay --overlay-port {int(VLM_OVERLAY_PORT)}" if VLM_ENABLE_OVERLAY else ""
         session_arg = f'--session-dir "{session_dir}"' if session_dir else ""
         # --neon-host "" forces discover_one_device in harmony_vlm's NeonLiveReader
         # (utils/neon/reader.py:224), matching our gaze_system.py:250 pattern.
@@ -1376,15 +1511,31 @@ class ControlPanel(QMainWindow):
             f'python -u "{VLM_SERVICE_PY}" '
             f'--repo-dir "{VLM_REPO_DIR}" '
             f'--host {VLM_SERVICE_HOST} --port {int(VLM_SERVICE_PORT)} '
-            f'--neon-host "" '
+            f'--neon-host "{NEON_COMPANION_HOST}" '
             f'--model {VLM_MODEL} '
-            f'{depth_flag} {session_arg}'
+            f'{depth_flag} {overlay_flag} {session_arg}'
         )
         self._start_proc(self.vlm_service, self.lbl_vlm_service, "VLM")
-        self._append_log("VLM", f"[{self._ts()}] Service start requested (depth={VLM_ENABLE_DEPTH}, model={VLM_MODEL})\n")
+        self._append_log(
+            "VLM",
+            f"[{self._ts()}] Service start requested "
+            f"(depth={VLM_ENABLE_DEPTH}, overlay={VLM_ENABLE_OVERLAY}, model={VLM_MODEL})\n",
+        )
+        if VLM_ENABLE_OVERLAY:
+            self._on_vlm_video_connect()
 
     def on_vlm_service_stop(self):
+        # Ask vlm_service to exit gracefully before killing the conda wrapper.
+        # conda run does not forward SIGTERM to child processes, so without this
+        # the inner Python process survives as an orphan holding the UDP port.
+        try:
+            self._vlm_udp_request({"cmd": "stop"}, timeout_s=0.5)
+        except Exception:
+            pass
         self._stop_proc(self.vlm_service, self.lbl_vlm_service, "VLM")
+        # Belt-and-suspenders: reap any surviving orphan regardless.
+        subprocess.run(["pkill", "-f", "vlm_service.py"], capture_output=True)
+        self._on_vlm_video_disconnect()
 
     def _vlm_command_threaded(self, payload: dict, timeout_s: float, label: str) -> None:
         import threading as _threading
