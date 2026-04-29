@@ -52,6 +52,8 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import struct
+
 import numpy as np
 
 
@@ -109,6 +111,10 @@ def parse_args():
     p.add_argument("--enable-depth", action="store_true")
     p.add_argument("--depth-checkpoint", default="models/depth_pro.pt", help="Relative to repo-dir")
     p.add_argument("--session-dir", default=None, help="Where to save depth PNGs etc.")
+    p.add_argument("--enable-overlay", action="store_true",
+                   help="Start the annotated JPEG TCP push server for control-panel display")
+    p.add_argument("--overlay-port", type=int, default=5590,
+                   help="TCP port for the overlay frame push server")
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
 
@@ -140,6 +146,22 @@ class VLMService:
         # user to look at A, think, then look at B; short enough that stale
         # frames can't linger indefinitely.
         self._snapshots = SnapshotCache(ttl_s=60.0, max_size=4)
+
+        # Render-state cache: shared between the serving thread (writers) and
+        # the overlay render thread (reader). Protected by _render_lock.
+        self._render_lock = threading.Lock()
+        self._cached_dets: list = []
+        self._cached_hit_det = None          # raw Detection object under gaze
+        self._cached_hit_wp: Optional[dict] = None   # JSON-safe hit waypoint dict
+        self._vlm_state: str = "IDLE"        # IDLE | THINKING | AWAITING_SECOND | DECIDED
+        self._last_decision: Optional[dict] = None
+        self._first_snap_det = None          # first-fixation Detection for AWAITING_SECOND badge
+
+        # Overlay frame store: render thread writes, TCP server thread reads.
+        self._overlay_lock = threading.Lock()
+        self._latest_overlay_jpg: Optional[bytes] = None
+        self._frame_count: int = 0
+        self._start_time: float = time.time()
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -230,6 +252,22 @@ class VLMService:
             return None
         return float((K[0, 0] + K[1, 1]) / 2.0)
 
+    def _cache_dets(self, dets: list, hit_det=None, hit_wp: Optional[dict] = None) -> None:
+        with self._render_lock:
+            self._cached_dets = list(dets)
+            self._cached_hit_det = hit_det
+            self._cached_hit_wp = hit_wp
+
+    def _set_vlm_state(self, state: str, decision: Optional[dict] = None, first_det=None) -> None:
+        with self._render_lock:
+            self._vlm_state = state
+            if decision is not None:
+                self._last_decision = decision
+            if first_det is not None:
+                self._first_snap_det = first_det
+            if state == "IDLE":
+                self._first_snap_det = None
+
     # ── dispatch ──────────────────────────────────────────────────────────
 
     def _dispatch(self, cmd: str, req: dict) -> dict:
@@ -248,6 +286,9 @@ class VLMService:
         handler = handlers.get(cmd)
         if handler is None:
             return {"ok": False, "error": f"unknown cmd '{cmd}'"}
+        # Signal the overlay renderer that a long model call is in progress.
+        if cmd in ("decide", "reason", "capture_first", "decide_pair"):
+            self._set_vlm_state("THINKING")
         return handler()
 
     # ── commands ──────────────────────────────────────────────────────────
@@ -300,6 +341,7 @@ class VLMService:
                 obj["mask_polygon"] = d.mask_polygon.reshape(-1, 2).astype(int).tolist()
             out.append(obj)
 
+        self._cache_dets(dets)
         return {"ok": True, "detections": out, "elapsed_s": elapsed, "n": len(out)}
 
     def _cmd_depth(self, req: dict) -> dict:
@@ -396,12 +438,16 @@ class VLMService:
             depth_at_gaze_m = float(depth_map[gy, gx])
 
         # Pick the waypoint whose detection bounding box contains the gaze px
+        hit_det = None
         hit_waypoint = None
         for d, wp in zip(dets, waypoints_out):
             x1, y1, x2, y2 = d.box_xyxy
             if x1 <= gaze_xy[0] <= x2 and y1 <= gaze_xy[1] <= y2:
+                hit_det = d
                 hit_waypoint = wp
                 break
+
+        self._cache_dets(dets, hit_det, hit_waypoint)
 
         fix_state = fix if fix is not None else self._FixationState(active=True)
         timeout_s = float(req.get("timeout", 30.0))
@@ -409,6 +455,7 @@ class VLMService:
         try:
             result = future.result(timeout=timeout_s)
         except FutureTimeoutError:
+            self._set_vlm_state("IDLE")
             return {
                 "ok": False,
                 "error": "vlm_timeout",
@@ -420,14 +467,15 @@ class VLMService:
         if not isinstance(result, dict):
             result = {}
 
-        return {
-            "ok": True,
+        decision = {
             "waypoints": waypoints_out,
             "hit_waypoint": hit_waypoint,
             "depth_at_gaze_m": depth_at_gaze_m,
             "gaze_px": list(gaze_xy),
             **result,
         }
+        self._set_vlm_state("DECIDED", decision=decision)
+        return {"ok": True, **decision}
 
     def _process_frame_and_gaze(self, frame_bgr, gaze_xy: tuple[float, float]) -> dict:
         """Segment + depth + waypoints + hit-test for an arbitrary frame.
@@ -461,15 +509,18 @@ class VLMService:
             gy = int(np.clip(round(gaze_xy[1]), 0, h - 1))
             depth_at_gaze = float(depth_map[gy, gx])
 
+        hit_det = None
         hit_waypoint: Optional[dict] = None
         for d, wp in zip(dets, waypoints_out):
             x1, y1, x2, y2 = d.box_xyxy
             if x1 <= gaze_xy[0] <= x2 and y1 <= gaze_xy[1] <= y2:
+                hit_det = d
                 hit_waypoint = wp
                 break
 
         return {
             "detections": dets,
+            "hit_det": hit_det,
             "waypoints": waypoints_out,
             "hit_waypoint": hit_waypoint,
             "depth_at_gaze_m": depth_at_gaze,
@@ -491,10 +542,14 @@ class VLMService:
             "gaze_xy": gaze_xy,
             "fix_state": fix if fix is not None else self._FixationState(active=True),
             "detections": processed["detections"],
+            "hit_det": processed["hit_det"],
             "waypoints": processed["waypoints"],
             "hit_waypoint": processed["hit_waypoint"],
             "depth_at_gaze_m": processed["depth_at_gaze_m"],
         })
+
+        self._cache_dets(processed["detections"], processed["hit_det"], processed["hit_waypoint"])
+        self._set_vlm_state("AWAITING_SECOND", first_det=processed["hit_det"])
 
         return {
             "ok": True,
@@ -555,8 +610,8 @@ class VLMService:
         if not isinstance(result, dict):
             result = {}
 
-        return {
-            "ok": True,
+        self._cache_dets(second["detections"], second["hit_det"], second["hit_waypoint"])
+        decision = {
             "snapshot_id": snap_id,
             "elapsed_s": elapsed,
             "first_gaze_px": list(first["gaze_xy"]),
@@ -569,6 +624,8 @@ class VLMService:
             "second_depth_at_gaze_m": second["depth_at_gaze_m"],
             **result,
         }
+        self._set_vlm_state("DECIDED", decision=decision)
+        return {"ok": True, **decision}
 
     def _cmd_camera_matrix(self) -> dict:
         K = getattr(self.reader, "camera_matrix", None)
@@ -584,6 +641,104 @@ class VLMService:
     def _cmd_stop(self) -> dict:
         self._stop_event.set()
         return {"ok": True}
+
+    # ── overlay rendering + TCP push server ───────────────────────────────
+
+    def start_overlay_server(self) -> None:
+        """Spawn the render thread and TCP push server thread."""
+        t_render = threading.Thread(target=self._render_loop, daemon=True, name="vlm-render")
+        t_server = threading.Thread(target=self._overlay_server_loop, daemon=True, name="vlm-overlay-tcp")
+        t_render.start()
+        t_server.start()
+        _log(f"overlay server started (tcp port {self.args.overlay_port})")
+
+    def _render_loop(self) -> None:
+        """Render annotated frames at ~5 Hz and store the latest JPEG."""
+        import cv2 as _cv2
+        from utils.overlay_renderer import OverlayRenderer
+
+        renderer = OverlayRenderer()
+        while not self._stop_event.is_set():
+            try:
+                bundle, fix, _ = self._latest()
+                if bundle is not None:
+                    with self._render_lock:
+                        dets = list(self._cached_dets)
+                        hit_det = self._cached_hit_det
+                        hit_wp = self._cached_hit_wp
+                        state = self._vlm_state
+                        decision = self._last_decision
+                        first_det = self._first_snap_det
+                        fc = self._frame_count
+
+                    fix_state = fix if fix is not None else self._FixationState(active=False)
+                    canvas = renderer.render(
+                        frame_bgr=bundle.video.bgr.copy(),
+                        detections=dets,
+                        hit=hit_det,
+                        fixation=fix_state,
+                        gaze=bundle.gaze,
+                        vlm_state=state,
+                        last_decision=decision,
+                        api_mode="VISION",
+                        pending_detection=None,
+                        frame_idx=fc,
+                        total_frames=0,
+                        duration_s=time.time() - self._start_time,
+                        first_object=first_det,
+                        hit_waypoint=hit_wp,
+                    )
+                    _, jpg_buf = _cv2.imencode(
+                        ".jpg", canvas, [_cv2.IMWRITE_JPEG_QUALITY, 75]
+                    )
+                    with self._overlay_lock:
+                        self._latest_overlay_jpg = bytes(jpg_buf)
+                        self._frame_count = fc + 1
+            except Exception as e:
+                if self.args.verbose:
+                    _log(f"render loop error: {e}")
+            time.sleep(0.2)  # 5 Hz
+
+    def _overlay_server_loop(self) -> None:
+        """TCP server: accept one client at a time and push length-prefixed JPEGs."""
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind((self.args.host, self.args.overlay_port))
+        except OSError as e:
+            _log(f"overlay server bind failed on port {self.args.overlay_port}: {e}")
+            return
+        srv.listen(1)
+        srv.settimeout(1.0)
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    conn, addr = srv.accept()
+                except socket.timeout:
+                    continue
+                _log(f"overlay client connected: {addr}")
+                conn.settimeout(2.0)
+                try:
+                    while not self._stop_event.is_set():
+                        with self._overlay_lock:
+                            jpg = self._latest_overlay_jpg
+                        if jpg:
+                            try:
+                                conn.sendall(struct.pack(">I", len(jpg)) + jpg)
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                break
+                        time.sleep(0.2)
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    _log(f"overlay client disconnected: {addr}")
+        finally:
+            try:
+                srv.close()
+            except Exception:
+                pass
 
 
 def _json_default(o):
@@ -603,11 +758,28 @@ def main() -> None:
         sys.exit(2)
     sys.path.insert(0, repo_dir)
     # .env at repo root holds GOOGLE_API_KEY / OPENAI_API_KEY for IntentReasoner.
-    # Change cwd so load_dotenv() and relative model paths resolve correctly.
+    # Change cwd so relative model paths (FastSAM-s.pt, depth_pro.pt) resolve correctly.
     os.chdir(repo_dir)
 
-    from dotenv import load_dotenv
-    load_dotenv()
+    # Read .env values and force-set them in os.environ so that a pre-existing
+    # empty-string value inherited from the parent process doesn't shadow the file.
+    # Using dotenv_values (returns a plain dict) then updating os.environ directly
+    # avoids load_dotenv's override=False default and any version-specific behaviour.
+    env_file = os.path.join(repo_dir, ".env")
+    if os.path.isfile(env_file):
+        try:
+            from dotenv import dotenv_values
+            for _k, _v in dotenv_values(env_file).items():
+                if _v is not None:
+                    os.environ[_k] = _v
+        except Exception as _e:
+            _log(f"warning: could not read .env via dotenv ({_e}); falling back to manual parse")
+            with open(env_file) as _fh:
+                for _line in _fh:
+                    _line = _line.strip()
+                    if _line and not _line.startswith("#") and "=" in _line:
+                        _ek, _ev = _line.split("=", 1)
+                        os.environ[_ek.strip()] = _ev.strip().strip('"').strip("'")
 
     from utils.neon import NeonLiveReader
     from utils.object_detector import ObjectDetector
@@ -616,7 +788,7 @@ def main() -> None:
 
     api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        _log("FATAL: no GOOGLE_API_KEY / OPENAI_API_KEY in env or .env")
+        _log(f"FATAL: no GOOGLE_API_KEY / OPENAI_API_KEY in env or .env (looked in {env_file})")
         sys.exit(2)
 
     _log(f"connecting to Neon (host={args.neon_host or 'auto-discover'})…")
@@ -652,6 +824,9 @@ def main() -> None:
         fixation_state_cls=FixationState,
     )
     service.start_frame_thread()
+
+    if args.enable_overlay:
+        service.start_overlay_server()
 
     _log("ready")
     try:

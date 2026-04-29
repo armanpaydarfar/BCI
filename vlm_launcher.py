@@ -39,6 +39,8 @@ class VLMLauncher:
         service_port: int = 5589,
         neon_host: str = "",
         device: str = "cpu",
+        enable_overlay: bool = False,
+        overlay_port: int = 5590,
         logger=None,
     ) -> None:
         self.repo_dir = Path(repo_dir)
@@ -51,6 +53,8 @@ class VLMLauncher:
         self.service_port = int(service_port)
         self.neon_host = str(neon_host)
         self.device = str(device)
+        self.enable_overlay = bool(enable_overlay)
+        self.overlay_port = int(overlay_port)
         self._logger = logger
 
         self._proc: Optional[subprocess.Popen] = None
@@ -88,6 +92,8 @@ class VLMLauncher:
         ]
         if self.enable_depth:
             cmd.append("--enable-depth")
+        if self.enable_overlay:
+            cmd.extend(["--enable-overlay", "--overlay-port", str(self.overlay_port)])
         return cmd
 
     def start(self) -> subprocess.Popen:
