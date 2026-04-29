@@ -141,6 +141,16 @@ GAZE_SAMPLE_HEIGHT = 1200.0
 POSE_LIBRARY_PATH = os.path.join(WORKING_DIR, "poses_with_gaze_20251202_153040.npz")
 
 # =============================================================================
+# Pupil Labs Neon — device connection
+# =============================================================================
+# IP address of the phone running the Pupil Labs Companion app.
+# Leave empty ("") to use mDNS auto-discovery, which works on home/hotspot
+# networks but is blocked on most enterprise/IoT VLANs.
+# Find the IP in the Companion app: tap the streaming icon → note the address
+# shown (e.g. "10.42.0.100").  Set it here when on a university IoT network.
+NEON_COMPANION_HOST = "10.159.68.45"
+
+# =============================================================================
 # VLM integration (harmony_vlm subprocess)
 # =============================================================================
 # Gaze/object-recognition backend selector:
@@ -175,6 +185,13 @@ VLM_SERVICE_TIMEOUT = 0.5
 # Root directory for VLM session artifacts (stdout/stderr logs + any saved
 # depth PNGs, overlay videos, etc.). Each run creates a timestamped subdir.
 VLM_SESSION_ROOT = os.path.join(DATA_DIR, "vlm_sessions")
+
+# TCP port for the optional VLM overlay stream (JPEG frames pushed at ~5 Hz).
+# Served by vlm_service.py when --enable-overlay is passed; consumed by the
+# control panel's "VLM Video" tab.
+VLM_OVERLAY_PORT    = 5590
+# Whether the control panel should start vlm_service with --enable-overlay.
+VLM_ENABLE_OVERLAY  = True
 
 # =============================================================================
 # FES

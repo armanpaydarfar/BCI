@@ -319,6 +319,9 @@ def parse_args():
     p.add_argument("--host", type=str, default="127.0.0.1")
     p.add_argument("--port", type=int, default=5588)
     p.add_argument("--ipc_verbose", action="store_true")
+    p.add_argument("--neon-device-host", type=str, default="",
+                   dest="neon_device_host",
+                   help="Companion app IP for direct connection; empty = mDNS discovery")
     return p.parse_args()
 
 
@@ -328,6 +331,7 @@ def main():
 
     sys_cfg = build_sys_cfg()
     sys_cfg.enable_prints = bool(args.prints)
+    sys_cfg.neon_host = str(args.neon_device_host)
 
     if args.loop_hz is not None:
         sys_cfg.target_loop_hz = float(args.loop_hz)

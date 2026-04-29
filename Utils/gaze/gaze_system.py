@@ -119,7 +119,10 @@ class GazeConfig:
     print_hz: float = 5.0
     topk_log: int = 3
 
-    # Device discovery
+    # Device connection — leave empty to use mDNS auto-discovery (works on home/
+    # hotspot networks but blocked on enterprise/IoT VLANs).  When set, connects
+    # directly via Device(address=neon_host, port=8080), bypassing mDNS entirely.
+    neon_host: str = ""
     discover_timeout_s: int = 10
 
 
@@ -246,8 +249,13 @@ class GazeSystem:
         """
         Discover device and start threads.
         """
-        self._log("Looking for the next best device...")
-        self._device = discover_one_device(max_search_duration_seconds=int(self.cfg.discover_timeout_s))
+        if self.cfg.neon_host:
+            from pupil_labs.realtime_api.simple import Device
+            self._log(f"Connecting directly to Neon at {self.cfg.neon_host}…")
+            self._device = Device(address=self.cfg.neon_host, port=8080)
+        else:
+            self._log("Looking for the next best device...")
+            self._device = discover_one_device(max_search_duration_seconds=int(self.cfg.discover_timeout_s))
         if self._device is None:
             raise RuntimeError("No Pupil Labs Neon device found.")
 
