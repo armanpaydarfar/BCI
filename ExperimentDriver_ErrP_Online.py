@@ -507,6 +507,10 @@ def main():
         logger.log_event(
             f"ErrP EA bootstrap: {ea_seconds:.0f}s of quiet fixation before first trial."
         )
+        ea_epoch_samples = int(round(
+            float(getattr(config, "ERRP_EPOCH_TMAX", 0.8)) * float(config.FS)
+        ))
+        errp_eeg_state.start_ea_accumulation(ea_epoch_samples)
         boot_start = time.time()
         while time.time() - boot_start < ea_seconds:
             eeg_state.update()

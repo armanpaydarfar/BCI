@@ -9,7 +9,7 @@ from Utils.preprocessing import (
     select_channels,
     car_rereference,
 )
-from Utils.errp_alignment import apply_ea, fit_ea_reference
+from Utils.errp_alignment import apply_ea, fit_ea_reference, _inv_sqrt_psd
 
 class EEGStreamState:
     """
@@ -106,6 +106,16 @@ class EEGStreamState:
         # writes this attribute.
         self.ea_reference = None
 
+        # Incremental EA accumulator — populated during the bootstrap window
+        # via start_ea_accumulation() + update() + fit_ea_bootstrap().
+        # Keeps the main filtered_buffer lightweight: only one epoch's worth
+        # of samples is ever needed in the buffer at once.
+        self._ea_accumulating  = False
+        self._ea_epoch_samples = 0
+        self._ea_cov_sum       = None
+        self._ea_cov_count     = 0
+        self._ea_total         = 0  # samples appended since accumulation started
+
     def update(self):
         """
         Pull and process any newly available EEG samples from the LSL inlet.
@@ -178,6 +188,31 @@ class EEGStreamState:
                 self.timestamps.append(timestamps[i])
                 if filtered_chunk_beta is not None:
                     self.filtered_buffer_beta.append(filtered_chunk_beta[:, i])
+
+            # === Incremental EA covariance accumulation ===
+            # Active only during the bootstrap window (start_ea_accumulation called).
+            # Detects each newly completed non-overlapping epoch and accumulates its
+            # covariance without requiring more than one epoch in the buffer at a time.
+            if self._ea_accumulating:
+                ep          = self._ea_epoch_samples
+                prev_total  = self._ea_total
+                self._ea_total += filtered_chunk.shape[1]
+                prev_epochs = prev_total // ep
+                curr_epochs = self._ea_total // ep
+                if curr_epochs > prev_epochs:
+                    buf = list(self.filtered_buffer)
+                    for k in range(prev_epochs, curr_epochs):
+                        offset    = self._ea_total - (k + 1) * ep
+                        end_idx   = len(buf) - offset
+                        start_idx = end_idx - ep
+                        if 0 <= start_idx and end_idx <= len(buf):
+                            x   = np.array(buf[start_idx:end_idx]).T  # (n_ch, ep)
+                            cov = (x @ x.T) / float(ep - 1)
+                            if self._ea_cov_sum is None:
+                                self._ea_cov_sum = cov.astype(np.float64)
+                            else:
+                                self._ea_cov_sum += cov
+                            self._ea_cov_count += 1
 
         except Exception as e:
             if self.logger:
@@ -304,29 +339,49 @@ class EEGStreamState:
         ts_window = ts[event_idx : event_idx + post_event_samples].tolist()
         return window, ts_window
 
+    def start_ea_accumulation(self, epoch_samples: int) -> None:
+        """Enable incremental EA covariance accumulation in update().
+
+        Call once before the bootstrap countdown begins. Each time a new
+        non-overlapping epoch of `epoch_samples` samples arrives through
+        update(), its covariance is added to a running sum. The main
+        filtered_buffer stays at its configured size — no enlargement needed.
+        Finalize with fit_ea_bootstrap() after the window closes.
+        """
+        self._ea_accumulating  = True
+        self._ea_epoch_samples = int(epoch_samples)
+        self._ea_cov_sum       = None
+        self._ea_cov_count     = 0
+        self._ea_total         = 0
+
     def fit_ea_bootstrap(self, epoch_samples: int, n_pseudo_epochs: int = 30):
         """
-        Bootstrap a Euclidean Alignment reference from session-start data.
+        Fit the per-session EA reference and store it in self.ea_reference.
 
-        Slices the most recent `n_pseudo_epochs * epoch_samples` samples
-        from the filtered buffer into back-to-back pseudo-epochs of the
-        same length the trained decoder expects, fits an EA reference
-        across them, and stores it in `self.ea_reference`. Subsequent
-        ErrP windows can be aligned via `apply_ea_to_window`.
+        If start_ea_accumulation() was called before the bootstrap window,
+        uses the incrementally accumulated covariances (preferred — works with
+        any buffer size). Falls back to the legacy batch path (requires
+        n_pseudo_epochs * epoch_samples samples in the buffer) when the
+        accumulator was not started.
 
-        Intended use: run after `update()` has accumulated enough
-        post-baseline data (e.g. a 30–60 s neutral recording at session
-        start). Fail-fast if the buffer holds fewer samples than
-        `n_pseudo_epochs * epoch_samples`.
+        Raises ValueError if neither path has enough data.
         """
+        if self._ea_cov_count > 0:
+            # Incremental path: compute R^{-1/2} from the running mean covariance.
+            self._ea_accumulating = False
+            R = self._ea_cov_sum / self._ea_cov_count
+            self.ea_reference = _inv_sqrt_psd(R)
+            return self.ea_reference
+
+        # Legacy batch path — requires full n_pseudo_epochs * epoch_samples in buffer.
         need = int(n_pseudo_epochs) * int(epoch_samples)
         if len(self.filtered_buffer) < need:
             raise ValueError(
                 f"Need {need} samples in buffer for EA bootstrap "
                 f"(have {len(self.filtered_buffer)})."
             )
-        buf = np.asarray(self.filtered_buffer)[-need:]      # (need, n_ch)
-        n_ch = buf.shape[1]
+        buf    = np.asarray(self.filtered_buffer)[-need:]
+        n_ch   = buf.shape[1]
         epochs = buf.reshape(n_pseudo_epochs, epoch_samples, n_ch).transpose(0, 2, 1)
         self.ea_reference = fit_ea_reference(epochs)
         return self.ea_reference
