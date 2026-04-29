@@ -46,23 +46,21 @@ SHAPE_MAX = 0.7
 SHAPE_MIN = 0.5
 CLASS_VISUAL_STYLE = "classic"  # "classic" or "modern"
 BIG_BROTHER_MODE = True         # If True, force pygame window to external display (0,0) at 1920x1080
-
 ROBOT_TRAJECTORY = ["a"]        # Opcode pool for random trajectory choice where used
 SEND_PROBS = False              # If True, stream classifier probs over UDP marker channel
-EARLYSTOP_MODE = "either"       # "correct_only" or "either"
-
+EARLYSTOP_MODE = "correct_only"       # "correct_only" or "either"
 # =============================================================================
 # Runtime decoder — online classification and thresholds
 # =============================================================================
 DECODER_BACKEND = "xgb_cov"   # "mdm" | "xgb_cov" | "xgb_cov_erd"
 CLASSIFY_WINDOW = 1000        # EEG window length for classification (ms)
 BASELINE_DURATION = 1         # seconds
-THRESHOLD_MI = 0.65
-THRESHOLD_REST = 0.65
+THRESHOLD_MI = 0.6
+THRESHOLD_REST = 0.6
 RELAXATION_RATIO = 0.5
 MIN_PREDICTIONS = 16
 STEP_SIZE = 1/16
-INTEGRATOR_ALPHA = 0.94
+INTEGRATOR_ALPHA = 0.97
 SELECT_MOTOR_CHANNELS = 1
 SELECT_ERRP_CHANNELS = 0
 SURFACE_LAPLACIAN_TOGGLE = 1
