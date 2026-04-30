@@ -250,6 +250,11 @@ The drivers in this repo are “modular” in what they require:
     - Marker streams used for synchronization.  
     - FES/STM and Arduino communication endpoints.
 
+- **Config is the single source of truth**
+  - Every knob declared in `config.py` must be load-bearing. Runtime code is expected to read the value, not treat it as a decorative default that a downstream artifact silently overrides.
+  - When a trained-model bundle (or similar artifact) ships the same parameter the runtime also reads from config (e.g., epoch window, channel list), the runtime asserts **equality** on load and raises on mismatch — no silent fallback from config to bundle. Deploying a bundle trained at different values requires updating config to match.
+  - This is how the ErrP decoder is wired (`Utils/runtime_common.py` checks `bundle["feature_spec"]` against `config.ERRP_EPOCH_TMIN/TMAX`); apply the same pattern when adding new config-controlled pipelines.
+
 ## 7. Real-Time / Hardware Considerations (IMPORTANT)
 
 - Parts of this system:
@@ -286,6 +291,13 @@ The drivers in this repo are “modular” in what they require:
   - Keep diffs as small and targeted as possible.  
   - Avoid broad refactors, renames, or code style changes unless explicitly needed.  
   - For high-risk areas (online loops, networking, FES/robot control, adaptive transforms), treat any change as safety-critical and review call paths carefully.
+
+- **Documentation architecture for plan-driven features**
+  - Features with substantial design work (e.g., the ErrP cross-subject decoder under `Documents/SoftwareDocs/`) maintain three separate documents with distinct temporal stances:
+    - **Plan** (`*_Plan.md`) — *living*, forward-looking. Current intent and rationale (the "why"). When the approach changes, edit the plan in place so it reads as if the current design was always intended. Do not accumulate dated amendment blocks — absorb them.
+    - **Report** (`*_Report.md`) — *historical*, chronological. What was actually done, with numeric evidence (AUC tables, commit hashes, pivots). This is the proof-of-plan document.
+    - **Reference** (`*_Reference.md`) — *evergreen*, code-anatomy. How the code is organised right now (the "how"). No phase references, no dates.
+  - Numbers live in the Report, not the Plan or Reference. Bug fixes done after the plan completes are just bug fixes — do not write them up as new phases unless they contradict something previously documented.
 
 ## 9. Status / Notes
 

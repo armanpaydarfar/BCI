@@ -56,6 +56,9 @@ Prev_T_beta = None
 counter_beta = 0
 _decoder_checked = False
 
+# ErrP decoder state (loaded separately; gated on config.ERRP_DECODER_ENABLE)
+errp_model = None
+
 
 # ----------------- Common helpers -----------------
 
@@ -262,8 +265,8 @@ def _shrink_single_cov(cov, raw_window=None):
     def _runtime_shrinkage_lambda() -> float:
         backend = str(getattr(config, "DECODER_BACKEND", "mdm")).strip().lower()
         if backend.startswith("xgb"):
-            return float(getattr(config, "SHRINKAGE_PARAM_XGB", 0.1))
-        return float(getattr(config, "SHRINKAGE_PARAM_MDM", 0.02))
+            return float(getattr(config, "SHRINKAGE_PARAM_XGB", getattr(config, "SHRINKAGE_PARAM", 0.1)))
+        return float(getattr(config, "SHRINKAGE_PARAM_MDM", getattr(config, "SHRINKAGE_PARAM", 0.02)))
 
     if config.LEDOITWOLF:
         if raw_window is None:
@@ -499,7 +502,7 @@ def classify_real_time(eeg_state, window_size_samples, all_probabilities, predic
         cov_matrix = np.array([(1 - lam) * cov_matrix + lam * (np.trace(cov_matrix) / n) * np.eye(n)])
     else:
         cov_matrix = np.expand_dims(cov_matrix, axis=0)
-        lam = float(getattr(config, "SHRINKAGE_PARAM_MDM", 0.02))
+        lam = float(getattr(config, "SHRINKAGE_PARAM_MDM", getattr(config, "SHRINKAGE_PARAM", 0.02)))
         shrinkage = Shrinkage(shrinkage=lam)
         cov_matrix = shrinkage.fit_transform(cov_matrix)
 
@@ -875,3 +878,217 @@ def show_feedback(duration=5, mode=0, eeg_state=None,
     send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_END" if mode==0 else "REST_END"], logger=logger)
     pygame.time.delay(300)  # ~300 ms delay to allow the visual feedback to complete rendering
     return final_class, running_avg_confidence, leaky_integrator, all_probabilities, earlystop_flag
+
+
+# =============================================================================
+# ErrP decoder — load and real-time classification
+# =============================================================================
+# These functions are gated on config.ERRP_DECODER_ENABLE and are fully
+# independent of the MI pipeline. Calling them when ERRP_DECODER_ENABLE == 0
+# is a no-op. The MI model, thresholds, and adaptive recentering state are
+# untouched by any ErrP function.
+# =============================================================================
+
+def load_errp_model(path: str) -> bool:
+    """
+    Load the ErrP model bundle from `path` into the module-level `errp_model` global.
+
+    The bundle is a dict produced by generate_errp_decoder.py:
+      {
+        "xdawn":        fitted XdawnCovariances,
+        "classifier":   fitted MDM or Pipeline(TangentSpace, LogisticRegression),
+        "backend":      "xdawn_mdm" | "xdawn_lr",
+        "tl_star":      float,   # lower decision threshold (below → correct / no-ErrP)
+        "th_star":      float,   # upper decision threshold (above → error / ErrP)
+        "feature_spec": { "tmin", "tmax", "epoch_samples", "n_filters", "ch_names", ... },
+        ...
+      }
+
+    Returns True on success, False on failure (logs the error).
+    """
+    global errp_model
+    import pickle
+    try:
+        with open(path, "rb") as fh:
+            errp_model = pickle.load(fh)
+        if logger:
+            logger.log_event(
+                f"✅ ErrP model loaded: {path}  "
+                f"backend={errp_model.get('backend','?')}  "
+                f"tl={errp_model.get('tl_star', float('nan')):.3f}  "
+                f"th={errp_model.get('th_star', float('nan')):.3f}"
+            )
+        return True
+    except FileNotFoundError:
+        if logger:
+            logger.log_event(f"❌ ErrP model not found: {path}", level="error")
+        return False
+    except Exception as exc:
+        if logger:
+            logger.log_event(f"❌ ErrP model load failed: {exc}", level="error")
+        return False
+
+
+_XDAWN_BACKENDS = ("xdawn_mdm", "xdawn_lr", "xdawn_xgb")
+_CCA_BACKENDS   = ("liu_cca_lda", "liu_cca_xgb")
+_errp_ea_warned = False
+
+
+def fit_errp_ea_bootstrap(eeg_state, *, min_epochs: int | None = None) -> bool:
+    """Fit the per-session Euclidean Alignment reference on the ErrP buffer.
+
+    Intended to be called once at session start after the driver has
+    spent `config.ERRP_EA_BOOTSTRAP_SEC` updating the buffer with idle
+    EEG. Slices the tail of the filtered buffer into back-to-back
+    pseudo-epochs of length `ERRP_EPOCH_TMAX × FS` and passes them to
+    `EEGStreamState.fit_ea_bootstrap`, which stores the reference on
+    the state object.  Subsequent `classify_errp_real_time` calls will
+    apply it automatically when the bundle was trained with EA.
+
+    Returns True on success, False if the buffer did not hold enough
+    samples (logs the error either way).
+    """
+    if min_epochs is None:
+        min_epochs = int(getattr(config, "ERRP_EA_MIN_EPOCHS", 20))
+
+    tmax          = float(getattr(config, "ERRP_EPOCH_TMAX", 0.8))
+    epoch_samples = int(round(tmax * float(config.FS)))
+
+    try:
+        eeg_state.fit_ea_bootstrap(epoch_samples, n_pseudo_epochs=min_epochs)
+    except ValueError as exc:
+        if logger:
+            logger.log_event(f"❌ EA bootstrap failed: {exc}", level="error")
+        return False
+
+    if logger:
+        logger.log_event(
+            f"✅ ErrP EA reference fit: {min_epochs} pseudo-epochs "
+            f"({min_epochs * epoch_samples / float(config.FS):.1f} s)."
+        )
+    return True
+
+
+def classify_errp_real_time(eeg_state, event_ts: float | None = None) -> tuple[float, int | None]:
+    """
+    Classify a single ErrP epoch from the real-time EEG buffer.
+
+    Dispatches on `errp_model["backend"]`:
+      - xdawn_mdm / xdawn_lr / xdawn_xgb → xDAWN augmented covariances,
+        then MDM / Pipeline(TangentSpace, LR or CalibratedXGB).
+      - liu_cca_lda / liu_cca_xgb       → LiuCCAFeaturizer (template-
+        based CCA + temporal/PSD features), then DiagonalLDA or
+        CalibratedXGB.
+
+    Epoch extraction:
+      - If `event_ts` is provided, use `eeg_state.get_event_baseline_window`
+        to subtract the per-channel mean of the pre-event window
+        [ERRP_BASELINE_TMIN, ERRP_BASELINE_TMAX] s from the post-event
+        window, then crop to the bundle's [tmin, tmax]. Matches the
+        offline pipeline byte-for-byte.
+      - If `event_ts` is None, falls back to the MI-style rolling baseline
+        path so pre-Phase-9 callers (ExperimentDriver_ErrP_Online.py) keep
+        working.
+
+    Euclidean Alignment:
+      - If the bundle's feature_spec reports `ea_alignment=True` and
+        `fit_errp_ea_bootstrap` has populated `eeg_state.ea_reference`,
+        the window is left-multiplied by R^{-1/2} before the featurizer.
+      - If the bundle needs EA but no reference is set, we log once and
+        proceed without alignment (graceful degradation over crash).
+
+    Returns:
+        (prob_error, decision)
+        decision: 1 (ErrP) | 0 (no ErrP) | None (ambiguous; between thresholds)
+    """
+    global errp_model, _errp_ea_warned
+
+    _errp_enable = bool(getattr(config, "ERRP_DECODER_ENABLE", 0))
+    if not _errp_enable or errp_model is None:
+        return 0.0, None
+
+    spec          = errp_model.get("feature_spec", {})
+    backend       = str(errp_model.get("backend", "xdawn_mdm"))
+    fs            = float(config.FS)
+    # Config is the source of truth for the epoch window.  The bundle's
+    # feature_spec records the window it was trained with; we require them to
+    # agree so a bundle trained at one window cannot be silently deployed
+    # against a config at a different window.
+    tmin = float(getattr(config, "ERRP_EPOCH_TMIN"))
+    tmax = float(getattr(config, "ERRP_EPOCH_TMAX"))
+    if "tmin" in spec or "tmax" in spec:
+        spec_tmin = float(spec.get("tmin", tmin))
+        spec_tmax = float(spec.get("tmax", tmax))
+        if (spec_tmin, spec_tmax) != (tmin, tmax):
+            raise ValueError(
+                f"ErrP bundle feature_spec window ({spec_tmin}, {spec_tmax}) s "
+                f"disagrees with config ERRP_EPOCH_TMIN/TMAX ({tmin}, {tmax}) s. "
+                f"Either retrain the bundle at the config window or update config "
+                f"to match the bundle."
+            )
+    epoch_samples = int(round((tmax - tmin) * fs))
+    tl            = float(errp_model.get("tl_star", 0.3))
+    th            = float(errp_model.get("th_star", 0.7))
+    ea_required   = bool(spec.get("ea_alignment", False))
+
+    # ── Epoch extraction ─────────────────────────────────────────────────
+    try:
+        if event_ts is not None:
+            base_tmin = float(getattr(config, "ERRP_BASELINE_TMIN", -0.200))
+            base_tmax = float(getattr(config, "ERRP_BASELINE_TMAX",  0.0))
+            baseline_samples = int(round((base_tmax - base_tmin) * fs))
+            # Request the full post-event window [0, tmax] so we can crop
+            # to the bundle's [tmin, tmax] in the same frame the trainer used.
+            post_full = int(round(tmax * fs))
+            window_full, _ = eeg_state.get_event_baseline_window(
+                event_ts, post_full, baseline_samples
+            )
+            start = int(round(tmin * fs))
+            window = window_full[:, start:start + epoch_samples]
+        else:
+            window, _ = eeg_state.get_baseline_corrected_window(epoch_samples)
+    except ValueError:
+        return 0.0, None  # Buffer not yet full
+
+    # ── Euclidean Alignment (optional, gated on bundle) ──────────────────
+    if ea_required:
+        if getattr(eeg_state, "ea_reference", None) is not None:
+            window = eeg_state.apply_ea_to_window(window)
+        elif not _errp_ea_warned:
+            if logger:
+                logger.log_event(
+                    "⚠️ ErrP bundle was trained with EA but no session EA "
+                    "reference is set — classifying without alignment. "
+                    "Call fit_errp_ea_bootstrap(eeg_state) at session start."
+                )
+            _errp_ea_warned = True
+
+    epoch_3d = window[np.newaxis]  # (1, n_ch, n_samp)
+
+    # ── Backend dispatch ─────────────────────────────────────────────────
+    try:
+        clf = errp_model["classifier"]
+        if backend in _XDAWN_BACKENDS:
+            xdc      = errp_model["xdawn"]
+            features = xdc.transform(epoch_3d)       # augmented covariances
+        elif backend in _CCA_BACKENDS:
+            featurizer = errp_model["cca_featurizer"]
+            features   = featurizer.transform(epoch_3d)  # (1, 72) flat feature vector
+        else:
+            raise ValueError(f"Unsupported ErrP backend: {backend!r}")
+
+        prob_err = float(clf.predict_proba(features)[0, 1])  # column 1 = P(error)
+    except Exception as exc:
+        if logger:
+            logger.log_event(f"⚠️ ErrP classification failed: {exc}")
+        return 0.0, None
+
+    # ── Dual-threshold decision ──────────────────────────────────────────
+    if prob_err >= th:
+        decision = 1
+    elif prob_err <= tl:
+        decision = 0
+    else:
+        decision = None
+
+    return prob_err, decision

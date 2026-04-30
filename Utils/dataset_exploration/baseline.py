@@ -107,6 +107,7 @@ def config_snapshot() -> dict[str, Any]:
         "BASELINE_DURATION",
         "SURFACE_LAPLACIAN_TOGGLE",
         "SELECT_MOTOR_CHANNELS",
+        "SHRINKAGE_PARAM",
         "SHRINKAGE_PARAM_MDM",
         "SHRINKAGE_PARAM_XGB",
         "RECENTERING",

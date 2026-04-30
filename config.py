@@ -231,6 +231,46 @@ ROBOT_OPCODES = {
 }
 
 # =============================================================================
+# ErrP decoder
+# =============================================================================
+# Master toggle: 0 = ErrP pipeline disabled (MI pipeline unaffected), 1 = enabled
+ERRP_DECODER_ENABLE = 0
+# Classifier backend — must match the suffix of the model file on disk:
+#   DATA_DIR/sub-{SUBJECT}/models/sub-{SUBJECT}_errp_{BACKEND}.pkl
+# Options validated live: "liu_cca_xgb", "xdawn_xgb"
+ERRP_DECODER_BACKEND = "liu_cca_xgb"
+# Epoch window anchored at the event marker (seconds post-event).
+# 0-800 ms captures ERN (~80-150 ms) and Pe (~200-400 ms).
+ERRP_EPOCH_TMIN = 0.0
+ERRP_EPOCH_TMAX = 0.8
+# xDAWN spatial filters per class (4 is standard for P300/ErrP paradigms)
+ERRP_XDAWN_N_FILTERS = 4
+# Artifact rejection threshold for ErrP epochs (µV, max_abs on 1-10 Hz filtered signal)
+ERRP_ARTIFACT_MAX_ABS_UV = 80.0
+# Dual-threshold ambiguity target for ErrP (fraction of trials allowed to be ambiguous)
+ERRP_TARGET_AMBIG = 0.20
+# LogisticRegression regularization (xdawn_lr backend only)
+ERRP_LR_C = 1.0
+# CAR rereferencing for ErrP stream (1 = on, matches offline training path)
+ERRP_CAR_REREFERENCE = 1
+# Bootstrap: seconds of quiet fixation before first trial used to fit EA reference
+ERRP_EA_BOOTSTRAP_SEC = 45.0
+# Minimum pseudo-epochs for EA bootstrap (each epoch = ERRP_EPOCH_TMAX * FS samples)
+ERRP_EA_MIN_EPOCHS = 20
+# ErrP experiment paradigm
+# Probability that the robot stops mid-trajectory (error condition) — online driver
+ERRP_ONLINE_P_STOP = 0.3
+# Minimum/maximum stop time bounds (seconds into trajectory)
+ERRP_STOP_TMIN = 1.0
+ERRP_STOP_TMAX_FRACTION = 0.7
+# Seconds the robot stays paused if no ErrP is detected before homing
+ERRP_NO_RESUME_TIMEOUT = 3.0
+# Total trials for dedicated ErrP experiment driver
+TOTAL_TRIALS_ERRP = 45
+# ErrP channel set — expanded to 14 channels based on cross-subject decoder validation
+ERRP_CHANNEL_NAMES = ['F3', 'Fz', 'F4', 'FC1', 'FC2', 'C3', 'Cz', 'C4', 'CP1', 'CP2', 'Pz', 'POz', 'O1', 'O2']
+
+# =============================================================================
 # Global runtime flags
 # =============================================================================
 SIMULATION_MODE = False

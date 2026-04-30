@@ -7,7 +7,9 @@ from Utils.preprocessing import (
     apply_streaming_filters,
     get_valid_channel_mask_and_metadata,
     select_channels,
+    car_rereference,
 )
+from Utils.errp_alignment import apply_ea, fit_ea_reference, _inv_sqrt_psd
 
 class EEGStreamState:
     """
@@ -46,6 +48,15 @@ class EEGStreamState:
         if self.mode == "errp":
             self.lowcut = config.LOWCUT_ERRP
             self.highcut = config.HIGHCUT_ERRP
+
+        # Common Average Reference toggle.  Active in errp mode only so the
+        # motor path is strictly unchanged.  Applied after the precomputed
+        # channel slice and before the causal filter bank, mirroring the
+        # offline path in errp_feature_pipeline.
+        self.apply_car = (
+            self.mode == "errp"
+            and bool(int(getattr(config, "ERRP_CAR_REREFERENCE", 1)))
+        )
 
 
         # Filtering
@@ -86,6 +97,24 @@ class EEGStreamState:
         self.final_indices = None  # NEW: final indices used for slicing in real-time
 
         self.first_chunk_processed = False
+
+        # Euclidean Alignment reference for the ErrP path.  Populated at
+        # session start by fit_ea_bootstrap() from a 30–60 s neutral
+        # recording, then applied to every ErrP epoch via the helper
+        # below before the epoch reaches the classifier.  None until
+        # bootstrap runs; callers must check.  MI mode never reads or
+        # writes this attribute.
+        self.ea_reference = None
+
+        # Incremental EA accumulator — populated during the bootstrap window
+        # via start_ea_accumulation() + update() + fit_ea_bootstrap().
+        # Keeps the main filtered_buffer lightweight: only one epoch's worth
+        # of samples is ever needed in the buffer at once.
+        self._ea_accumulating  = False
+        self._ea_epoch_samples = 0
+        self._ea_cov_sum       = None
+        self._ea_cov_count     = 0
+        self._ea_total         = 0  # samples appended since accumulation started
 
     def update(self):
         """
@@ -135,6 +164,14 @@ class EEGStreamState:
             if self.final_indices is not None:
                 raw_chunk = raw_chunk[self.final_indices]
 
+            # === Common Average Reference (errp mode) ===
+            # CAR is linear and commutes with the causal bandpass, so applying
+            # it chunk-by-chunk before the filter bank yields the same sample
+            # stream as a whole-recording CAR followed by filtering.  Each
+            # chunk is self-contained (no state carried between chunks).
+            if self.apply_car:
+                raw_chunk = car_rereference(raw_chunk)
+
             # === Apply streaming filters ===
             filtered_chunk, self.filter_state = apply_streaming_filters(
                 raw_chunk, self.filter_bank, self.filter_state
@@ -151,6 +188,31 @@ class EEGStreamState:
                 self.timestamps.append(timestamps[i])
                 if filtered_chunk_beta is not None:
                     self.filtered_buffer_beta.append(filtered_chunk_beta[:, i])
+
+            # === Incremental EA covariance accumulation ===
+            # Active only during the bootstrap window (start_ea_accumulation called).
+            # Detects each newly completed non-overlapping epoch and accumulates its
+            # covariance without requiring more than one epoch in the buffer at a time.
+            if self._ea_accumulating:
+                ep          = self._ea_epoch_samples
+                prev_total  = self._ea_total
+                self._ea_total += filtered_chunk.shape[1]
+                prev_epochs = prev_total // ep
+                curr_epochs = self._ea_total // ep
+                if curr_epochs > prev_epochs:
+                    buf = list(self.filtered_buffer)
+                    for k in range(prev_epochs, curr_epochs):
+                        offset    = self._ea_total - (k + 1) * ep
+                        end_idx   = len(buf) - offset
+                        start_idx = end_idx - ep
+                        if 0 <= start_idx and end_idx <= len(buf):
+                            x   = np.array(buf[start_idx:end_idx]).T  # (n_ch, ep)
+                            cov = (x @ x.T) / float(ep - 1)
+                            if self._ea_cov_sum is None:
+                                self._ea_cov_sum = cov.astype(np.float64)
+                            else:
+                                self._ea_cov_sum += cov
+                            self._ea_cov_count += 1
 
         except Exception as e:
             if self.logger:
@@ -218,6 +280,131 @@ class EEGStreamState:
         Return baseline segments used to compute ERD-style log-ratio features.
         """
         return self.baseline_segment_mu, self.baseline_segment_beta
+
+    def get_event_baseline_window(self, event_timestamp, post_event_samples, baseline_samples):
+        """
+        Causal pre-event baseline correction for ErrP event-triggered windows.
+
+        Locates the buffered sample whose timestamp is closest to
+        `event_timestamp`, then returns the post-event window with the
+        per-channel mean of the pre-event baseline window subtracted.
+
+        This matches the offline baseline correction applied in
+        `generate_errp_decoder_liu._baseline_correct` and
+        `errp_feature_pipeline.load_and_preprocess_errp_xdf`, so the online
+        Riemannian head sees the same signal it was trained on. Independent
+        of the rolling-mean `compute_baseline` / `get_baseline_corrected_window`
+        path used by the MI pipeline.
+
+        Args:
+            event_timestamp: LSL timestamp (seconds) of the event onset.
+            post_event_samples: number of samples to return after the event.
+            baseline_samples:   number of pre-event samples averaged for the
+                                per-channel baseline mean.
+
+        Returns:
+            window:    (n_channels, post_event_samples) float array,
+                       per-channel baseline subtracted.
+            ts_window: list of post-event timestamps (length post_event_samples).
+
+        Raises:
+            ValueError: buffer is empty, or insufficient samples on either side
+                        of the event.
+        """
+        if len(self.timestamps) == 0:
+            raise ValueError("Buffer is empty.")
+
+        ts = np.asarray(self.timestamps, dtype=float)
+        event_idx = int(np.searchsorted(ts, event_timestamp))
+        if event_idx >= len(ts):
+            event_idx = len(ts) - 1
+        if event_idx > 0 and abs(ts[event_idx - 1] - event_timestamp) < abs(ts[event_idx] - event_timestamp):
+            event_idx -= 1
+
+        if event_idx < baseline_samples:
+            raise ValueError(
+                f"Not enough pre-event samples in buffer "
+                f"(need {baseline_samples}, have {event_idx})."
+            )
+        if len(ts) - event_idx < post_event_samples:
+            raise ValueError(
+                f"Not enough post-event samples in buffer "
+                f"(need {post_event_samples}, have {len(ts) - event_idx})."
+            )
+
+        buf = np.asarray(self.filtered_buffer)  # (n_buffered, n_channels)
+        baseline = buf[event_idx - baseline_samples : event_idx]
+        post     = buf[event_idx : event_idx + post_event_samples]
+        window   = (post - baseline.mean(axis=0, keepdims=True)).T
+        ts_window = ts[event_idx : event_idx + post_event_samples].tolist()
+        return window, ts_window
+
+    def start_ea_accumulation(self, epoch_samples: int) -> None:
+        """Enable incremental EA covariance accumulation in update().
+
+        Call once before the bootstrap countdown begins. Each time a new
+        non-overlapping epoch of `epoch_samples` samples arrives through
+        update(), its covariance is added to a running sum. The main
+        filtered_buffer stays at its configured size — no enlargement needed.
+        Finalize with fit_ea_bootstrap() after the window closes.
+        """
+        self._ea_accumulating  = True
+        self._ea_epoch_samples = int(epoch_samples)
+        self._ea_cov_sum       = None
+        self._ea_cov_count     = 0
+        self._ea_total         = 0
+
+    def fit_ea_bootstrap(self, epoch_samples: int, n_pseudo_epochs: int = 30):
+        """
+        Fit the per-session EA reference and store it in self.ea_reference.
+
+        If start_ea_accumulation() was called before the bootstrap window,
+        uses the incrementally accumulated covariances (preferred — works with
+        any buffer size). Falls back to the legacy batch path (requires
+        n_pseudo_epochs * epoch_samples samples in the buffer) when the
+        accumulator was not started.
+
+        Raises ValueError if neither path has enough data.
+        """
+        if self._ea_cov_count > 0:
+            # Incremental path: compute R^{-1/2} from the running mean covariance.
+            self._ea_accumulating = False
+            R = self._ea_cov_sum / self._ea_cov_count
+            self.ea_reference = _inv_sqrt_psd(R)
+            return self.ea_reference
+
+        # Legacy batch path — requires full n_pseudo_epochs * epoch_samples in buffer.
+        need = int(n_pseudo_epochs) * int(epoch_samples)
+        if len(self.filtered_buffer) < need:
+            raise ValueError(
+                f"Need {need} samples in buffer for EA bootstrap "
+                f"(have {len(self.filtered_buffer)})."
+            )
+        buf    = np.asarray(self.filtered_buffer)[-need:]
+        n_ch   = buf.shape[1]
+        epochs = buf.reshape(n_pseudo_epochs, epoch_samples, n_ch).transpose(0, 2, 1)
+        self.ea_reference = fit_ea_reference(epochs)
+        return self.ea_reference
+
+    def apply_ea_to_window(self, window: np.ndarray) -> np.ndarray:
+        """
+        Apply the bootstrapped EA reference to a single epoch window.
+
+        Args:
+            window: (n_channels, n_samples)
+
+        Returns:
+            (n_channels, n_samples) with EA reference left-applied.
+
+        Raises:
+            ValueError: no reference has been fit yet.
+        """
+        if self.ea_reference is None:
+            raise ValueError(
+                "No EA reference. Call fit_ea_bootstrap() at session start "
+                "before applying alignment."
+            )
+        return apply_ea(window[np.newaxis, ...], self.ea_reference)[0]
     
     def _get_channel_names(self):
         """
