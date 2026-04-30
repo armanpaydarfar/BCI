@@ -579,16 +579,11 @@ def main():
         mode = backdoor_mode if backdoor_mode is not None else trial_sequence[current_trial]
         logger.log_event(f"Trial mode: {'MI' if mode==0 else 'REST'}")
 
-        # ── MI trigger + feedback ─────────────────────────────────────────────
-        if mode == 0:
-            send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"],
-                             config.UDP_MARKER["PORT"], config.TRIGGERS["MI_BEGIN"], logger=logger)
-            if FES_toggle == 1:
-                send_udp_message(udp_socket_fes, config.UDP_FES["IP"],
-                                 config.UDP_FES["PORT"], "FES_SENS_GO", logger=logger)
-        else:
-            send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"],
-                             config.UDP_MARKER["PORT"], config.TRIGGERS["REST_BEGIN"], logger=logger)
+        # MI_BEGIN / REST_BEGIN triggers are sent inside show_feedback() via
+        # runtime_common — do not send them here to avoid duplicates.
+        if mode == 0 and FES_toggle == 1:
+            send_udp_message(udp_socket_fes, config.UDP_FES["IP"],
+                             config.UDP_FES["PORT"], "FES_SENS_GO", logger=logger)
 
         # ── Compute baseline for both EEGStreamStates ─────────────────────────
         # MI baseline: already available from fixation period
