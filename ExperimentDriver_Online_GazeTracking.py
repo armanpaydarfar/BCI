@@ -352,6 +352,12 @@ def gaze_udp_request(sock, payload, timeout=GAZE_UDP_TIMEOUT):
     """
     Request a gaze snapshot from `gaze_runner.py` via UDP.
 
+    Delegates to ``Utils.perception_clients.udp_request_using`` for the
+    wire format, while keeping the caller-owned socket so the realtime
+    selection loop doesn't allocate per request (Tier 2 — preserve
+    allocation discipline). Logs and returns ``None`` on transport
+    failure rather than propagating, matching legacy behaviour.
+
     Args:
         sock: UDP socket connected to the gaze runner's request port.
         payload: JSON-serializable dict. Expected keys:
@@ -370,15 +376,11 @@ def gaze_udp_request(sock, payload, timeout=GAZE_UDP_TIMEOUT):
         - `gaze_hit`: None or dict describing the selected tracked object
         - `objects`: list of tracked detections (only present when `include_objects=True`)
     """
-    try:
-        sock.settimeout(timeout)
-        msg = json.dumps(payload).encode("utf-8")
-        sock.sendto(msg, (GAZE_UDP_IP, GAZE_UDP_PORT))
-        data, _ = sock.recvfrom(65535)
-        return json.loads(data.decode("utf-8"))
-    except Exception as e:
-        logger.log_event(f"⚠️ Gaze UDP request failed: {e}")
-        return None
+    from Utils.perception_clients import udp_request_using
+    resp = udp_request_using(sock, GAZE_UDP_IP, GAZE_UDP_PORT, payload, timeout)
+    if resp is None:
+        logger.log_event("⚠️ Gaze UDP request failed (transport error)")
+    return resp
 
 
 def make_object_key(hit):
