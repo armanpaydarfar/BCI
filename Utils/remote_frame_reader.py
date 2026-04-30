@@ -65,6 +65,61 @@ _DEFAULT_NEON_CX = 800.0
 _DEFAULT_NEON_CY = 600.0
 
 
+# Mirror of harmony_vlm.utils.visualize_neon.EYE_STATE_DTYPE so we can build
+# a stub eye_state record on the consumer side without importing harmony_vlm.
+# harmony_vlm's FixationDetector reads sample.eye_state["eyelid_aperture_*_mm"]
+# for blink suppression; NeonLiveReader supplies a stub with both fields set
+# to 99 (== "eyes wide open") since the live realtime SDK doesn't surface
+# eye_state per frame. We replicate that here so RemoteFrameReader-fed
+# consumers behave identically.
+_EYE_STATE_DTYPE = np.dtype([
+    ("pupil_diameter_left_mm",   "<f4"),
+    ("eyeball_center_left_x",    "<f4"),
+    ("eyeball_center_left_y",    "<f4"),
+    ("eyeball_center_left_z",    "<f4"),
+    ("optical_axis_left_x",      "<f4"),
+    ("optical_axis_left_y",      "<f4"),
+    ("optical_axis_left_z",      "<f4"),
+    ("pupil_diameter_right_mm",  "<f4"),
+    ("eyeball_center_right_x",   "<f4"),
+    ("eyeball_center_right_y",   "<f4"),
+    ("eyeball_center_right_z",   "<f4"),
+    ("optical_axis_right_x",     "<f4"),
+    ("optical_axis_right_y",     "<f4"),
+    ("optical_axis_right_z",     "<f4"),
+    ("eyelid_angle_top_left",    "<f4"),
+    ("eyelid_angle_bottom_left", "<f4"),
+    ("eyelid_aperture_left_mm",  "<f4"),
+    ("eyelid_angle_top_right",   "<f4"),
+    ("eyelid_angle_bottom_right","<f4"),
+    ("eyelid_aperture_right_mm", "<f4"),
+])
+
+
+def _build_eye_state(gaze_dict: Dict[str, Any]) -> np.void:
+    """Construct a stub eye_state record. Eyelid apertures default to 99 mm
+    (no blink) — matches harmony_vlm.utils.neon.NeonLiveReader.__iter__.
+    Eyeball-center / optical-axis fields are filled from the relay envelope
+    when present, zero otherwise (consumers that need them generally read
+    them from the gaze datum directly, not via eye_state)."""
+    rec = np.zeros(1, dtype=_EYE_STATE_DTYPE)[0]
+    rec["eyelid_aperture_left_mm"]  = 99.0
+    rec["eyelid_aperture_right_mm"] = 99.0
+    for fname in (
+        "eyeball_center_left_x", "eyeball_center_left_y", "eyeball_center_left_z",
+        "eyeball_center_right_x", "eyeball_center_right_y", "eyeball_center_right_z",
+        "optical_axis_left_x", "optical_axis_left_y", "optical_axis_left_z",
+        "optical_axis_right_x", "optical_axis_right_y", "optical_axis_right_z",
+    ):
+        v = gaze_dict.get(fname)
+        if v is not None:
+            try:
+                rec[fname] = float(v)
+            except (TypeError, ValueError):
+                pass
+    return rec
+
+
 # ── lightweight stub types mimicking pupil_labs / harmony_vlm shapes ───────
 
 
@@ -99,6 +154,10 @@ class _GazeStub:
                 setattr(self, k, float(v))
             except (TypeError, ValueError):
                 setattr(self, k, v)
+        # harmony_vlm's FixationDetector reads sample.eye_state[...] for
+        # blink suppression; supply a record with eyelid_aperture=99 so it
+        # behaves the same as a live NeonLiveReader-fed sample.
+        self.eye_state = _build_eye_state(gaze_dict)
 
     @property
     def timestamp_unix_ns(self) -> int:
