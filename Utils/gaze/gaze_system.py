@@ -737,16 +737,22 @@ class GazeSystem:
                 "Missing dependency 'ultralytics'. Install with:\n  pip install ultralytics\n"
             ) from e
 
+        det_device = "cpu"
         try:
             import torch  # type: ignore
             torch.set_num_threads(1)
             torch.set_num_interop_threads(1)
+            # Use CUDA when available — typically the Windows dev box (RTX 4070
+            # Ti). Linux deployment has no NVIDIA driver, so this falls back to
+            # CPU automatically per the CLAUDE.md platform-gating policy.
+            if torch.cuda.is_available():
+                det_device = "cuda"
         except Exception:
             pass
 
         model = YOLO(self.cfg.model_name)
         try:
-            model.to("cpu")
+            model.to(det_device)
         except Exception:
             pass
 
@@ -805,7 +811,7 @@ class GazeSystem:
                 verbose=False,
                 conf=float(self.cfg.det_conf),
                 iou=float(self.cfg.det_iou),
-                device="cpu",
+                device=det_device,
                 max_det=int(self.cfg.det_max_det),
                 classes=self.cfg.det_classes if (self.cfg.det_classes is not None and len(self.cfg.det_classes) > 0) else None,
             )

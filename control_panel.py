@@ -111,6 +111,87 @@ VLM_ENABLE_OVERLAY  = bool(getattr(_HCFG, "VLM_ENABLE_OVERLAY", True)) if _HCFG 
 NEON_COMPANION_HOST = str(getattr(_HCFG, "NEON_COMPANION_HOST", "")) if _HCFG else ""
 
 
+_IS_WINDOWS = sys.platform == "win32"
+
+
+def _resolve_conda_env_python(env_name: str) -> Optional[str]:
+    """Return the absolute path to a conda env's python interpreter.
+
+    Invoking the env's python directly avoids `conda run`, which on Windows
+    QProcess is unreliable (.bat resolution) and on POSIX swallows signals
+    (the inner python becomes an orphan when the wrapper is killed).
+
+    Resolution order:
+      1. Sibling of the panel's own env: <sys.prefix>/../<env_name>/python(.exe)
+         — fastest path; works whenever the panel and the target env share
+         a parent envs/ directory (true for stock conda installs).
+      2. $CONDA_PREFIX/../<env_name>/python(.exe) — same idea via env var.
+      3. `conda run` shell-out — last resort, slow.
+    """
+    py_name = "python.exe" if _IS_WINDOWS else "python"
+    py_subdir = "" if _IS_WINDOWS else "bin"
+
+    candidates = []
+    parent = os.path.dirname(sys.prefix)
+    if parent:
+        candidates.append(os.path.join(parent, env_name, py_subdir, py_name))
+    cp = os.environ.get("CONDA_PREFIX")
+    if cp:
+        cp_parent = os.path.dirname(cp)
+        if cp_parent:
+            candidates.append(os.path.join(cp_parent, env_name, py_subdir, py_name))
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+
+    try:
+        out = subprocess.check_output(
+            ["conda", "run", "-n", env_name, "python", "-c",
+             "import sys; print(sys.executable)"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=15,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    return out if out and os.path.isfile(out) else None
+
+
+VLM_ENV_PYTHON: Optional[str] = _resolve_conda_env_python(VLM_CONDA_ENV) if VLM_REPO_DIR else None
+print(f"[control_panel] VLM_ENV_PYTHON = {VLM_ENV_PYTHON!r}", flush=True)
+
+
+def _kill_orphan_vlm_service() -> None:
+    """Kill any leftover vlm_service.py processes from a prior crash.
+
+    `conda run` does not forward SIGTERM to its child, so a hard stop on the
+    panel can leave the inner python alive holding the UDP port. POSIX uses
+    `pkill -f`; Windows walks tasklist for python.exe with the script in its
+    command line and kills with taskkill.
+    """
+    if _IS_WINDOWS:
+        try:
+            out = subprocess.check_output(
+                ["wmic", "process", "where",
+                 "name='python.exe' and CommandLine like '%vlm_service.py%'",
+                 "get", "ProcessId"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return
+        for line in out.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", line],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+    else:
+        subprocess.run(["pkill", "-f", "vlm_service.py"], capture_output=True)
+
+
 def _marker_udp_port() -> int:
     if _HCFG is not None:
         return int(_HCFG.UDP_MARKER["PORT"])
@@ -688,6 +769,24 @@ class ControlPanel(QMainWindow):
         row += 1
 
         # Sequential (two-object) decide — look at A, capture; look at B, decide pair.
+        # Continuous segmentation: toggle drives FastSAM @ N Hz on the
+        # service side; results stream into the overlay (VLM Video tab).
+        self.btn_vlm_seg_stream = QPushButton("Stream Seg: OFF")
+        self.btn_vlm_seg_stream.setCheckable(True)
+        self.spin_vlm_seg_hz = QDoubleSpinBox()
+        self.spin_vlm_seg_hz.setRange(1.0, 30.0)
+        self.spin_vlm_seg_hz.setSingleStep(1.0)
+        self.spin_vlm_seg_hz.setDecimals(1)
+        self.spin_vlm_seg_hz.setValue(10.0)
+        self.spin_vlm_seg_hz.setSuffix(" Hz")
+        self.btn_vlm_seg_stream.toggled.connect(self.on_vlm_seg_stream_toggled)
+        self.spin_vlm_seg_hz.valueChanged.connect(self.on_vlm_seg_stream_hz_changed)
+
+        grid.addWidget(QLabel("<i>Continuous:</i>"), row, 0)
+        grid.addWidget(self.spin_vlm_seg_hz, row, 1)
+        grid.addWidget(self.btn_vlm_seg_stream, row, 2)
+        row += 1
+
         self.btn_vlm_capture_first = QPushButton("Capture First")
         self.btn_vlm_decide_pair = QPushButton("Decide Pair")
         self.lbl_vlm_pair_token = QLabel("<i>snapshot:</i> (none)")
@@ -1481,7 +1580,7 @@ class ControlPanel(QMainWindow):
 
         # Reap any orphaned vlm_service.py left over from a previous crash or
         # incomplete stop (conda run does not forward SIGTERM to child processes).
-        subprocess.run(["pkill", "-f", "vlm_service.py"], capture_output=True)
+        _kill_orphan_vlm_service()
 
         if _is_port_in_use(int(VLM_SERVICE_PORT), VLM_SERVICE_HOST):
             QMessageBox.warning(
@@ -1504,15 +1603,30 @@ class ControlPanel(QMainWindow):
         depth_flag = "--enable-depth" if VLM_ENABLE_DEPTH else ""
         overlay_flag = f"--enable-overlay --overlay-port {int(VLM_OVERLAY_PORT)}" if VLM_ENABLE_OVERLAY else ""
         session_arg = f'--session-dir "{session_dir}"' if session_dir else ""
+        # On the Windows dev box (RTX 4070 Ti) we want FastSAM + Depth Pro on
+        # CUDA; the Linux deployment is CPU-only (no NVIDIA driver).
+        device_flag = "--device cuda" if _IS_WINDOWS else "--device cpu"
+        # Invoke the env's python directly. `conda run` is fragile here — on
+        # Windows QProcess can't always resolve the conda.bat shim, and on POSIX
+        # it doesn't forward SIGTERM, leaving the inner python as an orphan.
+        if not VLM_ENV_PYTHON:
+            QMessageBox.warning(
+                self,
+                "harmony_vlm env not found",
+                f"Could not resolve python for conda env {VLM_CONDA_ENV!r}.\n"
+                "Verify the env exists with `conda env list`.",
+            )
+            return
+        py = VLM_ENV_PYTHON
+        self._append_log("VLM", f"[{self._ts()}] using python: {py}\n")
         # --neon-host "" forces discover_one_device in harmony_vlm's NeonLiveReader
         # (utils/neon/reader.py:224), matching our gaze_system.py:250 pattern.
         self.vlm_service.cmd = (
-            f'conda run --no-capture-output -n {VLM_CONDA_ENV} '
-            f'python -u "{VLM_SERVICE_PY}" '
+            f'"{py}" -u "{VLM_SERVICE_PY}" '
             f'--repo-dir "{VLM_REPO_DIR}" '
             f'--host {VLM_SERVICE_HOST} --port {int(VLM_SERVICE_PORT)} '
             f'--neon-host "{NEON_COMPANION_HOST}" '
-            f'--model {VLM_MODEL} '
+            f'--model {VLM_MODEL} {device_flag} '
             f'{depth_flag} {overlay_flag} {session_arg}'
         )
         self._start_proc(self.vlm_service, self.lbl_vlm_service, "VLM")
@@ -1525,6 +1639,14 @@ class ControlPanel(QMainWindow):
             self._on_vlm_video_connect()
 
     def on_vlm_service_stop(self):
+        # Reset the streaming toggle so the panel doesn't claim "ON" while
+        # the service it was driving is dead. blockSignals prevents the
+        # toggle handler from firing a doomed UDP send to the dying service.
+        if self.btn_vlm_seg_stream.isChecked():
+            self.btn_vlm_seg_stream.blockSignals(True)
+            self.btn_vlm_seg_stream.setChecked(False)
+            self.btn_vlm_seg_stream.setText("Stream Seg: OFF")
+            self.btn_vlm_seg_stream.blockSignals(False)
         # Ask vlm_service to exit gracefully before killing the conda wrapper.
         # conda run does not forward SIGTERM to child processes, so without this
         # the inner Python process survives as an orphan holding the UDP port.
@@ -1534,7 +1656,7 @@ class ControlPanel(QMainWindow):
             pass
         self._stop_proc(self.vlm_service, self.lbl_vlm_service, "VLM")
         # Belt-and-suspenders: reap any surviving orphan regardless.
-        subprocess.run(["pkill", "-f", "vlm_service.py"], capture_output=True)
+        _kill_orphan_vlm_service()
         self._on_vlm_video_disconnect()
 
     def _vlm_command_threaded(self, payload: dict, timeout_s: float, label: str) -> None:
@@ -1562,6 +1684,26 @@ class ControlPanel(QMainWindow):
 
     def on_vlm_service_segment(self):
         self._vlm_command_threaded({"cmd": "segment"}, 5.0, "segment")
+
+    def on_vlm_seg_stream_toggled(self, checked: bool) -> None:
+        hz = float(self.spin_vlm_seg_hz.value())
+        self.btn_vlm_seg_stream.setText(f"Stream Seg: {'ON' if checked else 'OFF'}")
+        self._vlm_command_threaded(
+            {"cmd": "segment_stream", "enabled": bool(checked), "hz": hz},
+            VLM_QUERY_TIMEOUT_S,
+            f"segment_stream({'on' if checked else 'off'}, {hz:.1f} Hz)",
+        )
+
+    def on_vlm_seg_stream_hz_changed(self, hz: float) -> None:
+        # Only push a rate change if the stream is currently on; otherwise
+        # the spinner just sets the rate the next toggle-on will use.
+        if not self.btn_vlm_seg_stream.isChecked():
+            return
+        self._vlm_command_threaded(
+            {"cmd": "segment_stream", "enabled": True, "hz": float(hz)},
+            VLM_QUERY_TIMEOUT_S,
+            f"segment_stream(rate={hz:.1f} Hz)",
+        )
 
     def on_vlm_service_depth(self):
         self._vlm_command_threaded({"cmd": "depth", "at_gaze": True}, 15.0, "depth")
@@ -2080,6 +2222,14 @@ class ControlPanel(QMainWindow):
 
         q.started.connect(lambda: self._on_started(p, led, title))
         q.finished.connect(lambda code, status: self._on_finished(p, led, title, code, status))
+        # Without errorOccurred, a FailedToStart (e.g. program not on PATH) is
+        # silent — the panel shows "start requested" with no STARTED/FINISHED.
+        q.errorOccurred.connect(
+            lambda err: self._append_log(
+                title,
+                f"[{self._ts()}] QProcess error: {err} (program={parts[0]!r})\n",
+            )
+        )
 
         if is_gaze:
             # single unified stream
@@ -2103,6 +2253,12 @@ class ControlPanel(QMainWindow):
             if led is not None:
                 self._set_led(led, "stopped")
             return
+        # Drop signal connections first so a late-fired finished/errorOccurred
+        # during/after window teardown can't call back into deleted widgets.
+        try:
+            p.q.disconnect()
+        except Exception:
+            pass
         if p.q.state() != QProcess.NotRunning:
             p.q.terminate()
             if not p.q.waitForFinished(1500):
@@ -2228,17 +2384,31 @@ class ControlPanel(QMainWindow):
 
     # ---------- Close cleanup ----------
     def closeEvent(self, event):
+        # Stop the overlay reader thread before tearing down its target service,
+        # otherwise QProcess teardown logs errors that try to write to widgets
+        # Qt has already destroyed.
+        try:
+            self._on_vlm_video_disconnect()
+        except Exception:
+            pass
         for p, led, title in (
             (self.driver, self.lbl_driver, "Driver"),
             (self.fes,    self.lbl_fes,    "FES"),
             (self.marker, self.lbl_marker, "Marker"),
             (self.gaze_service, self.lbl_gaze_service, "Gaze"),
             (self.gaze_runner, None, "Gaze"),
+            (self.vlm_service, self.lbl_vlm_service, "VLM"),
         ):
             try:
                 self._stop_proc(p, led, title)
             except Exception:
                 pass
+        # Belt-and-suspenders: same reap as on_vlm_service_stop, in case the
+        # conda-launched python orphaned itself between terminate and exit.
+        try:
+            _kill_orphan_vlm_service()
+        except Exception:
+            pass
         event.accept()
 
 # ----------------- Entrypoint -----------------

@@ -163,6 +163,14 @@ class VLMService:
         self._frame_count: int = 0
         self._start_time: float = time.time()
 
+        # Continuous segmentation stream (toggle from the panel). When on,
+        # _segment_stream_loop calls detector.detect at seg_stream_hz and
+        # writes into _cached_dets so the overlay stays fresh without manual
+        # "Segment Now" clicks.
+        self._seg_stream_thread: Optional[threading.Thread] = None
+        self._seg_stream_stop = threading.Event()
+        self._seg_stream_hz: float = 10.0
+
     # ── lifecycle ─────────────────────────────────────────────────────────
 
     def start_frame_thread(self) -> None:
@@ -275,6 +283,7 @@ class VLMService:
             "status": lambda: self._cmd_status(),
             "snapshot": lambda: self._cmd_snapshot(),
             "segment": lambda: self._cmd_segment(req),
+            "segment_stream": lambda: self._cmd_segment_stream(req),
             "depth": lambda: self._cmd_depth(req),
             "reason": lambda: self._cmd_reason(req),
             "decide": lambda: self._cmd_decide(req),
@@ -343,6 +352,77 @@ class VLMService:
 
         self._cache_dets(dets)
         return {"ok": True, "detections": out, "elapsed_s": elapsed, "n": len(out)}
+
+    def _cmd_segment_stream(self, req: dict) -> dict:
+        enabled = bool(req.get("enabled", False))
+        hz = float(req.get("hz", self._seg_stream_hz))
+        if hz <= 0.0:
+            return {"ok": False, "error": "hz must be > 0"}
+        if enabled:
+            self._start_segment_stream(hz)
+        else:
+            self._stop_segment_stream()
+        return {"ok": True, "enabled": enabled, "hz": hz}
+
+    def _start_segment_stream(self, hz: float) -> None:
+        # Idempotent: if already running at a different rate, swap the rate
+        # without restarting the thread.
+        self._seg_stream_hz = hz
+        if self._seg_stream_thread is not None and self._seg_stream_thread.is_alive():
+            return
+        self._seg_stream_stop.clear()
+        self._seg_stream_thread = threading.Thread(
+            target=self._segment_stream_loop, daemon=True, name="vlm-seg-stream",
+        )
+        self._seg_stream_thread.start()
+        _log(f"segment stream started at {hz:.1f} Hz")
+
+    def _stop_segment_stream(self) -> None:
+        self._seg_stream_stop.set()
+        t = self._seg_stream_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=2.0)
+        self._seg_stream_thread = None
+        # Clear cached detections so the overlay doesn't keep drawing the last
+        # mask set after the stream is turned off.
+        self._cache_dets([])
+        _log("segment stream stopped")
+
+    def _segment_stream_loop(self) -> None:
+        next_run = time.perf_counter()
+        last_hz = self._seg_stream_hz
+        period = 1.0 / max(last_hz, 1e-6)
+        while not self._seg_stream_stop.is_set() and not self._stop_event.is_set():
+            # Re-read the rate each iteration so live changes take effect.
+            if self._seg_stream_hz != last_hz:
+                last_hz = self._seg_stream_hz
+                period = 1.0 / max(last_hz, 1e-6)
+
+            now_pc = time.perf_counter()
+            if now_pc < next_run:
+                time.sleep(min(0.005, next_run - now_pc))
+                continue
+
+            bundle, _, _ = self._latest()
+            if bundle is None:
+                next_run = now_pc + period
+                time.sleep(0.020)
+                continue
+
+            try:
+                dets = self.detector.detect(bundle.video.bgr)
+                self._cache_dets(dets)
+            except Exception as e:
+                if self.args.verbose:
+                    _log(f"segment stream error: {e}")
+
+            # Schedule next tick relative to the original cadence, but if we're
+            # falling behind by more than 2 periods just resync — avoids a
+            # runaway catch-up burst after a slow inference.
+            next_run += period
+            now_pc2 = time.perf_counter()
+            if next_run < now_pc2 - 2.0 * period:
+                next_run = now_pc2
 
     def _cmd_depth(self, req: dict) -> dict:
         if self.depth_estimator is None:
@@ -639,6 +719,7 @@ class VLMService:
         }
 
     def _cmd_stop(self) -> dict:
+        self._stop_segment_stream()
         self._stop_event.set()
         return {"ok": True}
 
@@ -800,13 +881,19 @@ def main() -> None:
     depth_estimator = None
     if args.enable_depth:
         from utils.depth_estimator import DepthEstimator
+        import torch as _torch
         save_path = None
         if args.session_dir:
             save_path = Path(args.session_dir) / "depth"
-        _log(f"loading Depth Pro: {args.depth_checkpoint} on {args.device}…")
+        # fp16 on CUDA is ~2× faster per Depth Pro's own guidance and gives
+        # virtually identical depth (sub-cm differences for our use). CPU keeps
+        # fp32 because half-precision CPU kernels are slower, not faster.
+        precision = _torch.float16 if args.device == "cuda" else _torch.float32
+        _log(f"loading Depth Pro: {args.depth_checkpoint} on {args.device} ({precision})…")
         depth_estimator = DepthEstimator(
             checkpoint=args.depth_checkpoint,
             device=args.device,
+            precision=precision,
             save_path=save_path,
         )
 

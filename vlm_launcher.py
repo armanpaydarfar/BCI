@@ -19,10 +19,13 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+_IS_WINDOWS = sys.platform == "win32"
 
 
 class VLMLauncher:
@@ -111,15 +114,19 @@ class VLMLauncher:
         self._stdout_fh = open(session_dir / "vlm.stdout.log", "wb")
         self._stderr_fh = open(session_dir / "vlm.stderr.log", "wb")
 
-        # start_new_session=True puts the child in its own process group so
-        # SIGTERM on the pgid reaches the python worker, not just `conda run`.
-        self._proc = subprocess.Popen(
-            cmd,
+        # Put the child in its own process group so a single signal reaches
+        # the python worker, not just `conda run`. On POSIX use start_new_session;
+        # on Windows use CREATE_NEW_PROCESS_GROUP and tear down with taskkill /T.
+        popen_kwargs = dict(
             cwd=str(self.repo_dir),
             stdout=self._stdout_fh,
             stderr=self._stderr_fh,
-            start_new_session=True,
         )
+        if _IS_WINDOWS:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        self._proc = subprocess.Popen(cmd, **popen_kwargs)
         self._log(f"[vlm_launcher] pid={self._proc.pid} session_dir={session_dir}")
         return self._proc
 
@@ -161,12 +168,18 @@ class VLMLauncher:
             return
 
         pid = self._proc.pid
+        if _IS_WINDOWS:
+            self._stop_windows(pid, timeout_s)
+        else:
+            self._stop_posix(pid, timeout_s)
+        self._close_log_files()
+        self._proc = None
+
+    def _stop_posix(self, pid: int, timeout_s: float) -> None:
         try:
             pgid = os.getpgid(pid)
             os.killpg(pgid, signal.SIGTERM)
         except ProcessLookupError:
-            self._close_log_files()
-            self._proc = None
             return
 
         try:
@@ -176,14 +189,30 @@ class VLMLauncher:
             try:
                 os.killpg(pgid, signal.SIGKILL)
             except ProcessLookupError:
-                pass
+                return
             try:
                 self._proc.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
                 self._log(f"[vlm_launcher] pid={pid} still alive after SIGKILL")
-        finally:
-            self._close_log_files()
-            self._proc = None
+
+    def _stop_windows(self, pid: int, timeout_s: float) -> None:
+        # taskkill /T walks the job tree from `conda run` down to the python
+        # worker; /F is force. Plain SIGTERM via Popen.terminate() only kills
+        # the conda wrapper and orphans the worker.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout_s,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            self._log(f"[vlm_launcher] pid={pid} taskkill timed out")
+        try:
+            self._proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            self._log(f"[vlm_launcher] pid={pid} still alive after taskkill")
 
     def _close_log_files(self) -> None:
         for fh in (self._stdout_fh, self._stderr_fh):
