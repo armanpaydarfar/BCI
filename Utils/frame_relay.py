@@ -80,7 +80,8 @@ import struct
 import sys
 import threading
 import time
-from typing import Any, Dict, Optional
+from collections import deque
+from typing import Any, Deque, Dict, Optional
 
 import cv2
 import numpy as np
@@ -88,6 +89,27 @@ import numpy as np
 
 def _log(msg: str) -> None:
     print(f"[frame_relay] {msg}", flush=True)
+
+
+def _pct(samples: Deque[float], qs: list) -> list:
+    """Quick percentile from a deque (small N, doesn't justify numpy). Returns
+    NaN for empty input so the stats line can show '--' early on."""
+    if not samples:
+        return [float("nan")] * len(qs)
+    s = sorted(samples)
+    n = len(s)
+    out = []
+    for q in qs:
+        idx = max(0, min(n - 1, int(round(q * (n - 1)))))
+        out.append(s[idx])
+    return out
+
+
+def _fmt_addrs(addrs: list) -> str:
+    """Compact addr summary for the stats line: '[10.0.0.5,10.0.0.6]'."""
+    if not addrs:
+        return ""
+    return "[" + ",".join(f"{ip}:{port}" for ip, port in addrs) + "]"
 
 
 # Names of richer gaze-datum fields gaze_system.py needs. Best-effort —
@@ -198,6 +220,13 @@ class FrameRelayServer:
         self._frame_count_published = 0
         self._frame_count_dropped = 0
         self._reader = None  # NeonLiveReader, lazily imported
+
+        # Rolling latency samples for the stats line. Each deque is (ms).
+        # bundle_age   — Neon scene timestamp → moment we're ready to send
+        # send_ms      — wall time spent in sendall() for this broadcast tick
+        # send_per_cli — per-client send time (helps spot one slow consumer)
+        self._lat_bundle_age: Deque[float] = deque(maxlen=120)
+        self._lat_send_ms: Deque[float] = deque(maxlen=120)
 
     # ── public API ─────────────────────────────────────────────────────────
 
@@ -345,9 +374,19 @@ class FrameRelayServer:
                 # Encode once, broadcast many.
                 envelope = self._encode_frame(bundle)
                 if envelope is not None:
+                    # bundle_age: Neon scene timestamp → just before sendall.
+                    # video.timestamp_ns is unix-ns; clock-aligned via SDK.
+                    ts_video_ns = int(getattr(bundle.video, "timestamp_ns", 0))
+                    if ts_video_ns:
+                        age_ms = max(0.0, (time.time_ns() - ts_video_ns) / 1e6)
+                        self._lat_bundle_age.append(age_ms)
+
+                    send_t0 = time.perf_counter()
                     for addr, sock in snapshot:
                         if not self._send_envelope_safe(sock, envelope):
                             self._drop_client(addr)
+                    send_ms = (time.perf_counter() - send_t0) * 1e3
+                    self._lat_send_ms.append(send_ms)
 
                 next_send += period
                 # If we fell behind by >2 periods (slow encode, slow socket),
@@ -361,10 +400,15 @@ class FrameRelayServer:
                     last_log_t = time.time()
                     with self._client_lock:
                         n = len(self._clients)
+                        client_addrs = list(self._clients.keys())
+                    bp50, bp99 = _pct(self._lat_bundle_age, [0.5, 0.99])
+                    sp50, sp99 = _pct(self._lat_send_ms, [0.5, 0.99])
                     _log(
                         f"published={self._frame_count_published} "
                         f"dropped={self._frame_count_dropped} "
-                        f"clients={n}"
+                        f"clients={n}{_fmt_addrs(client_addrs)} "
+                        f"bundle_age p50/p99={bp50:.0f}/{bp99:.0f} ms "
+                        f"send p50/p99={sp50:.1f}/{sp99:.1f} ms"
                     )
         except Exception as e:
             _log(f"pump loop exited: {e}")
