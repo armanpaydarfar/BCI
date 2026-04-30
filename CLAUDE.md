@@ -22,6 +22,17 @@ runtime behavior.
   must degrade gracefully to CPU/Linux behaviour when the condition is
   not met.
 
+- **Perception services are Windows-hosted in production.** All ML
+  inference (FastSAM, Depth Pro, Gemini-backed VLM, YOLO + SORT) runs on
+  the Windows GPU host. Linux owns device I/O (Pupil Labs Neon, EEG, FES,
+  robot) and ships frames to Windows via a TCP relay; Windows ships
+  results back over UDP. The toggle is the `PERCEPTION_FRAME_SOURCE`
+  config key (`local` opens Neon directly, `remote` consumes from
+  `Utils/frame_relay.py`); default is `local` so single-machine workflows
+  keep working without config edits. See
+  `Documents/SoftwareDocs/GPU_Service_Host_Architecture_Plan.md` for the
+  full architecture, wire format, and deployment notes.
+
 ---
 
 ## Source of Truth
