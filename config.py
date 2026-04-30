@@ -129,7 +129,13 @@ XGB_TUNE_KL_BINS    = 15
 # =============================================================================
 # Gaze / object-selection experiment
 # =============================================================================
+# Bind vs dial split: GAZE_UDP_IP is the address clients dial (panel +
+# experiment driver). GAZE_BIND_HOST is the address gaze_runner.py binds
+# its UDP socket on. In production, set GAZE_BIND_HOST = "0.0.0.0" on the
+# Windows GPU host and GAZE_UDP_IP = <windows_lan_ip> on Linux. Both
+# default to 127.0.0.1 for the single-machine dev configuration.
 GAZE_UDP_IP = "127.0.0.1"
+GAZE_BIND_HOST = "127.0.0.1"
 GAZE_UDP_PORT = 5588
 GAZE_UDP_TIMEOUT = 0.15
 GAZE_SELECTION_WINDOW = 5.0
@@ -149,6 +155,43 @@ POSE_LIBRARY_PATH = os.path.join(WORKING_DIR, "poses_with_gaze_20251202_153040.n
 # Find the IP in the Companion app: tap the streaming icon → note the address
 # shown (e.g. "10.42.0.100").  Set it here when on a university IoT network.
 NEON_COMPANION_HOST = "10.159.68.45"
+
+# =============================================================================
+# Perception frame source — local Neon vs. remote frame_relay
+# =============================================================================
+# Selects how vlm_service.py and gaze_runner.py acquire scene frames.
+#   "local"  — service opens the Neon device directly (today's behaviour;
+#              works on a single machine that owns the Companion phone).
+#   "remote" — service consumes envelopes from a Utils/frame_relay.py TCP
+#              server. Production topology: Linux runs the relay against
+#              the Neon device, Windows runs the perception services with
+#              --frame-source=remote.
+# Reference: SoftwareDocs/GPU_Service_Host_Architecture_Plan.md §3.4.
+# Machine-local: this and the FRAME_RELAY_* keys below should be tuned per
+# host and not be committed (same convention as WORKING_DIR / DATA_DIR).
+PERCEPTION_FRAME_SOURCE = "local"
+
+# Where do the perception services (vlm_service.py, gaze_runner.py) run
+# from this panel's perspective? On the Linux device host this is True
+# (services live on the Windows GPU host); on Windows or single-machine
+# dev this is False. Drives panel UX: when True, Start/Stop buttons that
+# would spawn local conda subprocesses are disabled and replaced with
+# remote-status badges fed by `cmd: status` UDP pings.
+SERVICES_HOSTED_REMOTELY = False
+
+# Bind host for the relay server (the machine that owns Neon). 0.0.0.0
+# accepts connections from any LAN peer; 127.0.0.1 keeps it loopback-only
+# for single-machine validation.
+FRAME_RELAY_HOST = "0.0.0.0"
+# Dial host for the relay client (the machine that runs the models). Set
+# this to the relay host's LAN IP in production. For loopback validation
+# leave it as 127.0.0.1.
+FRAME_RELAY_DIAL_HOST = "127.0.0.1"
+FRAME_RELAY_PORT = 5591
+# 30 Hz matches the Neon scene-camera FPS — the relay can't go faster
+# than the producer regardless. Drop to 10 Hz if running over a weak
+# Wi-Fi link (~1.5 MB/s vs ~4.5 MB/s at q=75 JPEG).
+FRAME_RELAY_HZ = 30.0
 
 # =============================================================================
 # VLM integration (harmony_vlm subprocess)
@@ -178,7 +221,13 @@ VLM_ENABLE_DEPTH = True
 
 # UDP endpoint for the vlm_service request-reply protocol. Must differ from
 # GAZE_UDP_PORT (5588) since both services can run concurrently on localhost.
+# Bind vs dial split: VLM_SERVICE_HOST is the dial address (panel /
+# experiment driver). VLM_BIND_HOST is the address vlm_service.py binds on
+# (UDP request socket + TCP overlay socket). In production set
+# VLM_BIND_HOST = "0.0.0.0" on Windows and VLM_SERVICE_HOST = <windows_lan_ip>
+# on Linux. Both default to 127.0.0.1 for single-machine dev.
 VLM_SERVICE_HOST = "127.0.0.1"
+VLM_BIND_HOST = "127.0.0.1"
 VLM_SERVICE_PORT = 5589
 VLM_SERVICE_TIMEOUT = 0.5
 
