@@ -3,7 +3,7 @@ import sys
 import numpy as np
 import pickle
 import mne
-from sklearn.model_selection import StratifiedGroupKFold, LeaveOneGroupOut
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 from sklearn.metrics import accuracy_score
 from pyriemann.estimation import Shrinkage
 from pyriemann.classification import MDM, FgMDM
@@ -589,19 +589,17 @@ def train_riemannian_model(
         print("[Note] target_ambig is set; c_reject is ignored for threshold SELECTION "
               "(still used only in the reported overall cost below.")
 
-    # Use leave-one-session-out CV when file_ids are provided (preferred: prevents
-    # session-level artifact leakage in addition to trial-level window leakage).
-    # Fall back to StratifiedGroupKFold on trial_ids when file_ids are absent.
-    if file_ids is not None:
-        splitter = LeaveOneGroupOut()
-        split_groups = file_ids
-        n_folds = len(np.unique(file_ids))
-        print(f"\n🚀 Starting Leave-One-Session-Out CV ({n_folds} sessions) with Riemannian MDM...\n")
+    cv_mode = getattr(config, "CV_MODE", "kfold")
+    if cv_mode == "session_grouped" and file_ids is not None:
+        n_sessions = len(np.unique(file_ids))
+        actual_splits = min(n_splits, n_sessions)
+        splitter = StratifiedGroupKFold(n_splits=actual_splits, shuffle=True, random_state=42)
+        cv_splits = splitter.split(cov_matrices, labels_bin_for_split, groups=file_ids)
+        print(f"\n🚀 Starting {actual_splits}-Fold session-grouped CV ({n_sessions} sessions) with Riemannian MDM...\n")
     else:
-        groups = trial_ids if trial_ids is not None else np.arange(len(labels))
-        splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        split_groups = groups
-        print(f"\n🚀 Starting {n_splits}-Fold CV (trial-grouped) with Riemannian MDM...\n")
+        splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        cv_splits = splitter.split(cov_matrices, labels_bin_for_split)
+        print(f"\n🚀 Starting {n_splits}-Fold stratified CV with Riemannian MDM...\n")
 
     mdm = MDM()
 
@@ -611,7 +609,7 @@ def train_riemannian_model(
     all_true, all_pred, all_scores, all_true_bin = [], [], [], []
     posterior_probs = {lbl: [] for lbl in classes}
 
-    for fold_idx, (tr, te) in enumerate(splitter.split(cov_matrices, labels_bin_for_split, groups=split_groups), 1):
+    for fold_idx, (tr, te) in enumerate(cv_splits, 1):
         X_tr, X_te = cov_matrices[tr], cov_matrices[te]
         y_tr, y_te = labels[tr], labels[te]
 

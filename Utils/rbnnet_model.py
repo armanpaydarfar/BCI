@@ -29,25 +29,41 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import geoopt
 
 
 # ---------------------------------------------------------------------------
 # Utility: matrix functions via eigendecomposition
 # ---------------------------------------------------------------------------
 
-_JITTER = 1e-3
+_JITTER = 1e-2
 
 def _sym_eigh(A):
     """Eigendecompose a symmetric matrix; return (eigenvalues, eigenvectors).
     torch.linalg.eigh assumes symmetric input — more stable than torch.eig for SPD.
-    A jitter of 1e-3*I is added to prevent cuSOLVER convergence failures (error
-    code 2) on ill-conditioned matrices. 1e-4 was insufficient: it survived CV folds
-    but failed on the full-dataset final training pass. The jitter is independent of
-    the ReEig epsilon (which is data-derived, ~0.2 in practice); the two serve
-    different purposes and need not be matched.
+    A jitter of 1e-2*I is added to separate eigenvalues from zero and reduce
+    G_invsqrt amplification: (1e-2)^{-0.5}=10 vs (1e-3)^{-0.5}≈32.
+
+    Fallback for repeated-eigenvalue failure (error code 1):
+    With RECENTERING=1 and Stiefel-constrained BiMap weights, batch means in
+    _karcher_mean converge toward I as training progresses. Adding c*I jitter to
+    c*I still gives (c+jitter)*I — all eigenvalues identical — and cuSOLVER QR
+    fails with "too many repeated eigenvalues". In this regime A ≈ c*I exactly,
+    so eigenvalues = trace(A)/n and eigenvectors = I is the correct decomposition.
+    Gradients flow through c (the trace term), which is the only non-trivial
+    gradient direction when A is scalar.
     """
-    jitter = _JITTER * torch.eye(A.shape[-1], device=A.device, dtype=A.dtype)
-    return torch.linalg.eigh(A + jitter)
+    n = A.shape[-1]
+    jitter = _JITTER * torch.eye(n, device=A.device, dtype=A.dtype)
+    try:
+        return torch.linalg.eigh(A + jitter)
+    except RuntimeError:
+        # A ≈ c*I: exact decomposition is (c*ones, I). Gradients flow through c.
+        c = A.diagonal(dim1=-2, dim2=-1).mean(dim=-1) + _JITTER
+        vals = c.unsqueeze(-1).expand(*c.shape, n)
+        vecs = torch.eye(n, device=A.device, dtype=A.dtype).expand(
+            *A.shape[:-2], n, n).contiguous()
+        return vals, vecs
 
 
 def _mat_pow(A, p):
@@ -125,7 +141,13 @@ def compute_epsilon_threshold(cov_matrices_np, variance_retained=0.995):
 # ---------------------------------------------------------------------------
 
 class BiMapLayer(nn.Module):
-    """Bilinear Mapping: C_out = W @ C_in @ W^T. W QR-initialized for full row-rank."""
+    """Bilinear Mapping: C_out = W @ C_in @ W^T.
+    W lives on the Stiefel manifold (W^T W = I) and is optimised with
+    RiemannianAdam (geoopt.ManifoldParameter). QR initialization ensures
+    exact orthogonality at construction; the Riemannian optimizer maintains
+    it throughout training via geodesic retraction, preventing the BiMap
+    weight drift that causes Karcher mean ill-conditioning and gradient growth.
+    """
     def __init__(self, d_in, d_out):
         super().__init__()
         self.d_in  = d_in
@@ -133,7 +155,10 @@ class BiMapLayer(nn.Module):
         W_init = torch.randn(d_out, d_in)
         W_init, _ = torch.linalg.qr(W_init.T)
         W_init = W_init.T
-        self.W = nn.Parameter(W_init)
+        # canonical=False selects the SVD retraction instead of the Cayley map.
+        # The Cayley retraction solves (I + 0.5*skew)^{-1} which becomes singular
+        # when initial gradient steps are large. SVD retraction is unconditionally stable.
+        self.W = geoopt.ManifoldParameter(W_init, manifold=geoopt.Stiefel(canonical=False))
 
     def forward(self, X):
         # X: (batch, d_in, d_in) -> (batch, d_out, d_out)

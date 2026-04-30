@@ -46,6 +46,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+import geoopt
+import geoopt.optim
 
 # ---------------------------------------------------------------------------
 # Environment diagnostics (printed once at startup)
@@ -235,7 +237,7 @@ def _predict_proba_dual(model, cov_mu_np, cov_beta_np, device, batch_size=128):
 
 def _build_and_train(use_beta, n_ch, epsilon_mu, epsilon_beta,
                      cov_mu_tr, cov_beta_tr, y_tr, device,
-                     epochs, lr, batch_size, weight_decay):
+                     epochs, lr, batch_size, weight_decay, early_stop_patience):
     """Construct, train, and return a fresh model."""
     if use_beta:
         model = build_dual_band_rbnnet(n_ch, epsilon_mu, epsilon_beta)
@@ -262,8 +264,27 @@ def _build_and_train(use_beta, n_ch, epsilon_mu, epsilon_beta,
 
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=False)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=max(1, epochs // 3), gamma=0.5)
+
+    # BiMap weights live on the Stiefel manifold (geoopt.ManifoldParameter).
+    # RiemannianAdam applies geodesic retraction to keep W^T W = I exactly,
+    # preventing BiMap drift and the resulting Karcher mean ill-conditioning.
+    # No weight decay on Stiefel params — decay toward zero has no meaning on
+    # a compact manifold and is handled correctly by the Riemannian gradient.
+    from Utils.rbnnet_model import BiMapLayer
+    bimap_params = [p for m in model.modules()
+                    if isinstance(m, BiMapLayer) for p in m.parameters()]
+    bimap_ids    = {id(p) for p in bimap_params}
+    other_params = [p for p in model.parameters() if id(p) not in bimap_ids]
+
+    optimizer = geoopt.optim.RiemannianAdam([
+        {'params': bimap_params},
+        {'params': other_params, 'weight_decay': weight_decay},
+    ], lr=lr, weight_decay=0.0)
+
+    # ReduceLROnPlateau fires only when training loss stops improving, so the
+    # LR reduction tracks actual convergence rather than a fixed epoch schedule.
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', patience=20, factor=0.5, min_lr=1e-5)
 
     n_samples  = len(loader.dataset)
     n_batches  = len(loader)
@@ -291,7 +312,7 @@ def _build_and_train(use_beta, n_ch, epsilon_mu, epsilon_beta,
                         f"[RBNNet] Non-finite loss ({batch_loss.item()}) at epoch {epoch}.")
                 batch_loss.backward()
                 grad_norm_sum += torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), float('inf')).item()
+                    model.parameters(), 1.0).item()
                 optimizer.step()
                 epoch_loss += batch_loss.item() * len(y_batch)
         else:
@@ -303,18 +324,24 @@ def _build_and_train(use_beta, n_ch, epsilon_mu, epsilon_beta,
                         f"[RBNNet] Non-finite loss ({batch_loss.item()}) at epoch {epoch}.")
                 batch_loss.backward()
                 grad_norm_sum += torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), float('inf')).item()
+                    model.parameters(), 1.0).item()
                 optimizer.step()
                 epoch_loss += batch_loss.item() * len(y_batch)
 
         loss       = epoch_loss / n_samples
         epoch_time = time.time() - t_epoch
         current_lr = optimizer.param_groups[0]['lr']
-        scheduler.step()
+        scheduler.step(loss)
 
         if loss < best_loss:
             best_loss       = loss
             last_improve_ep = epoch
+
+        stale_epochs = epoch - last_improve_ep
+        if stale_epochs >= early_stop_patience:
+            print(f"  [RBNNet] Early stop at epoch {epoch}: "
+                  f"no improvement for {stale_epochs} epochs (patience={early_stop_patience})")
+            break
 
         if epoch % 20 == 0 or epoch == 1:
             elapsed       = time.time() - t_start
@@ -325,8 +352,8 @@ def _build_and_train(use_beta, n_ch, epsilon_mu, epsilon_beta,
                              if loss_at_last_log is not None else "   n/a")
 
             flags = ""
-            if epoch - last_improve_ep >= 40 and epoch > 40:
-                flags += f"  [PLATEAU {epoch - last_improve_ep} epochs]"
+            if stale_epochs >= 40 and epoch > 40:
+                flags += f"  [PLATEAU {stale_epochs} epochs]"
             if avg_grad_norm > 10.0:
                 flags += f"  [GRAD LARGE: {avg_grad_norm:.1f}]"
 
@@ -353,22 +380,36 @@ def _build_and_train(use_beta, n_ch, epsilon_mu, epsilon_beta,
 
 def cross_validate_rbnnet(use_beta, cov_mu_np, cov_beta_np, labels_bin_np,
                            epsilon_mu, epsilon_beta, device, trial_ids=None, file_ids=None):
-    n_splits     = int(getattr(config, "N_SPLITS", 5))
-    target_ambig = float(getattr(config, "TARGET_AMBIG", 0.20))
-    epochs       = int(getattr(config, "RBNNET_EPOCHS", 200))
-    lr           = float(getattr(config, "RBNNET_LR", 1e-3))
-    batch_size   = int(getattr(config, "RBNNET_BATCH_SIZE", 32))
-    weight_decay = float(getattr(config, "RBNNET_WEIGHT_DECAY", 1e-4))
-    n_ch         = cov_mu_np.shape[1]
+    n_splits           = int(getattr(config, "N_SPLITS", 5))
+    target_ambig       = float(getattr(config, "TARGET_AMBIG", 0.20))
+    epochs             = int(getattr(config, "RBNNET_EPOCHS", 200))
+    lr                 = float(getattr(config, "RBNNET_LR", 1e-3))
+    batch_size         = int(getattr(config, "RBNNET_BATCH_SIZE", 64))
+    weight_decay       = float(getattr(config, "RBNNET_WEIGHT_DECAY", 1e-4))
+    early_stop_patience = int(getattr(config, "RBNNET_EARLY_STOP_PATIENCE", 50))
+    n_ch               = cov_mu_np.shape[1]
 
     # Use leave-one-session-out CV when file_ids are provided (preferred: prevents
     # session-level artifact leakage in addition to trial-level window leakage).
+    # When n_sessions > MAX_LOSO_FOLDS, group consecutive sessions so that whole
+    # sessions remain in either train or val (session isolation is preserved).
     # Fall back to StratifiedGroupKFold on trial_ids when file_ids are absent.
     if file_ids is not None:
+        max_loso = int(getattr(config, "MAX_LOSO_FOLDS", 8))
+        unique_files = np.unique(file_ids)
+        n_sessions = len(unique_files)
+        if n_sessions > max_loso:
+            # Map each session index to one of max_loso groups (consecutive grouping).
+            group_of = {fid: int(i * max_loso // n_sessions)
+                        for i, fid in enumerate(unique_files)}
+            split_groups = np.array([group_of[fid] for fid in file_ids])
+            n_folds = max_loso
+            print(f"\n[CV] Leave-One-Group-Out: {n_sessions} sessions → {max_loso} groups")
+        else:
+            split_groups = file_ids
+            n_folds = n_sessions
+            print(f"\n[CV] Leave-One-Session-Out ({n_folds} sessions)")
         skf = LeaveOneGroupOut()
-        split_groups = file_ids
-        n_folds = len(np.unique(file_ids))
-        print(f"\n[CV] Leave-One-Session-Out ({n_folds} sessions)")
     else:
         groups = trial_ids if trial_ids is not None else np.arange(len(labels_bin_np))
         skf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
@@ -391,7 +432,7 @@ def cross_validate_rbnnet(use_beta, cov_mu_np, cov_beta_np, labels_bin_np,
         model = _build_and_train(
             use_beta, n_ch, epsilon_mu, epsilon_beta,
             cov_mu_tr, cov_b_tr, y_tr, device,
-            epochs, lr, batch_size, weight_decay,
+            epochs, lr, batch_size, weight_decay, early_stop_patience,
         )
 
         if use_beta:
@@ -664,9 +705,13 @@ def main():
     print(f"Label counts:   {dict(zip(*np.unique(labels_np, return_counts=True)))}")
 
     # --- Mu-band covariance matrices (always needed) ---
+    # When LEDOITWOLF=1, compute_processed_covariances fits LW per segment and
+    # ignores shrinkage_param. Pass the RBNNet lambda only as the fixed-lambda
+    # fallback for when LEDOITWOLF=0.
     lam = float(getattr(config, "SHRINKAGE_PARAM_RBNNET",
                 getattr(config, "SHRINKAGE_PARAM_MDM", 0.02)))
-    print(f"\n[Mu cov] shrinkage lambda={lam}")
+    shrinkage_desc = "LedoitWolf (per-segment)" if config.LEDOITWOLF else f"fixed lambda={lam}"
+    print(f"\n[Mu cov] shrinkage: {shrinkage_desc}")
     cov_mu_np = compute_processed_covariances(
         segments_np, labels_np, model_type="mdm", shrinkage_param=lam
     )
@@ -702,16 +747,17 @@ def main():
     )
 
     # --- Final model on all data ---
-    epochs       = int(getattr(config, "RBNNET_EPOCHS", 200))
-    lr           = float(getattr(config, "RBNNET_LR", 1e-3))
-    batch_size   = int(getattr(config, "RBNNET_BATCH_SIZE", 32))
-    weight_decay = float(getattr(config, "RBNNET_WEIGHT_DECAY", 1e-4))
+    epochs              = int(getattr(config, "RBNNET_EPOCHS", 200))
+    lr                  = float(getattr(config, "RBNNET_LR", 1e-3))
+    batch_size          = int(getattr(config, "RBNNET_BATCH_SIZE", 64))
+    weight_decay        = float(getattr(config, "RBNNET_WEIGHT_DECAY", 1e-4))
+    early_stop_patience = int(getattr(config, "RBNNET_EARLY_STOP_PATIENCE", 50))
 
     print("\n[Final Model] Training on all segments...")
     final_model = _build_and_train(
         use_beta, n_ch, epsilon_mu, epsilon_beta,
         cov_mu_np, cov_beta_np, labels_bin, device,
-        epochs, lr, batch_size, weight_decay,
+        epochs, lr, batch_size, weight_decay, early_stop_patience,
     )
 
     # Full-data scores for reporting

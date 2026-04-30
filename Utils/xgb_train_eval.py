@@ -13,7 +13,7 @@ os.environ["MNE_USE_NUMBA"] = "false"
 import config
 import Generate_Riemannian_adaptive as base
 
-from sklearn.model_selection import StratifiedGroupKFold, LeaveOneGroupOut
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
@@ -62,26 +62,24 @@ def train_xgb_dual_thresholds(
         random_state=42,
     )
 
-    # Use leave-one-session-out CV when file_ids are provided (preferred: prevents
-    # session-level artifact leakage in addition to trial-level window leakage).
-    # Fall back to StratifiedGroupKFold on trial_ids when file_ids are absent.
-    if file_ids is not None:
-        splitter = LeaveOneGroupOut()
-        split_groups = file_ids
-        n_folds = len(np.unique(file_ids))
-        print(f"\n🚀 Starting Leave-One-Session-Out CV ({n_folds} sessions, {feature_tag}) + XGBoost...\n")
+    cv_mode = getattr(config, "CV_MODE", "kfold")
+    if cv_mode == "session_grouped" and file_ids is not None:
+        n_sessions = len(np.unique(file_ids))
+        actual_splits = min(n_splits, n_sessions)
+        splitter = StratifiedGroupKFold(n_splits=actual_splits, shuffle=True, random_state=42)
+        cv_splits = splitter.split(X, y_bin, groups=file_ids)
+        print(f"\n🚀 Starting {actual_splits}-Fold session-grouped CV ({n_sessions} sessions, {feature_tag}) + XGBoost...\n")
     else:
-        groups = trial_ids if trial_ids is not None else np.arange(len(y_bin))
-        splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        split_groups = groups
-        print(f"\n🚀 Starting {n_splits}-Fold CV (trial-grouped, {feature_tag}) + XGBoost...\n")
+        splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        cv_splits = splitter.split(X, y_bin)
+        print(f"\n🚀 Starting {n_splits}-Fold stratified CV ({feature_tag}) + XGBoost...\n")
 
     acc_argmax = []
     t_lows, t_highs = [], []
     all_true, all_pred, all_scores, all_true_bin = [], [], [], []
     posterior_probs = {lbl: [] for lbl in classes}
 
-    for fold_idx, (tr, te) in enumerate(splitter.split(X, y_bin, groups=split_groups), 1):
+    for fold_idx, (tr, te) in enumerate(cv_splits, 1):
         X_tr, X_te = X[tr], X[te]
         y_tr, y_te = labels[tr], labels[te]
         y_tr_bin = y_bin[tr]

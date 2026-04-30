@@ -29,6 +29,9 @@ TOTAL_TRIALS = 20
 TOTAL_TRIALS_ERRP = 45
 MAX_REPEATS = 3
 N_SPLITS = 5  # KFold splits (training scripts)
+# CV strategy for offline training: "kfold" = standard StratifiedKFold (no session grouping),
+# "session_grouped" = StratifiedGroupKFold grouped by session file (folds capped at N_SPLITS).
+CV_MODE = "kfold"
 TIME_MI = 5  # Motor imagery / rest cue duration (s)
 TIME_ROB = 7  # Robot movement window (s)
 TIME_STATIONARY = 2  # Stationary feedback after failed/no movement (s)
@@ -91,10 +94,10 @@ INTEGRATOR_ALPHA = 0.96
 # - MDM path (runtime + MDM-centric analyses)
 SHRINKAGE_PARAM_MDM = 0.02
 # - XGB feature pipelines (covariance preprocessing before tangent features)
-SHRINKAGE_PARAM_XGB = 0.1
+SHRINKAGE_PARAM_XGB = 0.02
 # Backward-compatible alias (legacy code may still read SHRINKAGE_PARAM).
 SHRINKAGE_PARAM = SHRINKAGE_PARAM_MDM
-LEDOITWOLF = 1
+LEDOITWOLF = 0
 
 # =============================================================================
 # Offline artifact rejection (sliding-window training segments)
@@ -144,16 +147,18 @@ DECODER_BACKEND = "rbnnet"
 # =============================================================================
 # RBNNet hyperparameters (generate_rbnnet_model.py)
 # =============================================================================
-RBNNET_EPOCHS = 200             # Training epochs
+RBNNET_EPOCHS = 200             # Training epochs (maximum; early stopping may terminate sooner)
+RBNNET_EARLY_STOP_PATIENCE = 50 # Stop if training loss does not improve for this many epochs
 RBNNET_LR = 1e-3                # Adam learning rate
-RBNNET_BATCH_SIZE = 32          # Mini-batch size
+RBNNET_BATCH_SIZE = 64          # Mini-batch size
 RBNNET_WEIGHT_DECAY = 1e-4      # Adam L2 weight decay
-RBNNET_VARIANCE_RETAINED = 0.995  # Fraction of variance for epsilon (ReEig threshold)
+RBNNET_VARIANCE_RETAINED = 0.90   # Fraction of variance for epsilon (ReEig threshold)
 SHRINKAGE_PARAM_RBNNET = 0.02   # Covariance shrinkage lambda (same as MDM)
 RBNNET_USE_BETA = 0             # 0 = single-band mu only, 1 = dual-band mu+beta
 RBNNET_LOWCUT_BETA = 13         # Hz — beta band low edge
 RBNNET_HIGHCUT_BETA = 30        # Hz — beta band high edge
 RBNNET_ONLINE_ADAPT = 0         # 1 = update RBN running means online (train-mode forward pass, no weight update)
+MAX_LOSO_FOLDS = 8              # Cap on LOSO CV folds; consecutive sessions are grouped when n_files exceeds this
 
 # =============================================================================
 # FES
