@@ -55,8 +55,12 @@ angles. vlm_service.py only consumes (x, y, worn) from the gaze block, so the
 extra fields are transparent on that side.
 
 Backpressure: the pump never blocks the realtime loop. If the socket can't
-keep up the frame is dropped. The server accepts at most one client at a
-time; subsequent connection attempts replace the old client.
+keep up the frame is dropped (per-client). Multiple clients are supported —
+each accepted connection gets its own handshake and receives every frame
+the pump produces. A client whose send fails is removed from the broadcast
+set without disturbing the others. This is the configuration the GPU-host
+topology actually needs: vlm_service.py and gaze_runner.py both consume
+the same relay concurrently.
 
 Run as a module:
 
@@ -184,9 +188,12 @@ class FrameRelayServer:
         self.repo_dir = repo_dir
 
         self._stop_event = threading.Event()
+        # Multi-client: every accepted connection joins this dict. The pump
+        # iterates a snapshot under the lock and removes any socket that
+        # fails to send (peer crashed, peer rebooted, etc.) without
+        # disrupting the others.
         self._client_lock = threading.Lock()
-        self._client_sock: Optional[socket.socket] = None
-        self._client_addr: Optional[tuple] = None
+        self._clients: Dict[tuple, socket.socket] = {}
 
         self._frame_count_published = 0
         self._frame_count_dropped = 0
@@ -224,7 +231,7 @@ class FrameRelayServer:
                 srv.close()
             except Exception:
                 pass
-            self._close_client()
+            self._close_all_clients()
             try:
                 if self._reader is not None:
                     self._reader.close()
@@ -255,59 +262,65 @@ class FrameRelayServer:
         return NeonLiveReader(host=self.neon_host or None)
 
     def _install_client(self, conn: socket.socket, addr: tuple) -> None:
-        """Replace any existing client with the new connection."""
-        with self._client_lock:
-            self._close_client_locked()
-            try:
-                conn.settimeout(2.0)
-                # Send handshake immediately. Reader provides camera matrix +
-                # distortion (factory-calibrated). Width/height come from the
-                # NeonLiveReader class attributes.
-                K = np.asarray(self._reader.camera_matrix, dtype=float)
-                dist = self._reader.distortion_coeffs
-                handshake = {
-                    "type": "handshake",
-                    "camera_matrix": K.tolist(),
-                    "distortion_coeffs": (
-                        np.asarray(dist).tolist() if dist is not None else None
-                    ),
-                    "scene_width": int(getattr(self._reader, "width", 1600)),
-                    "scene_height": int(getattr(self._reader, "height", 1200)),
-                    "fps_video": float(getattr(self._reader, "fps", 30.0)),
-                    "relay_hz": float(self.hz),
-                }
-                _send_envelope(conn, handshake, b"")
-            except OSError as e:
-                _log(f"client {addr} dropped during handshake: {e}")
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                return
-            self._client_sock = conn
-            self._client_addr = addr
-            _log(f"client connected: {addr}")
-
-    def _close_client(self) -> None:
-        with self._client_lock:
-            self._close_client_locked()
-
-    def _close_client_locked(self) -> None:
-        sock = self._client_sock
-        addr = self._client_addr
-        self._client_sock = None
-        self._client_addr = None
-        if sock is None:
-            return
+        """Add a new client and send its handshake. Existing clients are
+        unaffected — the pump broadcasts every frame to all of them."""
         try:
-            sock.close()
-        except Exception:
-            pass
-        if addr is not None:
+            conn.settimeout(2.0)
+            # Send handshake immediately. Reader provides camera matrix +
+            # distortion (factory-calibrated). Width/height come from the
+            # NeonLiveReader class attributes.
+            K = np.asarray(self._reader.camera_matrix, dtype=float)
+            dist = self._reader.distortion_coeffs
+            handshake = {
+                "type": "handshake",
+                "camera_matrix": K.tolist(),
+                "distortion_coeffs": (
+                    np.asarray(dist).tolist() if dist is not None else None
+                ),
+                "scene_width": int(getattr(self._reader, "width", 1600)),
+                "scene_height": int(getattr(self._reader, "height", 1200)),
+                "fps_video": float(getattr(self._reader, "fps", 30.0)),
+                "relay_hz": float(self.hz),
+            }
+            _send_envelope(conn, handshake, b"")
+        except OSError as e:
+            _log(f"client {addr} dropped during handshake: {e}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
+        with self._client_lock:
+            self._clients[addr] = conn
+            n = len(self._clients)
+        _log(f"client connected: {addr} (total clients: {n})")
+
+    def _close_all_clients(self) -> None:
+        with self._client_lock:
+            clients = list(self._clients.items())
+            self._clients.clear()
+        for addr, sock in clients:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            _log(f"client disconnected: {addr}")
+
+    def _drop_client(self, addr: tuple) -> None:
+        with self._client_lock:
+            sock = self._clients.pop(addr, None)
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
             _log(f"client disconnected: {addr}")
 
     def _pump_loop(self) -> None:
-        """Iterate the Neon reader at video rate and forward at relay_hz."""
+        """Iterate the Neon reader at video rate and forward at relay_hz to
+        every connected client. JPEG encoding happens once per frame and
+        the bytes are sent verbatim to each client; encoding cost does not
+        scale with client count."""
         period = 1.0 / max(self.hz, 1e-6)
         next_send = time.perf_counter()
         last_log_t = time.time()
@@ -322,18 +335,19 @@ class FrameRelayServer:
                     continue
 
                 with self._client_lock:
-                    sock = self._client_sock
-                    addr = self._client_addr
+                    snapshot = list(self._clients.items())
 
-                if sock is None:
-                    # No consumer; just keep iterating to keep the SDK alive.
+                if not snapshot:
+                    # No consumers; just keep iterating to keep the SDK alive.
                     next_send = now_pc + period
                     continue
 
-                ok = self._send_frame(sock, bundle)
-                if not ok:
-                    _log(f"client send failed; dropping {addr}")
-                    self._close_client()
+                # Encode once, broadcast many.
+                envelope = self._encode_frame(bundle)
+                if envelope is not None:
+                    for addr, sock in snapshot:
+                        if not self._send_envelope_safe(sock, envelope):
+                            self._drop_client(addr)
 
                 next_send += period
                 # If we fell behind by >2 periods (slow encode, slow socket),
@@ -345,15 +359,24 @@ class FrameRelayServer:
                 # Periodic stats line; cheap, throttled.
                 if (time.time() - last_log_t) > 5.0:
                     last_log_t = time.time()
+                    with self._client_lock:
+                        n = len(self._clients)
                     _log(
                         f"published={self._frame_count_published} "
-                        f"dropped={self._frame_count_dropped}"
+                        f"dropped={self._frame_count_dropped} "
+                        f"clients={n}"
                     )
         except Exception as e:
             _log(f"pump loop exited: {e}")
             self._stop_event.set()
 
-    def _send_frame(self, sock: socket.socket, bundle) -> bool:
+    def _encode_frame(self, bundle) -> Optional[bytes]:
+        """Build the wire-ready bytes for one frame envelope.
+
+        Returns the full ``[json_len][jpeg_len][json][jpeg]`` byte string so
+        the broadcast loop can ``sendall`` it directly to each client.
+        Returns ``None`` if JPEG encoding fails (rare; logged + counted as
+        dropped)."""
         try:
             ok, buf = cv2.imencode(
                 ".jpg",
@@ -362,7 +385,7 @@ class FrameRelayServer:
             )
             if not ok:
                 self._frame_count_dropped += 1
-                return True  # encoding failed but socket is fine
+                return None
             jpeg = bytes(buf)
 
             header = {
@@ -377,15 +400,22 @@ class FrameRelayServer:
                 "gaze": _gaze_to_dict(bundle.gaze),
                 "imu": _imu_to_dict(bundle.imu),
             }
-            _send_envelope(sock, header, jpeg)
+            hdr_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+            return struct.pack(">II", len(hdr_bytes), len(jpeg)) + hdr_bytes + jpeg
+        except Exception as e:
+            _log(f"encode_frame error: {e}")
+            self._frame_count_dropped += 1
+            return None
+
+    def _send_envelope_safe(self, sock: socket.socket, envelope: bytes) -> bool:
+        """Write a pre-encoded envelope to one client socket. Returns False
+        on socket failure so the pump can drop that client."""
+        try:
+            sock.sendall(envelope)
             self._frame_count_published += 1
             return True
         except (BrokenPipeError, ConnectionResetError, OSError):
             return False
-        except Exception as e:
-            _log(f"send_frame error: {e}")
-            self._frame_count_dropped += 1
-            return True
 
 
 # ── module CLI ─────────────────────────────────────────────────────────────
