@@ -125,6 +125,16 @@ class GazeConfig:
     neon_host: str = ""
     discover_timeout_s: int = 10
 
+    # Frame source toggle for the GPU-host migration plan (see SoftwareDocs/
+    # GPU_Service_Host_Architecture_Plan.md §3.4). Default `local` opens the
+    # Neon device directly. `remote` consumes envelopes from a TCP relay
+    # (Utils/frame_relay.py) via Utils/remote_frame_reader.RemoteNeonDevice.
+    # In remote mode gaze + IMU are subsampled to the relay rate (~10 Hz vs
+    # native ~200 Hz); smoothing is therefore coarser.
+    frame_source: str = "local"            # "local" | "remote"
+    remote_frame_host: str = ""
+    remote_frame_port: int = 5591
+
 
 # -----------------------
 # Utility
@@ -249,7 +259,23 @@ class GazeSystem:
         """
         Discover device and start threads.
         """
-        if self.cfg.neon_host:
+        if self.cfg.frame_source == "remote":
+            if not self.cfg.remote_frame_host:
+                raise RuntimeError(
+                    "frame_source='remote' requires remote_frame_host to be set"
+                )
+            # Substitute a TCP-relay-backed Device shim. The shim implements
+            # receive_scene_video_frame / receive_gaze_datum / receive_imu_datum
+            # so the three Neon threads below consume it unchanged.
+            from Utils.remote_frame_reader import RemoteNeonDevice
+            self._log(
+                f"Connecting to frame relay tcp://"
+                f"{self.cfg.remote_frame_host}:{self.cfg.remote_frame_port}…"
+            )
+            self._device = RemoteNeonDevice(
+                self.cfg.remote_frame_host, int(self.cfg.remote_frame_port)
+            )
+        elif self.cfg.neon_host:
             from pupil_labs.realtime_api.simple import Device
             self._log(f"Connecting directly to Neon at {self.cfg.neon_host}…")
             self._device = Device(address=self.cfg.neon_host, port=8080)

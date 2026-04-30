@@ -102,6 +102,10 @@ class SnapshotCache:
 def parse_args():
     p = argparse.ArgumentParser(description="harmony_vlm UDP service")
     p.add_argument("--repo-dir", required=True, help="Path to harmony_vlm clone")
+    # `--host` is the bind address for both the UDP request socket and the
+    # TCP overlay socket. Production deployments set this to 0.0.0.0 so the
+    # Linux panel/driver can dial in across the LAN; single-machine dev
+    # keeps it on 127.0.0.1.
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=5589)
     p.add_argument("--neon-host", default="", help="Empty string triggers LAN discovery")
@@ -116,6 +120,16 @@ def parse_args():
     p.add_argument("--overlay-port", type=int, default=5590,
                    help="TCP port for the overlay frame push server")
     p.add_argument("--verbose", action="store_true")
+    # Frame source toggle for the GPU-host migration plan (see SoftwareDocs/
+    # GPU_Service_Host_Architecture_Plan.md §3.4). Default `local` preserves
+    # today's behaviour (open Neon directly via NeonLiveReader). `remote`
+    # consumes envelopes from a Utils/frame_relay.py TCP server instead.
+    p.add_argument("--frame-source", choices=["local", "remote"], default="local",
+                   help="local=open Neon directly; remote=consume Utils/frame_relay envelopes")
+    p.add_argument("--remote-frame-host", default=None,
+                   help="Host of the frame_relay server (required when --frame-source=remote)")
+    p.add_argument("--remote-frame-port", type=int, default=5591,
+                   help="Port of the frame_relay server (default 5591)")
     return p.parse_args()
 
 
@@ -137,6 +151,9 @@ class VLMService:
         self._latest_bundle = None
         self._latest_bundle_t: float = 0.0
         self._latest_fix = None
+        # Telemetry for the status payload — surfaced to the Windows panel's
+        # "Frame intake" badge and to the Linux panel's remote-status query.
+        self._frames_received: int = 0
 
         self._stop_event = threading.Event()
         self._frame_thread: Optional[threading.Thread] = None
@@ -187,6 +204,7 @@ class VLMService:
                     self._latest_bundle = bundle
                     self._latest_bundle_t = time.time()
                     self._latest_fix = fix_state
+                    self._frames_received += 1
         except Exception as e:
             _log(f"frame loop exited: {e}")
             self._stop_event.set()
@@ -304,13 +322,25 @@ class VLMService:
 
     def _cmd_status(self) -> dict:
         bundle, fix, t = self._latest()
+        with self._frame_lock:
+            frames_received = int(self._frames_received)
+        # `frame_source_connected` reports whether the underlying reader is
+        # currently producing frames — for `local` mode this means the Neon
+        # device is talking to the SDK; for `remote` mode it means the
+        # frame_relay TCP connection is alive and shipping envelopes.
+        # 2 s heuristic is generous compared to relay default of 10 Hz.
+        frame_age = (time.time() - t) if t else None
+        connected = bool(bundle is not None and frame_age is not None and frame_age < 2.0)
         return {
             "ok": True,
             "neon_connected": bundle is not None,
-            "frame_age_s": (time.time() - t) if t else None,
+            "frame_age_s": frame_age,
             "depth_enabled": self.depth_estimator is not None,
             "model": self.args.model,
             "fixation_active": bool(fix.active) if fix is not None else False,
+            "frame_source": getattr(self.args, "frame_source", "local"),
+            "frame_source_connected": connected,
+            "frames_received": frames_received,
         }
 
     def _cmd_snapshot(self) -> dict:
@@ -872,8 +902,23 @@ def main() -> None:
         _log(f"FATAL: no GOOGLE_API_KEY / OPENAI_API_KEY in env or .env (looked in {env_file})")
         sys.exit(2)
 
-    _log(f"connecting to Neon (host={args.neon_host or 'auto-discover'})…")
-    reader = NeonLiveReader(host=args.neon_host or None)
+    if args.frame_source == "remote":
+        if not args.remote_frame_host:
+            _log("FATAL: --frame-source=remote requires --remote-frame-host")
+            sys.exit(2)
+        # BCI/Utils/remote_frame_reader.py exposes a NeonLiveReader-shaped
+        # iterator over the TCP envelope stream produced by Utils/frame_relay.py.
+        # bundle.video.bgr / bundle.gaze / bundle.imu / camera_matrix all
+        # match NeonLiveReader, so the rest of this file is unchanged.
+        bci_root = os.path.dirname(os.path.abspath(__file__))
+        if bci_root not in sys.path:
+            sys.path.insert(0, bci_root)
+        from Utils.remote_frame_reader import RemoteFrameReader
+        _log(f"connecting to frame relay tcp://{args.remote_frame_host}:{args.remote_frame_port}…")
+        reader = RemoteFrameReader(args.remote_frame_host, args.remote_frame_port)
+    else:
+        _log(f"connecting to Neon (host={args.neon_host or 'auto-discover'})…")
+        reader = NeonLiveReader(host=args.neon_host or None)
 
     _log(f"loading segmentation model: {args.seg_model} on {args.device}…")
     detector = ObjectDetector(model_size=args.seg_model, device=args.device)

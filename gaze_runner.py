@@ -322,6 +322,18 @@ def parse_args():
     p.add_argument("--neon-device-host", type=str, default="",
                    dest="neon_device_host",
                    help="Companion app IP for direct connection; empty = mDNS discovery")
+    # Frame-source toggle for the GPU-host migration plan; mirrors the
+    # vlm_service.py flag. Default `local` keeps today's behaviour
+    # (gaze_system opens Neon directly).
+    p.add_argument("--frame-source", choices=["local", "remote"], default="local",
+                   dest="frame_source",
+                   help="local=open Neon directly; remote=consume Utils/frame_relay envelopes")
+    p.add_argument("--remote-frame-host", type=str, default="",
+                   dest="remote_frame_host",
+                   help="Host of the frame_relay server (required when --frame-source=remote)")
+    p.add_argument("--remote-frame-port", type=int, default=5591,
+                   dest="remote_frame_port",
+                   help="Port of the frame_relay server (default 5591)")
     return p.parse_args()
 
 
@@ -332,6 +344,11 @@ def main():
     sys_cfg = build_sys_cfg()
     sys_cfg.enable_prints = bool(args.prints)
     sys_cfg.neon_host = str(args.neon_device_host)
+    sys_cfg.frame_source = str(args.frame_source)
+    sys_cfg.remote_frame_host = str(args.remote_frame_host)
+    sys_cfg.remote_frame_port = int(args.remote_frame_port)
+    if sys_cfg.frame_source == "remote" and not sys_cfg.remote_frame_host:
+        raise SystemExit("--frame-source=remote requires --remote-frame-host")
 
     if args.loop_hz is not None:
         sys_cfg.target_loop_hz = float(args.loop_hz)
