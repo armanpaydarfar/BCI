@@ -668,17 +668,20 @@ def main():
                     )
 
                 # ── Home robot ────────────────────────────────────────────────
+                # Always home: earlystop means the robot stopped mid-trajectory
+                # and needs to be commanded home explicitly; skip the pre-home
+                # fixation only in that case (the HOLDING countdown already ran).
                 if not move_result["robot_earlystop"]:
                     display_fixation_period(duration=2, eeg_state=eeg_state)
-                    send_udp_message(
-                        udp_socket_marker, config.UDP_MARKER["IP"],
-                        config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_HOME"], logger=logger,
-                    )
-                    send_udp_message(
-                        udp_socket_robot, config.UDP_ROBOT["IP"],
-                        config.UDP_ROBOT["PORT"], config.ROBOT_OPCODES["HOME"],
-                        logger=logger, expect_ack=True, ack_timeout=1.5, max_retries=1,
-                    )
+                send_udp_message(
+                    udp_socket_marker, config.UDP_MARKER["IP"],
+                    config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_HOME"], logger=logger,
+                )
+                send_udp_message(
+                    udp_socket_robot, config.UDP_ROBOT["IP"],
+                    config.UDP_ROBOT["PORT"], config.ROBOT_OPCODES["HOME"],
+                    logger=logger, expect_ack=True, ack_timeout=1.5, max_retries=1,
+                )
                 display_fixation_period(duration=3, eeg_state=eeg_state)
 
             elif prediction is None:

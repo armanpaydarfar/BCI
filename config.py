@@ -20,7 +20,6 @@ LOWCUT_ERRP = 1   # Hz — ErrP band
 HIGHCUT_ERRP = 10
 FILTER_BUFFER_SIZE = 2048  # ~4 s at 512 Hz
 MOTOR_CHANNEL_NAMES = ['FC1','FC2','C3', 'Cz', 'C4', 'CP5', 'CP1', 'CP2', 'CP6', 'P7','P3', 'Pz', 'P4', 'P8', 'POz']
-ERRP_CHANNEL_NAMES  = ['F3', 'Fz', 'F4', 'FC1', 'FC2', 'Cz']
 EOG_CHANNEL_NAMES   = ['AUX1']
 
 # =============================================================================

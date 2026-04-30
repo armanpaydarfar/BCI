@@ -964,7 +964,7 @@ class ControlPanel(QMainWindow):
         form.addRow(self.errp_sel_channels)
         form.addRow("ERRP_EA_BOOTSTRAP_SEC", self.errp_ea_bootstrap_sec)
         form.addRow("ERRP_EA_MIN_EPOCHS", self.errp_ea_min_epochs)
-        form.addRow("ERRP_P_STOP", self.errp_p_stop)
+        form.addRow("ERRP_ONLINE_P_STOP", self.errp_p_stop)
 
         scroll.setWidget(inner)
         outer.addWidget(scroll, 1)
@@ -988,7 +988,7 @@ class ControlPanel(QMainWindow):
         self.errp_sel_channels.setChecked(bool(_read_01_key("SELECT_ERRP_CHANNELS", 0)))
         self.errp_ea_bootstrap_sec.setValue(_read_float_key("ERRP_EA_BOOTSTRAP_SEC", 45.0))
         self.errp_ea_min_epochs.setValue(_read_int_key("ERRP_EA_MIN_EPOCHS", 20))
-        self.errp_p_stop.setValue(_read_float_key("ERRP_P_STOP", 0.5))
+        self.errp_p_stop.setValue(_read_float_key("ERRP_ONLINE_P_STOP", 0.3))
         self._append_log("Panel", f"[{self._ts()}] ErrP config widgets reloaded from config.py\n")
 
     def on_errp_config_apply(self):
@@ -1002,7 +1002,7 @@ class ControlPanel(QMainWindow):
             _write_assign_rhs("SELECT_ERRP_CHANNELS", "1" if self.errp_sel_channels.isChecked() else "0")
             _write_assign_rhs("ERRP_EA_BOOTSTRAP_SEC", _fmtf(self.errp_ea_bootstrap_sec.value()))
             _write_assign_rhs("ERRP_EA_MIN_EPOCHS", str(self.errp_ea_min_epochs.value()))
-            _write_assign_rhs("ERRP_P_STOP", _fmtf(self.errp_p_stop.value()))
+            _write_assign_rhs("ERRP_ONLINE_P_STOP", _fmtf(self.errp_p_stop.value()))
         except Exception as e:
             QMessageBox.warning(self, "config.py", f"Failed to update config.py:\n{e}")
             self._append_log("Panel", f"[{self._ts()}] ErrP config apply FAILED: {e}\n")
