@@ -90,12 +90,19 @@ GAZE_RUNNER_PY = os.path.join(ROOT, "gaze_runner.py")
 GAZE_SERVICE_PY = os.path.join(ROOT, "gaze_runner.py")
 
 GAZE_SERVICE_HOST = getattr(_HCFG, "GAZE_UDP_IP", "127.0.0.1") if _HCFG else "127.0.0.1"
+# Bind vs dial: GAZE_SERVICE_HOST is what the panel dials; GAZE_BIND_HOST
+# is what gaze_runner.py binds on. Production sets BIND=0.0.0.0 on Windows
+# and SERVICE_HOST=<windows_lan_ip> on Linux.
+GAZE_BIND_HOST = getattr(_HCFG, "GAZE_BIND_HOST", GAZE_SERVICE_HOST) if _HCFG else GAZE_SERVICE_HOST
 GAZE_SERVICE_PORT = int(getattr(_HCFG, "GAZE_UDP_PORT", 5588)) if _HCFG else 5588
 GAZE_QUERY_TIMEOUT_S = 0.8
 
 # ---- VLM service (harmony_vlm) ----
 VLM_SERVICE_PY      = os.path.join(ROOT, "vlm_service.py")
 VLM_SERVICE_HOST    = getattr(_HCFG, "VLM_SERVICE_HOST", "127.0.0.1") if _HCFG else "127.0.0.1"
+# Bind vs dial: VLM_SERVICE_HOST is what the panel dials; VLM_BIND_HOST is
+# what vlm_service.py binds on (both UDP request and TCP overlay).
+VLM_BIND_HOST       = getattr(_HCFG, "VLM_BIND_HOST", VLM_SERVICE_HOST) if _HCFG else VLM_SERVICE_HOST
 VLM_SERVICE_PORT    = int(getattr(_HCFG, "VLM_SERVICE_PORT", 5589)) if _HCFG else 5589
 VLM_REPO_DIR        = getattr(_HCFG, "VLM_REPO_DIR", None) if _HCFG else None
 VLM_CONDA_ENV       = getattr(_HCFG, "VLM_CONDA_ENV", "harmony_vlm") if _HCFG else "harmony_vlm"
@@ -110,8 +117,38 @@ VLM_OVERLAY_PORT    = int(getattr(_HCFG, "VLM_OVERLAY_PORT", 5590)) if _HCFG els
 VLM_ENABLE_OVERLAY  = bool(getattr(_HCFG, "VLM_ENABLE_OVERLAY", True)) if _HCFG else True
 NEON_COMPANION_HOST = str(getattr(_HCFG, "NEON_COMPANION_HOST", "")) if _HCFG else ""
 
+# Remote-services mode: when True, the panel does NOT spawn local VLM /
+# gaze service subprocesses; instead it shows remote-status badges fed by
+# periodic `cmd: status` UDP pings (gaze_runner / vlm_service). Linux device
+# host runs with this True; Windows GPU host runs with this False (services
+# live locally and the panel manages their lifecycle).
+SERVICES_HOSTED_REMOTELY = bool(getattr(_HCFG, "SERVICES_HOSTED_REMOTELY", False)) if _HCFG else False
+PERCEPTION_FRAME_SOURCE  = str(getattr(_HCFG, "PERCEPTION_FRAME_SOURCE", "local")) if _HCFG else "local"
+
 
 _IS_WINDOWS = sys.platform == "win32"
+
+
+def _sleep_inhibit(enable: bool) -> None:
+    """Prevent / allow Windows from sleeping while perception services run.
+
+    Windows-only — uses kernel32.SetThreadExecutionState with
+    ES_CONTINUOUS | ES_SYSTEM_REQUIRED. Per
+    SoftwareDocs/GPU_Service_Host_Architecture_Plan.md §4.10 the GPU host
+    must not sleep mid-session. POSIX is a no-op (Linux deployment uses
+    systemd-inhibit / external power management).
+    """
+    if not _IS_WINDOWS:
+        return
+    try:
+        import ctypes
+        ES_CONTINUOUS = 0x80000000
+        ES_SYSTEM_REQUIRED = 0x00000001
+        flags = ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if enable else 0)
+        ctypes.windll.kernel32.SetThreadExecutionState(ctypes.c_uint(flags))
+    except Exception:
+        # Best-effort — sleep inhibit is a hardening, not a correctness gate.
+        pass
 
 
 def _resolve_conda_env_python(env_name: str) -> Optional[str]:
@@ -575,10 +612,32 @@ class ControlPanel(QMainWindow):
         self._set_led(self.lbl_gaze_service, "stopped")
         self._set_led(self.lbl_vlm_service, "stopped")
 
+        # When services are hosted remotely (Linux operator panel pointed at
+        # a Windows GPU host) the start/stop buttons can't drive local
+        # processes. Disable them and stand up a remote-status timer.
+        if SERVICES_HOSTED_REMOTELY:
+            self._configure_remote_services_ui()
+
         self.ui_timer = QTimer(self)
         self.ui_timer.setInterval(400)
         self.ui_timer.timeout.connect(self._tick)
         self.ui_timer.start()
+
+        # Periodic remote-status poller (cheap UDP ping). 1 s cadence.
+        self._remote_status_timer = QTimer(self)
+        self._remote_status_timer.setInterval(1000)
+        self._remote_status_timer.timeout.connect(self._poll_remote_status)
+        if SERVICES_HOSTED_REMOTELY:
+            self._remote_status_timer.start()
+
+        # Frame relay status — surfaced in either mode. The relay is a
+        # separate process from the perception services; running on Linux
+        # in production but optionally on Windows for single-machine tests.
+        self._relay_status_timer = QTimer(self)
+        self._relay_status_timer.setInterval(2000)
+        self._relay_status_timer.timeout.connect(self._poll_relay_status)
+        if PERCEPTION_FRAME_SOURCE == "remote" or SERVICES_HOSTED_REMOTELY:
+            self._relay_status_timer.start()
 
     # ---------- UI build ----------
     def _build_ui(self):
@@ -785,6 +844,24 @@ class ControlPanel(QMainWindow):
         grid.addWidget(QLabel("<i>Continuous:</i>"), row, 0)
         grid.addWidget(self.spin_vlm_seg_hz, row, 1)
         grid.addWidget(self.btn_vlm_seg_stream, row, 2)
+        row += 1
+
+        # ===== Frame relay status (GPU-host architecture; see SoftwareDocs/
+        # GPU_Service_Host_Architecture_Plan.md §4.7/§4.8). Visible whenever
+        # PERCEPTION_FRAME_SOURCE=remote (Windows consumer side) or
+        # SERVICES_HOSTED_REMOTELY=True (Linux operator side); stays inert
+        # in pure single-machine local mode.
+        self.lbl_relay_status_led = QLabel("●"); self._set_led(self.lbl_relay_status_led, "stopped")
+        self.lbl_relay_status_text = QLabel("relay: idle")
+        grid.addWidget(QLabel("<b>Frame Relay</b>"), row, 0)
+        grid.addWidget(self.lbl_relay_status_led, row, 1)
+        grid.addWidget(self.lbl_relay_status_text, row, 2, 1, 3)
+        row += 1
+
+        # Remote VLM intake badge: only meaningful when services run remotely.
+        self.lbl_remote_intake_text = QLabel("intake: --")
+        grid.addWidget(QLabel("<i>Remote VLM intake:</i>"), row, 0, 1, 2)
+        grid.addWidget(self.lbl_remote_intake_text, row, 2, 1, 3)
         row += 1
 
         self.btn_vlm_capture_first = QPushButton("Capture First")
@@ -1502,11 +1579,23 @@ class ControlPanel(QMainWindow):
 
         # Service: prints can be 0 (supressed) or 1 (verbose) — either way logs go to View: Gaze
         neon_arg = f'--neon-device-host "{NEON_COMPANION_HOST}"' if NEON_COMPANION_HOST else ""
+        # GPU-host topology: when PERCEPTION_FRAME_SOURCE=remote, gaze_runner
+        # consumes envelopes from the relay instead of opening Neon directly.
+        # Dial host comes from FRAME_RELAY_DIAL_HOST in config.
+        remote_arg = ""
+        if PERCEPTION_FRAME_SOURCE == "remote":
+            relay_dial = str(getattr(_HCFG, "FRAME_RELAY_DIAL_HOST", "127.0.0.1") or "127.0.0.1") if _HCFG else "127.0.0.1"
+            relay_port = int(getattr(_HCFG, "FRAME_RELAY_PORT", 5591)) if _HCFG else 5591
+            remote_arg = (
+                f'--frame-source remote '
+                f'--remote-frame-host {relay_dial} '
+                f'--remote-frame-port {relay_port}'
+            )
         self.gaze_service.cmd = (
             f'python -u "{GAZE_SERVICE_PY}" --mode service '
             f'--display {int(display)} --prints 1 '
-            f'--host {GAZE_SERVICE_HOST} --port {int(GAZE_SERVICE_PORT)} '
-            f'--udp_log 1 --udp_log_hz 50 {neon_arg}'
+            f'--host {GAZE_BIND_HOST} --port {int(GAZE_SERVICE_PORT)} '
+            f'--udp_log 1 --udp_log_hz 50 {neon_arg} {remote_arg}'
         )
         self._start_proc(self.gaze_service, self.lbl_gaze_service, "Gaze")
         self._append_log("Gaze", f"[{self._ts()}] Service start requested (display={display})\n")
@@ -1559,16 +1648,74 @@ class ControlPanel(QMainWindow):
 
     # ----- VLM service handlers -----
 
-    def _vlm_udp_request(self, payload: dict, timeout_s: float = VLM_QUERY_TIMEOUT_S) -> dict:
-        """One-shot JSON request against vlm_service.py (same idiom as _gaze_udp_request)."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    def _configure_remote_services_ui(self) -> None:
+        """Disable buttons that would spawn local conda subprocesses when
+        SERVICES_HOSTED_REMOTELY=True. Status queries remain functional —
+        they're plain UDP and travel transparently across the LAN."""
+        for btn_name in (
+            "btn_vlm_service_start", "btn_vlm_service_stop",
+            "btn_gaze_service_headless", "btn_gaze_service_ui",
+            "btn_gaze_service_stop",
+        ):
+            btn = getattr(self, btn_name, None)
+            if btn is not None:
+                btn.setEnabled(False)
+                btn.setToolTip("Disabled: SERVICES_HOSTED_REMOTELY=True. "
+                               "Manage these on the GPU host.")
+
+    def _poll_remote_status(self) -> None:
+        """1 s cadence. Pings the remote VLM service for its status payload
+        and reflects frame_source_connected + frames_received in the panel.
+        Network failures degrade gracefully — they just leave the badge in
+        the previous state (do not log; this fires every second)."""
         try:
-            sock.settimeout(float(timeout_s))
-            sock.sendto(json.dumps(payload).encode("utf-8"), (VLM_SERVICE_HOST, VLM_SERVICE_PORT))
-            data, _ = sock.recvfrom(65535)
-            return json.loads(data.decode("utf-8", errors="replace"))
-        finally:
-            sock.close()
+            resp = self._vlm_udp_request({"cmd": "status"}, timeout_s=0.4)
+        except Exception:
+            self._set_led(self.lbl_vlm_service, "error")
+            self.lbl_remote_intake_text.setText("intake: unreachable")
+            return
+        ok = bool(resp.get("ok"))
+        connected = bool(resp.get("frame_source_connected"))
+        frames = int(resp.get("frames_received") or 0)
+        src = resp.get("frame_source", "?")
+        age = resp.get("frame_age_s")
+        age_txt = f"{float(age):.2f}s" if isinstance(age, (int, float)) else "--"
+        self._set_led(self.lbl_vlm_service, "running" if (ok and connected) else "stopped")
+        self.lbl_remote_intake_text.setText(
+            f"intake: src={src} connected={connected} frames={frames} age={age_txt}"
+        )
+
+    def _poll_relay_status(self) -> None:
+        """2 s cadence. TCP-pings the frame relay and reads its handshake to
+        confirm the wire is alive."""
+        try:
+            from Utils.perception_clients import FrameRelayController
+        except Exception:
+            return
+        ctl = FrameRelayController(_HCFG) if _HCFG else None
+        if ctl is None:
+            return
+        ping = ctl.ping(timeout_s=0.5)
+        if ping.get("ok"):
+            self._set_led(self.lbl_relay_status_led, "running")
+            self.lbl_relay_status_text.setText(
+                f"relay: reachable @ {ping['host']}:{ping['port']}"
+            )
+        else:
+            self._set_led(self.lbl_relay_status_led, "stopped")
+            self.lbl_relay_status_text.setText(
+                f"relay: unreachable @ {ping['host']}:{ping['port']}"
+            )
+
+    def _vlm_udp_request(self, payload: dict, timeout_s: float = VLM_QUERY_TIMEOUT_S) -> dict:
+        """One-shot JSON request against vlm_service.py.
+
+        Delegates to ``Utils.perception_clients.udp_request`` so the wire
+        format (JSON, UDP, single datagram round-trip) lives in one place;
+        the panel layer here is purely UI plumbing.
+        """
+        from Utils.perception_clients import udp_request
+        return udp_request(VLM_SERVICE_HOST, VLM_SERVICE_PORT, payload, float(timeout_s))
 
     def on_vlm_service_start(self):
         if not os.path.exists(VLM_SERVICE_PY):
@@ -1621,13 +1768,25 @@ class ControlPanel(QMainWindow):
         self._append_log("VLM", f"[{self._ts()}] using python: {py}\n")
         # --neon-host "" forces discover_one_device in harmony_vlm's NeonLiveReader
         # (utils/neon/reader.py:224), matching our gaze_system.py:250 pattern.
+        # GPU-host topology: when PERCEPTION_FRAME_SOURCE=remote, vlm_service
+        # consumes envelopes from the Linux frame_relay rather than opening
+        # Neon itself. Dial host comes from FRAME_RELAY_DIAL_HOST.
+        remote_arg = ""
+        if PERCEPTION_FRAME_SOURCE == "remote":
+            relay_dial = str(getattr(_HCFG, "FRAME_RELAY_DIAL_HOST", "127.0.0.1") or "127.0.0.1") if _HCFG else "127.0.0.1"
+            relay_port = int(getattr(_HCFG, "FRAME_RELAY_PORT", 5591)) if _HCFG else 5591
+            remote_arg = (
+                f'--frame-source remote '
+                f'--remote-frame-host {relay_dial} '
+                f'--remote-frame-port {relay_port}'
+            )
         self.vlm_service.cmd = (
             f'"{py}" -u "{VLM_SERVICE_PY}" '
             f'--repo-dir "{VLM_REPO_DIR}" '
-            f'--host {VLM_SERVICE_HOST} --port {int(VLM_SERVICE_PORT)} '
+            f'--host {VLM_BIND_HOST} --port {int(VLM_SERVICE_PORT)} '
             f'--neon-host "{NEON_COMPANION_HOST}" '
             f'--model {VLM_MODEL} {device_flag} '
-            f'{depth_flag} {overlay_flag} {session_arg}'
+            f'{depth_flag} {overlay_flag} {session_arg} {remote_arg}'
         )
         self._start_proc(self.vlm_service, self.lbl_vlm_service, "VLM")
         self._append_log(
@@ -1635,6 +1794,8 @@ class ControlPanel(QMainWindow):
             f"[{self._ts()}] Service start requested "
             f"(depth={VLM_ENABLE_DEPTH}, overlay={VLM_ENABLE_OVERLAY}, model={VLM_MODEL})\n",
         )
+        # Block Windows from sleeping while the GPU stack is alive.
+        _sleep_inhibit(True)
         if VLM_ENABLE_OVERLAY:
             self._on_vlm_video_connect()
 
@@ -1658,6 +1819,7 @@ class ControlPanel(QMainWindow):
         # Belt-and-suspenders: reap any surviving orphan regardless.
         _kill_orphan_vlm_service()
         self._on_vlm_video_disconnect()
+        _sleep_inhibit(False)
 
     def _vlm_command_threaded(self, payload: dict, timeout_s: float, label: str) -> None:
         import threading as _threading
@@ -1853,19 +2015,14 @@ class ControlPanel(QMainWindow):
             f"{imu_txt} | {yolo_txt} | tracks={tracks} | {objs_txt} | {gaze_on} | {depth_txt} | {head_txt} {gaze_ang_txt}"
         )
     def _gaze_udp_request(self, payload: dict, timeout_s: float = 0.8) -> dict:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(float(timeout_s))
+        """One-shot JSON request against gaze_runner.py (service mode).
 
-        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        s.sendto(data, (GAZE_SERVICE_HOST, int(GAZE_SERVICE_PORT)))
-
-        resp, _addr = s.recvfrom(65535)
-        s.close()
-
-        txt = resp.decode("utf-8", errors="replace").strip()
-        if not txt:
-            raise RuntimeError("empty UDP response from gaze service")
-        return json.loads(txt)
+        Delegates to ``Utils.perception_clients.udp_request`` to keep the
+        wire format colocated with the VLM client and reusable from the
+        experiment driver.
+        """
+        from Utils.perception_clients import udp_request
+        return udp_request(GAZE_SERVICE_HOST, int(GAZE_SERVICE_PORT), payload, float(timeout_s))
 
     # ----- Arduino / Online BCI panel -----
     def on_serial_refresh(self):
