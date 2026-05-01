@@ -124,6 +124,14 @@ def parse_args():
                    help="Host of the frame_relay server (required when --frame-source=remote)")
     p.add_argument("--remote-frame-port", type=int, default=5591,
                    help="Port of the frame_relay server (default 5591)")
+    # Remote-stop guard: by default, cmd=stop is honoured only when it
+    # arrives from 127.0.0.1. This protects the unattended GPU host from
+    # an accidental click on a remote panel taking it down — operator
+    # would then have to physically reach the box to restart. Set this
+    # flag if you intentionally want the panel to be able to stop the
+    # service from across the network (e.g. for scripted teardowns).
+    p.add_argument("--allow-remote-stop", action="store_true",
+                   help="Honour cmd=stop from non-loopback addresses (off by default)")
     return p.parse_args()
 
 
@@ -333,7 +341,7 @@ class VLMService:
             "camera_matrix": lambda: self._cmd_camera_matrix(),
             "subscribe": lambda: self._cmd_subscribe(req, addr),
             "unsubscribe": lambda: self._cmd_unsubscribe(req),
-            "stop": lambda: self._cmd_stop(),
+            "stop": lambda: self._cmd_stop(addr),
         }
         handler = handlers.get(cmd)
         if handler is None:
@@ -773,7 +781,21 @@ class VLMService:
             "distortion_coeffs": dist.tolist() if dist is not None else None,
         }
 
-    def _cmd_stop(self) -> dict:
+    def _cmd_stop(self, addr: tuple) -> dict:
+        """Shut the service down. Honoured only from loopback unless the
+        operator explicitly passed --allow-remote-stop. This protects an
+        unattended GPU host from being taken offline by a remote panel
+        click, which would otherwise force a physical restart."""
+        host = addr[0] if addr else ""
+        is_local = isinstance(host, str) and (host == "127.0.0.1" or host.startswith("127."))
+        if not is_local and not getattr(self.args, "allow_remote_stop", False):
+            _log(f"refusing remote stop from {host} (use --allow-remote-stop to override)")
+            return {
+                "ok": False,
+                "error": "remote_stop_disabled",
+                "hint": "stop the service locally with Ctrl-C, "
+                        "or restart with --allow-remote-stop to allow this",
+            }
         self._stop_segment_stream()
         self._stop_event.set()
         return {"ok": True}
@@ -1088,6 +1110,15 @@ def main() -> None:
     # subscribe the loop is essentially idle (one prune pass per tick).
     service.start_results_push()
 
+    # Keep Windows awake while the service runs (no-op on POSIX). Without
+    # this an unattended GPU host can sleep mid-session and the operator
+    # has to physically wake it.
+    bci_root = os.path.dirname(os.path.abspath(__file__))
+    if bci_root not in sys.path:
+        sys.path.insert(0, bci_root)
+    from Utils.sleep_inhibit import inhibit as _sleep_inhibit, release as _sleep_release
+    _sleep_inhibit()
+
     _log("ready")
     try:
         service.serve_forever()
@@ -1095,6 +1126,7 @@ def main() -> None:
         _log("KeyboardInterrupt — stopping")
     finally:
         service.stop()
+        _sleep_release()
         _log("stopped")
 
 

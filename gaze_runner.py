@@ -54,6 +54,7 @@ class GazeUDPServer(threading.Thread):
         *,
         quiet: bool = True,
         allow_shutdown: bool = True,
+        allow_remote_stop: bool = False,
         max_req_bytes: int = 64 * 1024,
         max_resp_bytes: int = 64 * 1024,
         udp_log: bool = False,
@@ -66,6 +67,7 @@ class GazeUDPServer(threading.Thread):
         self.stop_event = stop_event
         self.quiet = quiet
         self.allow_shutdown = allow_shutdown
+        self.allow_remote_stop = bool(allow_remote_stop)
         self.max_req_bytes = int(max_req_bytes)
         self.max_resp_bytes = int(max_resp_bytes)
         self.udp_log = bool(udp_log)
@@ -220,7 +222,20 @@ class GazeUDPServer(threading.Thread):
 
         if cmd == "stop":
             if not self.allow_shutdown:
-                return {"ok": False, "error": "shutdown not allowed"}
+                return {"ok": False, "error": "shutdown not allowed", "cmd": "stop"}
+            # Refuse remote stops by default — protects an unattended GPU
+            # host from being taken offline by an accidental panel click,
+            # which would otherwise force a physical restart.
+            host = addr[0] if addr else ""
+            is_local = isinstance(host, str) and (host == "127.0.0.1" or host.startswith("127."))
+            if not is_local and not self.allow_remote_stop:
+                self.log(f"refusing remote stop from {host}")
+                return {
+                    "ok": False, "cmd": "stop",
+                    "error": "remote_stop_disabled",
+                    "hint": "stop the service locally with Ctrl-C, "
+                            "or restart with --allow-remote-stop to allow this",
+                }
             self.stop_event.set()
             return {"ok": True, "cmd": "stop"}
 
@@ -477,6 +492,9 @@ def parse_args():
     p.add_argument("--host", type=str, default="127.0.0.1")
     p.add_argument("--port", type=int, default=5588)
     p.add_argument("--ipc_verbose", action="store_true")
+    p.add_argument("--allow-remote-stop", action="store_true",
+                   dest="allow_remote_stop",
+                   help="Honour cmd=stop from non-loopback addresses (off by default)")
     p.add_argument("--neon-device-host", type=str, default="",
                    dest="neon_device_host",
                    help="Companion app IP for direct connection; empty = mDNS discovery")
@@ -534,6 +552,7 @@ def main():
             stop_event=stop_event,
             quiet=not bool(args.ipc_verbose),
             allow_shutdown=True,
+            allow_remote_stop=bool(getattr(args, "allow_remote_stop", False)),
             udp_log=bool(args.udp_log),
             udp_log_hz=float(args.udp_log_hz),
         )
@@ -542,32 +561,48 @@ def main():
             print(f"[service] UDP on {args.host}:{args.port} | display={args.display}")
     loop_period = 1.0 / max(float(sys_cfg.target_loop_hz), 1e-6)
 
+    # Keep Windows awake while the service runs (no-op on POSIX). Mirrors
+    # the inhibit in vlm_service.py's main(); see Utils/sleep_inhibit.py.
+    try:
+        from Utils.sleep_inhibit import inhibit as _sleep_inhibit, release as _sleep_release
+        _sleep_inhibit()
+    except Exception:
+        _sleep_release = lambda: None  # noqa: E731
+
     try:
         while not stop_event.is_set():
-            t0 = time.time()
+            try:
+                t0 = time.time()
 
-            # In runner mode, UI controls stop condition; in service mode, we run until stop_event
-            if args.mode == "runner" and ui is not None and ui.should_stop():
-                break
-
-            # Key handling (only if UI is present)
-            if ui is not None:
-                k = ui.get_last_key()
-                if k == 27:  # ESC
+                # In runner mode, UI controls stop condition; in service mode, we run until stop_event
+                if args.mode == "runner" and ui is not None and ui.should_stop():
                     break
-                if k in (ord("c"), ord("C")):
-                    system.recenter()
 
-            # Runner needs frames; service typically doesn't.
-            include_frame = bool(ui is not None)
+                # Key handling (only if UI is present)
+                if ui is not None:
+                    k = ui.get_last_key()
+                    if k == 27:  # ESC
+                        break
+                    if k in (ord("c"), ord("C")):
+                        system.recenter()
 
-            snap = system.get_snapshot(include_objects=True, include_frame=include_frame)
-            if not snap.get("ok", False):
-                time.sleep(0.002)
+                # Runner needs frames; service typically doesn't.
+                include_frame = bool(ui is not None)
+
+                snap = system.get_snapshot(include_objects=True, include_frame=include_frame)
+                if not snap.get("ok", False):
+                    time.sleep(0.002)
+                    continue
+
+                if ui is not None:
+                    _publish_ui(ui, sys_cfg, snap)
+            except Exception as e:
+                # Per-iteration error must not kill the service. Log and
+                # continue so the UDP request-reply / push channels stay
+                # alive even if a snapshot read fails transiently.
+                print(f"[gaze_runner] main loop iteration error: {e}", flush=True)
+                time.sleep(0.05)
                 continue
-
-            if ui is not None:
-                _publish_ui(ui, sys_cfg, snap)
 
             # Pace
             dt = time.time() - t0
@@ -578,6 +613,10 @@ def main():
     finally:
         print("Stopping...")
         stop_event.set()
+        try:
+            _sleep_release()
+        except Exception:
+            pass
         try:
             if ui is not None:
                 ui.stop()
