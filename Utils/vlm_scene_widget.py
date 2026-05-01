@@ -566,17 +566,42 @@ class VLMSceneWidget(QWidget):
                 )
 
     def _paint_canvas(self, canvas_bgr: np.ndarray) -> None:
-        # OpenCV BGR → QImage RGB888. ``data`` must outlive the QImage; we
-        # keep a reference on self until the next paint tick.
+        """Paint a BGR canvas into the QLabel.
+
+        Uses ``Format_BGR888`` so we hand Qt the SDK's native BGR ndarray
+        without a per-frame swap copy (Format_RGB888 + ``[:, :, ::-1]``
+        forced an extra contiguous allocation every paint and adds
+        rounding error on the integer slice/copy).
+
+        Honours the screen's device-pixel ratio: the QPixmap is rendered
+        at the QLabel's logical size × DPR, then ``setDevicePixelRatio``
+        tells Qt the buffer is already at native pixel resolution. On
+        HiDPI displays this avoids the upscale-then-downscale blur that
+        looks like grain at all times.
+
+        Skips ``scaled()`` when the source already matches the label —
+        ``SmoothTransformation`` is the most expensive step in this path
+        and pointless when the bitmap is already the right size.
+        """
+        # ``data`` must outlive the QImage. Keep a reference on self
+        # until the next paint replaces it.
+        self._last_canvas = canvas_bgr  # numpy refcount keeps it alive
         h, w = canvas_bgr.shape[:2]
-        self._last_rgb = np.ascontiguousarray(canvas_bgr[:, :, ::-1])
         qimg = QImage(
-            self._last_rgb.data, w, h, 3 * w, QImage.Format_RGB888,
+            canvas_bgr.data, w, h, 3 * w, QImage.Format_BGR888,
         )
-        pix = QPixmap.fromImage(qimg).scaled(
-            self.lbl_canvas.width(),
-            self.lbl_canvas.height(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
+        dpr = float(self.lbl_canvas.devicePixelRatioF()) if hasattr(
+            self.lbl_canvas, "devicePixelRatioF") else 1.0
+        target_w = int(self.lbl_canvas.width() * dpr)
+        target_h = int(self.lbl_canvas.height() * dpr)
+        if w == target_w and h == target_h:
+            pix = QPixmap.fromImage(qimg)
+        else:
+            pix = QPixmap.fromImage(qimg).scaled(
+                target_w, target_h,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        if dpr != 1.0:
+            pix.setDevicePixelRatio(dpr)
         self.lbl_canvas.setPixmap(pix)
