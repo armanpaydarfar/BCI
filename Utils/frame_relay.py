@@ -81,7 +81,7 @@ import sys
 import threading
 import time
 from collections import deque
-from typing import Any, Deque, Dict, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -228,6 +228,15 @@ class FrameRelayServer:
         self._lat_bundle_age: Deque[float] = deque(maxlen=120)
         self._lat_send_ms: Deque[float] = deque(maxlen=120)
 
+        # In-process fan-out: callbacks registered here are invoked with the
+        # raw NeonLiveReader bundle on the pump thread, before the JPEG
+        # encode/broadcast step. Used by the Linux-side scene/overlay
+        # renderer (Render_Layer_Refactor.md §4.2) so the panel can paint
+        # frames without a second NeonLiveReader subscription or a localhost
+        # TCP loopback.
+        self._local_subs_lock = threading.Lock()
+        self._local_subs: List[Callable[[Any], None]] = []
+
     # ── public API ─────────────────────────────────────────────────────────
 
     def serve_forever(self) -> None:
@@ -269,6 +278,38 @@ class FrameRelayServer:
 
     def stop(self) -> None:
         self._stop_event.set()
+
+    # ── in-process fan-out ────────────────────────────────────────────────
+
+    def add_local_subscriber(self, callback: Callable[[Any], None]) -> None:
+        """Register an in-process callback invoked with each new bundle on
+        the pump thread, before the broadcast step. The callback MUST NOT
+        block — it is on the realtime path. Used by the Linux-side scene
+        renderer to paint frames directly from the SDK reader without
+        opening a second NeonLiveReader."""
+        with self._local_subs_lock:
+            if callback not in self._local_subs:
+                self._local_subs.append(callback)
+
+    def remove_local_subscriber(self, callback: Callable[[Any], None]) -> None:
+        with self._local_subs_lock:
+            try:
+                self._local_subs.remove(callback)
+            except ValueError:
+                pass
+
+    def _dispatch_local(self, bundle) -> None:
+        """Call every registered callback. Exceptions are swallowed (with
+        verbose log) so one buggy subscriber can't take the pump down —
+        every other consumer (panel renderer, downstream TCP client) keeps
+        getting frames."""
+        with self._local_subs_lock:
+            subs = list(self._local_subs)
+        for cb in subs:
+            try:
+                cb(bundle)
+            except Exception as e:
+                _log(f"local subscriber raised, dropping its frame: {e}")
 
     # ── internals ──────────────────────────────────────────────────────────
 
@@ -357,6 +398,11 @@ class FrameRelayServer:
             for bundle in self._reader:
                 if self._stop_event.is_set():
                     break
+
+                # Local in-process subscribers (e.g. the panel renderer)
+                # always see every bundle at native Neon frame rate. The
+                # relay-hz throttle below only applies to the TCP broadcast.
+                self._dispatch_local(bundle)
 
                 now_pc = time.perf_counter()
                 if now_pc < next_send:
