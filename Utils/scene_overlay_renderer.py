@@ -58,6 +58,12 @@ COL_HIT_TEXT_BG = (60, 100, 30)
 COL_DECISION_BG = (40, 40, 40)
 COL_DECISION_FG = (240, 240, 240)
 
+# gaze_runner tracks (YOLO + SORT). Painted thinner / cooler-coloured
+# than VLM detections so the two sets coexist without visual collisions
+# when both backends run. BGR values.
+COL_TRACK     = (220, 180, 60)
+COL_TRACK_HIT = (240, 220, 80)
+
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 MASK_ALPHA = 0.35
 
@@ -90,6 +96,8 @@ class SceneOverlayRenderer:
         detections: Optional[Sequence[Dict[str, Any]]] = None,
         hit_det_id: Optional[int] = None,
         fixation: Optional[Dict[str, Any]] = None,
+        tracks: Optional[Sequence[Dict[str, Any]]] = None,
+        current_hit_track_id: Optional[int] = None,
         vlm_state: str = "IDLE",
         decision_text: Optional[str] = None,
         copy: bool = True,
@@ -139,6 +147,13 @@ class SceneOverlayRenderer:
         # Detections first so the gaze cursor and badges paint over them.
         if detections:
             self._draw_detections(canvas, detections, hit_det_id)
+
+        # Gaze runner tracks (separate visual style — thin stroke + id).
+        # These come from gaze_runner's `gaze_results` push and represent
+        # YOLO + SORT outputs; they coexist with VLM segmentation masks
+        # when both backends are running.
+        if tracks:
+            self._draw_tracks(canvas, tracks, current_hit_track_id)
 
         # Gaze cursor + fixation ring. Drawn from `gaze_xy` (which the panel
         # pulls from the freshest bundle), not from any field inside the
@@ -192,6 +207,37 @@ class SceneOverlayRenderer:
             label = str(det.get("label") or "")
             if label:
                 self._draw_label(canvas, label, (x1, y1), color)
+
+    def _draw_tracks(
+        self,
+        canvas: np.ndarray,
+        tracks: Sequence[Dict[str, Any]],
+        current_hit_track_id: Optional[int],
+    ) -> None:
+        """Draw gaze_runner.py tracks (YOLO + SORT). Each entry follows
+        the gaze_results.tracks schema in Render_Layer_Refactor.md §3:
+        ``{id, bbox=[x1,y1,x2,y2], label, score, age?, lost?}``.
+
+        Hit track is drawn with a thicker stroke; everything else uses a
+        single thin cyan stroke so VLM masks underneath remain visible.
+        """
+        h, w = canvas.shape[:2]
+        for tr in tracks:
+            box = tr.get("bbox") or []
+            if not box or len(box) != 4:
+                continue
+            x1, y1, x2, y2 = (int(round(v)) for v in box)
+            x1 = max(0, min(w - 1, x1)); x2 = max(0, min(w - 1, x2))
+            y1 = max(0, min(h - 1, y1)); y2 = max(0, min(h - 1, y2))
+            tid = int(tr.get("id", -1))
+            is_hit = (current_hit_track_id is not None and tid == current_hit_track_id)
+            color = COL_TRACK_HIT if is_hit else COL_TRACK
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2 if is_hit else 1, cv2.LINE_AA)
+            label_str = f"{tr.get('label', '?')}#{tid}"
+            score = tr.get("score")
+            if isinstance(score, (int, float)):
+                label_str += f" {float(score):.2f}"
+            self._draw_label(canvas, label_str, (x1, y2 + 18), color)
 
     @staticmethod
     def _draw_label(

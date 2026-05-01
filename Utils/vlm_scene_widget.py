@@ -426,6 +426,7 @@ class VLMSceneWidget(QWidget):
             return
 
         det_payload = self._latest_vlm or {}
+        gaze_payload = self._latest_gaze or {}
         canvas = self._renderer.render(
             frame_bgr,
             gaze_xy=(gx, gy),
@@ -433,6 +434,9 @@ class VLMSceneWidget(QWidget):
             hit_det_id=(det_payload.get("hit") or {}).get("det_id")
                 if det_payload.get("hit") else None,
             fixation=det_payload.get("fixation"),
+            tracks=gaze_payload.get("tracks"),
+            current_hit_track_id=(gaze_payload.get("current_hit") or {}).get("track_id")
+                if gaze_payload.get("current_hit") else None,
             vlm_state=str(det_payload.get("vlm_state", "IDLE")),
             decision_text=(det_payload.get("decision") or {}).get("text"),
         )
