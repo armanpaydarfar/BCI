@@ -193,19 +193,44 @@ class VLMService:
         self._frame_thread.start()
 
     def _frame_loop(self) -> None:
-        try:
-            for bundle in self.reader:
-                if self._stop_event.is_set():
-                    break
-                fix_state = self.fix_det.update(bundle.gaze)
-                with self._frame_lock:
-                    self._latest_bundle = bundle
-                    self._latest_bundle_t = time.time()
-                    self._latest_fix = fix_state
-                    self._frames_received += 1
-        except Exception as e:
-            _log(f"frame loop exited: {e}")
-            self._stop_event.set()
+        """Pull bundles from the reader and cache the latest one for UDP
+        handlers to read. Resilient against reader exceptions: a transient
+        error (relay disconnect, bad bundle, etc.) does NOT kill the
+        service. Logs and retries; the UDP service keeps responding to
+        status/decide/segment so the operator panel doesn't lose its
+        session every time the wire hiccups.
+
+        RemoteFrameReader's internal auto-reconnect handles relay
+        disconnects below this layer; this outer retry just covers any
+        per-bundle parsing/processing errors that bubble up here.
+        """
+        retry_delay_s = 1.0
+        while not self._stop_event.is_set():
+            try:
+                for bundle in self.reader:
+                    if self._stop_event.is_set():
+                        break
+                    try:
+                        fix_state = self.fix_det.update(bundle.gaze)
+                    except Exception as e:
+                        if self.args.verbose:
+                            _log(f"frame loop: per-bundle error, skipping: {e}")
+                        continue
+                    with self._frame_lock:
+                        self._latest_bundle = bundle
+                        self._latest_bundle_t = time.time()
+                        self._latest_fix = fix_state
+                        self._frames_received += 1
+                # Iterator returned cleanly (only happens on reader.close()).
+                # Don't kill the service — the operator may want to keep using
+                # cached state via UDP. Wait briefly then re-enter in case the
+                # reader can be re-iterated.
+                if not self._stop_event.is_set():
+                    _log("frame loop: reader iterator returned; retrying")
+                    time.sleep(retry_delay_s)
+            except Exception as e:
+                _log(f"frame loop: reader error, will retry in {retry_delay_s:.1f}s: {e}")
+                time.sleep(retry_delay_s)
 
     def serve_forever(self) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

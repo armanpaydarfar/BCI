@@ -344,7 +344,13 @@ class FrameRelayServer:
         """Add a new client and send its handshake. Existing clients are
         unaffected — the pump broadcasts every frame to all of them."""
         try:
-            conn.settimeout(2.0)
+            # Per-client send timeout. 2 s was fine on LAN where sendall
+            # finishes in <1 ms, but tunneled / cellular clients can take
+            # longer than that on the first 150 KB JPEG envelope and would
+            # be marked dead before they finished receiving frame 1. 10 s
+            # is generous enough for most slow uplinks; truly hung clients
+            # still get dropped eventually.
+            conn.settimeout(10.0)
             # Send handshake immediately. Reader provides camera matrix +
             # distortion (factory-calibrated). Width/height come from the
             # NeonLiveReader class attributes.
