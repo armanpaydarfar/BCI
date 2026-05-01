@@ -1763,8 +1763,32 @@ class ControlPanel(QMainWindow):
         )
 
     def _poll_relay_status(self) -> None:
-        """2 s cadence. TCP-pings the frame relay and reads its handshake to
-        confirm the wire is alive."""
+        """2 s cadence. Reflects whether the frame relay is alive.
+
+        When the panel hosts the relay in-process (FRAME_RELAY_EMBEDDED),
+        we ask the widget directly — TCP-pinging localhost would create
+        phantom client churn (each ping does connect-then-close, the
+        relay's accept loop installs the dead socket, the pump pays a
+        full JPEG encode + sendall before discovering the peer is gone,
+        and the SDK iterator stalls behind that work → visible stutter
+        in the local subscriber path).
+        """
+        widget = getattr(self, "vlm_scene_widget", None)
+        if widget is not None and getattr(widget, "_embedded_relay", None) is not None:
+            thread = getattr(widget, "_embedded_relay_thread", None)
+            alive = thread is not None and thread.is_alive()
+            if alive:
+                self._set_led(self.lbl_relay_status_led, "running")
+                self.lbl_relay_status_text.setText(
+                    f"relay: in-process @ {FRAME_RELAY_BIND_HOST}:{FRAME_RELAY_PORT}"
+                )
+            else:
+                self._set_led(self.lbl_relay_status_led, "stopped")
+                self.lbl_relay_status_text.setText("relay: in-process — thread exited")
+            return
+
+        # External relay (FRAME_RELAY_EMBEDDED=False or remote host) —
+        # fall back to the TCP ping.
         try:
             from Utils.perception_clients import FrameRelayController
         except Exception:
