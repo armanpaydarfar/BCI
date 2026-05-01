@@ -125,6 +125,12 @@ NEON_COMPANION_HOST = str(getattr(_HCFG, "NEON_COMPANION_HOST", "")) if _HCFG el
 SERVICES_HOSTED_REMOTELY = bool(getattr(_HCFG, "SERVICES_HOSTED_REMOTELY", False)) if _HCFG else False
 PERCEPTION_FRAME_SOURCE  = str(getattr(_HCFG, "PERCEPTION_FRAME_SOURCE", "local")) if _HCFG else "local"
 
+# Frame relay (used by the new Linux-side scene renderer in the VLM Video
+# tab). Dial host comes from FRAME_RELAY_DIAL_HOST in production; loopback
+# in single-machine dev. Bind/dial split mirrors VLM_BIND_HOST / VLM_SERVICE_HOST.
+FRAME_RELAY_DIAL_HOST = str(getattr(_HCFG, "FRAME_RELAY_DIAL_HOST", "127.0.0.1")) if _HCFG else "127.0.0.1"
+FRAME_RELAY_PORT = int(getattr(_HCFG, "FRAME_RELAY_PORT", 5591)) if _HCFG else 5591
+
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -1073,34 +1079,28 @@ class ControlPanel(QMainWindow):
         tabs.addTab(vvt, "VLM Video")
         vl = QVBoxLayout(vvt)
 
-        # Status / control row
-        ctrl = QHBoxLayout()
-        self.lbl_vlm_video_status = QLabel("Not connected — start VLM Service first")
-        btn_connect = QPushButton("Connect")
-        btn_connect.setMaximumWidth(90)
-        btn_connect.clicked.connect(self._on_vlm_video_connect)
-        btn_disconnect = QPushButton("Disconnect")
-        btn_disconnect.setMaximumWidth(100)
-        btn_disconnect.clicked.connect(self._on_vlm_video_disconnect)
-        ctrl.addWidget(self.lbl_vlm_video_status, 1)
-        ctrl.addWidget(btn_connect)
-        ctrl.addWidget(btn_disconnect)
-        vl.addLayout(ctrl)
-
-        # Video display label — scales incoming JPEG to fit available space
-        self.lbl_vlm_video = QLabel()
-        self.lbl_vlm_video.setAlignment(Qt.AlignCenter)
-        self.lbl_vlm_video.setMinimumSize(640, 360)
-        self.lbl_vlm_video.setStyleSheet("background: #111111; color: #666666;")
-        self.lbl_vlm_video.setText(
-            "VLM overlay not connected\n\n"
-            "Start the VLM Service then click Connect,\n"
-            "or enable VLM_ENABLE_OVERLAY in config.py"
+        # Linux-side scene + JSON-overlay renderer (Render_Layer_Refactor.md).
+        # Replaces the legacy JPEG-over-TCP overlay consumer: the widget pulls
+        # bundles from the local frame_relay and detection JSON from
+        # vlm_service.py's UDP 5589 subscribe channel, then composites
+        # locally at native frame rate via Utils.scene_overlay_renderer.
+        from Utils.vlm_scene_widget import VLMSceneWidget
+        self.vlm_scene_widget = VLMSceneWidget(
+            vlm_host=VLM_SERVICE_HOST,
+            vlm_port=VLM_SERVICE_PORT,
+            gaze_host=GAZE_SERVICE_HOST,
+            gaze_port=GAZE_SERVICE_PORT,
+            relay_dial_host=FRAME_RELAY_DIAL_HOST,
+            relay_dial_port=FRAME_RELAY_PORT,
         )
-        vl.addWidget(self.lbl_vlm_video, 1)
+        vl.addWidget(self.vlm_scene_widget, 1)
 
     def _on_vlm_frame(self, jpg_bytes: bytes) -> None:
-        """Slot: called on the main thread when a new overlay JPEG arrives."""
+        """Legacy slot: paint a Windows-rendered overlay JPEG into the legacy
+        QLabel. Used by the legacy `jpeg_remote` render path; bypassed when
+        the VLM Video tab hosts the new VLMSceneWidget."""
+        if not hasattr(self, "lbl_vlm_video"):
+            return
         pixmap = QPixmap()
         pixmap.loadFromData(jpg_bytes, "JPEG")
         if pixmap.isNull():
@@ -1117,6 +1117,13 @@ class ControlPanel(QMainWindow):
         )
 
     def _on_vlm_video_connect(self) -> None:
+        """Auto-connect handler invoked from on_vlm_service_start. Routes to
+        whichever render path the VLM Video tab is configured for."""
+        if hasattr(self, "vlm_scene_widget"):
+            self.vlm_scene_widget.start()
+            return
+        if not hasattr(self, "lbl_vlm_video_status"):
+            return
         if self._vlm_video_thread is not None and self._vlm_video_thread.isRunning():
             return
         self._vlm_video_thread = VLMVideoThread(VLM_SERVICE_HOST, VLM_OVERLAY_PORT)
@@ -1127,12 +1134,17 @@ class ControlPanel(QMainWindow):
         )
 
     def _on_vlm_video_disconnect(self) -> None:
+        if hasattr(self, "vlm_scene_widget"):
+            self.vlm_scene_widget.stop()
+            return
         if self._vlm_video_thread is not None:
             self._vlm_video_thread.stop()
             self._vlm_video_thread.wait(2000)
             self._vlm_video_thread = None
-        self.lbl_vlm_video.setText("Disconnected")
-        self.lbl_vlm_video_status.setText("Not connected")
+        if hasattr(self, "lbl_vlm_video"):
+            self.lbl_vlm_video.setText("Disconnected")
+        if hasattr(self, "lbl_vlm_video_status"):
+            self.lbl_vlm_video_status.setText("Not connected")
 
     def _build_runtime_config_tab(self, tabs: QTabWidget):
         rtc = QWidget()
