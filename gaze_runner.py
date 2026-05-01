@@ -30,6 +30,7 @@ os.environ.setdefault("KMP_AFFINITY", "granularity=fine,compact,1,0")
 import argparse
 import json
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -105,6 +106,16 @@ class GazeUDPServer(threading.Thread):
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind((self.host, self.port))
         self._sock.settimeout(0.5)
+        # Windows: disable SIO_UDP_CONNRESET so an ICMP "port unreachable"
+        # bounced back from a dead-or-firewalled previous reply target
+        # doesn't poison the next recvfrom() with WSAECONNRESET (10054)
+        # and silently kill the gaze service. Same fix as vlm_service.py.
+        if sys.platform == "win32":
+            try:
+                _SIO_UDP_CONNRESET = 0x9800000C
+                self._sock.ioctl(_SIO_UDP_CONNRESET, False)
+            except OSError as e:
+                self.log(f"WARN: could not disable SIO_UDP_CONNRESET: {e}")
         self.log(f"listening on udp://{self.host}:{self.port}")
 
         # Tick thread broadcasts gaze_results datagrams to subscribed
@@ -121,8 +132,21 @@ class GazeUDPServer(threading.Thread):
                     data, addr = self._sock.recvfrom(self.max_req_bytes)
                 except socket.timeout:
                     continue
-                except OSError:
-                    break
+                except ConnectionResetError as e:
+                    # WinError 10054 — belt-and-suspenders if SIO_UDP_CONNRESET
+                    # ioctl above isn't honoured. UDP is connectionless; keep
+                    # serving the next request.
+                    self._maybe_log(
+                        f"[gaze_udp] recvfrom WSAECONNRESET ({e}); continuing"
+                    )
+                    continue
+                except OSError as e:
+                    # Real socket failure (e.g. socket closed via stop_event).
+                    # Only break if we're shutting down anyway.
+                    if self.stop_event.is_set():
+                        break
+                    self.log(f"recvfrom OSError ({e}); continuing")
+                    continue
 
                 if not data:
                     continue

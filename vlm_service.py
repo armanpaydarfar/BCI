@@ -245,6 +245,17 @@ class VLMService:
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind((self.args.host, self.args.port))
         self._sock.settimeout(0.5)
+        # Windows: disable SIO_UDP_CONNRESET so an ICMP "port unreachable"
+        # bounced back from a dead-or-firewalled peer of a previous reply
+        # doesn't poison the next recvfrom() with WSAECONNRESET (10054).
+        # Without this, the GPU host is silently killed every time a remote
+        # operator panel terminates without a clean unsubscribe.
+        if sys.platform == "win32":
+            try:
+                _SIO_UDP_CONNRESET = 0x9800000C
+                self._sock.ioctl(_SIO_UDP_CONNRESET, False)
+            except OSError as e:
+                _log(f"WARN: could not disable SIO_UDP_CONNRESET: {e}")
         _log(f"listening on udp://{self.args.host}:{self.args.port}")
 
         while not self._stop_event.is_set():
@@ -252,8 +263,20 @@ class VLMService:
                 data, addr = self._sock.recvfrom(65535)
             except socket.timeout:
                 continue
-            except OSError:
-                break
+            except ConnectionResetError as e:
+                # WinError 10054 — ICMP unreachable from a stale peer.
+                # Belt-and-suspenders in case the ioctl above is unsupported
+                # on this Windows build. UDP is connectionless; keep serving.
+                if self.args.verbose:
+                    _log(f"recvfrom WSAECONNRESET ({e}); continuing")
+                continue
+            except OSError as e:
+                # Real socket failure (e.g. socket was closed by stop()).
+                # Only break if we're shutting down anyway.
+                if self._stop_event.is_set():
+                    break
+                _log(f"recvfrom OSError ({e}); continuing")
+                continue
 
             try:
                 req = json.loads(data.decode("utf-8", errors="replace"))
