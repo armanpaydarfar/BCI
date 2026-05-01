@@ -32,7 +32,8 @@ import json
 import socket
 import threading
 import time
-from typing import Any, Dict, Optional
+import uuid
+from typing import Any, Dict, Optional, Tuple
 
 from Utils.gaze.gaze_system import GazeSystem, GazeConfig
 from Utils.gaze.gaze_ui import GazeUI, UIConfig, RenderInputs
@@ -73,6 +74,15 @@ class GazeUDPServer(threading.Thread):
 
         self._last_log_t = 0.0
 
+        # Subscribe-mode push (Render_Layer_Refactor.md §3). One tick thread
+        # builds `gaze_results` JSON datagrams and broadcasts to subscribed
+        # panels. Existing request-reply commands keep working unchanged.
+        self._subscribers_lock = threading.Lock()
+        # subscriber_id (uuid hex) → {addr, hz, last_sent_t, expires_at}
+        self._subscribers: Dict[str, Dict[str, Any]] = {}
+        self._tick_thread: Optional[threading.Thread] = None
+        self._push_sock: Optional[socket.socket] = None
+
     def log(self, msg: str):
         if not self.quiet:
             print(f"[gaze_udp] {msg}")
@@ -94,6 +104,14 @@ class GazeUDPServer(threading.Thread):
         self._sock.bind((self.host, self.port))
         self._sock.settimeout(0.5)
         self.log(f"listening on udp://{self.host}:{self.port}")
+
+        # Tick thread broadcasts gaze_results datagrams to subscribed
+        # clients. Idle when no subscribers — one prune pass per tick.
+        self._push_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._tick_thread = threading.Thread(
+            target=self._results_tick_loop, daemon=True, name="gaze-results-push",
+        )
+        self._tick_thread.start()
 
         try:
             while not self.stop_event.is_set():
@@ -122,7 +140,7 @@ class GazeUDPServer(threading.Thread):
                         f"[gaze_udp] RX cmd={cmd} query_id={qid} bytes={len(data)} from={addr[0]}:{addr[1]}"
                     )
 
-                    resp = self.handle(req)
+                    resp = self.handle(req, addr)
 
                 except Exception as e:
                     resp = {"ok": False, "error": str(e), "cmd": cmd}
@@ -154,9 +172,14 @@ class GazeUDPServer(threading.Thread):
                     self._sock.close()
             except Exception:
                 pass
+            try:
+                if self._push_sock is not None:
+                    self._push_sock.close()
+            except Exception:
+                pass
             self.log("stopped")
 
-    def handle(self, req: Dict[str, Any]) -> Dict[str, Any]:
+    def handle(self, req: Dict[str, Any], addr: Tuple[str, int]) -> Dict[str, Any]:
         """
         Handle an incoming JSON UDP request and return a JSON response.
 
@@ -201,7 +224,142 @@ class GazeUDPServer(threading.Thread):
             self.stop_event.set()
             return {"ok": True, "cmd": "stop"}
 
+        if cmd == "subscribe":
+            return self._handle_subscribe(req, addr)
+
+        if cmd == "unsubscribe":
+            return self._handle_unsubscribe(req)
+
         return {"ok": False, "error": f"unknown cmd '{cmd}'"}
+
+    # ── subscribe-mode JSON push (Render_Layer_Refactor.md §3) ────────────
+
+    # Internal tick rate caps the per-subscriber push rate. The gaze
+    # detector itself runs at det_hz (default 3 Hz), so 20 Hz is plenty
+    # to ride on top of cached state without re-running the model.
+    _TICK_HZ: float = 20.0
+    _SUBSCRIBER_TTL_S: float = 30.0
+
+    def _handle_subscribe(self, req: Dict[str, Any], addr: Tuple[str, int]) -> Dict[str, Any]:
+        try:
+            hz = float(req.get("hz", self._TICK_HZ))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "bad_hz", "cmd": "subscribe"}
+        hz = max(0.5, min(hz, self._TICK_HZ))
+        ttl_s = float(req.get("ttl_s", self._SUBSCRIBER_TTL_S))
+        now = time.monotonic()
+        with self._subscribers_lock:
+            existing_id: Optional[str] = None
+            for sid, info in self._subscribers.items():
+                if info.get("addr") == addr:
+                    existing_id = sid
+                    break
+            sid = existing_id or uuid.uuid4().hex[:12]
+            self._subscribers[sid] = {
+                "addr": tuple(addr),
+                "hz": hz,
+                "last_sent_t": 0.0,
+                "expires_at": now + ttl_s,
+            }
+        return {"ok": True, "cmd": "subscribe", "stream": "results",
+                "subscriber_id": sid, "hz": hz}
+
+    def _handle_unsubscribe(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        sid = req.get("subscriber_id")
+        if not sid:
+            return {"ok": False, "error": "missing_subscriber_id", "cmd": "unsubscribe"}
+        with self._subscribers_lock:
+            removed = self._subscribers.pop(str(sid), None)
+        return {"ok": True, "cmd": "unsubscribe", "removed": bool(removed)}
+
+    def _results_tick_loop(self) -> None:
+        period = 1.0 / max(self._TICK_HZ, 1e-6)
+        while not self.stop_event.is_set():
+            t0 = time.monotonic()
+            try:
+                self._tick_send(t0)
+            except Exception as e:
+                if not self.quiet:
+                    print(f"[gaze_udp] tick error: {e}")
+            slept = time.monotonic() - t0
+            remaining = period - slept
+            if remaining > 0:
+                # Honour stop_event quickly so service shutdown isn't blocked
+                # by the tick period.
+                self.stop_event.wait(timeout=remaining)
+
+    def _tick_send(self, now: float) -> None:
+        with self._subscribers_lock:
+            for sid, info in list(self._subscribers.items()):
+                if info["expires_at"] < now:
+                    self._subscribers.pop(sid, None)
+            due = []
+            for sid, info in self._subscribers.items():
+                period = 1.0 / max(info["hz"], 1e-6)
+                if (now - info["last_sent_t"]) >= period:
+                    due.append((sid, info["addr"]))
+                    info["last_sent_t"] = now
+        if not due or self._push_sock is None:
+            return
+        try:
+            payload = json.dumps(self._build_gaze_results_payload(),
+                                 separators=(",", ":")).encode("utf-8")
+        except Exception:
+            return
+        if len(payload) > 60 * 1024:
+            return
+        for _sid, addr in due:
+            try:
+                self._push_sock.sendto(payload, addr)
+            except OSError:
+                pass
+
+    def _build_gaze_results_payload(self) -> Dict[str, Any]:
+        """Assemble a `gaze_results` payload from a fresh non-frame snapshot."""
+        snap = self.system.get_snapshot(include_objects=True, include_frame=False)
+        gaze_px = snap.get("gaze_px") or (None, None)
+        objects = snap.get("objects") or []
+        tracks = []
+        for d in objects:
+            if not isinstance(d, dict):
+                continue
+            xyxy = d.get("xyxy") or d.get("box_xyxy") or []
+            tracks.append({
+                "id": int(d.get("track_id", -1)),
+                "bbox": [float(v) for v in xyxy] if xyxy else None,
+                "label": str(d.get("name", "?")),
+                "score": float(d.get("conf", 0.0)),
+                "age": int(d.get("age", 0)) if "age" in d else None,
+                "lost": int(d.get("lost", 0)) if "lost" in d else None,
+            })
+        gaze_hit = snap.get("gaze_hit")
+        current_hit = None
+        if isinstance(gaze_hit, dict):
+            current_hit = {
+                "track_id": int(gaze_hit.get("track_id", -1)),
+                "name": str(gaze_hit.get("name", "?")),
+                "conf": float(gaze_hit.get("conf", 0.0)),
+            }
+        return {
+            "type": "gaze_results",
+            "ts_send_ns": int(time.time_ns()),
+            "wall_t": float(snap.get("wall_t", time.time())),
+            "worn": bool(snap.get("worn", False)),
+            "gaze_px": [float(gaze_px[0]), float(gaze_px[1])]
+                if (gaze_px[0] is not None and gaze_px[1] is not None) else None,
+            "tracks": tracks,
+            "current_hit": current_hit,
+            "governor": {
+                "cv_enabled": bool(snap.get("gov_enabled", True)),
+                "reason": str(snap.get("gov_reason", "")),
+                "cd_left_s": float(snap.get("gov_cd_left", 0.0)),
+            },
+            "rates": {
+                "loop_hz": float(snap.get("loop_hz", float("nan"))),
+                "video_hz": float(snap.get("video_hz", float("nan"))),
+                "det_hz": float(snap.get("det_hz", float("nan"))),
+            },
+        }
 
 # -------------------------
 # Helpers

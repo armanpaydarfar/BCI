@@ -110,6 +110,25 @@ class GazeClient:
             timeout_s or self.default_timeout_s,
         )
 
+    def subscribe(self, *, hz: float = 20.0, ttl_s: float = 30.0,
+                  timeout_s: Optional[float] = None) -> Dict[str, Any]:
+        """Register for ``gaze_results`` JSON push (Render_Layer_Refactor.md
+        §3). Heartbeat by re-calling ``subscribe`` well before ``ttl_s``."""
+        return _udp_request(
+            self.host, self.port,
+            {"cmd": "subscribe", "stream": "results",
+             "hz": float(hz), "ttl_s": float(ttl_s)},
+            timeout_s or self.default_timeout_s,
+        )
+
+    def unsubscribe(self, *, subscriber_id: str,
+                    timeout_s: Optional[float] = None) -> Dict[str, Any]:
+        return _udp_request(
+            self.host, self.port,
+            {"cmd": "unsubscribe", "subscriber_id": str(subscriber_id)},
+            timeout_s or self.default_timeout_s,
+        )
+
     def stop(self, *, timeout_s: Optional[float] = None) -> Dict[str, Any]:
         return _udp_request(self.host, self.port, {"cmd": "stop"}, timeout_s or self.default_timeout_s)
 
