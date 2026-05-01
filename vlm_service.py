@@ -139,6 +139,47 @@ def _log(msg: str) -> None:
     print(f"[vlm_service] {msg}", flush=True)
 
 
+def _disable_udp_connreset(sock) -> None:
+    """Call WSAIoctl(SIO_UDP_CONNRESET, FALSE) on a Windows UDP socket so
+    ICMP "port unreachable" replies no longer poison recvfrom() with
+    WSAECONNRESET (10054). Python's stdlib ``socket.ioctl`` only accepts
+    SIO_RCVALL / SIO_KEEPALIVE_VALS / SIO_LOOPBACK_FAST_PATH, so we go
+    around it via ctypes. Raises OSError on failure; caller swallows.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    SIO_UDP_CONNRESET = 0x9800000C  # IOC_IN | IOC_VENDOR | 12
+    ws2 = ctypes.WinDLL("Ws2_32", use_last_error=True)
+    WSAIoctl = ws2.WSAIoctl
+    WSAIoctl.argtypes = [
+        wintypes.HANDLE,                  # SOCKET
+        wintypes.DWORD,                   # dwIoControlCode
+        ctypes.c_void_p,                  # lpvInBuffer
+        wintypes.DWORD,                   # cbInBuffer
+        ctypes.c_void_p,                  # lpvOutBuffer
+        wintypes.DWORD,                   # cbOutBuffer
+        ctypes.POINTER(wintypes.DWORD),   # lpcbBytesReturned
+        ctypes.c_void_p,                  # lpOverlapped
+        ctypes.c_void_p,                  # lpCompletionRoutine
+    ]
+    WSAIoctl.restype = ctypes.c_int
+
+    inbuf = ctypes.c_uint32(0)  # FALSE
+    bytes_returned = wintypes.DWORD(0)
+    rc = WSAIoctl(
+        sock.fileno(),
+        SIO_UDP_CONNRESET,
+        ctypes.byref(inbuf), ctypes.sizeof(inbuf),
+        None, 0,
+        ctypes.byref(bytes_returned),
+        None, None,
+    )
+    if rc != 0:
+        err = ctypes.get_last_error()
+        raise OSError(f"WSAIoctl(SIO_UDP_CONNRESET) failed (WSAGetLastError={err})")
+
+
 class VLMService:
     def __init__(self, args, *, reader, detector, depth_estimator, reasoner, fix_det, fixation_state_cls):
         self.args = args
@@ -250,12 +291,14 @@ class VLMService:
         # doesn't poison the next recvfrom() with WSAECONNRESET (10054).
         # Without this, the GPU host is silently killed every time a remote
         # operator panel terminates without a clean unsubscribe.
+        # Python's socket.ioctl rejects arbitrary IOCTLs; call WSAIoctl
+        # directly via ctypes instead.
         if sys.platform == "win32":
             try:
-                _SIO_UDP_CONNRESET = 0x9800000C
-                self._sock.ioctl(_SIO_UDP_CONNRESET, False)
-            except OSError as e:
-                _log(f"WARN: could not disable SIO_UDP_CONNRESET: {e}")
+                _disable_udp_connreset(self._sock)
+            except (OSError, ValueError, AttributeError) as e:
+                _log(f"WARN: could not disable SIO_UDP_CONNRESET ({e}); "
+                     f"relying on ConnectionResetError catch in recv loop")
         _log(f"listening on udp://{self.args.host}:{self.args.port}")
 
         while not self._stop_event.is_set():

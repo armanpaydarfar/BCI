@@ -40,6 +40,36 @@ from Utils.gaze.gaze_system import GazeSystem, GazeConfig
 from Utils.gaze.gaze_ui import GazeUI, UIConfig, RenderInputs
 
 
+def _disable_udp_connreset(sock) -> None:
+    """Call WSAIoctl(SIO_UDP_CONNRESET, FALSE) on a Windows UDP socket so
+    ICMP "port unreachable" replies no longer poison recvfrom() with
+    WSAECONNRESET (10054). Python's stdlib ``socket.ioctl`` only accepts
+    SIO_RCVALL / SIO_KEEPALIVE_VALS / SIO_LOOPBACK_FAST_PATH, so we go
+    around it via ctypes. Raises OSError on failure; caller swallows."""
+    import ctypes
+    from ctypes import wintypes
+
+    SIO_UDP_CONNRESET = 0x9800000C
+    ws2 = ctypes.WinDLL("Ws2_32", use_last_error=True)
+    WSAIoctl = ws2.WSAIoctl
+    WSAIoctl.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    WSAIoctl.restype = ctypes.c_int
+    inbuf = ctypes.c_uint32(0)  # FALSE
+    bytes_returned = wintypes.DWORD(0)
+    rc = WSAIoctl(
+        sock.fileno(), SIO_UDP_CONNRESET,
+        ctypes.byref(inbuf), ctypes.sizeof(inbuf),
+        None, 0, ctypes.byref(bytes_returned), None, None,
+    )
+    if rc != 0:
+        err = ctypes.get_last_error()
+        raise OSError(f"WSAIoctl(SIO_UDP_CONNRESET) failed (WSAGetLastError={err})")
+
+
 
 
 class GazeUDPServer(threading.Thread):
@@ -109,13 +139,17 @@ class GazeUDPServer(threading.Thread):
         # Windows: disable SIO_UDP_CONNRESET so an ICMP "port unreachable"
         # bounced back from a dead-or-firewalled previous reply target
         # doesn't poison the next recvfrom() with WSAECONNRESET (10054)
-        # and silently kill the gaze service. Same fix as vlm_service.py.
+        # and silently kill the gaze service. Python's stdlib socket.ioctl
+        # only accepts a fixed set of IOCTLs (SIO_RCVALL, SIO_KEEPALIVE_VALS,
+        # SIO_LOOPBACK_FAST_PATH); call WSAIoctl directly via ctypes.
         if sys.platform == "win32":
             try:
-                _SIO_UDP_CONNRESET = 0x9800000C
-                self._sock.ioctl(_SIO_UDP_CONNRESET, False)
-            except OSError as e:
-                self.log(f"WARN: could not disable SIO_UDP_CONNRESET: {e}")
+                _disable_udp_connreset(self._sock)
+            except (OSError, ValueError, AttributeError) as e:
+                self.log(
+                    f"WARN: could not disable SIO_UDP_CONNRESET ({e}); "
+                    f"relying on ConnectionResetError catch in recv loop"
+                )
         self.log(f"listening on udp://{self.host}:{self.port}")
 
         # Tick thread broadcasts gaze_results datagrams to subscribed
