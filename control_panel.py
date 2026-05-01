@@ -219,6 +219,36 @@ VLM_ENV_PYTHON: Optional[str] = _resolve_conda_env_python(VLM_CONDA_ENV) if VLM_
 print(f"[control_panel] VLM_ENV_PYTHON = {VLM_ENV_PYTHON!r}", flush=True)
 
 
+def _detect_lan_ip() -> Optional[str]:
+    """Best-effort LAN IP discovery. Opens a UDP socket and asks the
+    kernel which interface it would use to reach a routable address —
+    no packet is actually sent. Returns None if no route is available
+    (offline, captive portal, etc.)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+_LAN_IP = _detect_lan_ip()
+if _LAN_IP:
+    print(
+        f"[control_panel] Linux LAN IP = {_LAN_IP}  "
+        f"— if Windows is in use, set FRAME_RELAY_DIAL_HOST=\"{_LAN_IP}\" "
+        f"in its config.py",
+        flush=True,
+    )
+else:
+    print("[control_panel] Linux LAN IP = <unavailable> (no route)", flush=True)
+
+
 def _kill_orphan_vlm_service() -> None:
     """Kill any leftover vlm_service.py processes from a prior crash.
 
