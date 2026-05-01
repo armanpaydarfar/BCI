@@ -201,6 +201,7 @@ class FrameRelayServer:
         neon_host: str = "",
         jpeg_quality: int = 75,
         repo_dir: Optional[str] = None,
+        reader: Optional[Any] = None,
     ) -> None:
         self.bind_host = bind_host
         self.bind_port = int(bind_port)
@@ -208,6 +209,14 @@ class FrameRelayServer:
         self.neon_host = neon_host or ""
         self.jpeg_quality = int(jpeg_quality)
         self.repo_dir = repo_dir
+        # Optional pre-opened reader (anything that quacks like
+        # NeonLiveReader: __iter__ yielding bundles, camera_matrix,
+        # distortion_coeffs, width/height/fps/close). Used by the
+        # operator panel to inject Utils.scene_only_neon_reader.SceneOnlyNeonReader,
+        # which mirrors neon_viewer.py's clean SDK call pattern.
+        # When None, _open_reader falls back to harmony_vlm's
+        # NeonLiveReader (matched-API path).
+        self._reader = reader
 
         self._stop_event = threading.Event()
         # Multi-client: every accepted connection joins this dict. The pump
@@ -219,7 +228,6 @@ class FrameRelayServer:
 
         self._frame_count_published = 0
         self._frame_count_dropped = 0
-        self._reader = None  # NeonLiveReader, lazily imported
 
         # Rolling latency samples for the stats line. Each deque is (ms).
         # bundle_age   — Neon scene timestamp → moment we're ready to send
@@ -241,7 +249,8 @@ class FrameRelayServer:
 
     def serve_forever(self) -> None:
         """Open the Neon device, then run the listen + pump loops together."""
-        self._reader = self._open_reader()
+        if self._reader is None:
+            self._reader = self._open_reader()
 
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

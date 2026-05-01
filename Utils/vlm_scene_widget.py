@@ -420,7 +420,18 @@ class VLMSceneWidget(QWidget):
         if self._embedded_relay_cfg is None:
             return False
         from Utils.frame_relay import FrameRelayServer
+        from Utils.scene_only_neon_reader import SceneOnlyNeonReader
         cfg = self._embedded_relay_cfg
+        try:
+            # Pre-construct the SDK-direct reader (mirrors neon_viewer.py
+            # exactly) and inject it into FrameRelayServer. Bypasses
+            # NeonLiveReader's matched-API path which delivers visibly
+            # grainier scene frames despite reading the same RTSP track.
+            reader = SceneOnlyNeonReader(host=str(cfg.get("neon_host", "") or "") or None)
+        except Exception as e:
+            self.lbl_status.setText(f"Render path: json_local — neon reader open failed: {e}")
+            self._embedded_relay = None
+            return False
         try:
             self._embedded_relay = FrameRelayServer(
                 bind_host=cfg.get("bind_host", "0.0.0.0"),
@@ -429,10 +440,15 @@ class VLMSceneWidget(QWidget):
                 neon_host=str(cfg.get("neon_host", "") or ""),
                 jpeg_quality=int(cfg.get("jpeg_quality", 75)),
                 repo_dir=cfg.get("repo_dir"),
+                reader=reader,
             )
         except Exception as e:
             self.lbl_status.setText(f"Render path: json_local — embedded relay ctor failed: {e}")
             self._embedded_relay = None
+            try:
+                reader.close()
+            except Exception:
+                pass
             return False
         # Register the local subscriber BEFORE starting the pump so we
         # don't miss the first few bundles.
