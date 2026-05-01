@@ -129,7 +129,15 @@ PERCEPTION_FRAME_SOURCE  = str(getattr(_HCFG, "PERCEPTION_FRAME_SOURCE", "local"
 # tab). Dial host comes from FRAME_RELAY_DIAL_HOST in production; loopback
 # in single-machine dev. Bind/dial split mirrors VLM_BIND_HOST / VLM_SERVICE_HOST.
 FRAME_RELAY_DIAL_HOST = str(getattr(_HCFG, "FRAME_RELAY_DIAL_HOST", "127.0.0.1")) if _HCFG else "127.0.0.1"
-FRAME_RELAY_PORT = int(getattr(_HCFG, "FRAME_RELAY_PORT", 5591)) if _HCFG else 5591
+FRAME_RELAY_PORT      = int(getattr(_HCFG, "FRAME_RELAY_PORT", 5591)) if _HCFG else 5591
+FRAME_RELAY_BIND_HOST = str(getattr(_HCFG, "FRAME_RELAY_HOST", "0.0.0.0")) if _HCFG else "0.0.0.0"
+FRAME_RELAY_HZ        = float(getattr(_HCFG, "FRAME_RELAY_HZ", 30.0)) if _HCFG else 30.0
+# When True, the panel hosts FrameRelayServer in-process so its
+# scene-tab widget can consume bundles via add_local_subscriber (raw
+# BGR, no JPEG encode/decode). Windows clients still connect to the
+# same TCP port. False → widget falls back to RemoteFrameReader and
+# the user is expected to run `python -m Utils.frame_relay` separately.
+FRAME_RELAY_EMBEDDED  = bool(getattr(_HCFG, "FRAME_RELAY_EMBEDDED", True)) if _HCFG else True
 
 # Migration switch for the VLM Video tab render path (see config.py:RENDER_PATH
 # and Render_Layer_Refactor.md §4):
@@ -1094,7 +1102,24 @@ class ControlPanel(QMainWindow):
         # (Render_Layer_Refactor.md §4). Bundles from the local frame_relay,
         # detection JSON from vlm_service.py UDP 5589 subscribe, composited
         # at native frame rate via Utils.scene_overlay_renderer.
+        #
+        # When FRAME_RELAY_EMBEDDED is True (the default), the panel hosts
+        # FrameRelayServer in-process and the widget consumes bundles via
+        # add_local_subscriber — raw SDK BGR, no JPEG round-trip — which
+        # matches neon_viewer.py quality. Windows TCP clients still dial
+        # the same listening socket. The user must NOT also run
+        # `python -m Utils.frame_relay` separately in this mode (two
+        # NeonLiveReaders would conflict at the SDK level).
         from Utils.vlm_scene_widget import VLMSceneWidget
+        embedded_relay = None
+        if FRAME_RELAY_EMBEDDED:
+            embedded_relay = {
+                "bind_host": FRAME_RELAY_BIND_HOST,
+                "bind_port": FRAME_RELAY_PORT,
+                "hz": FRAME_RELAY_HZ,
+                "neon_host": NEON_COMPANION_HOST,
+                "repo_dir": VLM_REPO_DIR,
+            }
         self.vlm_scene_widget = VLMSceneWidget(
             vlm_host=VLM_SERVICE_HOST,
             vlm_port=VLM_SERVICE_PORT,
@@ -1102,6 +1127,7 @@ class ControlPanel(QMainWindow):
             gaze_port=GAZE_SERVICE_PORT,
             relay_dial_host=FRAME_RELAY_DIAL_HOST,
             relay_dial_port=FRAME_RELAY_PORT,
+            embedded_relay=embedded_relay,
         )
         vl.addWidget(self.vlm_scene_widget, 1)
 

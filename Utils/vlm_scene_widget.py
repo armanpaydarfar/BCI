@@ -230,10 +230,18 @@ class _BundleSourceThread(threading.Thread):
 class VLMSceneWidget(QWidget):
     """Composited scene + overlay tab. See module docstring for context.
 
-    Pass ``local_relay_server`` (a :class:`Utils.frame_relay.FrameRelayServer`
-    instance) to enable in-process fan-out (§4.2). Otherwise the widget
-    dials the configured frame_relay over TCP — works whether the relay
-    runs on this machine (loopback) or another.
+    Bundle source priority (first that matches wins on ``start()``):
+      1. ``embedded_relay`` dict — the widget HOSTS a FrameRelayServer
+         in-process. Bundles flow SDK → add_local_subscriber callback,
+         no JPEG encode/decode, no TCP. This is the path that matches
+         neon_viewer.py quality. Windows TCP clients still connect to
+         the same listening socket.
+      2. ``local_relay_server`` — an externally-supplied FrameRelayServer
+         instance (e.g. for tests). Same in-process fan-out hook.
+      3. RemoteFrameReader on ``relay_dial_host:relay_dial_port`` —
+         legacy path, JPEG round-trip on every frame; only useful when
+         the relay genuinely lives on another machine or in another
+         process this panel doesn't own.
     """
 
     PAINT_HZ = 30.0
@@ -249,6 +257,7 @@ class VLMSceneWidget(QWidget):
         relay_dial_host: str,
         relay_dial_port: int,
         local_relay_server=None,
+        embedded_relay: Optional[Dict[str, Any]] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -259,6 +268,12 @@ class VLMSceneWidget(QWidget):
         self._relay_dial_host = relay_dial_host
         self._relay_dial_port = relay_dial_port
         self._local_relay_server = local_relay_server
+        # Config dict for an embedded relay; keys mirror FrameRelayServer
+        # constructor: bind_host, bind_port, hz, neon_host, jpeg_quality,
+        # repo_dir. None = caller doesn't want the panel to host the relay.
+        self._embedded_relay_cfg = dict(embedded_relay) if embedded_relay else None
+        self._embedded_relay = None
+        self._embedded_relay_thread: Optional[threading.Thread] = None
 
         self._renderer = SceneOverlayRenderer()
 
@@ -314,17 +329,24 @@ class VLMSceneWidget(QWidget):
     # ── public API ────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        if self._bundle_thread is not None:
+        if self._bundle_thread is not None or self._embedded_relay is not None:
             return  # already running
 
-        # 1. Bundle source.
-        if self._local_relay_server is not None:
+        # 1. Bundle source — prefer the in-process paths (embedded relay
+        #    or externally-supplied local_relay_server) so we get raw
+        #    SDK-decoded BGR with no JPEG round-trip. RemoteFrameReader
+        #    is only the fallback.
+        wired = False
+        if self._embedded_relay_cfg is not None:
+            if self._start_embedded_relay():
+                wired = True
+        if not wired and self._local_relay_server is not None:
             try:
                 self._local_relay_server.add_local_subscriber(self._on_bundle_callback)
+                wired = True
             except AttributeError:
-                # Not a FrameRelayServer; fall through to remote.
                 self._local_relay_server = None
-        if self._local_relay_server is None:
+        if not wired:
             self._bundle_thread = _BundleSourceThread(
                 self._relay_dial_host,
                 self._relay_dial_port,
@@ -358,6 +380,19 @@ class VLMSceneWidget(QWidget):
                 self._local_relay_server.remove_local_subscriber(self._on_bundle_callback)
             except AttributeError:
                 pass
+        if self._embedded_relay is not None:
+            try:
+                self._embedded_relay.remove_local_subscriber(self._on_bundle_callback)
+            except AttributeError:
+                pass
+            try:
+                self._embedded_relay.stop()
+            except Exception:
+                pass
+            if self._embedded_relay_thread is not None:
+                self._embedded_relay_thread.join(timeout=3.0)
+            self._embedded_relay = None
+            self._embedded_relay_thread = None
         if self._bundle_thread is not None:
             self._bundle_thread.stop()
             self._bundle_thread = None
@@ -368,6 +403,56 @@ class VLMSceneWidget(QWidget):
         self._vlm_subscriber = None
         self._gaze_subscriber = None
         self.lbl_status.setText("Render path: json_local — stopped")
+
+    # ── embedded-relay lifecycle ──────────────────────────────────────────
+
+    def _start_embedded_relay(self) -> bool:
+        """Construct + run a FrameRelayServer in-process. Returns True on
+        success. Falls back to RemoteFrameReader if construction fails so
+        the widget still tries to paint instead of going dark."""
+        if self._embedded_relay_cfg is None:
+            return False
+        from Utils.frame_relay import FrameRelayServer
+        cfg = self._embedded_relay_cfg
+        try:
+            self._embedded_relay = FrameRelayServer(
+                bind_host=cfg.get("bind_host", "0.0.0.0"),
+                bind_port=int(cfg.get("bind_port", 5591)),
+                hz=float(cfg.get("hz", 30.0)),
+                neon_host=str(cfg.get("neon_host", "") or ""),
+                jpeg_quality=int(cfg.get("jpeg_quality", 75)),
+                repo_dir=cfg.get("repo_dir"),
+            )
+        except Exception as e:
+            self.lbl_status.setText(f"Render path: json_local — embedded relay ctor failed: {e}")
+            self._embedded_relay = None
+            return False
+        # Register the local subscriber BEFORE starting the pump so we
+        # don't miss the first few bundles.
+        self._embedded_relay.add_local_subscriber(self._on_bundle_callback)
+
+        def _serve():
+            try:
+                self._embedded_relay.serve_forever()  # type: ignore[union-attr]
+            except SystemExit as e:
+                # _open_reader raises SystemExit("frame_relay: ...") if
+                # harmony_vlm utils can't be imported. Surface that
+                # message rather than crashing silently.
+                msg = str(e)
+                self.lbl_status.setText(
+                    f"Render path: json_local — embedded relay aborted: {msg}"
+                )
+            except Exception as e:
+                self.lbl_status.setText(
+                    f"Render path: json_local — embedded relay error: {e}"
+                )
+
+        self._embedded_relay_thread = threading.Thread(
+            target=_serve, daemon=True, name="panel-embedded-relay",
+        )
+        self._embedded_relay_thread.start()
+        self.lbl_status.setText("Render path: json_local — embedded relay starting…")
+        return True
 
     def recent_paint_latency_ms(self) -> Tuple[float, float, float]:
         """Rolling p50 / p95 / p99 of bundle-arrival → painted deltas in ms.
