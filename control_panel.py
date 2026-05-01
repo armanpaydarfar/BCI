@@ -569,10 +569,17 @@ class VLMVideoThread(QThread):
 
 
 class ControlPanel(QMainWindow):
+    # Emitted by the off-thread remote-status worker. Marshals the UDP
+    # status reply (or a "down" sentinel) back to the GUI thread so the
+    # 0.4 s socket timeout doesn't block paint.
+    _remote_status_received = Signal(dict)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Harmony Control Panel — Simplified")
         self.resize(1250, 800)
+        self._remote_status_in_flight = False
+        self._remote_status_received.connect(self._apply_remote_status)
 
         # State
         self.mode = MODES[0]
@@ -1741,13 +1748,33 @@ class ControlPanel(QMainWindow):
                                "Manage these on the GPU host.")
 
     def _poll_remote_status(self) -> None:
-        """1 s cadence. Pings the remote VLM service for its status payload
-        and reflects frame_source_connected + frames_received in the panel.
-        Network failures degrade gracefully — they just leave the badge in
-        the previous state (do not log; this fires every second)."""
-        try:
-            resp = self._vlm_udp_request({"cmd": "status"}, timeout_s=0.4)
-        except Exception:
+        """1 s cadence. Spawns a daemon thread to do the UDP RTT off the
+        GUI thread; the result comes back via the _remote_status_received
+        signal. The status request itself is cheap, but its 0.4 s timeout
+        blocked the Qt event loop when the Windows host is unreachable —
+        visible as a sub-second stutter in the VLM Video tab paint pass.
+
+        Skip if a previous poll is still in flight so a flaky link can't
+        accumulate worker threads.
+        """
+        if self._remote_status_in_flight:
+            return
+        self._remote_status_in_flight = True
+
+        def _worker() -> None:
+            try:
+                resp = self._vlm_udp_request({"cmd": "status"}, timeout_s=0.4)
+            except Exception:
+                resp = {"ok": False, "_unreachable": True}
+            self._remote_status_received.emit(resp or {})
+
+        threading.Thread(target=_worker, daemon=True,
+                         name="panel-remote-status").start()
+
+    def _apply_remote_status(self, resp: dict) -> None:
+        """GUI-thread slot for _remote_status_received."""
+        self._remote_status_in_flight = False
+        if resp.get("_unreachable"):
             self._set_led(self.lbl_vlm_service, "error")
             self.lbl_remote_intake_text.setText("intake: unreachable")
             return
