@@ -235,24 +235,6 @@ VLM_SERVICE_TIMEOUT = 0.5
 # depth PNGs, overlay videos, etc.). Each run creates a timestamped subdir.
 VLM_SESSION_ROOT = os.path.join(DATA_DIR, "vlm_sessions")
 
-# TCP port for the optional VLM overlay stream (JPEG frames pushed at ~5 Hz).
-# Served by vlm_service.py when --enable-overlay is passed; consumed by the
-# control panel's "VLM Video" tab.
-VLM_OVERLAY_PORT    = 5590
-# Whether the control panel should start vlm_service with --enable-overlay.
-VLM_ENABLE_OVERLAY  = True
-
-# Render path for the panel's "VLM Video" tab (Render_Layer_Refactor.md §4).
-#   "json_local"  — paint scene + detection JSON locally on Linux. The
-#                   default; the path that drops the Windows→Linux JPEG
-#                   round-trip and gives native frame rate.
-#   "jpeg_remote" — legacy: subscribe to vlm_service.py's TCP overlay JPEG
-#                   push and paint the rendered frames as-is. Kept as a
-#                   fallback during the migration window only; retired in
-#                   the cleanup commit once Phase B is fully validated.
-# Machine-local: edits to this line should NOT be committed.
-RENDER_PATH = "json_local"
-
 # =============================================================================
 # FES
 # =============================================================================

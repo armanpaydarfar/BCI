@@ -11,16 +11,17 @@ hard-code hosts or ports.
 
 Currently implements:
 
-- ``GazeClient``     — UDP 5588 (gaze_runner.py service mode).
-- ``VLMClient``      — UDP 5589 (vlm_service.py request-reply) plus a
-                       helper for the TCP 5590 overlay handshake. The
-                       overlay reader thread itself stays in the panel
-                       since it needs Qt threading hooks; the client just
-                       owns the host/port resolution.
-- ``FrameRelayController`` — UDP-style status helper for the new TCP
-                       relay (Utils/frame_relay.py). Phase 1 placeholder;
-                       the relay does not yet expose a status query — the
-                       client returns whether a TCP connect succeeds.
+- ``GazeClient``     — UDP 5588 (gaze_runner.py service mode), with
+                       subscribe/unsubscribe helpers for the gaze_results
+                       JSON push channel.
+- ``VLMClient``      — UDP 5589 (vlm_service.py request-reply), with
+                       subscribe/unsubscribe helpers for the vlm_results
+                       JSON push channel.
+- ``FrameRelayController`` — UDP-style status helper for the TCP relay
+                       (Utils/frame_relay.py). Used by external-relay
+                       deployments; the panel's embedded-relay path
+                       reads the in-process server state directly
+                       instead.
 
 Each method returns a plain ``dict`` (or ``None`` on transport failure).
 No business logic, no caching, no retries beyond what the legacy panel
@@ -139,16 +140,12 @@ class GazeClient:
 class VLMClient:
     """Wraps the UDP request-reply interface served by vlm_service.py.
     Endpoint comes from ``config.VLM_SERVICE_HOST`` /
-    ``config.VLM_SERVICE_PORT``. Overlay TCP host/port are exposed for the
-    panel's overlay reader thread but the actual TCP read loop stays in
-    the panel (it needs Qt threading hooks)."""
+    ``config.VLM_SERVICE_PORT``."""
 
     def __init__(self, cfg) -> None:
         self.host = str(getattr(cfg, "VLM_SERVICE_HOST", "127.0.0.1"))
         self.port = int(getattr(cfg, "VLM_SERVICE_PORT", 5589))
         self.default_timeout_s = float(getattr(cfg, "VLM_SERVICE_TIMEOUT", 2.0) or 2.0)
-        self.overlay_host = self.host
-        self.overlay_port = int(getattr(cfg, "VLM_OVERLAY_PORT", 5590))
 
     def status(self, *, timeout_s: Optional[float] = None) -> Dict[str, Any]:
         return _udp_request(self.host, self.port, {"cmd": "status"}, timeout_s or self.default_timeout_s)

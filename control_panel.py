@@ -37,7 +37,7 @@ IMPORTANT:
 - NO --telemetry flag is passed (that caused argparse errors).
 """
 
-import os, sys, shlex, time, re, tempfile, socket, subprocess, json, threading, glob, struct
+import os, sys, shlex, time, re, tempfile, socket, subprocess, json, threading, glob
 import serial
 import serial.tools.list_ports
 
@@ -113,8 +113,6 @@ VLM_SESSION_ROOT    = getattr(_HCFG, "VLM_SESSION_ROOT", None) if _HCFG else Non
 VLM_QUERY_TIMEOUT_S = 2.0
 VLM_DECIDE_TIMEOUT_S = 40.0
 GAZE_OR_BACKEND     = str(getattr(_HCFG, "GAZE_OR_BACKEND", "legacy")).lower() if _HCFG else "legacy"
-VLM_OVERLAY_PORT    = int(getattr(_HCFG, "VLM_OVERLAY_PORT", 5590)) if _HCFG else 5590
-VLM_ENABLE_OVERLAY  = bool(getattr(_HCFG, "VLM_ENABLE_OVERLAY", True)) if _HCFG else True
 NEON_COMPANION_HOST = str(getattr(_HCFG, "NEON_COMPANION_HOST", "")) if _HCFG else ""
 
 # Remote-services mode: when True, the panel does NOT spawn local VLM /
@@ -138,13 +136,6 @@ FRAME_RELAY_HZ        = float(getattr(_HCFG, "FRAME_RELAY_HZ", 30.0)) if _HCFG e
 # same TCP port. False → widget falls back to RemoteFrameReader and
 # the user is expected to run `python -m Utils.frame_relay` separately.
 FRAME_RELAY_EMBEDDED  = bool(getattr(_HCFG, "FRAME_RELAY_EMBEDDED", True)) if _HCFG else True
-
-# Migration switch for the VLM Video tab render path (see config.py:RENDER_PATH
-# and Render_Layer_Refactor.md §4):
-#   "json_local"  — Linux-side scene + JSON overlay (default; new path)
-#   "jpeg_remote" — legacy JPEG-over-TCP overlay consumer
-# Anything other than "jpeg_remote" falls through to "json_local".
-RENDER_PATH = str(getattr(_HCFG, "RENDER_PATH", "json_local")).lower() if _HCFG else "json_local"
 
 
 _IS_WINDOWS = sys.platform == "win32"
@@ -541,63 +532,6 @@ class Proc:
     err: bytearray = field(default_factory=bytearray)
 
 # ----------------- Main Window -----------------
-class VLMVideoThread(QThread):
-    """
-    Connects to vlm_service.py's TCP overlay push server and emits JPEG frames.
-    Protocol: server sends 4-byte big-endian uint32 (frame length) followed by
-    that many bytes of JPEG, repeating at ~5 Hz. Reconnects automatically on
-    disconnect or connection failure.
-    """
-
-    frame_ready = Signal(bytes)
-
-    def __init__(self, host: str, port: int, parent=None) -> None:
-        super().__init__(parent)
-        self._host = host
-        self._port = port
-        self._running = False
-
-    def stop(self) -> None:
-        self._running = False
-
-    def run(self) -> None:
-        self._running = True
-        while self._running:
-            sock = None
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(3.0)
-                sock.connect((self._host, self._port))
-                sock.settimeout(5.0)
-                while self._running:
-                    # Read 4-byte length prefix
-                    header = b""
-                    while len(header) < 4:
-                        chunk = sock.recv(4 - len(header))
-                        if not chunk:
-                            raise ConnectionError("server closed connection")
-                        header += chunk
-                    n = struct.unpack(">I", header)[0]
-                    # Read exactly n bytes of JPEG
-                    jpg = b""
-                    while len(jpg) < n:
-                        chunk = sock.recv(min(n - len(jpg), 65536))
-                        if not chunk:
-                            raise ConnectionError("server closed connection")
-                        jpg += chunk
-                    self.frame_ready.emit(jpg)
-            except Exception:
-                pass
-            finally:
-                if sock is not None:
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
-            if self._running:
-                self.msleep(1000)  # wait 1 s before reconnect attempt
-
-
 class ControlPanel(QMainWindow):
     # Emitted by the off-thread remote-status worker. Marshals the UDP
     # status reply (or a "down" sentinel) back to the GUI thread so the
@@ -642,7 +576,6 @@ class ControlPanel(QMainWindow):
         # ---- VLM service proc ----
         self.vlm_service = Proc("VLM Service", None, ROOT)
         self._vlm_last_snapshot_id: Optional[str] = None
-        self._vlm_video_thread: Optional[VLMVideoThread] = None
 
         # Robot terminal
         self.robot_term: Optional[QProcess] = None
@@ -1127,26 +1060,24 @@ class ControlPanel(QMainWindow):
         self._update_robot_buttons_for_mode()
 
     def _build_vlm_video_tab(self, tabs: QTabWidget) -> None:
+        """Linux-side scene + JSON-overlay renderer
+        (Render_Layer_Refactor.md §4). Bundles from a panel-hosted
+        FrameRelayServer (or an externally-supplied one when
+        FRAME_RELAY_EMBEDDED=False), detection JSON from vlm_service.py
+        UDP 5589 subscribe, gaze tracks from gaze_runner.py UDP 5588,
+        composited at native frame rate via Utils.scene_overlay_renderer.
+
+        Windows TCP clients still dial the embedded relay's listening
+        socket — the wire is unchanged.
+
+        When FRAME_RELAY_EMBEDDED is True (the default), the user must
+        NOT also run `python -m Utils.frame_relay` separately on this
+        machine: two NeonLiveReaders conflict at the SDK level.
+        """
         vvt = QWidget()
         tabs.addTab(vvt, "VLM Video")
         vl = QVBoxLayout(vvt)
 
-        if RENDER_PATH == "jpeg_remote":
-            self._build_vlm_video_tab_legacy_jpeg(vl)
-            return
-
-        # Default ("json_local"): Linux-side scene + JSON-overlay renderer
-        # (Render_Layer_Refactor.md §4). Bundles from the local frame_relay,
-        # detection JSON from vlm_service.py UDP 5589 subscribe, composited
-        # at native frame rate via Utils.scene_overlay_renderer.
-        #
-        # When FRAME_RELAY_EMBEDDED is True (the default), the panel hosts
-        # FrameRelayServer in-process and the widget consumes bundles via
-        # add_local_subscriber — raw SDK BGR, no JPEG round-trip — which
-        # matches neon_viewer.py quality. Windows TCP clients still dial
-        # the same listening socket. The user must NOT also run
-        # `python -m Utils.frame_relay` separately in this mode (two
-        # NeonLiveReaders would conflict at the SDK level).
         from Utils.vlm_scene_widget import VLMSceneWidget
         embedded_relay = None
         if FRAME_RELAY_EMBEDDED:
@@ -1168,85 +1099,16 @@ class ControlPanel(QMainWindow):
         )
         vl.addWidget(self.vlm_scene_widget, 1)
 
-    def _build_vlm_video_tab_legacy_jpeg(self, vl: QVBoxLayout) -> None:
-        """Legacy JPEG-overlay consumer. Kept around for the migration
-        window so the user can flip RENDER_PATH = "jpeg_remote" and fall
-        back to the old behaviour while validating the new path. Removed
-        in the cleanup commit at the end of Phase B."""
-        ctrl = QHBoxLayout()
-        self.lbl_vlm_video_status = QLabel("Not connected — start VLM Service first")
-        btn_connect = QPushButton("Connect")
-        btn_connect.setMaximumWidth(90)
-        btn_connect.clicked.connect(self._on_vlm_video_connect)
-        btn_disconnect = QPushButton("Disconnect")
-        btn_disconnect.setMaximumWidth(100)
-        btn_disconnect.clicked.connect(self._on_vlm_video_disconnect)
-        ctrl.addWidget(self.lbl_vlm_video_status, 1)
-        ctrl.addWidget(btn_connect)
-        ctrl.addWidget(btn_disconnect)
-        vl.addLayout(ctrl)
-
-        self.lbl_vlm_video = QLabel()
-        self.lbl_vlm_video.setAlignment(Qt.AlignCenter)
-        self.lbl_vlm_video.setMinimumSize(640, 360)
-        self.lbl_vlm_video.setStyleSheet("background: #111111; color: #666666;")
-        self.lbl_vlm_video.setText(
-            "VLM overlay not connected\n\n"
-            "Start the VLM Service then click Connect,\n"
-            'or set RENDER_PATH = "json_local" for the new render path.'
-        )
-        vl.addWidget(self.lbl_vlm_video, 1)
-
-    def _on_vlm_frame(self, jpg_bytes: bytes) -> None:
-        """Legacy slot: paint a Windows-rendered overlay JPEG into the legacy
-        QLabel. Used by the legacy `jpeg_remote` render path; bypassed when
-        the VLM Video tab hosts the new VLMSceneWidget."""
-        if not hasattr(self, "lbl_vlm_video"):
-            return
-        pixmap = QPixmap()
-        pixmap.loadFromData(jpg_bytes, "JPEG")
-        if pixmap.isNull():
-            return
-        scaled = pixmap.scaled(
-            self.lbl_vlm_video.width(),
-            self.lbl_vlm_video.height(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
-        self.lbl_vlm_video.setPixmap(scaled)
-        self.lbl_vlm_video_status.setText(
-            f"Live  ·  {pixmap.width()}×{pixmap.height()}  ·  {len(jpg_bytes)//1024} KB/frame"
-        )
-
     def _on_vlm_video_connect(self) -> None:
-        """Auto-connect handler invoked from on_vlm_service_start. Routes to
-        whichever render path the VLM Video tab is configured for."""
+        """Auto-connect hook invoked from on_vlm_service_start. The
+        VLMSceneWidget is also user-startable from its own button —
+        calling start() twice is idempotent."""
         if hasattr(self, "vlm_scene_widget"):
             self.vlm_scene_widget.start()
-            return
-        if not hasattr(self, "lbl_vlm_video_status"):
-            return
-        if self._vlm_video_thread is not None and self._vlm_video_thread.isRunning():
-            return
-        self._vlm_video_thread = VLMVideoThread(VLM_SERVICE_HOST, VLM_OVERLAY_PORT)
-        self._vlm_video_thread.frame_ready.connect(self._on_vlm_frame)
-        self._vlm_video_thread.start()
-        self.lbl_vlm_video_status.setText(
-            f"Connecting to {VLM_SERVICE_HOST}:{VLM_OVERLAY_PORT}…"
-        )
 
     def _on_vlm_video_disconnect(self) -> None:
         if hasattr(self, "vlm_scene_widget"):
             self.vlm_scene_widget.stop()
-            return
-        if self._vlm_video_thread is not None:
-            self._vlm_video_thread.stop()
-            self._vlm_video_thread.wait(2000)
-            self._vlm_video_thread = None
-        if hasattr(self, "lbl_vlm_video"):
-            self.lbl_vlm_video.setText("Disconnected")
-        if hasattr(self, "lbl_vlm_video_status"):
-            self.lbl_vlm_video_status.setText("Not connected")
 
     def _build_runtime_config_tab(self, tabs: QTabWidget):
         rtc = QWidget()
@@ -1906,7 +1768,6 @@ class ControlPanel(QMainWindow):
                 self._append_log("VLM", f"[{self._ts()}] Failed to create session dir: {e}\n")
 
         depth_flag = "--enable-depth" if VLM_ENABLE_DEPTH else ""
-        overlay_flag = f"--enable-overlay --overlay-port {int(VLM_OVERLAY_PORT)}" if VLM_ENABLE_OVERLAY else ""
         session_arg = f'--session-dir "{session_dir}"' if session_dir else ""
         # On the Windows dev box (RTX 4070 Ti) we want FastSAM + Depth Pro on
         # CUDA; the Linux deployment is CPU-only (no NVIDIA driver).
@@ -1944,18 +1805,17 @@ class ControlPanel(QMainWindow):
             f'--host {VLM_BIND_HOST} --port {int(VLM_SERVICE_PORT)} '
             f'--neon-host "{NEON_COMPANION_HOST}" '
             f'--model {VLM_MODEL} {device_flag} '
-            f'{depth_flag} {overlay_flag} {session_arg} {remote_arg}'
+            f'{depth_flag} {session_arg} {remote_arg}'
         )
         self._start_proc(self.vlm_service, self.lbl_vlm_service, "VLM")
         self._append_log(
             "VLM",
             f"[{self._ts()}] Service start requested "
-            f"(depth={VLM_ENABLE_DEPTH}, overlay={VLM_ENABLE_OVERLAY}, model={VLM_MODEL})\n",
+            f"(depth={VLM_ENABLE_DEPTH}, model={VLM_MODEL})\n",
         )
         # Block Windows from sleeping while the GPU stack is alive.
         _sleep_inhibit(True)
-        if VLM_ENABLE_OVERLAY:
-            self._on_vlm_video_connect()
+        self._on_vlm_video_connect()
 
     def on_vlm_service_stop(self):
         # Reset the streaming toggle so the panel doesn't claim "ON" while

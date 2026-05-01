@@ -52,8 +52,6 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-import struct
-
 import numpy as np
 
 
@@ -115,10 +113,6 @@ def parse_args():
     p.add_argument("--enable-depth", action="store_true")
     p.add_argument("--depth-checkpoint", default="models/depth_pro.pt", help="Relative to repo-dir")
     p.add_argument("--session-dir", default=None, help="Where to save depth PNGs etc.")
-    p.add_argument("--enable-overlay", action="store_true",
-                   help="Start the annotated JPEG TCP push server for control-panel display")
-    p.add_argument("--overlay-port", type=int, default=5590,
-                   help="TCP port for the overlay frame push server")
     p.add_argument("--verbose", action="store_true")
     # Frame source toggle for the GPU-host migration plan (see SoftwareDocs/
     # GPU_Service_Host_Architecture_Plan.md §3.4). Default `local` preserves
@@ -173,12 +167,6 @@ class VLMService:
         self._vlm_state: str = "IDLE"        # IDLE | THINKING | AWAITING_SECOND | DECIDED
         self._last_decision: Optional[dict] = None
         self._first_snap_det = None          # first-fixation Detection for AWAITING_SECOND badge
-
-        # Overlay frame store: render thread writes, TCP server thread reads.
-        self._overlay_lock = threading.Lock()
-        self._latest_overlay_jpg: Optional[bytes] = None
-        self._frame_count: int = 0
-        self._start_time: float = time.time()
 
         # Continuous segmentation stream (toggle from the panel). When on,
         # _segment_stream_loop calls detector.detect at seg_stream_hz and
@@ -934,105 +922,6 @@ class VLMService:
             "gaze_px": [float(bundle.gaze.x), float(bundle.gaze.y)] if bundle is not None else None,
         }
 
-    # ── overlay rendering + TCP push server ───────────────────────────────
-
-    def start_overlay_server(self) -> None:
-        """Spawn the render thread and TCP push server thread."""
-        t_render = threading.Thread(target=self._render_loop, daemon=True, name="vlm-render")
-        t_server = threading.Thread(target=self._overlay_server_loop, daemon=True, name="vlm-overlay-tcp")
-        t_render.start()
-        t_server.start()
-        _log(f"overlay server started (tcp port {self.args.overlay_port})")
-
-    def _render_loop(self) -> None:
-        """Render annotated frames at ~5 Hz and store the latest JPEG."""
-        import cv2 as _cv2
-        from utils.overlay_renderer import OverlayRenderer
-
-        renderer = OverlayRenderer()
-        while not self._stop_event.is_set():
-            try:
-                bundle, fix, _ = self._latest()
-                if bundle is not None:
-                    with self._render_lock:
-                        dets = list(self._cached_dets)
-                        hit_det = self._cached_hit_det
-                        hit_wp = self._cached_hit_wp
-                        state = self._vlm_state
-                        decision = self._last_decision
-                        first_det = self._first_snap_det
-                        fc = self._frame_count
-
-                    fix_state = fix if fix is not None else self._FixationState(active=False)
-                    canvas = renderer.render(
-                        frame_bgr=bundle.video.bgr.copy(),
-                        detections=dets,
-                        hit=hit_det,
-                        fixation=fix_state,
-                        gaze=bundle.gaze,
-                        vlm_state=state,
-                        last_decision=decision,
-                        api_mode="VISION",
-                        pending_detection=None,
-                        frame_idx=fc,
-                        total_frames=0,
-                        duration_s=time.time() - self._start_time,
-                        first_object=first_det,
-                        hit_waypoint=hit_wp,
-                    )
-                    _, jpg_buf = _cv2.imencode(
-                        ".jpg", canvas, [_cv2.IMWRITE_JPEG_QUALITY, 60]
-                    )
-                    with self._overlay_lock:
-                        self._latest_overlay_jpg = bytes(jpg_buf)
-                        self._frame_count = fc + 1
-            except Exception as e:
-                if self.args.verbose:
-                    _log(f"render loop error: {e}")
-            time.sleep(0.05)  # 20 Hz — defensive bump pending Linux-side renderer (Render_Layer_Refactor.md)
-
-    def _overlay_server_loop(self) -> None:
-        """TCP server: accept one client at a time and push length-prefixed JPEGs."""
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            srv.bind((self.args.host, self.args.overlay_port))
-        except OSError as e:
-            _log(f"overlay server bind failed on port {self.args.overlay_port}: {e}")
-            return
-        srv.listen(1)
-        srv.settimeout(1.0)
-        try:
-            while not self._stop_event.is_set():
-                try:
-                    conn, addr = srv.accept()
-                except socket.timeout:
-                    continue
-                _log(f"overlay client connected: {addr}")
-                conn.settimeout(2.0)
-                try:
-                    while not self._stop_event.is_set():
-                        with self._overlay_lock:
-                            jpg = self._latest_overlay_jpg
-                        if jpg:
-                            try:
-                                conn.sendall(struct.pack(">I", len(jpg)) + jpg)
-                            except (BrokenPipeError, ConnectionResetError, OSError):
-                                break
-                        time.sleep(0.05)
-                finally:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                    _log(f"overlay client disconnected: {addr}")
-        finally:
-            try:
-                srv.close()
-            except Exception:
-                pass
-
-
 def _json_default(o):
     if isinstance(o, np.ndarray):
         return o.tolist()
@@ -1173,9 +1062,6 @@ def main() -> None:
     # Always run the JSON push loop. Subscribers self-register; if none ever
     # subscribe the loop is essentially idle (one prune pass per tick).
     service.start_results_push()
-
-    if args.enable_overlay:
-        service.start_overlay_server()
 
     _log("ready")
     try:
