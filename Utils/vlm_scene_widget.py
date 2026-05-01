@@ -18,8 +18,8 @@ Threads owned by this widget:
     optional gaze_results).
   - QTimer on the main Qt thread for the paint pass.
 
-The bundle source updates ``self._latest_bundle`` under
-``self._bundle_lock``. The push subscribers emit Qt Signals; their slots
+The bundle source updates ``self._latest_frame_bgr`` (an owned copy)
+plus the gaze scalars under ``self._bundle_lock``. The push subscribers emit Qt Signals; their slots
 update ``self._latest_vlm`` / ``self._latest_gaze`` on the main thread.
 The QTimer composites all three via SceneOverlayRenderer and paints.
 
@@ -278,8 +278,15 @@ class VLMSceneWidget(QWidget):
         self._renderer = SceneOverlayRenderer()
 
         self._bundle_lock = threading.Lock()
-        # Latest bundle + arrival monotonic timestamp.
-        self._latest_bundle = None
+        # Snapshotted bundle fields. NeonLiveReader.__iter__ reuses its
+        # output buffer, so we must copy / scalar-extract on the pump
+        # thread before the SDK pulls the next frame — otherwise the
+        # paint pass reads a torn buffer (visible as grain/artifacts on
+        # head motion). See vlm_service.py:649 for the same comment.
+        self._latest_frame_bgr = None  # owned copy
+        self._latest_gaze_xy: Optional[Tuple[float, float]] = None
+        self._latest_frame_idx: int = 0
+        self._latest_frame_ts_ns: int = 0
         self._latest_arrival_t: float = 0.0
 
         # Latest JSON push state — both keyed by message type.
@@ -476,9 +483,29 @@ class VLMSceneWidget(QWidget):
     # ── slots / callbacks ─────────────────────────────────────────────────
 
     def _on_bundle_callback(self, bundle) -> None:
-        """Realtime path. Runs on the relay/reader thread; do not block."""
+        """Realtime path. Runs on the relay pump thread; do not block.
+
+        Snapshot the BGR pixels and gaze scalars NOW because
+        NeonLiveReader.__iter__ reuses its output buffer — by the next
+        SDK iteration, ``bundle.video.bgr`` will be partially overwritten
+        and any deferred read tears. The copy is unconditional; the
+        renderer is then called with copy=False since we already own a
+        clean ndarray.
+        """
+        try:
+            frame = bundle.video.bgr
+            frame_copy = frame.copy() if frame is not None else None
+            gx = float(getattr(bundle.gaze, "x", float("nan")))
+            gy = float(getattr(bundle.gaze, "y", float("nan")))
+            ts_ns = int(getattr(bundle.video, "timestamp_ns", 0) or 0)
+            idx = int(getattr(bundle.video, "frame_idx", 0) or 0)
+        except AttributeError:
+            return
         with self._bundle_lock:
-            self._latest_bundle = bundle
+            self._latest_frame_bgr = frame_copy
+            self._latest_gaze_xy = (gx, gy)
+            self._latest_frame_idx = idx
+            self._latest_frame_ts_ns = ts_ns
             self._latest_arrival_t = time.monotonic()
 
     def _on_vlm_payload(self, payload: Dict[str, Any]) -> None:
@@ -497,24 +524,20 @@ class VLMSceneWidget(QWidget):
 
     def _on_paint_tick(self) -> None:
         with self._bundle_lock:
-            bundle = self._latest_bundle
+            frame_bgr = self._latest_frame_bgr
+            gaze_xy = self._latest_gaze_xy
             arrival_t = self._latest_arrival_t
-        if bundle is None:
-            return
-        try:
-            frame_bgr = bundle.video.bgr
-            gx = float(getattr(bundle.gaze, "x", float("nan")))
-            gy = float(getattr(bundle.gaze, "y", float("nan")))
-        except AttributeError:
-            return
-        if frame_bgr is None or not isinstance(frame_bgr, np.ndarray):
+        if frame_bgr is None or gaze_xy is None:
             return
 
         det_payload = self._latest_vlm or {}
         gaze_payload = self._latest_gaze or {}
+        # frame_bgr is already an owned copy from _on_bundle_callback;
+        # tell the renderer to draw in-place to skip a redundant copy.
         canvas = self._renderer.render(
             frame_bgr,
-            gaze_xy=(gx, gy),
+            copy=False,
+            gaze_xy=gaze_xy,
             detections=det_payload.get("detections"),
             hit_det_id=(det_payload.get("hit") or {}).get("det_id")
                 if det_payload.get("hit") else None,
