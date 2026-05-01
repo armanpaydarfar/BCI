@@ -800,7 +800,7 @@ class VLMService:
                         hit_waypoint=hit_wp,
                     )
                     _, jpg_buf = _cv2.imencode(
-                        ".jpg", canvas, [_cv2.IMWRITE_JPEG_QUALITY, 75]
+                        ".jpg", canvas, [_cv2.IMWRITE_JPEG_QUALITY, 60]
                     )
                     with self._overlay_lock:
                         self._latest_overlay_jpg = bytes(jpg_buf)
@@ -808,7 +808,7 @@ class VLMService:
             except Exception as e:
                 if self.args.verbose:
                     _log(f"render loop error: {e}")
-            time.sleep(0.2)  # 5 Hz
+            time.sleep(0.05)  # 20 Hz — defensive bump pending Linux-side renderer (Render_Layer_Refactor.md)
 
     def _overlay_server_loop(self) -> None:
         """TCP server: accept one client at a time and push length-prefixed JPEGs."""
@@ -838,7 +838,7 @@ class VLMService:
                                 conn.sendall(struct.pack(">I", len(jpg)) + jpg)
                             except (BrokenPipeError, ConnectionResetError, OSError):
                                 break
-                        time.sleep(0.2)
+                        time.sleep(0.05)
                 finally:
                     try:
                         conn.close()
