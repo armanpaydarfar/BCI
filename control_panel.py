@@ -131,6 +131,13 @@ PERCEPTION_FRAME_SOURCE  = str(getattr(_HCFG, "PERCEPTION_FRAME_SOURCE", "local"
 FRAME_RELAY_DIAL_HOST = str(getattr(_HCFG, "FRAME_RELAY_DIAL_HOST", "127.0.0.1")) if _HCFG else "127.0.0.1"
 FRAME_RELAY_PORT = int(getattr(_HCFG, "FRAME_RELAY_PORT", 5591)) if _HCFG else 5591
 
+# Migration switch for the VLM Video tab render path (see config.py:RENDER_PATH
+# and Render_Layer_Refactor.md §4):
+#   "json_local"  — Linux-side scene + JSON overlay (default; new path)
+#   "jpeg_remote" — legacy JPEG-over-TCP overlay consumer
+# Anything other than "jpeg_remote" falls through to "json_local".
+RENDER_PATH = str(getattr(_HCFG, "RENDER_PATH", "json_local")).lower() if _HCFG else "json_local"
+
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -1079,11 +1086,14 @@ class ControlPanel(QMainWindow):
         tabs.addTab(vvt, "VLM Video")
         vl = QVBoxLayout(vvt)
 
-        # Linux-side scene + JSON-overlay renderer (Render_Layer_Refactor.md).
-        # Replaces the legacy JPEG-over-TCP overlay consumer: the widget pulls
-        # bundles from the local frame_relay and detection JSON from
-        # vlm_service.py's UDP 5589 subscribe channel, then composites
-        # locally at native frame rate via Utils.scene_overlay_renderer.
+        if RENDER_PATH == "jpeg_remote":
+            self._build_vlm_video_tab_legacy_jpeg(vl)
+            return
+
+        # Default ("json_local"): Linux-side scene + JSON-overlay renderer
+        # (Render_Layer_Refactor.md §4). Bundles from the local frame_relay,
+        # detection JSON from vlm_service.py UDP 5589 subscribe, composited
+        # at native frame rate via Utils.scene_overlay_renderer.
         from Utils.vlm_scene_widget import VLMSceneWidget
         self.vlm_scene_widget = VLMSceneWidget(
             vlm_host=VLM_SERVICE_HOST,
@@ -1094,6 +1104,35 @@ class ControlPanel(QMainWindow):
             relay_dial_port=FRAME_RELAY_PORT,
         )
         vl.addWidget(self.vlm_scene_widget, 1)
+
+    def _build_vlm_video_tab_legacy_jpeg(self, vl: QVBoxLayout) -> None:
+        """Legacy JPEG-overlay consumer. Kept around for the migration
+        window so the user can flip RENDER_PATH = "jpeg_remote" and fall
+        back to the old behaviour while validating the new path. Removed
+        in the cleanup commit at the end of Phase B."""
+        ctrl = QHBoxLayout()
+        self.lbl_vlm_video_status = QLabel("Not connected — start VLM Service first")
+        btn_connect = QPushButton("Connect")
+        btn_connect.setMaximumWidth(90)
+        btn_connect.clicked.connect(self._on_vlm_video_connect)
+        btn_disconnect = QPushButton("Disconnect")
+        btn_disconnect.setMaximumWidth(100)
+        btn_disconnect.clicked.connect(self._on_vlm_video_disconnect)
+        ctrl.addWidget(self.lbl_vlm_video_status, 1)
+        ctrl.addWidget(btn_connect)
+        ctrl.addWidget(btn_disconnect)
+        vl.addLayout(ctrl)
+
+        self.lbl_vlm_video = QLabel()
+        self.lbl_vlm_video.setAlignment(Qt.AlignCenter)
+        self.lbl_vlm_video.setMinimumSize(640, 360)
+        self.lbl_vlm_video.setStyleSheet("background: #111111; color: #666666;")
+        self.lbl_vlm_video.setText(
+            "VLM overlay not connected\n\n"
+            "Start the VLM Service then click Connect,\n"
+            'or set RENDER_PATH = "json_local" for the new render path.'
+        )
+        vl.addWidget(self.lbl_vlm_video, 1)
 
     def _on_vlm_frame(self, jpg_bytes: bytes) -> None:
         """Legacy slot: paint a Windows-rendered overlay JPEG into the legacy
