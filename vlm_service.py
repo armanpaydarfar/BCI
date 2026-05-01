@@ -188,6 +188,16 @@ class VLMService:
         self._seg_stream_stop = threading.Event()
         self._seg_stream_hz: float = 10.0
 
+        # Subscribe-mode push: panel/clients send `cmd=subscribe` and we
+        # broadcast `vlm_results` JSON datagrams from a tick thread. The
+        # render-on-Linux refactor (Render_Layer_Refactor.md §3) replaces
+        # the JPEG overlay round-trip with this JSON channel.
+        self._subscribers_lock = threading.Lock()
+        # subscriber_id (uuid hex) → {addr, hz, last_sent_t, expires_at}
+        self._subscribers: Dict[str, Dict[str, Any]] = {}
+        self._results_tick_thread: Optional[threading.Thread] = None
+        self._results_tick_stop = threading.Event()
+
     # ── lifecycle ─────────────────────────────────────────────────────────
 
     def start_frame_thread(self) -> None:
@@ -233,7 +243,7 @@ class VLMService:
 
             cmd = str(req.get("cmd", "")).lower()
             try:
-                resp = self._dispatch(cmd, req)
+                resp = self._dispatch(cmd, req, addr)
             except Exception as e:
                 resp = {"ok": False, "error": f"handler exception: {e}", "cmd": cmd}
 
@@ -296,7 +306,7 @@ class VLMService:
 
     # ── dispatch ──────────────────────────────────────────────────────────
 
-    def _dispatch(self, cmd: str, req: dict) -> dict:
+    def _dispatch(self, cmd: str, req: dict, addr: tuple) -> dict:
         handlers = {
             "status": lambda: self._cmd_status(),
             "snapshot": lambda: self._cmd_snapshot(),
@@ -308,6 +318,8 @@ class VLMService:
             "capture_first": lambda: self._cmd_capture_first(req),
             "decide_pair": lambda: self._cmd_decide_pair(req),
             "camera_matrix": lambda: self._cmd_camera_matrix(),
+            "subscribe": lambda: self._cmd_subscribe(req, addr),
+            "unsubscribe": lambda: self._cmd_unsubscribe(req),
             "stop": lambda: self._cmd_stop(),
         }
         handler = handlers.get(cmd)
@@ -753,6 +765,175 @@ class VLMService:
         self._stop_event.set()
         return {"ok": True}
 
+    # ── subscribe-mode JSON push (Render_Layer_Refactor.md §3) ────────────
+
+    # Internal tick rate caps the per-subscriber rate. Subscribers may
+    # request lower hz; higher requests are clamped at this ceiling.
+    _RESULTS_TICK_HZ: float = 20.0
+    # Subscribers expire after this long without a refresh. The panel is
+    # expected to re-subscribe every ~10 s as a heartbeat — drops dead
+    # subscribers automatically when a client crashes.
+    _SUBSCRIBER_TTL_S: float = 30.0
+
+    def start_results_push(self) -> None:
+        """Spawn the tick thread that broadcasts vlm_results JSON to subscribers."""
+        if self._results_tick_thread is not None and self._results_tick_thread.is_alive():
+            return
+        self._results_tick_stop.clear()
+        self._results_tick_thread = threading.Thread(
+            target=self._results_tick_loop, daemon=True, name="vlm-results-push",
+        )
+        self._results_tick_thread.start()
+        _log("results push thread started")
+
+    def _cmd_subscribe(self, req: dict, addr: tuple) -> dict:
+        """Add (or refresh) a subscriber. Idempotent on (addr, port) so a
+        client re-subscribing as a heartbeat doesn't accumulate ghosts."""
+        try:
+            hz = float(req.get("hz", self._RESULTS_TICK_HZ))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "bad_hz"}
+        hz = max(0.5, min(hz, self._RESULTS_TICK_HZ))
+        ttl_s = float(req.get("ttl_s", self._SUBSCRIBER_TTL_S))
+        now = time.monotonic()
+        with self._subscribers_lock:
+            # Reuse existing id when the same (addr, port) re-subscribes;
+            # this keeps the subscriber set stable across heartbeats and
+            # lets the client treat subscribe as idempotent.
+            existing_id: Optional[str] = None
+            for sid, info in self._subscribers.items():
+                if info.get("addr") == addr:
+                    existing_id = sid
+                    break
+            sid = existing_id or uuid.uuid4().hex[:12]
+            self._subscribers[sid] = {
+                "addr": tuple(addr),
+                "hz": hz,
+                "last_sent_t": 0.0,
+                "expires_at": now + ttl_s,
+            }
+        return {"ok": True, "stream": "results", "subscriber_id": sid, "hz": hz}
+
+    def _cmd_unsubscribe(self, req: dict) -> dict:
+        sid = req.get("subscriber_id")
+        if not sid:
+            return {"ok": False, "error": "missing_subscriber_id"}
+        with self._subscribers_lock:
+            removed = self._subscribers.pop(str(sid), None)
+        return {"ok": True, "removed": bool(removed)}
+
+    def _results_tick_loop(self) -> None:
+        """Build one payload per tick, send to each due subscriber. Reads
+        cached state under the existing _render_lock — no model calls in
+        this thread."""
+        push_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        period = 1.0 / max(self._RESULTS_TICK_HZ, 1e-6)
+        try:
+            while not self._stop_event.is_set() and not self._results_tick_stop.is_set():
+                t0 = time.monotonic()
+                self._tick_send_results(push_sock, t0)
+                slept = time.monotonic() - t0
+                remaining = period - slept
+                if remaining > 0:
+                    time.sleep(remaining)
+        finally:
+            try:
+                push_sock.close()
+            except OSError:
+                pass
+
+    def _tick_send_results(self, push_sock: socket.socket, now: float) -> None:
+        """One pass: prune expired, build payload if any subscriber is due, send."""
+        # Drop expired subscribers up front so we don't serialise for nobody.
+        with self._subscribers_lock:
+            for sid, info in list(self._subscribers.items()):
+                if info["expires_at"] < now:
+                    self._subscribers.pop(sid, None)
+            due = []
+            for sid, info in self._subscribers.items():
+                period = 1.0 / max(info["hz"], 1e-6)
+                if (now - info["last_sent_t"]) >= period:
+                    due.append((sid, info["addr"]))
+                    info["last_sent_t"] = now
+        if not due:
+            return
+        try:
+            payload = json.dumps(self._build_vlm_results_payload(), default=_json_default).encode("utf-8")
+        except Exception as e:
+            if self.args.verbose:
+                _log(f"results push: payload build failed: {e}")
+            return
+        if len(payload) > 60 * 1024:
+            # UDP datagrams >~64 KB get IP-fragmented. Keep payloads small;
+            # the panel will fall back to the next tick.
+            if self.args.verbose:
+                _log(f"results push: payload {len(payload)} B exceeds 60 KB; skipping tick")
+            return
+        for _sid, addr in due:
+            try:
+                push_sock.sendto(payload, addr)
+            except OSError:
+                pass
+
+    def _build_vlm_results_payload(self) -> dict:
+        """Snapshot the current detection / hit / fixation / decision state
+        as the JSON push payload defined in Render_Layer_Refactor.md §3."""
+        bundle, fix, _ = self._latest()
+        with self._render_lock:
+            dets = list(self._cached_dets)
+            hit_det = self._cached_hit_det
+            hit_wp = self._cached_hit_wp
+            state = self._vlm_state
+            decision = self._last_decision
+            first_det = self._first_snap_det
+
+        detections_out = [_serialize_detection_for_push(d) for d in dets]
+        hit_payload = None
+        if hit_det is not None:
+            hit_id = next((i for i, d in enumerate(dets) if d is hit_det), -1)
+            wp_pixel = (hit_wp or {}).get("pixel_center") if isinstance(hit_wp, dict) else None
+            hit_payload = {
+                "det_id": hit_id,
+                "waypoint": list(wp_pixel) if wp_pixel is not None else None,
+                "label": getattr(hit_det, "label", None),
+            }
+
+        fixation_payload = None
+        if fix is not None and getattr(fix, "active", False):
+            duration_ns = int(getattr(fix, "duration_ns", 0))
+            fx = float(bundle.gaze.x) if bundle is not None else None
+            fy = float(bundle.gaze.y) if bundle is not None else None
+            fixation_payload = {
+                "active": True,
+                "duration_ms": duration_ns / 1_000_000.0,
+                "x": fx,
+                "y": fy,
+                "stable": bool(getattr(fix, "is_stable", False)),
+            }
+
+        depth_at_gaze_m = None
+        if isinstance(decision, dict):
+            depth_at_gaze_m = decision.get("depth_at_gaze_m")
+
+        first_object_payload = None
+        if first_det is not None:
+            first_object_payload = _serialize_detection_for_push(first_det)
+
+        return {
+            "type": "vlm_results",
+            "frame_idx": int(getattr(getattr(bundle, "video", None), "frame_idx", 0)) if bundle is not None else 0,
+            "frame_ts_ns": int(getattr(getattr(bundle, "video", None), "timestamp_ns", 0)) if bundle is not None else 0,
+            "ts_send_ns": int(time.time_ns()),
+            "detections": detections_out,
+            "hit": hit_payload,
+            "fixation": fixation_payload,
+            "decision": _serialize_decision_for_push(decision) if isinstance(decision, dict) else None,
+            "depth_at_gaze_m": depth_at_gaze_m,
+            "vlm_state": state,
+            "first_object": first_object_payload,
+            "gaze_px": [float(bundle.gaze.x), float(bundle.gaze.y)] if bundle is not None else None,
+        }
+
     # ── overlay rendering + TCP push server ───────────────────────────────
 
     def start_overlay_server(self) -> None:
@@ -860,6 +1041,39 @@ def _json_default(o):
     raise TypeError(f"unsupported type for JSON: {type(o)}")
 
 
+def _serialize_detection_for_push(d) -> dict:
+    """Compact JSON-safe view of a harmony_vlm Detection for the UDP push.
+
+    Mask polygons are int-quantised vertex lists (already int via .astype(int)
+    in _cmd_segment) — small enough that 5-10 detections at 20 Hz stay
+    comfortably under the 60 KB datagram budget."""
+    box_xyxy = [float(v) for v in getattr(d, "box_xyxy", (0.0, 0.0, 0.0, 0.0))]
+    out = {
+        "label": getattr(d, "label", None),
+        "confidence": float(getattr(d, "confidence", 0.0)),
+        "box_xyxy": box_xyxy,
+        "box_center": [float(v) for v in getattr(d, "box_center", (0.0, 0.0))],
+    }
+    poly = getattr(d, "mask_polygon", None)
+    if poly is not None:
+        try:
+            out["mask_polygon"] = poly.reshape(-1, 2).astype(int).tolist()
+        except Exception:
+            pass
+    return out
+
+
+def _serialize_decision_for_push(decision: dict) -> dict:
+    """Trim a decision dict to fields the renderer actually paints.
+
+    The full _last_decision can hold large nested fields (waypoints lists,
+    paired-object metadata). The push payload only carries what the
+    Linux-side renderer needs to draw the decision badge."""
+    keep = ("text", "object_label", "object", "second_object",
+            "ts_ns", "model", "elapsed_s", "summary")
+    return {k: decision[k] for k in keep if k in decision}
+
+
 def main() -> None:
     args = parse_args()
 
@@ -956,6 +1170,9 @@ def main() -> None:
         fixation_state_cls=FixationState,
     )
     service.start_frame_thread()
+    # Always run the JSON push loop. Subscribers self-register; if none ever
+    # subscribe the loop is essentially idle (one prune pass per tick).
+    service.start_results_push()
 
     if args.enable_overlay:
         service.start_overlay_server()
