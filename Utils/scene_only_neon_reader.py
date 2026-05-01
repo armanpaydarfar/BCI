@@ -162,9 +162,16 @@ class SceneOnlyNeonReader:
                 fx, fy = K[0, 0], K[1, 1]
                 cx, cy = K[0, 2], K[1, 2]
                 _log(f"factory intrinsics: fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}")
-                dist = cal.get("scene_distortion_coefficients")
+                # pupil_labs returns a numpy record (structured-array element),
+                # not a dict — bracket access works on both, .get() doesn't.
+                # See harmony_vlm/utils/neon/reader.py:252 for the same pattern.
+                try:
+                    dist = cal["scene_distortion_coefficients"]
+                except (KeyError, ValueError, IndexError):
+                    dist = None
                 if dist is not None:
                     self._distortion_coeffs = np.array(dist, dtype=np.float64).ravel()
+                    _log(f"distortion coeffs: {self._distortion_coeffs}")
                 return K
             except Exception as e:
                 if attempt < 2:
