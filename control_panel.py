@@ -228,16 +228,43 @@ def _detect_lan_ip() -> Optional[str]:
             pass
 
 
+def _detect_tailscale_ip() -> Optional[str]:
+    """Return this host's Tailscale IPv4 if the daemon is up + signed in,
+    else None. The tailnet IP is the address remote peers (Windows GPU
+    host, lab box) should dial — it's stable across physical networks,
+    unlike the LAN IP from _detect_lan_ip()."""
+    try:
+        out = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    ip = (out.stdout or "").strip().splitlines()
+    return ip[0].strip() if ip and ip[0].strip() else None
+
+
 _LAN_IP = _detect_lan_ip()
+_TS_IP = _detect_tailscale_ip()
 if _LAN_IP:
+    print(f"[control_panel] Linux LAN IP = {_LAN_IP} (physical network)", flush=True)
+else:
+    print("[control_panel] Linux LAN IP = <unavailable> (no route)", flush=True)
+if _TS_IP:
     print(
-        f"[control_panel] Linux LAN IP = {_LAN_IP}  "
-        f"— if Windows is in use, set FRAME_RELAY_DIAL_HOST=\"{_LAN_IP}\" "
-        f"in its config.py",
+        f"[control_panel] Linux Tailscale IP = {_TS_IP}  "
+        f"— remote peers should use this in FRAME_RELAY_DIAL_HOST "
+        f"(stable across networks)",
         flush=True,
     )
 else:
-    print("[control_panel] Linux LAN IP = <unavailable> (no route)", flush=True)
+    print(
+        "[control_panel] Tailscale not active — peers reach this box via the LAN IP above. "
+        "Run `sudo tailscale up` to get a stable tailnet IP for cross-network use.",
+        flush=True,
+    )
 
 
 def _kill_orphan_vlm_service() -> None:
