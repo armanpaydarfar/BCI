@@ -64,7 +64,7 @@ the same relay concurrently.
 
 Run as a module:
 
-    python -m Utils.frame_relay --bind 0.0.0.0 --port 5591 --hz 30
+    python -m Utils.frame_relay --bind 0.0.0.0 --port 5591 --hz 15
 
 For Phase 1 single-machine validation, --bind 127.0.0.1 keeps the relay
 loopback-only on Windows.
@@ -185,11 +185,18 @@ class FrameRelayServer:
     forward frames encoded as JPEG until the client disconnects.
 
     Frames are produced by NeonLiveReader at video rate (~30 Hz). The relay
-    downsamples to `hz` (default 10 Hz) by skipping bundles. Gaze + IMU
-    fields travel inside each forwarded envelope, which means in remote mode
-    consumers see gaze + IMU at relay_hz, not at native Neon rates. For
-    Phase 1 validation that's an accepted limitation; production may need
-    split streams (video at 10 Hz, gaze/IMU at native).
+    downsamples to `hz` (default 15 Hz — chosen to fit a UT IoT / cellular
+    uplink budget; LAN deployments can raise to 30 with --hz 30) by
+    skipping bundles. Per-client steady-state at 15 Hz × ~150 KB JPEG is
+    ~18 Mbit/s; both perception services pulling concurrently is ~36
+    Mbit/s. If you see `dropped > 0` and `bundle_age p99 > 1s` in the
+    stats line, the network is the bottleneck and `--jpeg-quality 60` is
+    the next lever (~30% smaller frames, no measurable accuracy hit).
+
+    Gaze + IMU fields travel inside each forwarded envelope, which means
+    in remote mode consumers see gaze + IMU at relay_hz, not at native
+    Neon rates. Production may need split streams (video at relay_hz,
+    gaze/IMU at native) if smoothing-quality is observed to suffer.
     """
 
     def __init__(
@@ -530,8 +537,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Linux-side Neon frame relay (TCP)")
     p.add_argument("--bind", default="0.0.0.0", help="Bind host (default 0.0.0.0)")
     p.add_argument("--port", type=int, default=5591, help="Bind port (default 5591)")
-    p.add_argument("--hz", type=float, default=30.0,
-                   help="Relay rate in Hz (default 30, matches Neon scene-camera native FPS)")
+    p.add_argument("--hz", type=float, default=15.0,
+                   help="Relay rate in Hz (default 15 — fits UT IoT / cellular "
+                        "uplink budget at q=75 JPEG; raise to 30 on LAN to match "
+                        "Neon scene-camera native FPS)")
     p.add_argument("--neon-host", default="",
                    help="Companion phone IP; empty = mDNS auto-discovery")
     p.add_argument("--jpeg-quality", type=int, default=75, help="JPEG quality 1-100")

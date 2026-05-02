@@ -188,10 +188,14 @@ FRAME_RELAY_HOST = "0.0.0.0"
 # leave it as 127.0.0.1.
 FRAME_RELAY_DIAL_HOST = "127.0.0.1"
 FRAME_RELAY_PORT = 5591
-# 30 Hz matches the Neon scene-camera FPS — the relay can't go faster
-# than the producer regardless. Drop to 10 Hz if running over a weak
-# Wi-Fi link (~1.5 MB/s vs ~4.5 MB/s at q=75 JPEG).
-FRAME_RELAY_HZ = 30.0
+# Default 15 Hz — chosen to fit a UT IoT / cellular uplink budget. With
+# both vlm_service and gaze_runner pulling concurrently the steady-state
+# wire load is ~36 Mbit/s at q=75 JPEG; comfortable on a typical IoT VLAN
+# or 5G hotspot. Raise to 30.0 on LAN to match Neon's native scene-camera
+# FPS for sharper fixation timing; at 30 Hz both consumers together push
+# ~72 Mbit/s which UT IoT will not carry. The relay can never exceed the
+# Neon producer (~30 Hz), so values above 30 are silently capped.
+FRAME_RELAY_HZ = 15.0
 
 # =============================================================================
 # VLM integration (harmony_vlm subprocess)

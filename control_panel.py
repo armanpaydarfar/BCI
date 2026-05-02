@@ -129,7 +129,7 @@ PERCEPTION_FRAME_SOURCE  = str(getattr(_HCFG, "PERCEPTION_FRAME_SOURCE", "local"
 FRAME_RELAY_DIAL_HOST = str(getattr(_HCFG, "FRAME_RELAY_DIAL_HOST", "127.0.0.1")) if _HCFG else "127.0.0.1"
 FRAME_RELAY_PORT      = int(getattr(_HCFG, "FRAME_RELAY_PORT", 5591)) if _HCFG else 5591
 FRAME_RELAY_BIND_HOST = str(getattr(_HCFG, "FRAME_RELAY_HOST", "0.0.0.0")) if _HCFG else "0.0.0.0"
-FRAME_RELAY_HZ        = float(getattr(_HCFG, "FRAME_RELAY_HZ", 30.0)) if _HCFG else 30.0
+FRAME_RELAY_HZ        = float(getattr(_HCFG, "FRAME_RELAY_HZ", 15.0)) if _HCFG else 15.0
 # When True, the panel hosts FrameRelayServer in-process so its
 # scene-tab widget can consume bundles via add_local_subscriber (raw
 # BGR, no JPEG encode/decode). Windows clients still connect to the
