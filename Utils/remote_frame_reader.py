@@ -501,9 +501,16 @@ class _RelayConnection:
 
     def _read_until_eof(self, sock: socket.socket) -> None:
         """Parse envelopes off `sock` until EOF. First envelope must be a
-        handshake; subsequent ones are frames."""
+        handshake; subsequent ones are frames.
+
+        Also exits on pause: if pause() raced with mgr_loop's connect
+        and the socket was stored AFTER pause() had already inspected
+        self._sock as None, the next loop iteration here sees _paused
+        and returns. mgr_loop's finally block then closes the socket
+        and the manager parks at the top of its outer loop.
+        """
         try:
-            while not self._user_closed.is_set():
+            while not self._user_closed.is_set() and not self._paused.is_set():
                 env = self._recv_envelope(sock)
                 if env is None:
                     return  # EOF or socket error → caller decides reconnect
