@@ -1141,22 +1141,14 @@ class ControlPanel(QMainWindow):
             embedded_relay=embedded_relay,
         )
         vl.addWidget(self.vlm_scene_widget, 1)
-        # Pause inactive / resume active backend whenever the widget
-        # transitions to "started", regardless of whether the trigger
-        # was a panel-side auto-connect (greyed-out under
-        # SERVICES_HOSTED_REMOTELY=True) or a user click on the
-        # widget's own Start button.
-        self.vlm_scene_widget.started.connect(self._sync_backend_intake)
 
     def _on_vlm_video_connect(self) -> None:
-        """Auto-connect hook invoked from on_vlm_service_start. Calling
-        widget.start() twice is idempotent. Backend-intake sync runs
-        from the widget's `started` signal — wired in
-        _build_vlm_video_tab — so it fires regardless of whether the
-        operator clicked the panel's VLM Service button or the widget's
-        own Start button."""
+        """Auto-connect hook invoked from on_vlm_service_start. The
+        VLMSceneWidget is also user-startable from its own button —
+        calling start() twice is idempotent."""
         if hasattr(self, "vlm_scene_widget"):
             self.vlm_scene_widget.start()
+            self._sync_backend_intake()
 
     def _on_vlm_video_disconnect(self) -> None:
         if hasattr(self, "vlm_scene_widget"):

@@ -247,14 +247,6 @@ class VLMSceneWidget(QWidget):
     PAINT_HZ = 30.0
     LATENCY_WINDOW = 240  # ~8 s of paint deltas at 30 Hz
 
-    # Emitted at the end of start() (and only on a transition from
-    # stopped→started). The control panel listens to drive
-    # backend-intake sync (pause inactive backend, resume active) so
-    # the same hook fires whether the user clicks the widget's own
-    # Start button or the panel auto-starts via on_vlm_service_start.
-    started = Signal()
-    stopped = Signal()
-
     def __init__(
         self,
         *,
@@ -390,7 +382,6 @@ class VLMSceneWidget(QWidget):
 
         self._paint_timer.start()
         self.lbl_status.setText("Render path: json_local — started")
-        self.started.emit()
 
     def stop(self) -> None:
         self._paint_timer.stop()
@@ -422,7 +413,6 @@ class VLMSceneWidget(QWidget):
         self._vlm_subscriber = None
         self._gaze_subscriber = None
         self.lbl_status.setText("Render path: json_local — stopped")
-        self.stopped.emit()
 
     # ── embedded-relay lifecycle ──────────────────────────────────────────
 
