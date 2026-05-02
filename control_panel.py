@@ -1148,41 +1148,10 @@ class ControlPanel(QMainWindow):
         calling start() twice is idempotent."""
         if hasattr(self, "vlm_scene_widget"):
             self.vlm_scene_widget.start()
-            self._sync_backend_intake()
 
     def _on_vlm_video_disconnect(self) -> None:
         if hasattr(self, "vlm_scene_widget"):
             self.vlm_scene_widget.stop()
-
-    def _sync_backend_intake(self) -> None:
-        """Tell the GAZE_OR_BACKEND-active service to resume frame intake
-        and the inactive one to pause. Enforces single-active-backend
-        end-to-end so only one perception service consumes relay
-        bandwidth at a time. Fire-and-forget on a daemon thread —
-        UDP timeout would otherwise block the Qt event loop for up
-        to ~1 s when a service is unreachable.
-        """
-        active_target = (VLM_SERVICE_HOST, VLM_SERVICE_PORT) \
-            if GAZE_OR_BACKEND == "vlm" else (GAZE_SERVICE_HOST, GAZE_SERVICE_PORT)
-        inactive_target = (GAZE_SERVICE_HOST, GAZE_SERVICE_PORT) \
-            if GAZE_OR_BACKEND == "vlm" else (VLM_SERVICE_HOST, VLM_SERVICE_PORT)
-
-        def _worker() -> None:
-            from Utils.perception_clients import udp_request
-            for target, payload in (
-                (active_target,   {"cmd": "resume_intake"}),
-                (inactive_target, {"cmd": "pause_intake"}),
-            ):
-                try:
-                    udp_request(target[0], int(target[1]), payload, 0.8)
-                except Exception:
-                    # Silent — service unreachable / older version. The
-                    # widget keeps working; only the bandwidth-saving
-                    # optimisation is lost.
-                    pass
-
-        threading.Thread(target=_worker, daemon=True,
-                         name="panel-backend-sync").start()
 
     def _build_runtime_config_tab(self, tabs: QTabWidget):
         rtc = QWidget()

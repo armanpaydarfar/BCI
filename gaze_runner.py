@@ -303,47 +303,7 @@ class GazeUDPServer(threading.Thread):
         if cmd == "unsubscribe":
             return self._handle_unsubscribe(req)
 
-        if cmd == "pause_intake":
-            return self._handle_pause_intake()
-
-        if cmd == "resume_intake":
-            return self._handle_resume_intake()
-
         return {"ok": False, "error": f"unknown cmd '{cmd}'"}
-
-    def _handle_pause_intake(self) -> Dict[str, Any]:
-        """Pause the relay-client TCP connection so this service stops
-        consuming frames. Used by the panel for single-active-backend
-        end-to-end via GAZE_OR_BACKEND. Service stays alive — only the
-        frame wire is torn down. No-op when frame_source=local (no
-        underlying RemoteNeonDevice to pause)."""
-        device = getattr(self.system, "_device", None)
-        pause = getattr(device, "pause", None)
-        if not callable(pause):
-            return {"ok": False, "cmd": "pause_intake",
-                    "error": "intake_pause_unsupported",
-                    "hint": "gaze_system is using a local Neon device, not a remote relay client"}
-        try:
-            pause()
-        except Exception as e:
-            return {"ok": False, "cmd": "pause_intake",
-                    "error": f"pause failed: {e}"}
-        self.log("intake paused (relay TCP client torn down)")
-        return {"ok": True, "cmd": "pause_intake", "paused": True}
-
-    def _handle_resume_intake(self) -> Dict[str, Any]:
-        device = getattr(self.system, "_device", None)
-        resume = getattr(device, "resume", None)
-        if not callable(resume):
-            return {"ok": False, "cmd": "resume_intake",
-                    "error": "intake_resume_unsupported"}
-        try:
-            resume()
-        except Exception as e:
-            return {"ok": False, "cmd": "resume_intake",
-                    "error": f"resume failed: {e}"}
-        self.log("intake resumed")
-        return {"ok": True, "cmd": "resume_intake", "paused": False}
 
     # ── subscribe-mode JSON push (Render_Layer_Refactor.md §3) ────────────
 

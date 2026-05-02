@@ -407,8 +407,6 @@ class VLMService:
             "camera_matrix": lambda: self._cmd_camera_matrix(),
             "subscribe": lambda: self._cmd_subscribe(req, addr),
             "unsubscribe": lambda: self._cmd_unsubscribe(req),
-            "pause_intake": lambda: self._cmd_pause_intake(),
-            "resume_intake": lambda: self._cmd_resume_intake(),
             "stop": lambda: self._cmd_stop(addr),
         }
         handler = handlers.get(cmd)
@@ -848,37 +846,6 @@ class VLMService:
             "camera_matrix": K.tolist(),
             "distortion_coeffs": dist.tolist() if dist is not None else None,
         }
-
-    def _cmd_pause_intake(self) -> dict:
-        """Pause the relay-client TCP connection so this service stops
-        consuming bundles. Service stays alive for status/decide/segment
-        replies (those operate on the last cached bundle); only the wire
-        is torn down. Used by the panel when GAZE_OR_BACKEND switches
-        and only one of the two perception services should be pulling
-        frames end-to-end. No-op when frame_source=local."""
-        pause = getattr(self.reader, "pause", None)
-        if not callable(pause):
-            return {"ok": False, "error": "intake_pause_unsupported",
-                    "hint": "service is using a local Neon reader, not a remote relay client"}
-        try:
-            pause()
-        except Exception as e:
-            return {"ok": False, "error": f"pause failed: {e}"}
-        _log("intake paused (relay TCP client torn down)")
-        return {"ok": True, "paused": True}
-
-    def _cmd_resume_intake(self) -> dict:
-        """Counterpart of pause_intake. Lets the manager loop reconnect
-        to the relay. No-op when already running or when frame_source=local."""
-        resume = getattr(self.reader, "resume", None)
-        if not callable(resume):
-            return {"ok": False, "error": "intake_resume_unsupported"}
-        try:
-            resume()
-        except Exception as e:
-            return {"ok": False, "error": f"resume failed: {e}"}
-        _log("intake resumed")
-        return {"ok": True, "paused": False}
 
     def _cmd_stop(self, addr: tuple) -> dict:
         """Shut the service down. Honoured only from loopback unless the
