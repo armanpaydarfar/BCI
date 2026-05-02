@@ -278,6 +278,12 @@ class _RelayConnection:
         # use it as the sole exit condition. Don't conflate it with
         # transient disconnects.
         self._user_closed = threading.Event()
+        # `_paused` is set by pause() and cleared by resume(). When set,
+        # the manager loop tears down any active connection and parks
+        # until cleared. Lets the operator-side panel toggle the relay
+        # client off without exiting the service — used to enforce
+        # single-active-backend end-to-end via GAZE_OR_BACKEND.
+        self._paused = threading.Event()
         # `_connected` reflects whether the wire is currently up AND the
         # most recent handshake has arrived.
         self._connected = threading.Event()
@@ -343,6 +349,39 @@ class _RelayConnection:
             except queue.Full:
                 pass
 
+    def pause(self) -> None:
+        """Tear down any active TCP connection and stop the manager loop
+        from reconnecting until resume() is called. Idempotent.
+
+        Used by the panel to enforce single-active-backend end-to-end:
+        when GAZE_OR_BACKEND switches from one service to the other,
+        the inactive service's intake is paused so it stops consuming
+        relay bandwidth on the GPU host. The service stays alive — its
+        UDP request-reply surface keeps responding — only the frame
+        wire is torn down.
+        """
+        self._paused.set()
+        with self._sock_lock:
+            sock = self._sock
+            self._sock = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def resume(self) -> None:
+        """Allow the manager loop to reconnect to the relay. Idempotent."""
+        self._paused.clear()
+
+    @property
+    def paused(self) -> bool:
+        return self._paused.is_set()
+
     # ── subscription markers ──────────────────────────────────────────────
 
     def enable_frame_bundle(self) -> None:
@@ -391,10 +430,22 @@ class _RelayConnection:
     # ── internals ─────────────────────────────────────────────────────────
 
     def _mgr_loop(self) -> None:
-        """Connect → read until EOF → backoff → retry, until close()."""
+        """Connect → read until EOF → backoff → retry, until close().
+        When `_paused` is set, parks here until cleared."""
         backoff = self._BACKOFF_INITIAL_S
         attempt = 0
         while not self._user_closed.is_set():
+            # Park while paused. Resume restarts the connect cycle from
+            # a clean attempt count and reset backoff.
+            if self._paused.is_set():
+                while self._paused.is_set() and not self._user_closed.is_set():
+                    self._user_closed.wait(timeout=0.5)
+                if self._user_closed.is_set():
+                    break
+                attempt = 0
+                backoff = self._BACKOFF_INITIAL_S
+                _log("intake resumed; reconnecting to relay")
+                continue
             attempt += 1
             sock: Optional[socket.socket] = None
             try:
@@ -644,6 +695,16 @@ class RemoteFrameReader:
     def close(self) -> None:
         self._conn.close()
 
+    def pause(self) -> None:
+        self._conn.pause()
+
+    def resume(self) -> None:
+        self._conn.resume()
+
+    @property
+    def paused(self) -> bool:
+        return self._conn.paused
+
 
 def _build_bundle_stub(hdr: Dict[str, Any], bgr: np.ndarray) -> _FrameBundleStub:
     video = _VideoFrameStub(
@@ -766,6 +827,16 @@ class RemoteNeonDevice:
 
     def close(self) -> None:
         self._conn.close()
+
+    def pause(self) -> None:
+        self._conn.pause()
+
+    def resume(self) -> None:
+        self._conn.resume()
+
+    @property
+    def paused(self) -> bool:
+        return self._conn.paused
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostic
         return f"<RemoteNeonDevice {self._conn.host}:{self._conn.port}>"
