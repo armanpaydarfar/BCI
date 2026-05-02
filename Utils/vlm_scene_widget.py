@@ -361,13 +361,16 @@ class VLMSceneWidget(QWidget):
             )
             self._bundle_thread.start()
 
-        # 2. VLM push subscriber.
-        self._vlm_subscriber = _JsonPushSubscriber(
-            self._vlm_host, self._vlm_port, hz=self.PAINT_HZ,
-        )
-        self._vlm_subscriber.payload_received.connect(self._on_vlm_payload)
-        self._vlm_subscriber.state_changed.connect(self._on_vlm_state)
-        self._vlm_subscriber.start()
+        # 2. VLM push subscriber (optional). The control panel can pass
+        #    vlm_host=None to skip this — used when GAZE_OR_BACKEND is
+        #    set to "legacy" so the panel only subscribes to gaze_runner.
+        if self._vlm_host and self._vlm_port:
+            self._vlm_subscriber = _JsonPushSubscriber(
+                self._vlm_host, self._vlm_port, hz=self.PAINT_HZ,
+            )
+            self._vlm_subscriber.payload_received.connect(self._on_vlm_payload)
+            self._vlm_subscriber.state_changed.connect(self._on_vlm_state)
+            self._vlm_subscriber.start()
 
         # 3. Gaze push subscriber (optional).
         if self._gaze_host and self._gaze_port:

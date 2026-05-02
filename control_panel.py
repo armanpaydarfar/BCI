@@ -1115,11 +1115,27 @@ class ControlPanel(QMainWindow):
                 "neon_host": NEON_COMPANION_HOST,
                 "repo_dir": VLM_REPO_DIR,
             }
+        # GAZE_OR_BACKEND selects which perception service the panel
+        # subscribes to (same semantic as ExperimentDriver_Online_GazeTracking
+        # uses to pick the active backend):
+        #   "vlm"    → only subscribe to vlm_service.py (UDP 5589). The
+        #              gaze_runner channel is left dark.
+        #   "legacy" → only subscribe to gaze_runner.py (UDP 5588). The
+        #              VLM channel is left dark.
+        # Either subscriber's _JsonPushSubscriber heartbeats every ~10 s,
+        # so a service that goes down then comes back is reconnected
+        # automatically with no panel restart.
+        if GAZE_OR_BACKEND == "vlm":
+            vlm_host_arg, vlm_port_arg = VLM_SERVICE_HOST, VLM_SERVICE_PORT
+            gaze_host_arg, gaze_port_arg = None, None
+        else:
+            vlm_host_arg, vlm_port_arg = None, None
+            gaze_host_arg, gaze_port_arg = GAZE_SERVICE_HOST, GAZE_SERVICE_PORT
         self.vlm_scene_widget = VLMSceneWidget(
-            vlm_host=VLM_SERVICE_HOST,
-            vlm_port=VLM_SERVICE_PORT,
-            gaze_host=GAZE_SERVICE_HOST,
-            gaze_port=GAZE_SERVICE_PORT,
+            vlm_host=vlm_host_arg,
+            vlm_port=vlm_port_arg,
+            gaze_host=gaze_host_arg,
+            gaze_port=gaze_port_arg,
             relay_dial_host=FRAME_RELAY_DIAL_HOST,
             relay_dial_port=FRAME_RELAY_PORT,
             embedded_relay=embedded_relay,
