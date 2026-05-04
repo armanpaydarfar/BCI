@@ -55,6 +55,65 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 
+# Live-overlay detection cap. Paint cost on the Linux side is O(N) full-canvas
+# alpha blends (Utils/scene_overlay_renderer.py). Capping N here keeps the
+# overlay budget bounded; one-shot segment/decide command paths intentionally
+# bypass this filter so the reasoner sees the full mask set.
+_OVERLAY_TOP_K = 20
+_OVERLAY_CONTAIN_RATIO = 0.85
+_OVERLAY_AREA_RATIO = 0.5
+
+
+def _filter_overlay_dets(dets):
+    """Reduce detection count for the live segment-stream cache.
+
+    Two passes:
+      1. Top-K by confidence — caps live-overlay paint cost.
+      2. Containment drop — if det B is mostly inside det A
+         (intersection / area(B) > _OVERLAY_CONTAIN_RATIO) AND
+         area(B) < _OVERLAY_AREA_RATIO × area(A), drop B. Targets
+         FastSAM-everything's parent+children pattern (e.g. monitor
+         co-segmented with icons on the monitor); the gaze-pointing
+         workflow prefers the parent.
+
+    Applied only to the seg-stream cache; segment/decide one-shots are
+    unfiltered.
+    """
+    if not dets:
+        return dets
+
+    if len(dets) > _OVERLAY_TOP_K:
+        dets = sorted(dets, key=lambda d: float(d.confidence), reverse=True)[:_OVERLAY_TOP_K]
+
+    def _bbox_area(d):
+        x1, y1, x2, y2 = d.box_xyxy
+        return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+    def _intersection(a, b):
+        ax1, ay1, ax2, ay2 = a.box_xyxy
+        bx1, by1, bx2, by2 = b.box_xyxy
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        return (ix2 - ix1) * (iy2 - iy1)
+
+    areas = [_bbox_area(d) for d in dets]
+    drop = [False] * len(dets)
+    for i, di in enumerate(dets):
+        if drop[i] or areas[i] <= 0:
+            continue
+        for j, dj in enumerate(dets):
+            if i == j or drop[j] or areas[j] <= 0:
+                continue
+            if areas[j] >= _OVERLAY_AREA_RATIO * areas[i]:
+                continue
+            if _intersection(di, dj) / areas[j] > _OVERLAY_CONTAIN_RATIO:
+                drop[j] = True
+
+    return [d for d, dropped in zip(dets, drop) if not dropped]
+
+
 class SnapshotCache:
     """
     Bounded TTL cache of captured frame+gaze+detections+waypoints snapshots.
@@ -540,6 +599,7 @@ class VLMService:
 
             try:
                 dets = self.detector.detect(bundle.video.bgr)
+                dets = _filter_overlay_dets(dets)
                 self._cache_dets(dets)
             except Exception as e:
                 if self.args.verbose:
@@ -1137,7 +1197,12 @@ def main() -> None:
         reader = NeonLiveReader(host=args.neon_host or None)
 
     _log(f"loading segmentation model: {args.seg_model} on {args.device}…")
-    detector = ObjectDetector(model_size=args.seg_model, device=args.device)
+    # conf_threshold raised from harmony_vlm's 0.4 default — at 0.4 the
+    # FastSAM-everything output is dense enough (40+ masks under bright lab
+    # lighting) to swamp the Linux overlay's per-detection alpha blend.
+    detector = ObjectDetector(
+        model_size=args.seg_model, device=args.device, conf_threshold=0.6,
+    )
 
     depth_estimator = None
     if args.enable_depth:
