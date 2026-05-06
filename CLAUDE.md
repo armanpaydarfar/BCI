@@ -119,16 +119,36 @@ realtime but not in the critical path.
 
 ---
 
-## config.py
+## config.py and config_local.py
 
-- `config.py` changes may be proposed and committed from either machine.
+- `config.py` is **global and committed**. It holds algorithm /
+  decoder / EEG / protocol settings, plus *safe defaults* for every
+  machine-local key (loopback IPs, empty paths, `False` flags). Changes
+  here are committed from either machine.
 
-- The following two lines are **always machine-local and must never be
-  committed**:
-  ```python
-  WORKING_DIR = "..."
-  DATA_DIR    = "..."
+- `config_local.py` is **per-machine and gitignored**. It supplies real
+  values for paths and network endpoints on this host. `config.py`
+  imports it via `from config_local import *` at the bottom of the file,
+  so anything defined in `config_local.py` shadows the default.
+
+- A new machine bootstraps with:
+  ```bash
+  cp config_local.example.py config_local.py
+  # edit config_local.py
   ```
+
+- The following keys are machine-local and must only be assigned in
+  `config_local.py`. A pre-commit hook
+  (`~/.claude/hooks/config-py-guard.sh`) blocks any non-default value
+  for these keys appearing in a staged `config.py` diff:
+  - `WORKING_DIR`, `DATA_DIR`
+  - `GAZE_UDP_IP`, `GAZE_BIND_HOST`
+  - `NEON_COMPANION_HOST`
+  - `PERCEPTION_FRAME_SOURCE`, `SERVICES_HOSTED_REMOTELY`
+  - `FRAME_RELAY_HOST`, `FRAME_RELAY_DIAL_HOST`
+  - `VLM_REPO_DIR`
+  - `VLM_SERVICE_HOST`, `VLM_BIND_HOST`
+  - `ARDUINO_PORT`
 
 - All other config changes are safe to commit provided they are
   platform-neutral.
@@ -266,8 +286,12 @@ the reference in the commit message and relevant docstrings.
   feature branches.)
 - Stage files individually — never `git add .` or `git add -A`. (A
   PreToolUse hook blocks the wildcard forms.)
-- Do not commit `WORKING_DIR` / `DATA_DIR` lines from `config.py`. (A
-  PreToolUse hook blocks `git commit` if these lines are staged.)
+- Do not commit machine-local keys (paths, network IPs, USB device
+  paths) into `config.py`; they belong in `config_local.py`. (A
+  PreToolUse hook blocks `git commit` if a staged `config.py` diff
+  assigns one of these keys to a non-default value. The full list of
+  guarded keys is in the `config.py and config_local.py` section
+  above.)
 - Commit messages should explain *why*, not just *what*.
 - All commits must be compatible with Linux (CPU) regardless of which
   machine they were developed on.
