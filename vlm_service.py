@@ -49,6 +49,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -191,11 +192,35 @@ def parse_args():
     # service from across the network (e.g. for scripted teardowns).
     p.add_argument("--allow-remote-stop", action="store_true",
                    help="Honour cmd=stop from non-loopback addresses (off by default)")
+    # Anonymous service-side log file. Defaults to ~/.harmony_vlm_logs/
+    # (host-local, NOT under any subject directory) — the GPU host runs
+    # continuously across multiple subjects and this log is only read
+    # for service-level troubleshooting. Set "" / "off" / "none" to
+    # disable file logging entirely; stdout is unaffected.
+    p.add_argument("--service-log-dir", default=None,
+                   help="Directory for the service-side log file. "
+                        "Default: ~/.harmony_vlm_logs/. Pass an empty "
+                        "string to disable.")
     return p.parse_args()
 
 
+# Module-level handle for the anonymous service log, opened in main()
+# once --service-log-dir is resolved. _log() tees to it when present.
+_LOG_FILE = None
+
+
 def _log(msg: str) -> None:
-    print(f"[vlm_service] {msg}", flush=True)
+    line = f"[vlm_service] {msg}"
+    print(line, flush=True)
+    fh = _LOG_FILE
+    if fh is not None:
+        try:
+            fh.write(f"{datetime.now().isoformat(timespec='milliseconds')} {line}\n")
+            fh.flush()
+        except OSError:
+            # Disk drop-out shouldn't crash the service. Stop tee'ing
+            # by clearing the global; stdout still works.
+            globals()["_LOG_FILE"] = None
 
 
 def _disable_udp_connreset(sock) -> None:
@@ -1266,8 +1291,53 @@ def _serialize_decision_for_push(decision: dict) -> dict:
     return {k: decision[k] for k in keep if k in decision}
 
 
+def _open_service_log_file(arg_value):
+    """Open the anonymous service log unless explicitly disabled.
+
+    arg_value semantics:
+      - None        → use default (~/.harmony_vlm_logs/)
+      - ""/off/none → disable file logging entirely
+      - any other   → use that directory verbatim
+    The directory is host-local and intentionally NOT under any
+    subject path: the GPU host runs across multiple subjects and the
+    Linux operator panel owns the subject-tied logs.
+    """
+    if arg_value is not None and arg_value.strip().lower() in ("", "off", "none"):
+        return None, None
+    log_dir = arg_value if arg_value else os.path.join(
+        os.path.expanduser("~"), ".harmony_vlm_logs"
+    )
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError as e:
+        _log(f"WARN: could not create service log dir {log_dir}: {e}; file logging disabled")
+        return None, None
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(log_dir, f"vlm_service_{ts}.log")
+    try:
+        fh = open(path, "a", encoding="utf-8")
+        fh.write(
+            f"# vlm_service log opened {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"# host=anonymous service-side log; not tied to any subject\n"
+        )
+        fh.flush()
+    except OSError as e:
+        _log(f"WARN: could not open service log file {path}: {e}; file logging disabled")
+        return None, None
+    return fh, path
+
+
 def main() -> None:
     args = parse_args()
+
+    # Open the anonymous service log before anything else can _log() —
+    # otherwise the early FATAL paths below escape the file. The
+    # globals() set is intentional; _log() reads the module attribute.
+    global _LOG_FILE
+    _log_fh, _log_path = _open_service_log_file(args.service_log_dir)
+    _LOG_FILE = _log_fh
+    if _log_path is not None:
+        _log(f"service log file: {_log_path}")
 
     repo_dir = os.path.abspath(args.repo_dir)
     if not os.path.isdir(repo_dir):
@@ -1389,6 +1459,17 @@ def main() -> None:
         service.stop()
         _sleep_release()
         _log("stopped")
+        # Close the anonymous service log last so the "stopped" line
+        # makes it onto disk before the handle goes away.
+        global _LOG_FILE
+        fh = _LOG_FILE
+        _LOG_FILE = None
+        if fh is not None:
+            try:
+                fh.write(f"# vlm_service log closed {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                fh.close()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

@@ -688,6 +688,17 @@ class ControlPanel(QMainWindow):
         # Logs
         self._log_buffers: Dict[str, str] = {"Marker": "", "FES": "", "Driver": "", "Gaze": "", "VLM": "", "Robot": "", "Panel": ""}
         self._current_log_target = "Panel"
+        # Subject-tied VLM log file. Captures only the "VLM" buffer
+        # (vlm_service stdout when local + every panel-side UDP TX/RX
+        # trace + the periodic seg-stream readouts). Other buffers are
+        # intentionally NOT teed here — Marker/FES/Driver have their
+        # own files via their respective scripts; Robot/Gaze/Panel
+        # stay in-memory only for now (revisit if a forensic need
+        # appears). Path mirrors marker_logs / impedance_logs naming.
+        self._vlm_log_subject: Optional[str] = None
+        self._vlm_log_path: Optional[str] = None
+        self._vlm_log_fh = None
+        self._open_vlm_log_file(self.training_subject)
 
         # Build UI
         self._build_ui()
@@ -1694,11 +1705,17 @@ class ControlPanel(QMainWindow):
         if not val:
             QMessageBox.warning(self, "Subject", "Subject cannot be empty.")
             return
+        prev_subject = self.training_subject
         self.training_subject = val
         write_training_subject(val)
         for p in (self.marker, self.driver, self.fes, self.gaze_runner, self.gaze_service, self.vlm_service):
             p.env["TRAINING_SUBJECT"] = self.training_subject
         self._append_log("Panel", f"[{self._ts()}] TRAINING_SUBJECT saved: {val}\n")
+        # Rotate the VLM log file into the new subject's directory so
+        # session events stay sorted by who they belong to. No-op if
+        # the subject hasn't actually changed.
+        if val != prev_subject:
+            self._open_vlm_log_file(val)
         if hasattr(self, "on_refresh_training_data_list"):
             self.on_refresh_training_data_list()
 
@@ -2841,6 +2858,61 @@ class ControlPanel(QMainWindow):
         full = f'gnome-terminal -- bash -lc "{quoted}; exec bash"'
         subprocess.Popen(full, shell=True)
 
+    def _open_vlm_log_file(self, subject: str) -> None:
+        """Open (or rotate to) the subject-tied VLM log file under
+        ``<DATA_DIR>/sub-<SUBJECT>/vlm_logs/``. Closes any prior handle
+        first so a subject change cleanly switches files. Safe to call
+        before _HCFG / DATA_DIR is set — it just no-ops in that case
+        and logs land only in the in-memory panel buffer.
+        """
+        self._close_vlm_log_file()
+        if not subject or _HCFG is None:
+            return
+        data_dir = os.path.expanduser(getattr(_HCFG, "DATA_DIR", "") or "")
+        if not data_dir:
+            return
+        try:
+            log_dir = os.path.join(data_dir, f"sub-{subject}", "vlm_logs")
+            os.makedirs(log_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(log_dir, f"vlm_panel_{ts}.log")
+            fh = open(path, "a", encoding="utf-8")
+            # Header — one line per panel launch / subject rotation so a
+            # later reader can match the file to a config snapshot.
+            fh.write(
+                f"# vlm_panel log opened {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"# subject={subject}\n"
+                f"# GAZE_OR_BACKEND={GAZE_OR_BACKEND}\n"
+                f"# PERCEPTION_FRAME_SOURCE={PERCEPTION_FRAME_SOURCE}\n"
+                f"# SERVICES_HOSTED_REMOTELY={SERVICES_HOSTED_REMOTELY}\n"
+                f"# VLM_SERVICE_HOST={VLM_SERVICE_HOST}\n"
+                f"# VLM_MODEL={VLM_MODEL}\n"
+            )
+            fh.flush()
+        except OSError as e:
+            # Disk full / permission denied / etc. — surface in the panel
+            # buffer and keep running with file logging disabled.
+            self._append_log(
+                "Panel",
+                f"[{self._ts()}] WARN: could not open VLM log file: {e}\n",
+            )
+            return
+        self._vlm_log_subject = subject
+        self._vlm_log_path = path
+        self._vlm_log_fh = fh
+
+    def _close_vlm_log_file(self) -> None:
+        fh = self._vlm_log_fh
+        if fh is not None:
+            try:
+                fh.write(f"# vlm_panel log closed {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                fh.close()
+            except OSError:
+                pass
+        self._vlm_log_fh = None
+        self._vlm_log_path = None
+        self._vlm_log_subject = None
+
     def _append_log(self, title: str, text: str):
         key = title if title in self._log_buffers else "Panel"
         self._log_buffers[key] = (self._log_buffers.get(key, "") + text)[-2_000_000:]
@@ -2849,6 +2921,16 @@ class ControlPanel(QMainWindow):
             self.txt_logs.insertPlainText(text)
             self.txt_logs.moveCursor(QTextCursor.End)
             self.txt_logs.ensureCursorVisible()
+        # Tee VLM events to the subject-tied log file. Other buffers
+        # stay in-memory only — see _open_vlm_log_file docstring.
+        if key == "VLM" and self._vlm_log_fh is not None:
+            try:
+                self._vlm_log_fh.write(text)
+                self._vlm_log_fh.flush()
+            except OSError:
+                # If the disk drops out mid-session there's nothing useful
+                # to do but stop tee'ing — the panel buffer still works.
+                self._close_vlm_log_file()
 
     def _append_log_ui(self, title: str, text: str):
         # Force execution on the Qt main thread by providing a receiver (self).
@@ -2910,6 +2992,10 @@ class ControlPanel(QMainWindow):
         # conda-launched python orphaned itself between terminate and exit.
         try:
             _kill_orphan_vlm_service()
+        except Exception:
+            pass
+        try:
+            self._close_vlm_log_file()
         except Exception:
             pass
         event.accept()
