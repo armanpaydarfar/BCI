@@ -422,13 +422,46 @@ def write_fes_toggle(val: int):
     write_atomic(CONFIG_PY, new)
 
 
+CONFIG_LOCAL_PY = os.path.join(ROOT, "config_local.py")
+
+# Keys that live in config_local.py (machine-local). config.py holds safe
+# defaults; the bottom of config.py does `from config_local import *` so a
+# value set here shadows the default at import time. Mirrored in
+# ~/.claude/hooks/config-py-guard.sh — keep both lists in sync.
+LOCAL_CONFIG_KEYS = frozenset({
+    "WORKING_DIR", "DATA_DIR",
+    "GAZE_UDP_IP", "GAZE_BIND_HOST",
+    "NEON_COMPANION_HOST",
+    "PERCEPTION_FRAME_SOURCE", "SERVICES_HOSTED_REMOTELY",
+    "FRAME_RELAY_HOST", "FRAME_RELAY_DIAL_HOST",
+    "VLM_REPO_DIR",
+    "VLM_SERVICE_HOST", "VLM_BIND_HOST",
+    "ARDUINO_PORT",
+})
+
+
 def _assign_line_re(name: str) -> re.Pattern:
     return re.compile(rf"^(\s*{re.escape(name)}\s*=\s*)([^#\n]+?)(\s*(#.*)?)\s*$", re.M)
 
 
+def _find_assignment(name: str):
+    """Return (file_path, match_object) for the first config file that
+    contains an assignment to ``name``. config_local.py is checked first
+    so local overrides take precedence — same precedence the live import
+    uses at runtime. Returns (None, None) if neither file has the key."""
+    pat = _assign_line_re(name)
+    if os.path.isfile(CONFIG_LOCAL_PY):
+        m = pat.search(read_text(CONFIG_LOCAL_PY))
+        if m:
+            return CONFIG_LOCAL_PY, m
+    m = pat.search(read_text(CONFIG_PY))
+    if m:
+        return CONFIG_PY, m
+    return None, None
+
+
 def _read_float_key(name: str, default: float) -> float:
-    txt = read_text(CONFIG_PY)
-    m = _assign_line_re(name).search(txt)
+    _, m = _find_assignment(name)
     if not m:
         return default
     try:
@@ -438,8 +471,7 @@ def _read_float_key(name: str, default: float) -> float:
 
 
 def _read_int_key(name: str, default: int) -> int:
-    txt = read_text(CONFIG_PY)
-    m = _assign_line_re(name).search(txt)
+    _, m = _find_assignment(name)
     if not m:
         return default
     try:
@@ -449,8 +481,7 @@ def _read_int_key(name: str, default: int) -> int:
 
 
 def _read_bool_key(name: str, default: bool) -> bool:
-    txt = read_text(CONFIG_PY)
-    m = _assign_line_re(name).search(txt)
+    _, m = _find_assignment(name)
     if not m:
         return default
     v = m.group(2).strip()
@@ -462,8 +493,7 @@ def _read_bool_key(name: str, default: bool) -> bool:
 
 
 def _read_quoted_str_key(name: str, default: str) -> str:
-    txt = read_text(CONFIG_PY)
-    m = _assign_line_re(name).search(txt)
+    _, m = _find_assignment(name)
     if not m:
         return default
     raw = m.group(2).strip()
@@ -472,7 +502,37 @@ def _read_quoted_str_key(name: str, default: str) -> str:
     return raw
 
 
+def _write_assign_rhs_local(name: str, rhs: str) -> None:
+    """Write/update an assignment in config_local.py.
+
+    config_local.py is gitignored and may not exist on a fresh checkout —
+    if missing, we create it with a single-line header. If the key is
+    already assigned, the line is rewritten in place; otherwise a new
+    line is appended.
+    """
+    header = (
+        "# Machine-local config overrides. Gitignored. Loaded by config.py\n"
+        "# via `from config_local import *`. Schema in config_local.example.py.\n"
+    )
+    if not os.path.isfile(CONFIG_LOCAL_PY):
+        write_atomic(CONFIG_LOCAL_PY, header)
+    txt = read_text(CONFIG_LOCAL_PY)
+    pat = _assign_line_re(name)
+    if pat.search(txt):
+        new = pat.sub(rf"\g<1>{rhs}\3", txt, count=1)
+    else:
+        sep = "" if (txt.endswith("\n") or txt == "") else "\n"
+        new = txt + f"{sep}{name} = {rhs}\n"
+    write_atomic(CONFIG_LOCAL_PY, new)
+
+
 def _write_assign_rhs(name: str, rhs: str):
+    """Route writes to the right file. Machine-local keys land in
+    config_local.py; everything else stays in config.py (where the
+    runtime-config tab's algorithm settings live)."""
+    if name in LOCAL_CONFIG_KEYS:
+        _write_assign_rhs_local(name, rhs)
+        return
     txt = read_text(CONFIG_PY)
     pat = _assign_line_re(name)
     if not pat.search(txt):
@@ -504,13 +564,10 @@ def read_arduino_baud_from_config(default: int = 9600) -> int:
 
 
 def write_arduino_port_to_config(port: str):
-    txt = read_text(CONFIG_PY)
-    if ARDUINO_PORT_RE.search(txt):
-        new = ARDUINO_PORT_RE.sub(rf'\g<1>"{port}"\3', txt, count=1)
-    else:
-        sep = "" if (txt.endswith("\n") or txt == "") else "\n"
-        new = txt + f'{sep}ARDUINO_PORT = "{port}"\n'
-    write_atomic(CONFIG_PY, new)
+    """ARDUINO_PORT is machine-local — route through the local writer so
+    the value lands in config_local.py rather than the committed
+    config.py default."""
+    _write_assign_rhs_local("ARDUINO_PORT", f'"{port}"')
 
 
 def write_arduino_baud_to_config(baud: int):
@@ -1179,8 +1236,13 @@ class ControlPanel(QMainWindow):
         tabs.addTab(rtc, "Runtime config")
         outer = QVBoxLayout(rtc)
         outer.addWidget(QLabel(
-            "<b>Edits config.py on disk.</b> Restart Marker/Driver/FES after changing simulation "
-            "or network flags (<code>Utils/networking</code> caches SIMULATION_MODE at import)."
+            "<b>Edits config.py / config_local.py on disk.</b> "
+            "Machine-local keys (PERCEPTION_FRAME_SOURCE, "
+            "SERVICES_HOSTED_REMOTELY) write to config_local.py; "
+            "everything else writes to config.py. Restart "
+            "Marker/Driver/FES after changing simulation or network "
+            "flags (<code>Utils/networking</code> caches SIMULATION_MODE "
+            "at import)."
         ))
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1231,6 +1293,23 @@ class ControlPanel(QMainWindow):
         self.rc_shape_min.setRange(0.0, 1.0)
         self.rc_shape_min.setSingleStep(0.01)
         self.rc_shape_min.setDecimals(2)
+
+        # Perception / VLM section (mix of global + machine-local keys —
+        # the writer routes by key name).
+        self.rc_gaze_backend = QComboBox()
+        self.rc_gaze_backend.addItems(["legacy", "vlm"])
+        self.rc_perception_source = QComboBox()
+        self.rc_perception_source.addItems(["local", "remote"])
+        self.rc_services_remote = QCheckBox("SERVICES_HOSTED_REMOTELY (panel → remote GPU host; machine-local)")
+        self.rc_relay_hz = QDoubleSpinBox()
+        self.rc_relay_hz.setRange(1.0, 30.0)
+        self.rc_relay_hz.setSingleStep(1.0)
+        self.rc_relay_hz.setDecimals(1)
+        self.rc_relay_hz.setSuffix(" Hz")
+        self.rc_vlm_depth = QCheckBox("VLM_ENABLE_DEPTH (load Depth Pro at vlm_service start)")
+        self.rc_arduino_baud = QSpinBox()
+        self.rc_arduino_baud.setRange(300, 1_000_000)
+        self.rc_arduino_baud.setSingleStep(100)
         form.addRow("DECODER_BACKEND", self.rc_decoder)
         form.addRow("EARLYSTOP_MODE", self.rc_earlystop)
         form.addRow("CLASS_VISUAL_STYLE", self.rc_visual)
@@ -1253,6 +1332,15 @@ class ControlPanel(QMainWindow):
         form.addRow("TOTAL_TRIALS", self.rc_total_trials)
         form.addRow("SHAPE_MAX", self.rc_shape_max)
         form.addRow("SHAPE_MIN", self.rc_shape_min)
+
+        # Perception / VLM rows — mark local keys explicitly in the label
+        # so the operator knows which file the Apply will touch.
+        form.addRow("GAZE_OR_BACKEND", self.rc_gaze_backend)
+        form.addRow("PERCEPTION_FRAME_SOURCE  [local]", self.rc_perception_source)
+        form.addRow(self.rc_services_remote)
+        form.addRow("FRAME_RELAY_HZ", self.rc_relay_hz)
+        form.addRow(self.rc_vlm_depth)
+        form.addRow("ARDUINO_BAUD", self.rc_arduino_baud)
         scroll.setWidget(inner)
         outer.addWidget(scroll, 1)
         btn_row = QHBoxLayout()
@@ -1296,7 +1384,17 @@ class ControlPanel(QMainWindow):
         self.rc_total_trials.setValue(_read_int_key("TOTAL_TRIALS", 10))
         self.rc_shape_max.setValue(_read_float_key("SHAPE_MAX", 0.7))
         self.rc_shape_min.setValue(_read_float_key("SHAPE_MIN", 0.5))
-        self._append_log("Panel", f"[{self._ts()}] Runtime config widgets reloaded from config.py\n")
+        # Perception / VLM (readers consult config_local.py first, then
+        # config.py — same precedence as the live import).
+        gob = _read_quoted_str_key("GAZE_OR_BACKEND", "legacy").lower()
+        self._rc_set_combo(self.rc_gaze_backend, gob if gob in ("legacy", "vlm") else "legacy")
+        pfs = _read_quoted_str_key("PERCEPTION_FRAME_SOURCE", "local").lower()
+        self._rc_set_combo(self.rc_perception_source, pfs if pfs in ("local", "remote") else "local")
+        self.rc_services_remote.setChecked(_read_bool_key("SERVICES_HOSTED_REMOTELY", False))
+        self.rc_relay_hz.setValue(_read_float_key("FRAME_RELAY_HZ", 15.0))
+        self.rc_vlm_depth.setChecked(_read_bool_key("VLM_ENABLE_DEPTH", True))
+        self.rc_arduino_baud.setValue(_read_int_key("ARDUINO_BAUD", 9600))
+        self._append_log("Panel", f"[{self._ts()}] Runtime config widgets reloaded from config.py / config_local.py\n")
 
     def on_runtime_apply_config(self):
         try:
@@ -1326,15 +1424,23 @@ class ControlPanel(QMainWindow):
             _write_assign_rhs("TOTAL_TRIALS", str(self.rc_total_trials.value()))
             _write_assign_rhs("SHAPE_MAX", _fmtf(self.rc_shape_max.value()))
             _write_assign_rhs("SHAPE_MIN", _fmtf(self.rc_shape_min.value()))
+            # Perception / VLM (the writer routes machine-local keys to
+            # config_local.py automatically).
+            _write_assign_rhs("GAZE_OR_BACKEND", f'"{self.rc_gaze_backend.currentText()}"')
+            _write_assign_rhs("PERCEPTION_FRAME_SOURCE", f'"{self.rc_perception_source.currentText()}"')
+            _write_assign_rhs("SERVICES_HOSTED_REMOTELY", "True" if self.rc_services_remote.isChecked() else "False")
+            _write_assign_rhs("FRAME_RELAY_HZ", _fmtf(self.rc_relay_hz.value()))
+            _write_assign_rhs("VLM_ENABLE_DEPTH", "True" if self.rc_vlm_depth.isChecked() else "False")
+            _write_assign_rhs("ARDUINO_BAUD", str(self.rc_arduino_baud.value()))
         except Exception as e:
-            QMessageBox.warning(self, "config.py", f"Failed to update config.py:\n{e}")
+            QMessageBox.warning(self, "Runtime config", f"Failed to update config files:\n{e}")
             self._append_log("Panel", f"[{self._ts()}] Runtime config apply FAILED: {e}\n")
             return
-        self._append_log("Panel", f"[{self._ts()}] Runtime config written to config.py\n")
+        self._append_log("Panel", f"[{self._ts()}] Runtime config written to config.py / config_local.py\n")
         QMessageBox.information(
             self, "Runtime config",
-            "config.py updated. Restart experiment driver / marker stream if a process "
-            "was already running so it reloads settings.",
+            "config.py / config_local.py updated. Restart experiment driver / marker stream if a "
+            "process was already running so it reloads settings.",
         )
 
     def _populate_training_script_combo(self):
