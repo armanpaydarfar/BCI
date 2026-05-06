@@ -942,7 +942,10 @@ class ControlPanel(QMainWindow):
         ]
 
         # ===== VLM Service (harmony_vlm subprocess — FastSAM + Depth Pro + Gemini) =====
-        # Two rows: (a) lifecycle + ad-hoc reasoning commands, (b) continuous
+        # Three stacked rows: (a) lifecycle + ad-hoc reasoning commands,
+        # (b) frame relay + intake status (kept adjacent to the VLM row
+        # so the operator sees both services at a glance, and merged
+        # into a single line since both are status-only), (c) continuous
         # segmentation + sequential pair decide.
         self.lbl_vlm_service = QLabel("●"); self._set_led(self.lbl_vlm_service, "stopped")
         self.btn_vlm_service_start  = QPushButton("Start")
@@ -967,6 +970,33 @@ class ControlPanel(QMainWindow):
         grid.addWidget(vlm_lbl_title, row, 0)
         grid.addWidget(self.lbl_vlm_service, row, 1)
         grid.addWidget(vlm_actions_holder, row, 2, 1, 3)
+        row += 1
+
+        # ===== Frame relay + Remote intake (merged into one status row) =====
+        # Sits directly below VLM Service so the two related status badges
+        # share a visual block. The relay portion is shared infra (also
+        # used by gaze_runner in legacy mode); the intake portion is
+        # VLM-specific and gets hidden in legacy mode via
+        # _vlm_row_widgets. See GPU_Service_Host_Architecture_Plan.md §4.7/§4.8.
+        self.lbl_relay_status_led = QLabel("●"); self._set_led(self.lbl_relay_status_led, "stopped")
+        self.lbl_relay_status_text = QLabel("relay: idle")
+        self.lbl_remote_intake_text = QLabel("intake: --")
+        # Faint separator between relay and intake portions so they read
+        # as related-but-distinct. Hidden in legacy mode along with intake.
+        intake_sep = QLabel("·")
+        intake_sep.setStyleSheet("color: #888;")
+
+        relay_text_box = QHBoxLayout()
+        relay_text_box.setContentsMargins(0, 0, 0, 0)
+        relay_text_box.setSpacing(8)
+        relay_text_box.addWidget(self.lbl_relay_status_text)
+        relay_text_box.addWidget(intake_sep)
+        relay_text_box.addWidget(self.lbl_remote_intake_text)
+        relay_text_box.addStretch(1)
+        relay_text_holder = QWidget(); relay_text_holder.setLayout(relay_text_box)
+        grid.addWidget(QLabel("<b>Frame Relay</b>"), row, 0)
+        grid.addWidget(self.lbl_relay_status_led, row, 1)
+        grid.addWidget(relay_text_holder, row, 2, 1, 3)
         row += 1
 
         # Continuous segmentation: toggle drives FastSAM @ N Hz on the
@@ -1004,33 +1034,14 @@ class ControlPanel(QMainWindow):
         grid.addWidget(vlm_run_holder, row, 1, 1, 4)
         row += 1
 
-        # ===== Frame relay status (GPU-host architecture; see SoftwareDocs/
-        # GPU_Service_Host_Architecture_Plan.md §4.7/§4.8). Visible whenever
-        # PERCEPTION_FRAME_SOURCE=remote (Windows consumer side) or
-        # SERVICES_HOSTED_REMOTELY=True (Linux operator side); stays inert
-        # in pure single-machine local mode.
-        self.lbl_relay_status_led = QLabel("●"); self._set_led(self.lbl_relay_status_led, "stopped")
-        self.lbl_relay_status_text = QLabel("relay: idle")
-        grid.addWidget(QLabel("<b>Frame Relay</b>"), row, 0)
-        grid.addWidget(self.lbl_relay_status_led, row, 1)
-        grid.addWidget(self.lbl_relay_status_text, row, 2, 1, 3)
-        row += 1
-
-        # Remote VLM intake badge: only meaningful when services run remotely.
-        self.lbl_remote_intake_text = QLabel("intake: --")
-        remote_intake_title = QLabel("<i>Remote VLM intake:</i>")
-        grid.addWidget(remote_intake_title, row, 0, 1, 2)
-        grid.addWidget(self.lbl_remote_intake_text, row, 2, 1, 3)
-        row += 1
-
         # Aggregate VLM widgets so backend gating (legacy mode) can hide
-        # them in one shot. Frame Relay is intentionally NOT in here — it
-        # is consumed by both gaze_runner (legacy) and vlm_service, so
-        # its visibility is governed only by the perception-source flag.
+        # them in one shot. Frame Relay row stays visible (relay is shared
+        # infra) but the intake portion of its text is VLM-specific and
+        # gets hidden along with the rest of the VLM block.
         self._vlm_row_widgets = [
             vlm_lbl_title, self.lbl_vlm_service, vlm_actions_holder,
             vlm_run_title, vlm_run_holder,
-            remote_intake_title, self.lbl_remote_intake_text,
+            intake_sep, self.lbl_remote_intake_text,
         ]
 
         # ===== Arduino =====
@@ -1844,11 +1855,22 @@ class ControlPanel(QMainWindow):
     # ----- VLM service handlers -----
 
     def _configure_remote_services_ui(self) -> None:
-        """Disable buttons that would spawn local conda subprocesses when
-        SERVICES_HOSTED_REMOTELY=True. Status queries remain functional —
-        they're plain UDP and travel transparently across the LAN."""
+        """Hide / disable buttons that would spawn local conda
+        subprocesses when SERVICES_HOSTED_REMOTELY=True. Status queries
+        remain functional — they're plain UDP and travel transparently
+        across the LAN.
+
+        VLM Start/Stop are hidden outright: their HBox holder reflows
+        cleanly once they're invisible, leaving Status / Decide / Depth
+        sitting flush. Gaze Start variants stay visible-but-disabled so
+        the surrounding grid row keeps its column alignment with the
+        other module rows.
+        """
+        for btn_name in ("btn_vlm_service_start", "btn_vlm_service_stop"):
+            btn = getattr(self, btn_name, None)
+            if btn is not None:
+                btn.setVisible(False)
         for btn_name in (
-            "btn_vlm_service_start", "btn_vlm_service_stop",
             "btn_gaze_service_headless", "btn_gaze_service_ui",
             "btn_gaze_service_stop",
         ):
@@ -1883,10 +1905,19 @@ class ControlPanel(QMainWindow):
                          name="panel-remote-status").start()
 
     def _apply_remote_status(self, resp: dict) -> None:
-        """GUI-thread slot for _remote_status_received."""
+        """GUI-thread slot for _remote_status_received.
+
+        Color semantics on the VLM LED:
+          - gray  (stopped) → unreachable, or reachable but no frame source
+          - red   (error)   → reachable and replied with ok=False
+          - green (running) → reachable, ok, frame source connected
+        Red is reserved for "the service told us something went wrong";
+        an unreachable host is treated as unknown/not-running rather
+        than an error condition, matching the relay LED's behaviour.
+        """
         self._remote_status_in_flight = False
         if resp.get("_unreachable"):
-            self._set_led(self.lbl_vlm_service, "error")
+            self._set_led(self.lbl_vlm_service, "stopped")
             self.lbl_remote_intake_text.setText("intake: unreachable")
             return
         ok = bool(resp.get("ok"))
@@ -1895,7 +1926,13 @@ class ControlPanel(QMainWindow):
         src = resp.get("frame_source", "?")
         age = resp.get("frame_age_s")
         age_txt = f"{float(age):.2f}s" if isinstance(age, (int, float)) else "--"
-        self._set_led(self.lbl_vlm_service, "running" if (ok and connected) else "stopped")
+        if not ok:
+            led_state = "error"
+        elif connected:
+            led_state = "running"
+        else:
+            led_state = "stopped"
+        self._set_led(self.lbl_vlm_service, led_state)
         self.lbl_remote_intake_text.setText(
             f"intake: src={src} connected={connected} frames={frames} age={age_txt}"
         )
