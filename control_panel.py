@@ -57,8 +57,20 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QComboBox, QCheckBox, QGridLayout, QLineEdit,
     QTextEdit, QGroupBox, QMessageBox, QSplitter, QToolBar, QStyle,
     QScrollArea, QFormLayout, QDoubleSpinBox, QSpinBox,
-    QListWidget,
+    QListWidget, QSizePolicy,
 )
+
+
+def _fixed_v(widget: QWidget) -> QWidget:
+    """Pin a widget's vertical size policy so it stops absorbing leftover
+    grid space. QWidget defaults to Preferred-vertical, which makes any
+    HBox-holder row in a QGridLayout stretch to 4-5x its natural height
+    when the panel has spare vertical room. Fixed clamps it at the
+    sizeHint."""
+    sp = widget.sizePolicy()
+    sp.setVerticalPolicy(QSizePolicy.Fixed)
+    widget.setSizePolicy(sp)
+    return widget
 
 # ----------------- Paths & constants -----------------
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -842,7 +854,7 @@ class ControlPanel(QMainWindow):
         led_box.setContentsMargins(0, 0, 0, 0)
         led_box.addWidget(self.lbl_robot_init)
         led_box.addWidget(self.lbl_robot)
-        led_holder = QWidget(); led_holder.setLayout(led_box)
+        led_holder = _fixed_v(QWidget()); led_holder.setLayout(led_box)
         btn_init_robot = QPushButton("Init Robot (SSH)")
         btn_init_robot.clicked.connect(self.on_init_robot)
         self.btn_robot_start     = QPushButton("Start (SSH terminal)")
@@ -965,7 +977,7 @@ class ControlPanel(QMainWindow):
                   self.btn_vlm_service_status, self.btn_vlm_service_decide,
                   self.btn_vlm_service_depth):
             vlm_actions.addWidget(w)
-        vlm_actions_holder = QWidget(); vlm_actions_holder.setLayout(vlm_actions)
+        vlm_actions_holder = _fixed_v(QWidget()); vlm_actions_holder.setLayout(vlm_actions)
         vlm_lbl_title = QLabel("<b>VLM Service</b>")
         grid.addWidget(vlm_lbl_title, row, 0)
         grid.addWidget(self.lbl_vlm_service, row, 1)
@@ -993,7 +1005,7 @@ class ControlPanel(QMainWindow):
         relay_text_box.addWidget(intake_sep)
         relay_text_box.addWidget(self.lbl_remote_intake_text)
         relay_text_box.addStretch(1)
-        relay_text_holder = QWidget(); relay_text_holder.setLayout(relay_text_box)
+        relay_text_holder = _fixed_v(QWidget()); relay_text_holder.setLayout(relay_text_box)
         grid.addWidget(QLabel("<b>Frame Relay</b>"), row, 0)
         grid.addWidget(self.lbl_relay_status_led, row, 1)
         grid.addWidget(relay_text_holder, row, 2, 1, 3)
@@ -1028,7 +1040,7 @@ class ControlPanel(QMainWindow):
         vlm_run.addWidget(self.btn_vlm_capture_first)
         vlm_run.addWidget(self.btn_vlm_decide_pair)
         vlm_run.addWidget(self.lbl_vlm_pair_token, 1)
-        vlm_run_holder = QWidget(); vlm_run_holder.setLayout(vlm_run)
+        vlm_run_holder = _fixed_v(QWidget()); vlm_run_holder.setLayout(vlm_run)
         vlm_run_title = QLabel("<i>Continuous / Pair:</i>")
         grid.addWidget(vlm_run_title, row, 0)
         grid.addWidget(vlm_run_holder, row, 1, 1, 4)
@@ -1074,7 +1086,7 @@ class ControlPanel(QMainWindow):
                   self.btn_save_serial_to_config,
                   self.btn_send_1, self.btn_send_0):
             arduino_row.addWidget(w)
-        arduino_row_holder = QWidget(); arduino_row_holder.setLayout(arduino_row)
+        arduino_row_holder = _fixed_v(QWidget()); arduino_row_holder.setLayout(arduino_row)
         grid.addWidget(QLabel("<b>Arduino</b>"), row, 0)
         grid.addWidget(self.lbl_arduino, row, 1)
         grid.addWidget(arduino_row_holder, row, 2, 1, 3)
@@ -1094,6 +1106,11 @@ class ControlPanel(QMainWindow):
         grid.addWidget(self.btn_driver_start, row, 2)
         grid.addWidget(self.btn_driver_stop, row, 3)
         row += 1
+
+        # Bottom stretch: absorbs any leftover vertical space in the
+        # controls panel so the data rows above stay packed at the
+        # natural row pitch instead of distributing slack between them.
+        grid.setRowStretch(row, 1)
 
         # ===== Logs Pane =====
         logw = QWidget(); split.addWidget(logw)
