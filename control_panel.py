@@ -629,6 +629,7 @@ class ControlPanel(QMainWindow):
         self._set_led(self.lbl_labrec, "stopped")
         self._set_led(self.lbl_gaze_service, "stopped")
         self._set_led(self.lbl_vlm_service, "stopped")
+        self._set_led(self.lbl_arduino, "stopped")
 
         # When services are hosted remotely (Linux operator panel pointed at
         # a Windows GPU host) the start/stop buttons can't drive local
@@ -733,13 +734,28 @@ class ControlPanel(QMainWindow):
         grid = QGridLayout(controls)
 
         row = 0
-        # ===== Initialize Robot =====
+        # ===== Robot =====
+        # Init + Start + Remove Overrides on one row — these three are
+        # invariably done in sequence at the start of a session, so keeping
+        # them adjacent matches the operator's actual workflow.
         self.lbl_robot_init = QLabel("●"); self._set_led(self.lbl_robot_init, "stopped")
-        grid.addWidget(QLabel("<b>Initialize Robot</b>"), row, 0)
-        grid.addWidget(self.lbl_robot_init, row, 1)
+        self.lbl_robot      = QLabel("●"); self._set_led(self.lbl_robot, "stopped")
+        led_box = QHBoxLayout()
+        led_box.setContentsMargins(0, 0, 0, 0)
+        led_box.addWidget(self.lbl_robot_init)
+        led_box.addWidget(self.lbl_robot)
+        led_holder = QWidget(); led_holder.setLayout(led_box)
         btn_init_robot = QPushButton("Init Robot (SSH)")
         btn_init_robot.clicked.connect(self.on_init_robot)
-        grid.addWidget(btn_init_robot, row, 2, 1, 2)
+        self.btn_robot_start     = QPushButton("Start (SSH terminal)")
+        self.btn_robot_removeovr = QPushButton("Remove Overrides")
+        self.btn_robot_start.clicked.connect(self.on_robot_start)
+        self.btn_robot_removeovr.clicked.connect(self.on_robot_remove_overrides)
+        grid.addWidget(QLabel("<b>Robot</b>"), row, 0)
+        grid.addWidget(led_holder, row, 1)
+        grid.addWidget(btn_init_robot, row, 2)
+        grid.addWidget(self.btn_robot_start, row, 3)
+        grid.addWidget(self.btn_robot_removeovr, row, 4)
         row += 1
 
         # eegoSports
@@ -815,39 +831,36 @@ class ControlPanel(QMainWindow):
         row += 1
 
         # ===== VLM Service (harmony_vlm subprocess — FastSAM + Depth Pro + Gemini) =====
+        # Two rows: (a) lifecycle + ad-hoc reasoning commands, (b) continuous
+        # segmentation + sequential pair decide.
         self.lbl_vlm_service = QLabel("●"); self._set_led(self.lbl_vlm_service, "stopped")
-        grid.addWidget(QLabel("<b>VLM Service</b>"), row, 0)
-        grid.addWidget(self.lbl_vlm_service, row, 1)
-
-        self.btn_vlm_service_start = QPushButton("Start")
-        self.btn_vlm_service_stop = QPushButton("Stop")
+        self.btn_vlm_service_start  = QPushButton("Start")
+        self.btn_vlm_service_stop   = QPushButton("Stop")
         self.btn_vlm_service_status = QPushButton("Status")
         self.btn_vlm_service_decide = QPushButton("Decide Now")
-
+        self.btn_vlm_service_depth  = QPushButton("Depth Now")
         self.btn_vlm_service_start.clicked.connect(self.on_vlm_service_start)
         self.btn_vlm_service_stop.clicked.connect(self.on_vlm_service_stop)
         self.btn_vlm_service_status.clicked.connect(self.on_vlm_service_status)
         self.btn_vlm_service_decide.clicked.connect(self.on_vlm_service_decide)
-
-        grid.addWidget(self.btn_vlm_service_start, row, 2)
-        grid.addWidget(self.btn_vlm_service_stop, row, 3)
-        grid.addWidget(self.btn_vlm_service_status, row, 4)
-        row += 1
-
-        self.btn_vlm_service_segment = QPushButton("Segment Now")
-        self.btn_vlm_service_depth = QPushButton("Depth Now")
-        self.btn_vlm_service_segment.clicked.connect(self.on_vlm_service_segment)
         self.btn_vlm_service_depth.clicked.connect(self.on_vlm_service_depth)
 
-        grid.addWidget(QLabel(f"<i>Backend:</i> {GAZE_OR_BACKEND}"), row, 0, 1, 2)
-        grid.addWidget(self.btn_vlm_service_decide, row, 2)
-        grid.addWidget(self.btn_vlm_service_segment, row, 3)
-        grid.addWidget(self.btn_vlm_service_depth, row, 4)
+        vlm_actions = QHBoxLayout()
+        vlm_actions.setContentsMargins(0, 0, 0, 0)
+        for w in (self.btn_vlm_service_start, self.btn_vlm_service_stop,
+                  self.btn_vlm_service_status, self.btn_vlm_service_decide,
+                  self.btn_vlm_service_depth):
+            vlm_actions.addWidget(w)
+        vlm_actions_holder = QWidget(); vlm_actions_holder.setLayout(vlm_actions)
+        grid.addWidget(QLabel("<b>VLM Service</b>"), row, 0)
+        grid.addWidget(self.lbl_vlm_service, row, 1)
+        grid.addWidget(vlm_actions_holder, row, 2, 1, 3)
         row += 1
 
-        # Sequential (two-object) decide — look at A, capture; look at B, decide pair.
         # Continuous segmentation: toggle drives FastSAM @ N Hz on the
         # service side; results stream into the overlay (VLM Video tab).
+        # Sequential (two-object) decide lives on the same row — look at A,
+        # capture; look at B, decide pair.
         self.btn_vlm_seg_stream = QPushButton("Stream Seg: OFF")
         self.btn_vlm_seg_stream.setCheckable(True)
         self.spin_vlm_seg_hz = QDoubleSpinBox()
@@ -859,9 +872,23 @@ class ControlPanel(QMainWindow):
         self.btn_vlm_seg_stream.toggled.connect(self.on_vlm_seg_stream_toggled)
         self.spin_vlm_seg_hz.valueChanged.connect(self.on_vlm_seg_stream_hz_changed)
 
-        grid.addWidget(QLabel("<i>Continuous:</i>"), row, 0)
-        grid.addWidget(self.spin_vlm_seg_hz, row, 1)
-        grid.addWidget(self.btn_vlm_seg_stream, row, 2)
+        self.btn_vlm_capture_first = QPushButton("Capture First")
+        self.btn_vlm_decide_pair = QPushButton("Decide Pair")
+        self.lbl_vlm_pair_token = QLabel("<i>snapshot:</i> (none)")
+        self.btn_vlm_capture_first.clicked.connect(self.on_vlm_capture_first)
+        self.btn_vlm_decide_pair.clicked.connect(self.on_vlm_decide_pair)
+
+        vlm_run = QHBoxLayout()
+        vlm_run.setContentsMargins(0, 0, 0, 0)
+        vlm_run.addWidget(self.spin_vlm_seg_hz)
+        vlm_run.addWidget(self.btn_vlm_seg_stream)
+        vlm_run.addSpacing(12)
+        vlm_run.addWidget(self.btn_vlm_capture_first)
+        vlm_run.addWidget(self.btn_vlm_decide_pair)
+        vlm_run.addWidget(self.lbl_vlm_pair_token, 1)
+        vlm_run_holder = QWidget(); vlm_run_holder.setLayout(vlm_run)
+        grid.addWidget(QLabel("<i>Continuous / Pair:</i>"), row, 0)
+        grid.addWidget(vlm_run_holder, row, 1, 1, 4)
         row += 1
 
         # ===== Frame relay status (GPU-host architecture; see SoftwareDocs/
@@ -882,30 +909,6 @@ class ControlPanel(QMainWindow):
         grid.addWidget(self.lbl_remote_intake_text, row, 2, 1, 3)
         row += 1
 
-        self.btn_vlm_capture_first = QPushButton("Capture First")
-        self.btn_vlm_decide_pair = QPushButton("Decide Pair")
-        self.lbl_vlm_pair_token = QLabel("<i>snapshot:</i> (none)")
-        self.btn_vlm_capture_first.clicked.connect(self.on_vlm_capture_first)
-        self.btn_vlm_decide_pair.clicked.connect(self.on_vlm_decide_pair)
-
-        grid.addWidget(QLabel("<i>Sequential:</i>"), row, 0)
-        grid.addWidget(self.lbl_vlm_pair_token, row, 1, 1, 2)
-        grid.addWidget(self.btn_vlm_capture_first, row, 3)
-        grid.addWidget(self.btn_vlm_decide_pair, row, 4)
-        row += 1
-
-        # Robot
-        self.lbl_robot = QLabel("●"); self._set_led(self.lbl_robot, "stopped")
-        grid.addWidget(QLabel("<b>Robot</b>"), row, 0)
-        grid.addWidget(self.lbl_robot, row, 1)
-        self.btn_robot_start = QPushButton("Start (SSH terminal)")
-        self.btn_robot_removeovr = QPushButton("Remove Overrides")
-        self.btn_robot_start.clicked.connect(self.on_robot_start)
-        self.btn_robot_removeovr.clicked.connect(self.on_robot_remove_overrides)
-        grid.addWidget(self.btn_robot_start, row, 2)
-        grid.addWidget(self.btn_robot_removeovr, row, 3)
-        row += 1
-
         # ===== Driver =====
         self.lbl_driver = QLabel("●"); self._set_led(self.lbl_driver, "stopped")
         grid.addWidget(QLabel("<b>Experiment Driver</b>"), row, 0)
@@ -918,63 +921,40 @@ class ControlPanel(QMainWindow):
         grid.addWidget(self.btn_driver_stop, row, 3)
         row += 1
 
-        grid.addWidget(QLabel("<i>External Apps:</i> eegoSports, LabRecorder (use Initialize / buttons)"), row, 0, 1, 5)
-        row += 1
-
-        # ===== Arduino / Online BCI (grouped) =====
-        arduino_group = QGroupBox("Arduino / Online BCI")
-        ag_outer = QVBoxLayout(arduino_group)
-
-        conn_box = QGroupBox("Serial connection")
-        conn_grid = QGridLayout(conn_box)
-        conn_grid.addWidget(QLabel("Device:"), 0, 0)
+        # ===== Arduino =====
+        # Single-line layout matching the other module rows. Baud lives in
+        # the Runtime config tab (rarely changed); per-test status updates
+        # land in the Panel log buffer rather than a dedicated label, and
+        # the LED reflects the last connection-test / send result.
+        self.lbl_arduino = QLabel("●"); self._set_led(self.lbl_arduino, "stopped")
         self.cmb_serial_port = QComboBox()
         self.cmb_serial_port.currentIndexChanged.connect(self.on_serial_port_changed)
-        conn_grid.addWidget(self.cmb_serial_port, 0, 1)
         self.btn_serial_refresh = QPushButton("Refresh")
-        self.btn_serial_refresh.setMaximumWidth(100)
         self.btn_serial_refresh.clicked.connect(self.on_serial_refresh)
-        conn_grid.addWidget(self.btn_serial_refresh, 0, 2)
-
-        conn_grid.addWidget(QLabel("Baud:"), 1, 0)
-        self.le_serial_baud = QLineEdit(self.serial_baudrate)
-        self.le_serial_baud.setMaximumWidth(120)
-        conn_grid.addWidget(self.le_serial_baud, 1, 1)
-        self.le_serial_baud.editingFinished.connect(self.on_serial_baud_changed)
-
-        row_conn = QHBoxLayout()
-        self.btn_serial_test = QPushButton("Test connection")
-        self.btn_serial_test.setMaximumWidth(160)
+        self.btn_serial_test = QPushButton("Test")
         self.btn_serial_test.clicked.connect(self.on_serial_test)
-        self.btn_save_serial_to_config = QPushButton("Save port/baud → config.py")
+        self.btn_save_serial_to_config = QPushButton("Save → config")
         self.btn_save_serial_to_config.setToolTip(
-            "Writes ARDUINO_PORT and ARDUINO_BAUD in config.py (e.g. for Online Glove driver)."
+            "Writes ARDUINO_PORT to config_local.py (machine-local) and "
+            "ARDUINO_BAUD to config.py."
         )
         self.btn_save_serial_to_config.clicked.connect(self.on_save_serial_to_config)
-        row_conn.addWidget(self.btn_serial_test)
-        row_conn.addWidget(self.btn_save_serial_to_config)
-        row_conn.addStretch(1)
-        conn_grid.addLayout(row_conn, 2, 0, 1, 3)
-
-        self.lbl_serial_status = QLabel("Status: Not tested")
-        self.lbl_serial_status.setWordWrap(True)
-        conn_grid.addWidget(self.lbl_serial_status, 3, 0, 1, 3)
-        ag_outer.addWidget(conn_box)
-
-        manual_box = QGroupBox("Manual exo / actuator test")
-        man_row = QHBoxLayout(manual_box)
-        self.btn_send_1 = QPushButton("Send '1' (close)")
-        self.btn_send_1.setMaximumWidth(140)
+        self.btn_send_1 = QPushButton("Send 1 (close)")
         self.btn_send_1.clicked.connect(self.on_send_arduino_one)
-        self.btn_send_0 = QPushButton("Send '0' (open)")
-        self.btn_send_0.setMaximumWidth(140)
+        self.btn_send_0 = QPushButton("Send 0 (open)")
         self.btn_send_0.clicked.connect(self.on_send_arduino_zero)
-        man_row.addWidget(self.btn_send_1)
-        man_row.addWidget(self.btn_send_0)
-        man_row.addStretch(1)
-        ag_outer.addWidget(manual_box)
 
-        grid.addWidget(arduino_group, row, 0, 1, 5)
+        arduino_row = QHBoxLayout()
+        arduino_row.setContentsMargins(0, 0, 0, 0)
+        arduino_row.addWidget(self.cmb_serial_port, 1)
+        for w in (self.btn_serial_refresh, self.btn_serial_test,
+                  self.btn_save_serial_to_config,
+                  self.btn_send_1, self.btn_send_0):
+            arduino_row.addWidget(w)
+        arduino_row_holder = QWidget(); arduino_row_holder.setLayout(arduino_row)
+        grid.addWidget(QLabel("<b>Arduino</b>"), row, 0)
+        grid.addWidget(self.lbl_arduino, row, 1)
+        grid.addWidget(arduino_row_holder, row, 2, 1, 3)
         row += 1
 
         # ===== Logs Pane =====
@@ -1396,9 +1376,9 @@ class ControlPanel(QMainWindow):
             QMessageBox.warning(self, "Serial", "Select a serial port first.")
             return
         try:
-            baud = int(self.le_serial_baud.text().strip())
+            baud = int(str(self.serial_baudrate).strip())
         except ValueError:
-            QMessageBox.warning(self, "Serial", "Baud must be an integer.")
+            QMessageBox.warning(self, "Serial", "Baud must be an integer (set it in Runtime config).")
             return
         try:
             write_arduino_port_to_config(port)
@@ -1905,9 +1885,6 @@ class ControlPanel(QMainWindow):
     def on_vlm_service_decide(self):
         self._vlm_command_threaded({"cmd": "decide"}, VLM_DECIDE_TIMEOUT_S, "decide")
 
-    def on_vlm_service_segment(self):
-        self._vlm_command_threaded({"cmd": "segment"}, 5.0, "segment")
-
     def on_vlm_seg_stream_toggled(self, checked: bool) -> None:
         hz = float(self.spin_vlm_seg_hz.value())
         self.btn_vlm_seg_stream.setText(f"Stream Seg: {'ON' if checked else 'OFF'}")
@@ -2095,15 +2072,15 @@ class ControlPanel(QMainWindow):
         except Exception as e:
             self.cmb_serial_port.blockSignals(False)
             self._append_log("Panel", f"[{self._ts()}] Error listing serial ports: {e}\n")
-            self.lbl_serial_status.setText("Status: Error listing ports")
+            self._set_led(self.lbl_arduino, "error")
             return
 
         if not ports:
             self.cmb_serial_port.addItem("No ports found", "")
             self.serial_port_name = ""
             self.cmb_serial_port.blockSignals(False)
-            self.lbl_serial_status.setText("Status: No ports")
             self._append_log("Panel", f"[{self._ts()}] No serial ports found\n")
+            self._set_led(self.lbl_arduino, "stopped")
             return
 
         for p in ports:
@@ -2123,7 +2100,6 @@ class ControlPanel(QMainWindow):
         self.serial_port_name = self.cmb_serial_port.currentData() or ""
         self.cmb_serial_port.blockSignals(False)
 
-        self.lbl_serial_status.setText(f"Status: Selected {self.serial_port_name}" if self.serial_port_name else "Status: No port selected")
         self._append_log("Panel", f"[{self._ts()}] Serial ports refreshed. Selected: {self.serial_port_name or 'None'}\n")
 
         self._set_cmds_for_mode_and_driver()
@@ -2132,68 +2108,68 @@ class ControlPanel(QMainWindow):
         device = self.cmb_serial_port.itemData(index)
         self.serial_port_name = device or ""
         self._append_log("Panel", f"[{self._ts()}] Serial port set to: {self.serial_port_name}\n")
+        # New port not yet validated — clear any prior pass/fail signal.
+        self._set_led(self.lbl_arduino, "stopped")
         self._set_cmds_for_mode_and_driver()
 
-    def on_serial_baud_changed(self):
-        text = self.le_serial_baud.text().strip()
-        if not text:
-            return
+    def _serial_baud_int(self) -> Optional[int]:
+        """Return the configured baud rate as int, or None on parse failure.
+        Source of truth is ``self.serial_baudrate`` (loaded from config and
+        editable from the Runtime config tab)."""
         try:
-            int(text)
-        except ValueError:
-            QMessageBox.warning(self, "Baudrate", "Baudrate must be an integer, e.g., 9600.")
-            self.le_serial_baud.setText(self.serial_baudrate)
-            return
-        self.serial_baudrate = text
-        self._append_log("Panel", f"[{self._ts()}] Serial baudrate set to: {self.serial_baudrate}\n")
-        self._set_cmds_for_mode_and_driver()
+            return int(str(self.serial_baudrate).strip())
+        except (TypeError, ValueError):
+            return None
 
     def on_serial_test(self):
         port = self.serial_port_name or self.cmb_serial_port.currentData()
         if not port:
-            self.lbl_serial_status.setText("Status: No port selected")
+            self._append_log("Panel", f"[{self._ts()}] Serial test: no port selected\n")
+            self._set_led(self.lbl_arduino, "error")
             QMessageBox.information(self, "Serial test", "No serial port selected.")
             return
 
-        try:
-            baud = int(self.le_serial_baud.text().strip())
-        except ValueError:
-            self.lbl_serial_status.setText("Status: Invalid baudrate")
-            QMessageBox.warning(self, "Serial test", "Invalid baudrate.")
+        baud = self._serial_baud_int()
+        if baud is None:
+            self._append_log("Panel", f"[{self._ts()}] Serial test: invalid baudrate {self.serial_baudrate!r}\n")
+            self._set_led(self.lbl_arduino, "error")
+            QMessageBox.warning(self, "Serial test", "Invalid baudrate (set ARDUINO_BAUD in Runtime config).")
             return
 
+        self._set_led(self.lbl_arduino, "starting")
         try:
             ser = serial.Serial(port, baudrate=baud, timeout=1)
             time.sleep(2)
             if ser.is_open:
-                self.lbl_serial_status.setText(f"Status: OK on {port}")
                 self.serial_port_name = port
-                self.serial_baudrate = str(baud)
                 self._append_log("Panel", f"[{self._ts()}] Serial test OK on {port} @ {baud}\n")
                 ser.close()
+                self._set_led(self.lbl_arduino, "running")
                 self._set_cmds_for_mode_and_driver()
             else:
-                self.lbl_serial_status.setText("Status: Failed to open")
                 self._append_log("Panel", f"[{self._ts()}] Serial test FAILED (not open)\n")
+                self._set_led(self.lbl_arduino, "error")
         except Exception as e:
-            self.lbl_serial_status.setText("Status: Error")
             self._append_log("Panel", f"[{self._ts()}] Serial test ERROR: {e}\n")
+            self._set_led(self.lbl_arduino, "error")
             QMessageBox.warning(self, "Serial test", f"Error opening {port}:\n{e}")
 
     def _send_arduino_manual_value(self, value: str):
         port = self.serial_port_name or self.cmb_serial_port.currentData()
         if not port:
-            self.lbl_serial_status.setText("Status: No port selected")
+            self._append_log("Panel", f"[{self._ts()}] Arduino send: no port selected\n")
+            self._set_led(self.lbl_arduino, "error")
             QMessageBox.information(self, "Arduino manual test", "No serial port selected.")
             return
 
-        try:
-            baud = int(self.le_serial_baud.text().strip())
-        except ValueError:
-            self.lbl_serial_status.setText("Status: Invalid baudrate")
-            QMessageBox.warning(self, "Arduino manual test", "Invalid baudrate.")
+        baud = self._serial_baud_int()
+        if baud is None:
+            self._append_log("Panel", f"[{self._ts()}] Arduino send: invalid baudrate {self.serial_baudrate!r}\n")
+            self._set_led(self.lbl_arduino, "error")
+            QMessageBox.warning(self, "Arduino manual test", "Invalid baudrate (set ARDUINO_BAUD in Runtime config).")
             return
 
+        self._set_led(self.lbl_arduino, "starting")
         try:
             ser = serial.Serial(port, baudrate=baud, timeout=1)
             self._append_log("Panel", f"[{self._ts()}] Waiting for Arduino reset (2s)...\n")
@@ -2201,19 +2177,19 @@ class ControlPanel(QMainWindow):
             time.sleep(2)
 
             if not ser.is_open:
-                self.lbl_serial_status.setText("Status: Failed to open")
                 self._append_log("Panel", f"[{self._ts()}] Arduino manual: failed to open {port}\n")
+                self._set_led(self.lbl_arduino, "error")
                 return
 
             ser.write(value.encode("ascii"))
             ser.flush()
             self._append_log("Panel", f"[{self._ts()}] Arduino manual: sent '{value}' on {port}\n")
-            self.lbl_serial_status.setText(f"Status: Sent '{value}' on {port}")
+            self._set_led(self.lbl_arduino, "running")
             ser.close()
 
         except Exception as e:
-            self.lbl_serial_status.setText("Status: Error")
             self._append_log("Panel", f"[{self._ts()}] Arduino manual ERROR: {e}\n")
+            self._set_led(self.lbl_arduino, "error")
             QMessageBox.warning(self, "Arduino manual test", f"Error sending '{value}' on {port}:\n{e}")
 
     def on_send_arduino_one(self):
