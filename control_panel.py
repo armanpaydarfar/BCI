@@ -806,9 +806,14 @@ class ControlPanel(QMainWindow):
         grid.addWidget(btn_labrec, row, 2)
         row += 1
 
-        # ===== Gaze Service (NEW) =====
+        # ===== Gaze Service =====
+        # Collected in self._gaze_row_widgets so _apply_backend_visibility()
+        # can hide the whole block when GAZE_OR_BACKEND == "vlm". An empty
+        # grid row collapses to zero height in Qt once all its items are
+        # hidden, so toggling visibility is sufficient.
         self.lbl_gaze_service = QLabel("●"); self._set_led(self.lbl_gaze_service, "stopped")
-        grid.addWidget(QLabel("<b>Gaze Service</b>"), row, 0)
+        gaze_lbl_title = QLabel("<b>Gaze Service</b>")
+        grid.addWidget(gaze_lbl_title, row, 0)
         grid.addWidget(self.lbl_gaze_service, row, 1)
 
         self.btn_gaze_service_headless = QPushButton("Start (Headless)")
@@ -826,9 +831,17 @@ class ControlPanel(QMainWindow):
         grid.addWidget(self.btn_gaze_service_stop, row, 4)
         row += 1
 
-        grid.addWidget(QLabel("<i>Telemetry:</i> view output in View: Gaze"), row, 0, 1, 2)
+        gaze_telemetry_lbl = QLabel("<i>Telemetry:</i> view output in View: Gaze")
+        grid.addWidget(gaze_telemetry_lbl, row, 0, 1, 2)
         grid.addWidget(self.btn_gaze_service_query, row, 2, 1, 3)
         row += 1
+
+        self._gaze_row_widgets = [
+            gaze_lbl_title, self.lbl_gaze_service,
+            self.btn_gaze_service_headless, self.btn_gaze_service_ui,
+            self.btn_gaze_service_stop,
+            gaze_telemetry_lbl, self.btn_gaze_service_query,
+        ]
 
         # ===== VLM Service (harmony_vlm subprocess — FastSAM + Depth Pro + Gemini) =====
         # Two rows: (a) lifecycle + ad-hoc reasoning commands, (b) continuous
@@ -852,7 +865,8 @@ class ControlPanel(QMainWindow):
                   self.btn_vlm_service_depth):
             vlm_actions.addWidget(w)
         vlm_actions_holder = QWidget(); vlm_actions_holder.setLayout(vlm_actions)
-        grid.addWidget(QLabel("<b>VLM Service</b>"), row, 0)
+        vlm_lbl_title = QLabel("<b>VLM Service</b>")
+        grid.addWidget(vlm_lbl_title, row, 0)
         grid.addWidget(self.lbl_vlm_service, row, 1)
         grid.addWidget(vlm_actions_holder, row, 2, 1, 3)
         row += 1
@@ -887,7 +901,8 @@ class ControlPanel(QMainWindow):
         vlm_run.addWidget(self.btn_vlm_decide_pair)
         vlm_run.addWidget(self.lbl_vlm_pair_token, 1)
         vlm_run_holder = QWidget(); vlm_run_holder.setLayout(vlm_run)
-        grid.addWidget(QLabel("<i>Continuous / Pair:</i>"), row, 0)
+        vlm_run_title = QLabel("<i>Continuous / Pair:</i>")
+        grid.addWidget(vlm_run_title, row, 0)
         grid.addWidget(vlm_run_holder, row, 1, 1, 4)
         row += 1
 
@@ -905,9 +920,20 @@ class ControlPanel(QMainWindow):
 
         # Remote VLM intake badge: only meaningful when services run remotely.
         self.lbl_remote_intake_text = QLabel("intake: --")
-        grid.addWidget(QLabel("<i>Remote VLM intake:</i>"), row, 0, 1, 2)
+        remote_intake_title = QLabel("<i>Remote VLM intake:</i>")
+        grid.addWidget(remote_intake_title, row, 0, 1, 2)
         grid.addWidget(self.lbl_remote_intake_text, row, 2, 1, 3)
         row += 1
+
+        # Aggregate VLM widgets so backend gating (legacy mode) can hide
+        # them in one shot. Frame Relay is intentionally NOT in here — it
+        # is consumed by both gaze_runner (legacy) and vlm_service, so
+        # its visibility is governed only by the perception-source flag.
+        self._vlm_row_widgets = [
+            vlm_lbl_title, self.lbl_vlm_service, vlm_actions_holder,
+            vlm_run_title, vlm_run_holder,
+            remote_intake_title, self.lbl_remote_intake_text,
+        ]
 
         # ===== Driver =====
         self.lbl_driver = QLabel("●"); self._set_led(self.lbl_driver, "stopped")
@@ -1065,6 +1091,21 @@ class ControlPanel(QMainWindow):
         self._refresh_log_view()
 
         self._update_robot_buttons_for_mode()
+        self._apply_backend_visibility()
+
+    def _apply_backend_visibility(self) -> None:
+        """Hide rows that are inert for the current GAZE_OR_BACKEND.
+
+        legacy → vlm_service is not running, so the VLM rows + remote-intake
+        badge would only display dead controls. vlm → gaze_runner is not
+        running, so the Gaze service rows have nothing to drive. Frame Relay
+        is shared by both backends in remote mode and is gated separately
+        by the perception-source flag, not by this method."""
+        is_vlm = (GAZE_OR_BACKEND == "vlm")
+        for w in getattr(self, "_gaze_row_widgets", ()):
+            w.setVisible(not is_vlm)
+        for w in getattr(self, "_vlm_row_widgets", ()):
+            w.setVisible(is_vlm)
 
     def _build_vlm_video_tab(self, tabs: QTabWidget) -> None:
         """Linux-side scene + JSON-overlay renderer
