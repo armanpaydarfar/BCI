@@ -625,7 +625,14 @@ class ControlPanel(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Harmony Control Panel — Simplified")
-        self.resize(1250, 800)
+        # Default size tuned for a typical 1366x768 laptop / second
+        # monitor. setMinimumSize is intentionally small so the operator
+        # can drag the window narrower without Qt clamping at the
+        # natural-size of the widest child (the original 1250 default
+        # was rooted in inner-widget sizeHints rather than a deliberate
+        # choice and made the window unusable on smaller displays).
+        self.resize(1100, 700)
+        self.setMinimumSize(700, 500)
         self._remote_status_in_flight = False
         self._remote_status_received.connect(self._apply_remote_status)
 
@@ -746,7 +753,12 @@ class ControlPanel(QMainWindow):
         mv = QVBoxLayout(main)
 
         # Top row: Mode + Driver + Subject + FES + Tools
-        top = QHBoxLayout(); mv.addLayout(top)
+        # Tight margins — the default QHBoxLayout spacing leaves the
+        # group boxes feeling separated; with five of them in a row that
+        # extra padding pushes the window width up by ~40 px.
+        top = QHBoxLayout(); top.setContentsMargins(0, 0, 0, 0)
+        mv.addLayout(top)
+        mv.setSpacing(4)
 
         # Mode
         gb_mode = QGroupBox("Mode"); fm = QHBoxLayout(gb_mode)
@@ -762,7 +774,14 @@ class ControlPanel(QMainWindow):
         self.cmb_driver = QComboBox(); self.cmb_driver.addItems(DRIVERS)
         self.cmb_driver.setCurrentText(self.driver_choice)
         self.cmb_driver.currentTextChanged.connect(self.on_driver_choice_changed)
-        fd.addWidget(QLabel("Experiment Driver:"))
+        # Driver names like "ExperimentDriver_Online_GazeTracking" are
+        # ~37 chars long; QComboBox's default AdjustToContentsOnFirstShow
+        # sizes the widget to the longest item and that single combo
+        # used to push the panel >1100 px wide. Cap the visible width
+        # — the full text is still visible in the dropdown.
+        self.cmb_driver.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_driver.setMinimumContentsLength(15)
+        fd.addWidget(QLabel("Driver:"))
         fd.addWidget(self.cmb_driver)
         top.addWidget(gb_drv, 2)
 
@@ -782,17 +801,20 @@ class ControlPanel(QMainWindow):
         self.chk_fes = QCheckBox("Enable")
         self.chk_fes.setChecked(bool(self.fes_enabled_pref))
         self.chk_fes.toggled.connect(self.on_fes_pref_toggled)
-        btn_fes_cfg = QPushButton("Configure FES (STMsetup)")
+        btn_fes_cfg = QPushButton("Configure")
+        btn_fes_cfg.setToolTip("Open STMsetup.py")
         btn_fes_cfg.clicked.connect(self.on_open_fes_cfg)
         ff.addWidget(self.chk_fes); ff.addWidget(btn_fes_cfg)
         top.addWidget(gb_fes)
 
         # Utilities
         gb_utils = QGroupBox("Utilities"); fu = QHBoxLayout(gb_utils)
-        self.btn_mne = QPushButton("Open MNE-LSL Viewer")
+        self.btn_mne = QPushButton("MNE Viewer")
+        self.btn_mne.setToolTip("Open MNE-LSL viewer")
         self.btn_mne.clicked.connect(self.on_open_mne_viewer)
         fu.addWidget(self.btn_mne)
-        self.btn_impedance = QPushButton("Impedance Monitor")
+        self.btn_impedance = QPushButton("Impedance")
+        self.btn_impedance.setToolTip("Open impedance monitor")
         self.btn_impedance.clicked.connect(self.on_open_impedance_monitor)
         fu.addWidget(self.btn_impedance)
         top.addWidget(gb_utils)
@@ -801,6 +823,13 @@ class ControlPanel(QMainWindow):
         split = QSplitter(); mv.addWidget(split, 1)
         controls = QWidget(); split.addWidget(controls)
         grid = QGridLayout(controls)
+        # Tighten row pitch — Qt's default vertical spacing (~6 px) plus
+        # default margins make the module rows feel sparse. Pulling them
+        # together makes the whole control column scan as one block of
+        # related actions rather than a list with gaps.
+        grid.setVerticalSpacing(2)
+        grid.setHorizontalSpacing(6)
+        grid.setContentsMargins(6, 4, 6, 4)
 
         row = 0
         # ===== Robot =====
@@ -1004,18 +1033,6 @@ class ControlPanel(QMainWindow):
             remote_intake_title, self.lbl_remote_intake_text,
         ]
 
-        # ===== Driver =====
-        self.lbl_driver = QLabel("●"); self._set_led(self.lbl_driver, "stopped")
-        grid.addWidget(QLabel("<b>Experiment Driver</b>"), row, 0)
-        grid.addWidget(self.lbl_driver, row, 1)
-        self.btn_driver_start = QPushButton("Start")
-        self.btn_driver_stop  = QPushButton("Stop")
-        self.btn_driver_start.clicked.connect(self.on_driver_start)
-        self.btn_driver_stop.clicked.connect(self.on_driver_stop)
-        grid.addWidget(self.btn_driver_start, row, 2)
-        grid.addWidget(self.btn_driver_stop, row, 3)
-        row += 1
-
         # ===== Arduino =====
         # Single-line layout matching the other module rows. Baud lives in
         # the Runtime config tab (rarely changed); per-test status updates
@@ -1050,6 +1067,21 @@ class ControlPanel(QMainWindow):
         grid.addWidget(QLabel("<b>Arduino</b>"), row, 0)
         grid.addWidget(self.lbl_arduino, row, 1)
         grid.addWidget(arduino_row_holder, row, 2, 1, 3)
+        row += 1
+
+        # ===== Driver =====
+        # Anchored at the bottom — starting the experiment driver is the
+        # last step before a session begins, so keeping it visually
+        # separate from device setup matches the operator's flow.
+        self.lbl_driver = QLabel("●"); self._set_led(self.lbl_driver, "stopped")
+        grid.addWidget(QLabel("<b>Experiment Driver</b>"), row, 0)
+        grid.addWidget(self.lbl_driver, row, 1)
+        self.btn_driver_start = QPushButton("Start")
+        self.btn_driver_stop  = QPushButton("Stop")
+        self.btn_driver_start.clicked.connect(self.on_driver_start)
+        self.btn_driver_stop.clicked.connect(self.on_driver_stop)
+        grid.addWidget(self.btn_driver_start, row, 2)
+        grid.addWidget(self.btn_driver_stop, row, 3)
         row += 1
 
         # ===== Logs Pane =====
@@ -1247,7 +1279,10 @@ class ControlPanel(QMainWindow):
         rtc = QWidget()
         tabs.addTab(rtc, "Runtime config")
         outer = QVBoxLayout(rtc)
-        outer.addWidget(QLabel(
+        # setWordWrap on this label is load-bearing: without it, the
+        # full unwrapped text width becomes the tab's minimumSizeHint
+        # (~1900 px) and propagates to the whole window's minimum size.
+        intro = QLabel(
             "<b>Edits config.py / config_local.py on disk.</b> "
             "Machine-local keys (PERCEPTION_FRAME_SOURCE, "
             "SERVICES_HOSTED_REMOTELY) write to config_local.py; "
@@ -1255,7 +1290,9 @@ class ControlPanel(QMainWindow):
             "Marker/Driver/FES after changing simulation or network "
             "flags (<code>Utils/networking</code> caches SIMULATION_MODE "
             "at import)."
-        ))
+        )
+        intro.setWordWrap(True)
+        outer.addWidget(intro)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         inner = QWidget()
