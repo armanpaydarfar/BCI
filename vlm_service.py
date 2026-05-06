@@ -283,6 +283,21 @@ class VLMService:
         self._seg_stream_thread: Optional[threading.Thread] = None
         self._seg_stream_stop = threading.Event()
         self._seg_stream_hz: float = 10.0
+        # Telemetry for the seg-stream loop. Updated under no lock from the
+        # loop thread and read read-only from _cmd_status; consumers tolerate
+        # a slightly stale snapshot. Each window covers _SEG_STREAM_STATS_S
+        # seconds; periodic stats lines log to stdout, the latest snapshot is
+        # included in status replies so the panel can surface it.
+        self._seg_stream_stats: Dict[str, Any] = {
+            "active": False,
+            "hz_target": 0.0,
+            "hz_achieved": 0.0,
+            "mean_dets": 0.0,
+            "mean_infer_ms": 0.0,
+            "errors": 0,
+            "window_s": 0.0,
+            "last_emit_t": 0.0,
+        }
 
         # Subscribe-mode push: panel/clients send `cmd=subscribe` and we
         # broadcast `vlm_results` JSON datagrams from a tick thread. The
@@ -499,6 +514,11 @@ class VLMService:
             "frame_source": getattr(self.args, "frame_source", "local"),
             "frame_source_connected": connected,
             "frames_received": frames_received,
+            # Seg-stream telemetry — refreshed every _SEG_STREAM_STATS_S
+            # while the loop is running. Stays present (active=False) so
+            # clients can render a single status panel regardless of
+            # whether streaming is on.
+            "seg_stream": dict(self._seg_stream_stats),
         }
 
     def _cmd_snapshot(self) -> dict:
@@ -576,42 +596,99 @@ class VLMService:
         self._cache_dets([])
         _log("segment stream stopped")
 
+    # Window size for seg-stream stats accumulation. 5 s is short enough
+    # to feel live in the panel readout but long enough that a single slow
+    # inference doesn't dominate the average.
+    _SEG_STREAM_STATS_S: float = 5.0
+
     def _segment_stream_loop(self) -> None:
         next_run = time.perf_counter()
         last_hz = self._seg_stream_hz
         period = 1.0 / max(last_hz, 1e-6)
-        while not self._seg_stream_stop.is_set() and not self._stop_event.is_set():
-            # Re-read the rate each iteration so live changes take effect.
-            if self._seg_stream_hz != last_hz:
-                last_hz = self._seg_stream_hz
-                period = 1.0 / max(last_hz, 1e-6)
+        # Stats accumulators for the current window. Reset after each
+        # periodic emit so each line summarises fresh activity.
+        win_start = time.perf_counter()
+        win_ticks = 0
+        win_dets = 0
+        win_infer_s = 0.0
+        win_errors = 0
+        self._seg_stream_stats.update({
+            "active": True, "hz_target": last_hz, "last_emit_t": time.time(),
+        })
+        try:
+            while not self._seg_stream_stop.is_set() and not self._stop_event.is_set():
+                # Re-read the rate each iteration so live changes take effect.
+                if self._seg_stream_hz != last_hz:
+                    last_hz = self._seg_stream_hz
+                    period = 1.0 / max(last_hz, 1e-6)
+                    self._seg_stream_stats["hz_target"] = last_hz
 
-            now_pc = time.perf_counter()
-            if now_pc < next_run:
-                time.sleep(min(0.005, next_run - now_pc))
-                continue
+                now_pc = time.perf_counter()
+                if now_pc < next_run:
+                    time.sleep(min(0.005, next_run - now_pc))
+                    continue
 
-            bundle, _, _ = self._latest()
-            if bundle is None:
-                next_run = now_pc + period
-                time.sleep(0.020)
-                continue
+                bundle, _, _ = self._latest()
+                if bundle is None:
+                    next_run = now_pc + period
+                    time.sleep(0.020)
+                    continue
 
-            try:
-                dets = self.detector.detect(bundle.video.bgr)
-                dets = _filter_overlay_dets(dets)
-                self._cache_dets(dets)
-            except Exception as e:
-                if self.args.verbose:
+                try:
+                    t0 = time.perf_counter()
+                    dets = self.detector.detect(bundle.video.bgr)
+                    dets = _filter_overlay_dets(dets)
+                    self._cache_dets(dets)
+                    win_ticks += 1
+                    win_dets += len(dets)
+                    win_infer_s += (time.perf_counter() - t0)
+                except Exception as e:
+                    # Errors always log — silent failure here used to hide
+                    # detector misconfiguration (wrong device, missing
+                    # weights) until the operator wondered why the overlay
+                    # was empty.
+                    win_errors += 1
                     _log(f"segment stream error: {e}")
 
-            # Schedule next tick relative to the original cadence, but if we're
-            # falling behind by more than 2 periods just resync — avoids a
-            # runaway catch-up burst after a slow inference.
-            next_run += period
-            now_pc2 = time.perf_counter()
-            if next_run < now_pc2 - 2.0 * period:
-                next_run = now_pc2
+                # Periodic stats emit. Logs one line and refreshes the
+                # status-reply snapshot so the panel readout stays current.
+                window_s = time.perf_counter() - win_start
+                if window_s >= self._SEG_STREAM_STATS_S:
+                    achieved = win_ticks / max(window_s, 1e-6)
+                    mean_dets = (win_dets / win_ticks) if win_ticks else 0.0
+                    mean_infer_ms = (win_infer_s / win_ticks * 1000.0) if win_ticks else 0.0
+                    _log(
+                        f"seg-stream: target={last_hz:.1f}Hz achieved={achieved:.1f}Hz "
+                        f"ticks={win_ticks} mean_dets={mean_dets:.1f} "
+                        f"mean_infer={mean_infer_ms:.0f}ms errors={win_errors}"
+                    )
+                    self._seg_stream_stats.update({
+                        "active": True,
+                        "hz_target": last_hz,
+                        "hz_achieved": achieved,
+                        "mean_dets": mean_dets,
+                        "mean_infer_ms": mean_infer_ms,
+                        "errors": win_errors,
+                        "window_s": window_s,
+                        "last_emit_t": time.time(),
+                    })
+                    win_start = time.perf_counter()
+                    win_ticks = 0
+                    win_dets = 0
+                    win_infer_s = 0.0
+                    win_errors = 0
+
+                # Schedule next tick relative to the original cadence, but if we're
+                # falling behind by more than 2 periods just resync — avoids a
+                # runaway catch-up burst after a slow inference.
+                next_run += period
+                now_pc2 = time.perf_counter()
+                if next_run < now_pc2 - 2.0 * period:
+                    next_run = now_pc2
+        finally:
+            # Mark the loop dead so a stale snapshot doesn't make the panel
+            # claim the stream is still healthy after a stop.
+            self._seg_stream_stats["active"] = False
 
     def _cmd_depth(self, req: dict) -> dict:
         if self.depth_estimator is None:
@@ -677,11 +754,14 @@ class VLMService:
         # Import here so this file parses even if harmony_vlm utils aren't loaded
         from utils.object_detector import compute_3d_waypoints
 
+        cmd_t0 = time.time()
         bundle, fix, _ = self._latest()
         if bundle is None:
+            _log("decide: no_frame")
             return {"ok": False, "error": "no_frame"}
 
         gaze_xy = (float(bundle.gaze.x), float(bundle.gaze.y))
+        _log(f"decide IN: gaze=({gaze_xy[0]:.0f},{gaze_xy[1]:.0f})")
         dets = self.detector.detect(bundle.video.bgr)
 
         waypoints_out: list[dict] = []
@@ -725,6 +805,8 @@ class VLMService:
             result = future.result(timeout=timeout_s)
         except FutureTimeoutError:
             self._set_vlm_state("IDLE")
+            elapsed_ms = (time.time() - cmd_t0) * 1000.0
+            _log(f"decide OUT: vlm_timeout dets={len(dets)} elapsed={elapsed_ms:.0f}ms")
             return {
                 "ok": False,
                 "error": "vlm_timeout",
@@ -744,6 +826,9 @@ class VLMService:
             **result,
         }
         self._set_vlm_state("DECIDED", decision=decision)
+        hit_lbl = (hit_waypoint or {}).get("label") if isinstance(hit_waypoint, dict) else None
+        elapsed_ms = (time.time() - cmd_t0) * 1000.0
+        _log(f"decide OUT: hit={hit_lbl!r} dets={len(dets)} elapsed={elapsed_ms:.0f}ms")
         return {"ok": True, **decision}
 
     def _process_frame_and_gaze(self, frame_bgr, gaze_xy: tuple[float, float]) -> dict:
@@ -798,9 +883,11 @@ class VLMService:
     def _cmd_capture_first(self, req: dict) -> dict:
         bundle, fix, _ = self._latest()
         if bundle is None:
+            _log("capture_first: no_frame")
             return {"ok": False, "error": "no_frame"}
 
         gaze_xy = (float(bundle.gaze.x), float(bundle.gaze.y))
+        _log(f"capture_first IN: gaze=({gaze_xy[0]:.0f},{gaze_xy[1]:.0f})")
         t0 = time.time()
         processed = self._process_frame_and_gaze(bundle.video.bgr, gaze_xy)
         elapsed = time.time() - t0
@@ -820,6 +907,11 @@ class VLMService:
         self._cache_dets(processed["detections"], processed["hit_det"], processed["hit_waypoint"])
         self._set_vlm_state("AWAITING_SECOND", first_det=processed["hit_det"])
 
+        hit_lbl = (processed["hit_waypoint"] or {}).get("label") if isinstance(processed["hit_waypoint"], dict) else None
+        _log(
+            f"capture_first OUT: snap={snap_id} hit={hit_lbl!r} "
+            f"dets={len(processed['detections'])} elapsed={elapsed*1000:.0f}ms"
+        )
         return {
             "ok": True,
             "snapshot_id": snap_id,
@@ -834,17 +926,21 @@ class VLMService:
     def _cmd_decide_pair(self, req: dict) -> dict:
         snap_id = req.get("snapshot_id")
         if not snap_id:
+            _log("decide_pair: missing_snapshot_id")
             return {"ok": False, "error": "missing_snapshot_id"}
         first = self._snapshots.get(str(snap_id))
         if first is None:
+            _log(f"decide_pair: snapshot {snap_id} not found or expired")
             return {"ok": False, "error": "snapshot_not_found_or_expired"}
 
         bundle, fix, _ = self._latest()
         if bundle is None:
+            _log(f"decide_pair: no_frame (snap={snap_id})")
             return {"ok": False, "error": "no_frame"}
 
         second_gaze_xy = (float(bundle.gaze.x), float(bundle.gaze.y))
         second_frame = bundle.video.bgr
+        _log(f"decide_pair IN: snap={snap_id} second_gaze=({second_gaze_xy[0]:.0f},{second_gaze_xy[1]:.0f})")
 
         t0 = time.time()
         second = self._process_frame_and_gaze(second_frame, second_gaze_xy)
@@ -867,6 +963,8 @@ class VLMService:
         try:
             result = future.result(timeout=timeout_s)
         except FutureTimeoutError:
+            elapsed_ms = (time.time() - t0) * 1000.0
+            _log(f"decide_pair OUT: vlm_timeout snap={snap_id} elapsed={elapsed_ms:.0f}ms")
             return {
                 "ok": False,
                 "error": "vlm_timeout",
@@ -894,6 +992,12 @@ class VLMService:
             **result,
         }
         self._set_vlm_state("DECIDED", decision=decision)
+        first_lbl = (first["hit_waypoint"] or {}).get("label") if isinstance(first["hit_waypoint"], dict) else None
+        second_lbl = (second["hit_waypoint"] or {}).get("label") if isinstance(second["hit_waypoint"], dict) else None
+        _log(
+            f"decide_pair OUT: snap={snap_id} first={first_lbl!r} second={second_lbl!r} "
+            f"elapsed={elapsed*1000:.0f}ms"
+        )
         return {"ok": True, **decision}
 
     def _cmd_camera_matrix(self) -> dict:
@@ -989,10 +1093,29 @@ class VLMService:
         this thread."""
         push_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         period = 1.0 / max(self._RESULTS_TICK_HZ, 1e-6)
+        # Periodic stats — emitted every _RESULTS_LOG_PERIOD_S so the
+        # operator can see whether subscribers exist + whether sends are
+        # actually happening. Counts reset after each emit.
+        stats_period_s = 30.0
+        last_emit = time.monotonic()
+        ticks_run = 0
+        sends_done = 0
         try:
             while not self._stop_event.is_set() and not self._results_tick_stop.is_set():
                 t0 = time.monotonic()
-                self._tick_send_results(push_sock, t0)
+                sent_this_tick = self._tick_send_results(push_sock, t0)
+                ticks_run += 1
+                sends_done += sent_this_tick
+                if (t0 - last_emit) >= stats_period_s:
+                    with self._subscribers_lock:
+                        n_subs = len(self._subscribers)
+                    _log(
+                        f"results push: subs={n_subs} ticks={ticks_run} "
+                        f"sends={sends_done} window={t0 - last_emit:.0f}s"
+                    )
+                    last_emit = t0
+                    ticks_run = 0
+                    sends_done = 0
                 slept = time.monotonic() - t0
                 remaining = period - slept
                 if remaining > 0:
@@ -1003,8 +1126,11 @@ class VLMService:
             except OSError:
                 pass
 
-    def _tick_send_results(self, push_sock: socket.socket, now: float) -> None:
-        """One pass: prune expired, build payload if any subscriber is due, send."""
+    def _tick_send_results(self, push_sock: socket.socket, now: float) -> int:
+        """One pass: prune expired, build payload if any subscriber is due,
+        send. Returns the number of datagrams successfully transmitted on
+        this tick so _results_tick_loop can roll them up into the
+        periodic stats line."""
         # Drop expired subscribers up front so we don't serialise for nobody.
         with self._subscribers_lock:
             for sid, info in list(self._subscribers.items()):
@@ -1017,24 +1143,28 @@ class VLMService:
                     due.append((sid, info["addr"]))
                     info["last_sent_t"] = now
         if not due:
-            return
+            return 0
         try:
             payload = json.dumps(self._build_vlm_results_payload(), default=_json_default).encode("utf-8")
         except Exception as e:
-            if self.args.verbose:
-                _log(f"results push: payload build failed: {e}")
-            return
+            # Always log payload build failures — silent failure here used
+            # to mask broken cached_dets contents and the panel just kept
+            # reporting "intake: connected" with no detections drawn.
+            _log(f"results push: payload build failed: {e}")
+            return 0
         if len(payload) > 60 * 1024:
             # UDP datagrams >~64 KB get IP-fragmented. Keep payloads small;
             # the panel will fall back to the next tick.
-            if self.args.verbose:
-                _log(f"results push: payload {len(payload)} B exceeds 60 KB; skipping tick")
-            return
+            _log(f"results push: payload {len(payload)} B exceeds 60 KB; skipping tick")
+            return 0
+        sent = 0
         for _sid, addr in due:
             try:
                 push_sock.sendto(payload, addr)
+                sent += 1
             except OSError:
                 pass
+        return sent
 
     def _build_vlm_results_payload(self) -> dict:
         """Snapshot the current detection / hit / fixation / decision state

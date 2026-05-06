@@ -715,6 +715,18 @@ class ControlPanel(QMainWindow):
         if PERCEPTION_FRAME_SOURCE == "remote" or SERVICES_HOSTED_REMOTELY:
             self._relay_status_timer.start()
 
+        # Seg-stream readout — only running while the operator has the
+        # stream toggled on. Cadence matches the service's stats window
+        # (_SEG_STREAM_STATS_S = 5s) so the same numbers refresh once per
+        # log line. Emits to the VLM log buffer; a separate timer keeps
+        # this off the 1 Hz remote-status path so latency on that hot
+        # path stays unchanged.
+        self._seg_stream_log_timer = QTimer(self)
+        self._seg_stream_log_timer.setInterval(5000)
+        self._seg_stream_log_timer.timeout.connect(self._poll_seg_stream_stats)
+        # Suppress duplicate emissions when last_emit_t hasn't advanced.
+        self._last_seg_stream_emit_t: float = 0.0
+
     # ---------- UI build ----------
     def _build_ui(self):
         self._building_ui = True
@@ -1996,6 +2008,10 @@ class ControlPanel(QMainWindow):
             self.btn_vlm_seg_stream.setChecked(False)
             self.btn_vlm_seg_stream.setText("Stream Seg: OFF")
             self.btn_vlm_seg_stream.blockSignals(False)
+        # Stop the seg-stream readout timer too — its 5 s tick would
+        # otherwise spam "unreachable" lines into the VLM log while the
+        # service tears down.
+        self._seg_stream_log_timer.stop()
         # Ask vlm_service to exit gracefully before killing the conda wrapper.
         # conda run does not forward SIGTERM to child processes, so without this
         # the inner Python process survives as an orphan holding the UDP port.
@@ -2040,6 +2056,14 @@ class ControlPanel(QMainWindow):
             VLM_QUERY_TIMEOUT_S,
             f"segment_stream({'on' if checked else 'off'}, {hz:.1f} Hz)",
         )
+        # Drive the seg-stream readout off the toggle: the timer is only
+        # meaningful while the stream is running. Reset the dedup marker
+        # on each on-edge so the very first stats window emits.
+        if checked:
+            self._last_seg_stream_emit_t = 0.0
+            self._seg_stream_log_timer.start()
+        else:
+            self._seg_stream_log_timer.stop()
 
     def on_vlm_seg_stream_hz_changed(self, hz: float) -> None:
         # Only push a rate change if the stream is currently on; otherwise
@@ -2054,6 +2078,53 @@ class ControlPanel(QMainWindow):
 
     def on_vlm_service_depth(self):
         self._vlm_command_threaded({"cmd": "depth", "at_gaze": True}, 15.0, "depth")
+
+    def _poll_seg_stream_stats(self) -> None:
+        """Pull the seg-stream stats block from the VLM status reply and
+        append a one-line summary to the VLM log buffer. Runs on a 5 s
+        timer that's only active while the operator has Stream Seg on.
+
+        The status request is the same UDP roundtrip the existing handlers
+        use; we run it on a worker thread so a slow GPU host (or a service
+        that just died) cannot stall the GUI thread."""
+        def worker():
+            try:
+                resp = self._vlm_udp_request({"cmd": "status"}, timeout_s=0.5)
+            except Exception as e:
+                # Timer is short-lived; if status is unreachable while the
+                # stream is supposedly on, surface that — most likely the
+                # service died and the toggle is stale.
+                self._append_log_ui(
+                    "VLM",
+                    f"[{self._ts()}] seg-stream status: unreachable ({e})\n",
+                )
+                return
+            stats = resp.get("seg_stream") if isinstance(resp, dict) else None
+            if not isinstance(stats, dict):
+                return
+            # Skip ticks where the service hasn't refreshed its window yet
+            # — avoids three identical lines while the first 5 s window
+            # accumulates.
+            emit_t = float(stats.get("last_emit_t") or 0.0)
+            if emit_t and emit_t == self._last_seg_stream_emit_t:
+                return
+            self._last_seg_stream_emit_t = emit_t
+            active = bool(stats.get("active"))
+            target = float(stats.get("hz_target") or 0.0)
+            achieved = float(stats.get("hz_achieved") or 0.0)
+            mean_dets = float(stats.get("mean_dets") or 0.0)
+            mean_infer = float(stats.get("mean_infer_ms") or 0.0)
+            errors = int(stats.get("errors") or 0)
+            self._append_log_ui(
+                "VLM",
+                f"[{self._ts()}] seg-stream: active={active} "
+                f"target={target:.1f}Hz achieved={achieved:.1f}Hz "
+                f"mean_dets={mean_dets:.1f} mean_infer={mean_infer:.0f}ms "
+                f"errors={errors}\n",
+            )
+
+        threading.Thread(target=worker, daemon=True,
+                         name="panel-seg-stream-stats").start()
 
     def on_vlm_capture_first(self):
         import threading as _threading
