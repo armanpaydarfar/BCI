@@ -1460,8 +1460,10 @@ def main() -> None:
         _sleep_release()
         _log("stopped")
         # Close the anonymous service log last so the "stopped" line
-        # makes it onto disk before the handle goes away.
-        global _LOG_FILE
+        # makes it onto disk before the handle goes away. The `global`
+        # declaration at the top of main() (line ~1336) already covers
+        # this scope; a second `global` here is a SyntaxError because
+        # the name has been assigned earlier in the function.
         fh = _LOG_FILE
         _LOG_FILE = None
         if fh is not None:
