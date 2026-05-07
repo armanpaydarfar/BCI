@@ -54,7 +54,7 @@ SUBJECTS = [
 ]
 
 # ... OR use a glob-like prefix filter if SUBJECTS is empty.
-SUBJECT_PREFIX_FILTER = "CLIN_SUBJ_"   # e.g. "F25CLASS_SUBJ_" or "CLIN_SUBJ_" or "" for ALL subjects
+SUBJECT_PREFIX_FILTER = "PILOT00"   # e.g. "F25CLASS_SUBJ_" or "CLIN_SUBJ_" or "" for ALL subjects
 
 # Sessions: provide dict subject->list of session folder names (e.g., "ses-S001ONLINE") to include.
 # If None, includes ALL sessions found (subject to exclusion rules).
@@ -82,14 +82,61 @@ SESSIONS_BY_SUBJECT = {
 '''
 
 SESSIONS_BY_SUBJECT = {
-    "CLIN_SUBJ_002": ["ses-S002ONLINE","ses-S004ONLINE"],
-    "CLIN_SUBJ_003": ["ses-S001ONLINE","ses-S002ONLINE","ses-S003ONLINE","ses-S004ONLINE","ses-S005ONLINE"],
-    "CLIN_SUBJ_004": ["ses-S001ONLINE","ses-S002ONLINE","ses-S003ONLINE","ses-S004ONLINE","ses-S005ONLINE"], 
+    "PILOT001": ["ses-S001ONLINE"],
+    "PILOT002": ["ses-S001ONLINE"],
+    "PILOT003": ["ses-S001ONLINE"],
+    "PILOT004": ["ses-S001ONLINE"],
+    "PILOT005": ["ses-S001ONLINE"],
+    "PILOT006": ["ses-S001ONLINE"],
+    "PILOT007": ["ses-S001ONLINE"],
+    "PILOT008": ["ses-S001ONLINE"],
 }
 
 # Runs: leave as None for "all ONLINE_ runs in logs/".
 # Or provide a dict (subject, session)->list of run folder names.
-RUNS_BY_SUBJECT_SESSION = None
+# Aborted runs identified by tiny decoder_output.csv / trial_summary.csv are excluded here.
+RUNS_BY_SUBJECT_SESSION = {
+    ("PILOT001", "ses-S001ONLINE"): [
+        "ONLINE_2026-02-10_17-29-45_run-001",
+        "ONLINE_2026-02-10_17-50-03_run-001",
+        "ONLINE_2026-02-10_18-10-30_run-001",
+    ],
+    ("PILOT002", "ses-S001ONLINE"): [
+        "ONLINE_2026-02-18_14-40-27_run-001",
+        "ONLINE_2026-02-18_14-56-13_run-001",
+        "ONLINE_2026-02-18_15-11-57_run-001",
+    ],
+    ("PILOT003", "ses-S001ONLINE"): [
+        "ONLINE_2026-02-12_12-43-42_run-001",
+        "ONLINE_2026-02-12_13-00-23_run-001",
+        "ONLINE_2026-02-12_13-15-02_run-001",
+    ],
+    ("PILOT004", "ses-S001ONLINE"): [
+        "ONLINE_2026-02-13_12-48-20_run-001",
+        "ONLINE_2026-02-13_13-06-31_run-001",
+        "ONLINE_2026-02-13_13-22-33_run-001",
+    ],
+    ("PILOT005", "ses-S001ONLINE"): [
+        "ONLINE_2026-02-16_12-26-19_run-001",
+        "ONLINE_2026-02-16_12-45-40_run-001",
+        "ONLINE_2026-02-16_13-03-47_run-001",
+    ],
+    ("PILOT006", "ses-S001ONLINE"): [
+        "ONLINE_2026-02-17_12-55-47_run-001",
+        "ONLINE_2026-02-17_13-09-58_run-001",
+        "ONLINE_2026-02-17_13-28-04_run-001",
+    ],
+    ("PILOT007", "ses-S001ONLINE"): [
+        "ONLINE_2026-02-17_17-21-21_run-001",
+        "ONLINE_2026-02-17_17-38-02_run-001",
+        "ONLINE_2026-02-17_17-54-00_run-001",
+    ],
+    ("PILOT008", "ses-S001ONLINE"): [
+        "ONLINE_2026-02-25_13-38-40_run-001",
+        "ONLINE_2026-02-25_13-52-47_run-001",
+        "ONLINE_2026-02-25_14-08-26_run-001",
+    ],
+}
 
 # ---- Bar dynamics definition (Lean16Hz internal) ----
 THRESH = 0.50  # correct-class probability threshold for "lean" (internal)
@@ -99,8 +146,9 @@ ACCURACY_MODE = "decision"      # "decision" (exclude ambiguous) OR "total" (inc
 ACCURACY_SOURCE = "csv"      # "csv" recommended for class-split accuracy; "event_log" provides only overall
 
 # ---- Plot control ----
-DO_PLOTS = True
+DO_PLOTS = False
 METRICS_TO_PLOT = ["accuracy", "bar_dynamics"]  # subset of ["accuracy", "bar_dynamics"]
+PLOT_AGGREGATE_CM = True   # if True, also pop up the aggregate (sum across runs) confusion matrix
 
 GROUP_LEVEL = "session"    # "run", "session", or "subject"
 PLOT_STYLE = "box"         # "box" or "bar"
@@ -597,6 +645,91 @@ def summary_table(runs_df: pd.DataFrame, level: str, metric: str):
 
 
 # =========================================================
+# Aggregate confusion matrix
+# =========================================================
+
+def compute_confusion_matrix_from_csv(df_run: pd.DataFrame) -> np.ndarray | None:
+    """
+    Per run: 2x3 confusion matrix using each trial's final Predicted Label.
+      Rows = Actual MI (200), Actual REST (100)
+      Cols = Predicted MI (200), Predicted REST (100), Ambiguous (anything else / no decision)
+    Returns None if required columns are missing.
+    """
+    required = ["GlobalTrialID", "True Label", "Predicted Label", "Phase"]
+    for c in required:
+        if c not in df_run.columns:
+            return None
+
+    df = df_run[df_run["Phase"] != "ROBOT"].copy()
+    if "Timestamp" in df.columns:
+        df = df.sort_values("Timestamp")
+    last = df.groupby("GlobalTrialID", as_index=False).tail(1)
+
+    cm = np.zeros((2, 3), dtype=int)
+    true_num = pd.to_numeric(last["True Label"], errors="coerce").astype("Int64")
+    for true_lab, row_idx in [(200, 0), (100, 1)]:
+        sub = last[true_num == true_lab]
+        preds = pd.to_numeric(sub["Predicted Label"], errors="coerce")
+        cm[row_idx, 0] = int((preds == 200).sum())
+        cm[row_idx, 1] = int((preds == 100).sum())
+        cm[row_idx, 2] = int((~preds.isin([200, 100])).sum())
+    return cm
+
+
+def plot_aggregate_confusion_matrix(
+    cm: np.ndarray,
+    n_subjects: int,
+    n_runs: int,
+    title_suffix: str = "",
+    save_path: str | None = None,
+):
+    """
+    cm: 2x3 [Actual MI, Actual REST] x [Pred MI, Pred REST, Ambiguous]
+    Heatmap colored by row-normalized percentage; cell text shows count and %.
+    """
+    row_totals = cm.sum(axis=1, keepdims=True)
+    pct = np.where(row_totals > 0, 100.0 * cm / np.maximum(row_totals, 1), 0.0)
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.8))
+    im = ax.imshow(pct, cmap="Blues", vmin=0, vmax=100, aspect="auto")
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("% of actual class")
+
+    ax.set_xticks([0, 1, 2])
+    ax.set_xticklabels(["Pred MI", "Pred REST", "Ambiguous"])
+    ax.set_yticks([0, 1])
+    ax.set_yticklabels(["Actual MI", "Actual REST"])
+
+    for i in range(2):
+        for j in range(3):
+            ax.text(
+                j, i, f"{cm[i, j]}\n({pct[i, j]:.1f}%)",
+                ha="center", va="center",
+                color="white" if pct[i, j] > 50 else "black",
+                fontsize=11,
+            )
+
+    decisions_n = int(cm[:, :2].sum())
+    correct_n = int(cm[0, 0] + cm[1, 1])
+    ambiguous_n = int(cm[:, 2].sum())
+    total_trials = int(cm.sum())
+    dec_acc = 100.0 * correct_n / decisions_n if decisions_n else float("nan")
+    tot_acc = 100.0 * correct_n / total_trials if total_trials else float("nan")
+
+    ax.set_title(
+        f"Aggregate Confusion Matrix{title_suffix}\n"
+        f"{n_subjects} subjects · {n_runs} runs · {total_trials} trials | "
+        f"Decision acc = {dec_acc:.1f}% | Total acc = {tot_acc:.1f}% | "
+        f"Ambiguous = {ambiguous_n}/{total_trials}"
+    )
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"💾 Saved confusion matrix figure to: {save_path}")
+    plt.show()
+
+
+# =========================================================
 # Main
 # =========================================================
 
@@ -624,6 +757,9 @@ def main():
 
     # ---- Main aggregation loop ----
     rows = []
+    cm_aggregate = np.zeros((2, 3), dtype=int)
+    cm_runs_count = 0
+    cm_subjects_set = set()
 
     for sub_dir in selected_sub_dirs:
         subj_id = subject_dir_to_id(sub_dir)
@@ -734,6 +870,13 @@ def main():
                 Decisions_MI = acc_by_class.get("Decisions_MI", 0)
                 Decisions_REST = acc_by_class.get("Decisions_REST", 0)
 
+                # ---------- Per-run confusion matrix (CSV-based) ----------
+                cm_run = compute_confusion_matrix_from_csv(df_run)
+                if cm_run is not None:
+                    cm_aggregate += cm_run
+                    cm_runs_count += 1
+                    cm_subjects_set.add(subj_id)
+
                 # ---------- Optional: overall event_log accuracy (sanity check) ----------
                 if ACCURACY_SOURCE == "event_log":
                     AccDecision_overall, AccTotal_overall, Ambiguous_overall = compute_overall_accuracy_from_event_log(run_path)
@@ -798,6 +941,22 @@ def main():
     if DO_PLOTS:
         for m in METRICS_TO_PLOT:
             dispatch_plot(runs_df, m)
+
+    if PLOT_AGGREGATE_CM:
+        if cm_runs_count == 0:
+            print("⚠️ No runs contributed to the aggregate confusion matrix.")
+        else:
+            print("\n--- Aggregate confusion matrix ---")
+            print("Rows: Actual [MI, REST] | Cols: Predicted [MI, REST, Ambiguous]")
+            print(cm_aggregate)
+            cm_save_path = os.path.join(CURRENT_STUDY_ROOT, "aggregate_confusion_matrix.png")
+            plot_aggregate_confusion_matrix(
+                cm_aggregate,
+                n_subjects=len(cm_subjects_set),
+                n_runs=cm_runs_count,
+                title_suffix="",
+                save_path=cm_save_path,
+            )
 
     # ---- Summary tables ----
     print("\n--- Session-wise summary (mean/median/IQR across runs) ---")
