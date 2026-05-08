@@ -2149,19 +2149,23 @@ class ControlPanel(QMainWindow):
         self.lbl_compute_led.setToolTip(
             f"compute: src={src} connected={connected} frames={frames} age={age_txt}"
         )
-        # End-to-end warmup. When Compute first transitions green after
-        # a Connect, fire one `cmd=segment` so the GPU runs an inference
-        # and pushes a real vlm_results payload back, lighting Receive
-        # without requiring the operator to click Stream Seg / Decide /
-        # Segment. Gated on led_state=running so we know the GPU has at
-        # least one frame to operate on (segment returns no_frame
-        # otherwise; see vlm_service.py:566). Fires exactly once per
+        # End-to-end chain verification. When Compute first transitions
+        # green after a Connect, fire one `cmd=verify_chain` so the GPU
+        # confirms it has a frame + the detector is loaded + the push
+        # path works, then sends one synthetic `chain_verify` payload
+        # to subscribers. The panel's _on_vlm_payload only paints
+        # vlm_results (Utils/vlm_scene_widget.py:413-415), so this
+        # leaves the video tab clean — no stray segmentation overlay
+        # from a verification action the operator didn't request.
+        # Gated on led_state=running so the GPU has at least one frame
+        # to verify against (verify_chain returns no_frame otherwise;
+        # vlm_service.py:_cmd_verify_chain). Fires exactly once per
         # Connect — the pending flag is cleared here and re-armed only
         # by _on_vlm_video_connect.
         if led_state == "running" and self._connect_warmup_pending:
             self._connect_warmup_pending = False
             self._vlm_command_threaded(
-                {"cmd": "segment"}, 5.0, "warmup-segment"
+                {"cmd": "verify_chain"}, 5.0, "verification"
             )
 
     def _poll_relay_status(self) -> None:

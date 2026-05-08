@@ -506,6 +506,7 @@ class VLMService:
             "camera_matrix": lambda: self._cmd_camera_matrix(),
             "subscribe": lambda: self._cmd_subscribe(req, addr),
             "unsubscribe": lambda: self._cmd_unsubscribe(req),
+            "verify_chain": lambda: self._cmd_verify_chain(),
             "stop": lambda: self._cmd_stop(addr),
         }
         handler = handlers.get(cmd)
@@ -1112,6 +1113,57 @@ class VLMService:
             removed = self._subscribers.pop(str(sid), None)
         return {"ok": True, "removed": bool(removed)}
 
+    def _cmd_verify_chain(self) -> dict:
+        """End-to-end chain verification, used by the operator panel
+        immediately after Connect to flip the Receive LED green
+        without firing a real segment that would leave detections on
+        the panel's overlay.
+
+        Confirms (a) we have a frame from the upstream relay (proves
+        Send + ingest), (b) the detector is loaded (proves the GPU
+        side can compute), and (c) we can push to subscribers (proves
+        the return path). Pushes one synthetic payload with
+        ``type="chain_verify"`` to all current subscribers. The panel's
+        ``_on_vlm_payload`` only paints overlays for ``type="vlm_results"``
+        (Utils/vlm_scene_widget.py:413-415), so this push lights
+        Receive without any visible artifact on the video tab.
+
+        No state is mutated — ``_cached_dets`` is left untouched, the
+        VLM state machine is not bumped, and the regular results-tick
+        loop is unaffected.
+        """
+        bundle, _, _ = self._latest()
+        if bundle is None:
+            return {"ok": False, "error": "no_frame"}
+        if self.detector is None:
+            return {"ok": False, "error": "detector_not_loaded"}
+
+        payload_dict = {
+            "type": "chain_verify",
+            "ok": True,
+            "ts_send_ns": int(time.time_ns()),
+        }
+        payload = json.dumps(payload_dict).encode("utf-8")
+
+        with self._subscribers_lock:
+            addrs = [info["addr"] for info in self._subscribers.values()]
+        sent = 0
+        if addrs:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                for sub_addr in addrs:
+                    try:
+                        sock.sendto(payload, sub_addr)
+                        sent += 1
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        return {"ok": True, "subscribers_notified": sent}
+
     def _results_tick_loop(self) -> None:
         """Build one payload per tick, send to each due subscriber. Reads
         cached state under the existing _render_lock — no model calls in
@@ -1220,6 +1272,21 @@ class VLMService:
             state = self._vlm_state
             decision = self._last_decision
             first_det = self._first_snap_det
+
+        # Skip the push when nothing has happened yet on the GPU side
+        # (no detections cached, no hit, no fixation, no decision, no
+        # first-snap object, and we're still in IDLE). Without this,
+        # the very first frame after Connect would trigger a fully-
+        # default "vlm_results" datagram that lights the panel's
+        # Receive LED before any real compute has run — breaking the
+        # operator's chain-of-causation expectation. The chain_verify
+        # command provides the affirmative verification path; idle
+        # ticks stay silent.
+        fix_active = fix is not None and getattr(fix, "active", False)
+        if (not dets and hit_det is None and not fix_active
+                and decision is None and first_det is None
+                and state == "IDLE"):
+            return None
 
         detections_out = [_serialize_detection_for_push(d) for d in dets]
         hit_payload = None
