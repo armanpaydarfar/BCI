@@ -708,10 +708,14 @@ class ControlPanel(QMainWindow):
         self._relay_log_path: Optional[str] = None
         self._relay_log_fh = None
         self._open_relay_log_file(self.training_subject)
-        # Replace Utils.frame_relay's default stdout sink with one that
-        # tees lines into the panel's "Relay" buffer + the file opened
-        # above. Standalone `python -m Utils.frame_relay` keeps the
-        # default print sink (set_log_callback isn't called there).
+        # Replace the default stdout sinks of frame_relay AND
+        # scene_only_neon_reader with one that tees lines into the
+        # panel's "Relay" buffer + the file opened above. The two
+        # modules are halves of the same upstream pipeline (reader
+        # opens Neon → relay pumps frames out), so co-locating their
+        # output is what an operator wants when troubleshooting why
+        # frames aren't flowing. Standalone usages keep the default
+        # print sinks (set_log_callback isn't called there).
         try:
             from Utils.frame_relay import set_log_callback as _set_relay_log_cb
             _set_relay_log_cb(self._relay_log_callback)
@@ -719,6 +723,14 @@ class ControlPanel(QMainWindow):
             self._append_log(
                 "Panel",
                 f"[{self._ts()}] WARN: could not install relay log callback: {e}\n",
+            )
+        try:
+            from Utils.scene_only_neon_reader import set_log_callback as _set_reader_log_cb
+            _set_reader_log_cb(self._relay_log_callback)
+        except Exception as e:
+            self._append_log(
+                "Panel",
+                f"[{self._ts()}] WARN: could not install neon-reader log callback: {e}\n",
             )
 
         # Build UI
@@ -2988,13 +3000,22 @@ class ControlPanel(QMainWindow):
         self._relay_log_subject = None
 
     def _relay_log_callback(self, line: str) -> None:
-        """Sink installed on Utils.frame_relay._log. Called from the
-        relay's pump thread + per-client send threads, so the actual
-        buffer/file mutation is bounced onto the Qt main thread via
-        ``QTimer.singleShot`` (same pattern as :meth:`_append_log_ui`).
-        We prepend a ``[HH:MM:SS]`` prefix here so the in-panel buffer
-        and the on-disk file both have time context — the standalone
-        stdout path is unaffected because it uses the default sink.
+        """Shared sink for both ``Utils.frame_relay._log`` and
+        ``Utils.scene_only_neon_reader._log``. Routes both to the
+        "Relay" channel because reader + relay are halves of the same
+        upstream pipeline; the line's source is already self-evident
+        from its embedded prefix (``[frame_relay] …`` vs.
+        ``[scene_only_neon_reader] …``).
+
+        Called from worker threads (relay's pump thread and per-client
+        send threads) as well as the UI thread (the reader is
+        constructed synchronously from VLMSceneWidget._start_embedded_relay
+        on the main thread). ``QTimer.singleShot`` is safe in both
+        cases — it's the same marshalling pattern as
+        :meth:`_append_log_ui` — and it prepends a ``[HH:MM:SS]``
+        stamp so the in-panel buffer and the on-disk file both have
+        time context. Standalone CLI usage of either module is
+        unaffected because the default sink stays in place there.
         """
         stamped = f"[{self._ts()}] {line}\n"
         QTimer.singleShot(0, self, lambda: self._append_log("Relay", stamped))

@@ -35,7 +35,7 @@ downstream model code that already tolerates per-frame jitter.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import numpy as np
 
@@ -46,8 +46,30 @@ _DEFAULT_NEON_CX = 800.0
 _DEFAULT_NEON_CY = 600.0
 
 
+def _default_log_callback(line: str) -> None:
+    print(line, flush=True)
+
+
+# Module-level sink for log lines. control_panel swaps this so reader
+# events ("connecting to <host>… connected to Device(...) … factory
+# intrinsics …") land in the panel's "Relay" channel alongside the
+# frame_relay output — the reader is the upstream half of the same
+# perception pipeline, so co-locating their logs makes triage easier.
+# Standalone usage keeps the default print sink.
+_LOG_CALLBACK: Callable[[str], None] = _default_log_callback
+
+
+def set_log_callback(fn: Optional[Callable[[str], None]]) -> None:
+    """Install a custom sink for ``_log`` lines. ``None`` restores the
+    stdout default. Lines arrive already prefixed with
+    ``[scene_only_neon_reader] ``.
+    """
+    global _LOG_CALLBACK
+    _LOG_CALLBACK = fn if fn is not None else _default_log_callback
+
+
 def _log(msg: str) -> None:
-    print(f"[scene_only_neon_reader] {msg}", flush=True)
+    _LOG_CALLBACK(f"[scene_only_neon_reader] {msg}")
 
 
 # ── bundle stub types (mirror harmony_vlm/utils/pupil_reader shapes) ──────
