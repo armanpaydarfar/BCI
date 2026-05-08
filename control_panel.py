@@ -686,7 +686,7 @@ class ControlPanel(QMainWindow):
         self.eego_term: Optional[QProcess] = None
 
         # Logs
-        self._log_buffers: Dict[str, str] = {"Marker": "", "FES": "", "Driver": "", "Gaze": "", "VLM": "", "Robot": "", "Panel": ""}
+        self._log_buffers: Dict[str, str] = {"Marker": "", "FES": "", "Driver": "", "Gaze": "", "VLM": "", "Relay": "", "Robot": "", "Panel": ""}
         self._current_log_target = "Panel"
         # Subject-tied VLM log file. Captures only the "VLM" buffer
         # (vlm_service stdout when local + every panel-side UDP TX/RX
@@ -699,6 +699,27 @@ class ControlPanel(QMainWindow):
         self._vlm_log_path: Optional[str] = None
         self._vlm_log_fh = None
         self._open_vlm_log_file(self.training_subject)
+        # Subject-tied frame_relay log file. Co-located with the VLM
+        # log under <DATA_DIR>/sub-<SUBJECT>/vlm_logs/ — the relay is
+        # the upstream half of the same perception pipeline, so
+        # keeping the two files together makes post-session forensics
+        # easier. Default file naming: frame_relay_<timestamp>.log.
+        self._relay_log_subject: Optional[str] = None
+        self._relay_log_path: Optional[str] = None
+        self._relay_log_fh = None
+        self._open_relay_log_file(self.training_subject)
+        # Replace Utils.frame_relay's default stdout sink with one that
+        # tees lines into the panel's "Relay" buffer + the file opened
+        # above. Standalone `python -m Utils.frame_relay` keeps the
+        # default print sink (set_log_callback isn't called there).
+        try:
+            from Utils.frame_relay import set_log_callback as _set_relay_log_cb
+            _set_relay_log_cb(self._relay_log_callback)
+        except Exception as e:
+            self._append_log(
+                "Panel",
+                f"[{self._ts()}] WARN: could not install relay log callback: {e}\n",
+            )
 
         # Build UI
         self._build_ui()
@@ -1130,7 +1151,7 @@ class ControlPanel(QMainWindow):
         pick_row = QHBoxLayout()
         self.log_title = QLabel("Logs:")
         self.log_selector = QComboBox()
-        self.log_selector.addItems(["Marker", "FES", "Driver", "Gaze", "VLM", "Robot", "Panel"])
+        self.log_selector.addItems(["Marker", "FES", "Driver", "Gaze", "VLM", "Relay", "Robot", "Panel"])
         self.log_selector.setCurrentText(self._current_log_target)
         self.log_selector.currentTextChanged.connect(self._on_log_target_changed)
         pick_row.addWidget(self.log_title); pick_row.addStretch(1)
@@ -1716,6 +1737,7 @@ class ControlPanel(QMainWindow):
         # the subject hasn't actually changed.
         if val != prev_subject:
             self._open_vlm_log_file(val)
+            self._open_relay_log_file(val)
         if hasattr(self, "on_refresh_training_data_list"):
             self.on_refresh_training_data_list()
 
@@ -2913,6 +2935,70 @@ class ControlPanel(QMainWindow):
         self._vlm_log_path = None
         self._vlm_log_subject = None
 
+    def _open_relay_log_file(self, subject: str) -> None:
+        """Open (or rotate to) the subject-tied frame_relay log file
+        under ``<DATA_DIR>/sub-<SUBJECT>/vlm_logs/``. Mirrors
+        :meth:`_open_vlm_log_file` exactly, just with a distinct
+        filename prefix so the two channels don't collide. Co-located
+        intentionally — relay + vlm_service are halves of one pipeline.
+        """
+        self._close_relay_log_file()
+        if not subject or _HCFG is None:
+            return
+        data_dir = os.path.expanduser(getattr(_HCFG, "DATA_DIR", "") or "")
+        if not data_dir:
+            return
+        try:
+            log_dir = os.path.join(data_dir, f"sub-{subject}", "vlm_logs")
+            os.makedirs(log_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(log_dir, f"frame_relay_{ts}.log")
+            fh = open(path, "a", encoding="utf-8")
+            fh.write(
+                f"# frame_relay log opened {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"# subject={subject}\n"
+                f"# FRAME_RELAY_BIND_HOST={FRAME_RELAY_BIND_HOST}\n"
+                f"# FRAME_RELAY_PORT={FRAME_RELAY_PORT}\n"
+                f"# FRAME_RELAY_HZ={FRAME_RELAY_HZ}\n"
+                f"# FRAME_RELAY_EMBEDDED={FRAME_RELAY_EMBEDDED}\n"
+                f"# NEON_COMPANION_HOST={NEON_COMPANION_HOST}\n"
+                f"# PERCEPTION_FRAME_SOURCE={PERCEPTION_FRAME_SOURCE}\n"
+            )
+            fh.flush()
+        except OSError as e:
+            self._append_log(
+                "Panel",
+                f"[{self._ts()}] WARN: could not open relay log file: {e}\n",
+            )
+            return
+        self._relay_log_subject = subject
+        self._relay_log_path = path
+        self._relay_log_fh = fh
+
+    def _close_relay_log_file(self) -> None:
+        fh = self._relay_log_fh
+        if fh is not None:
+            try:
+                fh.write(f"# frame_relay log closed {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                fh.close()
+            except OSError:
+                pass
+        self._relay_log_fh = None
+        self._relay_log_path = None
+        self._relay_log_subject = None
+
+    def _relay_log_callback(self, line: str) -> None:
+        """Sink installed on Utils.frame_relay._log. Called from the
+        relay's pump thread + per-client send threads, so the actual
+        buffer/file mutation is bounced onto the Qt main thread via
+        ``QTimer.singleShot`` (same pattern as :meth:`_append_log_ui`).
+        We prepend a ``[HH:MM:SS]`` prefix here so the in-panel buffer
+        and the on-disk file both have time context — the standalone
+        stdout path is unaffected because it uses the default sink.
+        """
+        stamped = f"[{self._ts()}] {line}\n"
+        QTimer.singleShot(0, self, lambda: self._append_log("Relay", stamped))
+
     def _append_log(self, title: str, text: str):
         key = title if title in self._log_buffers else "Panel"
         self._log_buffers[key] = (self._log_buffers.get(key, "") + text)[-2_000_000:]
@@ -2931,6 +3017,15 @@ class ControlPanel(QMainWindow):
                 # If the disk drops out mid-session there's nothing useful
                 # to do but stop tee'ing — the panel buffer still works.
                 self._close_vlm_log_file()
+        # Same tee, separate file, for the frame_relay channel. Lines
+        # arrive pre-stamped from _relay_log_callback so the file has
+        # usable time context on its own.
+        if key == "Relay" and self._relay_log_fh is not None:
+            try:
+                self._relay_log_fh.write(text)
+                self._relay_log_fh.flush()
+            except OSError:
+                self._close_relay_log_file()
 
     def _append_log_ui(self, title: str, text: str):
         # Force execution on the Qt main thread by providing a receiver (self).
@@ -2996,6 +3091,10 @@ class ControlPanel(QMainWindow):
             pass
         try:
             self._close_vlm_log_file()
+        except Exception:
+            pass
+        try:
+            self._close_relay_log_file()
         except Exception:
             pass
         event.accept()

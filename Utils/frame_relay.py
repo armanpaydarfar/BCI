@@ -87,8 +87,27 @@ import cv2
 import numpy as np
 
 
+def _default_log_callback(line: str) -> None:
+    print(line, flush=True)
+
+
+# Module-level sink for log lines. The control_panel swaps this for a
+# callback that tees into the in-panel "Relay" buffer + a subject-tied
+# file; standalone `python -m Utils.frame_relay` leaves the default in
+# place so terminal behaviour is unchanged.
+_LOG_CALLBACK: Callable[[str], None] = _default_log_callback
+
+
+def set_log_callback(fn: Optional[Callable[[str], None]]) -> None:
+    """Install a custom sink for ``_log`` lines. ``None`` restores the
+    stdout default. Lines arrive already prefixed with ``[frame_relay] ``.
+    """
+    global _LOG_CALLBACK
+    _LOG_CALLBACK = fn if fn is not None else _default_log_callback
+
+
 def _log(msg: str) -> None:
-    print(f"[frame_relay] {msg}", flush=True)
+    _LOG_CALLBACK(f"[frame_relay] {msg}")
 
 
 def _pct(samples: Deque[float], qs: list) -> list:
