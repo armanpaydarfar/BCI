@@ -998,7 +998,7 @@ class ControlPanel(QMainWindow):
         ]
 
         # ===== Perception Pipeline =====
-        # Three pipeline stages, each with its own LED:
+        # Three pipeline stages, each with its own LED in the LED column:
         #   Send    — local frame_relay (Utils/frame_relay.py), opens Neon
         #             and ships TCP envelopes. Driven by _poll_relay_status.
         #   Compute — remote vlm_service.py (or local QProcess in single-
@@ -1009,40 +1009,33 @@ class ControlPanel(QMainWindow):
         #             VLMSceneWidget). Driven by the subscriber's
         #             state_changed signal, bubbled up via the widget's
         #             subscriber_state_changed signal.
-        # Layout: row 1 = LEDs with labels, row 2 = action buttons,
-        # row 3 = per-stage detail text. Connect / Disconnect are the
-        # session-lifecycle primary actions (driven by _on_vlm_video_*
-        # in remote mode, or by on_vlm_service_start/stop in local mode
-        # — see _configure_remote_services_ui for the rewire).
-        # The Continuous / Pair row below is VLM-runtime control, kept
-        # separate because it operates on an already-running pipeline.
+        # Layout matches the Robot row's inline style — row 1: title +
+        # 3 LEDs + lifecycle/runtime buttons; row 2: VLM-specific
+        # commands (no separate "Continuous / Pair" row, those merge in).
+        # Per-stage detail text lives on each LED's tooltip rather than
+        # a third row, keeping the block compact while preserving the
+        # diagnostic information for hover.
         self.lbl_send_led    = QLabel("●"); self._set_led(self.lbl_send_led,    "stopped")
         self.lbl_compute_led = QLabel("●"); self._set_led(self.lbl_compute_led, "stopped")
         self.lbl_receive_led = QLabel("●"); self._set_led(self.lbl_receive_led, "stopped")
-
-        # Per-LED inline labels.
-        send_lbl    = QLabel("Send")
-        compute_lbl = QLabel("Compute")
-        receive_lbl = QLabel("Receive")
+        # Initial tooltip text — updated in place by the same drivers
+        # (_apply_remote_status, _poll_relay_status, _on_subscriber_state)
+        # that set the LED colour.
+        self.lbl_send_led.setToolTip("send: idle")
+        self.lbl_compute_led.setToolTip("compute: --")
+        self.lbl_receive_led.setToolTip("receive: --")
 
         leds_box = QHBoxLayout()
         leds_box.setContentsMargins(0, 0, 0, 0)
-        leds_box.setSpacing(6)
-        for led, lbl in (
-            (self.lbl_send_led,    send_lbl),
-            (self.lbl_compute_led, compute_lbl),
-            (self.lbl_receive_led, receive_lbl),
-        ):
+        leds_box.setSpacing(2)
+        for led in (self.lbl_send_led, self.lbl_compute_led, self.lbl_receive_led):
             leds_box.addWidget(led)
-            leds_box.addWidget(lbl)
-            leds_box.addSpacing(14)
-        leds_box.addStretch(1)
         leds_holder = _fixed_v(QWidget()); leds_holder.setLayout(leds_box)
 
-        # Action row. btn_vlm_service_start/stop are constructed here
-        # but rebranded to "Connect"/"Disconnect" in remote mode by
-        # _configure_remote_services_ui (which also rewires their
-        # handlers to _on_vlm_video_connect/disconnect).
+        # Lifecycle + runtime actions. btn_vlm_service_start/stop are
+        # constructed here but rebranded to "Connect"/"Disconnect" in
+        # remote mode by _configure_remote_services_ui (which also
+        # rewires their handlers to _on_vlm_video_connect/disconnect).
         self.btn_vlm_service_start  = QPushButton("Start")
         self.btn_vlm_service_stop   = QPushButton("Stop")
         self.btn_vlm_service_status = QPushButton("Status")
@@ -1054,45 +1047,10 @@ class ControlPanel(QMainWindow):
         self.btn_vlm_service_decide.clicked.connect(self.on_vlm_service_decide)
         self.btn_vlm_service_depth.clicked.connect(self.on_vlm_service_depth)
 
-        actions_box = QHBoxLayout()
-        actions_box.setContentsMargins(0, 0, 0, 0)
-        for w in (self.btn_vlm_service_start, self.btn_vlm_service_stop,
-                  self.btn_vlm_service_status, self.btn_vlm_service_decide,
-                  self.btn_vlm_service_depth):
-            actions_box.addWidget(w)
-        actions_box.addStretch(1)
-        actions_holder = _fixed_v(QWidget()); actions_holder.setLayout(actions_box)
-
-        # Per-stage detail text — one line per stage, separated by ·.
-        # Each is updated independently by its driver.
-        self.lbl_send_text    = QLabel("send: idle")
-        self.lbl_compute_text = QLabel("compute: --")
-        self.lbl_receive_text = QLabel("receive: --")
-        detail_sep_a = QLabel("·"); detail_sep_a.setStyleSheet("color: #888;")
-        detail_sep_b = QLabel("·"); detail_sep_b.setStyleSheet("color: #888;")
-        detail_box = QHBoxLayout()
-        detail_box.setContentsMargins(0, 0, 0, 0)
-        detail_box.setSpacing(8)
-        for w in (self.lbl_send_text, detail_sep_a,
-                  self.lbl_compute_text, detail_sep_b,
-                  self.lbl_receive_text):
-            detail_box.addWidget(w)
-        detail_box.addStretch(1)
-        detail_holder = _fixed_v(QWidget()); detail_holder.setLayout(detail_box)
-
-        pipeline_title = QLabel("<b>Perception Pipeline</b>")
-        grid.addWidget(pipeline_title, row, 0)
-        grid.addWidget(leds_holder,    row, 1, 1, 4)
-        row += 1
-        grid.addWidget(actions_holder, row, 1, 1, 4)
-        row += 1
-        grid.addWidget(detail_holder,  row, 1, 1, 4)
-        row += 1
-
-        # Continuous segmentation: toggle drives FastSAM @ N Hz on the
-        # service side; results stream into the overlay (VLM Video tab).
-        # Sequential (two-object) decide lives on the same row — look at A,
-        # capture; look at B, decide pair.
+        # Continuous segmentation toggle + cadence — merged onto the
+        # main perception row instead of a separate "Continuous / Pair"
+        # row, since stream control belongs alongside lifecycle in the
+        # operator's mental model.
         self.btn_vlm_seg_stream = QPushButton("Stream Seg: OFF")
         self.btn_vlm_seg_stream.setCheckable(True)
         self.spin_vlm_seg_hz = QDoubleSpinBox()
@@ -1104,39 +1062,63 @@ class ControlPanel(QMainWindow):
         self.btn_vlm_seg_stream.toggled.connect(self.on_vlm_seg_stream_toggled)
         self.spin_vlm_seg_hz.valueChanged.connect(self.on_vlm_seg_stream_hz_changed)
 
+        # Sequential (two-object) decide controls.
         self.btn_vlm_capture_first = QPushButton("Capture First")
         self.btn_vlm_decide_pair = QPushButton("Decide Pair")
         self.lbl_vlm_pair_token = QLabel("<i>snapshot:</i> (none)")
         self.btn_vlm_capture_first.clicked.connect(self.on_vlm_capture_first)
         self.btn_vlm_decide_pair.clicked.connect(self.on_vlm_decide_pair)
 
-        vlm_run = QHBoxLayout()
-        vlm_run.setContentsMargins(0, 0, 0, 0)
-        vlm_run.addWidget(self.spin_vlm_seg_hz)
-        vlm_run.addWidget(self.btn_vlm_seg_stream)
-        vlm_run.addSpacing(12)
-        vlm_run.addWidget(self.btn_vlm_capture_first)
-        vlm_run.addWidget(self.btn_vlm_decide_pair)
-        vlm_run.addWidget(self.lbl_vlm_pair_token, 1)
-        vlm_run_holder = _fixed_v(QWidget()); vlm_run_holder.setLayout(vlm_run)
-        vlm_run_title = QLabel("<i>Continuous / Pair:</i>")
-        grid.addWidget(vlm_run_title, row, 0)
-        grid.addWidget(vlm_run_holder, row, 1, 1, 4)
+        # Row 1: lifecycle (Connect/Disconnect) + stream-seg toggle + cadence.
+        actions_row1 = QHBoxLayout()
+        actions_row1.setContentsMargins(0, 0, 0, 0)
+        for w in (self.btn_vlm_service_start, self.btn_vlm_service_stop,
+                  self.btn_vlm_seg_stream, self.spin_vlm_seg_hz):
+            actions_row1.addWidget(w)
+        actions_row1.addStretch(1)
+        actions_row1_holder = _fixed_v(QWidget()); actions_row1_holder.setLayout(actions_row1)
+
+        # Row 2: ad-hoc commands (status, decide-once, depth-once,
+        # sequential-pair). All require the Compute LED to be green;
+        # we don't gate them in code, but the operator's flow is to
+        # press these only after Connect resolves.
+        actions_row2 = QHBoxLayout()
+        actions_row2.setContentsMargins(0, 0, 0, 0)
+        for w in (self.btn_vlm_service_status, self.btn_vlm_service_decide,
+                  self.btn_vlm_service_depth, self.btn_vlm_capture_first,
+                  self.btn_vlm_decide_pair, self.lbl_vlm_pair_token):
+            actions_row2.addWidget(w)
+        actions_row2.addStretch(1)
+        actions_row2_holder = _fixed_v(QWidget()); actions_row2_holder.setLayout(actions_row2)
+
+        # Title carries the legend so dots-only LED column matches the
+        # Robot row's style — see GPU_Service_Cross_Host_Hardening_Notes
+        # for the design rationale.
+        pipeline_title = QLabel(
+            "<b>Perception Pipeline</b><br>"
+            "<i>(send / compute / receive)</i>"
+        )
+        grid.addWidget(pipeline_title,    row, 0)
+        grid.addWidget(leds_holder,       row, 1)
+        grid.addWidget(actions_row1_holder, row, 2, 1, 3)
+        row += 1
+        grid.addWidget(actions_row2_holder, row, 1, 1, 4)
         row += 1
 
         # Aggregate VLM-specific widgets so backend gating (legacy mode)
         # can hide them in one shot. The pipeline-block title and the
-        # Send LED/label/text stay visible because the frame_relay is
-        # shared infra (gaze_runner consumes it too); only the
-        # Compute/Receive halves and the VLM-only commands are hidden.
+        # Send LED stay visible because the frame_relay is shared infra
+        # (gaze_runner consumes it too); only Compute/Receive LEDs and
+        # the VLM-only commands are hidden.
         self._vlm_row_widgets = [
-            self.lbl_compute_led, compute_lbl, self.lbl_compute_text,
-            self.lbl_receive_led, receive_lbl, self.lbl_receive_text,
+            self.lbl_compute_led, self.lbl_receive_led,
+            self.btn_vlm_seg_stream, self.spin_vlm_seg_hz,
             self.btn_vlm_service_status,
             self.btn_vlm_service_decide,
             self.btn_vlm_service_depth,
-            detail_sep_a, detail_sep_b,
-            vlm_run_title, vlm_run_holder,
+            self.btn_vlm_capture_first,
+            self.btn_vlm_decide_pair,
+            self.lbl_vlm_pair_token,
         ]
 
         # ===== Arduino =====
@@ -1403,20 +1385,20 @@ class ControlPanel(QMainWindow):
     def _on_subscriber_state(self, state: str) -> None:
         """Slot for VLMSceneWidget.subscriber_state_changed. Translates
         ``"subscribed"`` / ``"unsubscribed"`` / ``"error: …"`` into the
-        Receive LED + detail-text update. Three-color palette per the
+        Receive LED colour + tooltip. Three-color palette per the
         operator's clarification (gray = not started, red = error,
         green = ok); no warning state, only error or ok.
         """
         if state == "subscribed":
             self._set_led(self.lbl_receive_led, "running")
-            self.lbl_receive_text.setText("receive: subscribed")
+            self.lbl_receive_led.setToolTip("receive: subscribed")
         elif state.startswith("error"):
             self._set_led(self.lbl_receive_led, "error")
-            self.lbl_receive_text.setText(f"receive: {state}")
+            self.lbl_receive_led.setToolTip(f"receive: {state}")
         else:
             # "unsubscribed" or anything we don't recognise — gray.
             self._set_led(self.lbl_receive_led, "stopped")
-            self.lbl_receive_text.setText(f"receive: {state}")
+            self.lbl_receive_led.setToolTip(f"receive: {state}")
 
     def _build_runtime_config_tab(self, tabs: QTabWidget):
         rtc = QWidget()
@@ -2102,7 +2084,7 @@ class ControlPanel(QMainWindow):
         self._remote_status_in_flight = False
         if resp.get("_unreachable"):
             self._set_led(self.lbl_compute_led, "stopped")
-            self.lbl_compute_text.setText("compute: unreachable")
+            self.lbl_compute_led.setToolTip("compute: unreachable")
             return
         ok = bool(resp.get("ok"))
         connected = bool(resp.get("frame_source_connected"))
@@ -2117,7 +2099,7 @@ class ControlPanel(QMainWindow):
         else:
             led_state = "stopped"
         self._set_led(self.lbl_compute_led, led_state)
-        self.lbl_compute_text.setText(
+        self.lbl_compute_led.setToolTip(
             f"compute: src={src} connected={connected} frames={frames} age={age_txt}"
         )
 
@@ -2138,12 +2120,12 @@ class ControlPanel(QMainWindow):
             alive = thread is not None and thread.is_alive()
             if alive:
                 self._set_led(self.lbl_send_led, "running")
-                self.lbl_send_text.setText(
+                self.lbl_send_led.setToolTip(
                     f"send: in-process @ {FRAME_RELAY_BIND_HOST}:{FRAME_RELAY_PORT}"
                 )
             else:
                 self._set_led(self.lbl_send_led, "stopped")
-                self.lbl_send_text.setText("send: in-process — thread exited")
+                self.lbl_send_led.setToolTip("send: in-process — thread exited")
             return
 
         # External relay (FRAME_RELAY_EMBEDDED=False or remote host) —
@@ -2158,12 +2140,12 @@ class ControlPanel(QMainWindow):
         ping = ctl.ping(timeout_s=0.5)
         if ping.get("ok"):
             self._set_led(self.lbl_send_led, "running")
-            self.lbl_send_text.setText(
+            self.lbl_send_led.setToolTip(
                 f"send: reachable @ {ping['host']}:{ping['port']}"
             )
         else:
             self._set_led(self.lbl_send_led, "stopped")
-            self.lbl_send_text.setText(
+            self.lbl_send_led.setToolTip(
                 f"send: unreachable @ {ping['host']}:{ping['port']}"
             )
 
