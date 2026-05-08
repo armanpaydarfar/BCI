@@ -646,6 +646,15 @@ class ControlPanel(QMainWindow):
         self.resize(1100, 700)
         self.setMinimumSize(700, 500)
         self._remote_status_in_flight = False
+        # One-shot end-to-end warmup gate. Set True on Connect; cleared
+        # by _apply_remote_status when Compute first transitions green,
+        # at which point we fire `cmd=segment` so the GPU runs one
+        # inference and pushes a real vlm_results payload back. That
+        # final push is what flips the Receive LED green — without the
+        # warmup, the operator would have to manually click Stream Seg
+        # / Decide / Segment for Receive to verify, which leaves only
+        # 2 of 3 lights green after a fresh Connect.
+        self._connect_warmup_pending: bool = False
         self._remote_status_received.connect(self._apply_remote_status)
 
         # State
@@ -1377,6 +1386,11 @@ class ControlPanel(QMainWindow):
         met (Send: ≥1 frame published; Compute: GPU reports
         frames_received>0; Receive: first push payload arrived) — the
         kick just makes the next probe happen now instead of later.
+
+        Arm the one-shot end-to-end warmup so Receive can verify
+        without an operator click. _apply_remote_status fires the
+        actual `cmd=segment` once Compute transitions green; see the
+        warmup gate at __init__ for the full rationale.
         """
         if hasattr(self, "vlm_scene_widget"):
             self.vlm_scene_widget.start()
@@ -1384,10 +1398,17 @@ class ControlPanel(QMainWindow):
             self._poll_relay_status()
         if SERVICES_HOSTED_REMOTELY and getattr(self, "_remote_status_timer", None) is not None:
             self._poll_remote_status()
+        self._connect_warmup_pending = True
 
     def _on_vlm_video_disconnect(self) -> None:
         if hasattr(self, "vlm_scene_widget"):
             self.vlm_scene_widget.stop()
+        # Cancel any in-flight warmup arming; a fresh Connect will
+        # re-arm it. Without this, a Disconnect-before-Compute-green
+        # would leave the gate True and a subsequent Connect would
+        # re-arm to True (still fine), but the explicit clear keeps
+        # the state machine readable.
+        self._connect_warmup_pending = False
         # Subscriber stop emits "unsubscribed" on its own thread; reset
         # the Receive LED here too so we don't depend on that signal
         # arriving (e.g., if stop() is called before the subscriber's
@@ -2128,6 +2149,20 @@ class ControlPanel(QMainWindow):
         self.lbl_compute_led.setToolTip(
             f"compute: src={src} connected={connected} frames={frames} age={age_txt}"
         )
+        # End-to-end warmup. When Compute first transitions green after
+        # a Connect, fire one `cmd=segment` so the GPU runs an inference
+        # and pushes a real vlm_results payload back, lighting Receive
+        # without requiring the operator to click Stream Seg / Decide /
+        # Segment. Gated on led_state=running so we know the GPU has at
+        # least one frame to operate on (segment returns no_frame
+        # otherwise; see vlm_service.py:566). Fires exactly once per
+        # Connect — the pending flag is cleared here and re-armed only
+        # by _on_vlm_video_connect.
+        if led_state == "running" and self._connect_warmup_pending:
+            self._connect_warmup_pending = False
+            self._vlm_command_threaded(
+                {"cmd": "segment"}, 5.0, "warmup-segment"
+            )
 
     def _poll_relay_status(self) -> None:
         """2 s cadence. Reflects whether the frame relay is alive.
