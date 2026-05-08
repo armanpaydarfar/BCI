@@ -33,8 +33,6 @@ test harness — can read the headline metric.
 
 from __future__ import annotations
 
-import json
-import socket
 import threading
 import time
 from collections import deque
@@ -42,137 +40,12 @@ from typing import Any, Deque, Dict, Optional, Tuple
 
 import numpy as np
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from Utils.scene_overlay_renderer import SceneOverlayRenderer
-
-
-# ── UDP push subscriber thread ─────────────────────────────────────────────
-
-
-class _JsonPushSubscriber(QThread):
-    """Subscribe-mode UDP listener. Sends ``cmd=subscribe`` to the configured
-    service, then rx-loops on the same socket for pushed JSON datagrams.
-
-    Emits one Signal per received payload. Re-subscribes on a heartbeat
-    timer so the service-side TTL can prune dead clients without the
-    widget having to track its own watchdog.
-    """
-
-    payload_received = Signal(dict)
-    state_changed = Signal(str)  # "subscribed" / "unsubscribed" / "error: ..."
-
-    HEARTBEAT_S = 10.0  # well below vlm_service's 30 s TTL.
-
-    def __init__(self, host: str, port: int, *, hz: float = 20.0,
-                 ttl_s: float = 30.0, parent=None) -> None:
-        super().__init__(parent)
-        self._host = str(host)
-        self._port = int(port)
-        self._hz = float(hz)
-        self._ttl_s = float(ttl_s)
-        self._sock: Optional[socket.socket] = None
-        self._running = False
-        self._subscriber_id: Optional[str] = None
-        self._last_subscribe_t: float = 0.0
-
-    def stop(self) -> None:
-        self._running = False
-        # Unblock the recvfrom by closing the socket; the run loop
-        # tolerates the resulting OSError and exits.
-        try:
-            if self._sock is not None:
-                self._sock.close()
-        except OSError:
-            pass
-
-    # ── thread body ───────────────────────────────────────────────────────
-
-    def run(self) -> None:
-        self._running = True
-        try:
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self._sock.bind(("", 0))  # ephemeral port; service replies here.
-            self._sock.settimeout(0.5)
-        except OSError as e:
-            self.state_changed.emit(f"error: bind: {e}")
-            return
-
-        if not self._subscribe():
-            self.state_changed.emit("error: initial subscribe failed")
-        else:
-            self.state_changed.emit("subscribed")
-
-        while self._running:
-            self._maybe_heartbeat()
-            try:
-                data, _addr = self._sock.recvfrom(65535)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            if not data:
-                continue
-            try:
-                payload = json.loads(data.decode("utf-8", errors="replace"))
-            except json.JSONDecodeError:
-                continue
-            # Subscribe replies and push payloads share this socket. Only
-            # forward push payloads (they carry a `type` field; the
-            # subscribe reply has `ok`/`subscriber_id`).
-            if "type" in payload:
-                self.payload_received.emit(payload)
-
-        # Best-effort unsubscribe so the service prunes immediately.
-        if self._subscriber_id:
-            try:
-                self._send({"cmd": "unsubscribe",
-                            "subscriber_id": self._subscriber_id})
-            except OSError:
-                pass
-        try:
-            if self._sock is not None:
-                self._sock.close()
-        except OSError:
-            pass
-        self.state_changed.emit("unsubscribed")
-
-    # ── helpers ───────────────────────────────────────────────────────────
-
-    def _send(self, payload: Dict[str, Any]) -> None:
-        if self._sock is None:
-            return
-        self._sock.sendto(
-            json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-            (self._host, self._port),
-        )
-
-    def _subscribe(self) -> bool:
-        try:
-            self._send({"cmd": "subscribe", "stream": "results",
-                        "hz": self._hz, "ttl_s": self._ttl_s})
-            assert self._sock is not None
-            self._sock.settimeout(1.5)
-            data, _addr = self._sock.recvfrom(65535)
-            self._sock.settimeout(0.5)
-        except (OSError, AssertionError):
-            return False
-        try:
-            resp = json.loads(data.decode("utf-8", errors="replace"))
-        except json.JSONDecodeError:
-            return False
-        if not resp.get("ok"):
-            return False
-        self._subscriber_id = resp.get("subscriber_id")
-        self._last_subscribe_t = time.monotonic()
-        return True
-
-    def _maybe_heartbeat(self) -> None:
-        if time.monotonic() - self._last_subscribe_t < self.HEARTBEAT_S:
-            return
-        self._subscribe()  # idempotent on (addr, port) — re-uses same id
+from Utils.vlm_subscriber import JsonPushSubscriber
 
 
 # ── bundle-source thread (RemoteFrameReader path) ──────────────────────────
@@ -247,6 +120,11 @@ class VLMSceneWidget(QWidget):
     PAINT_HZ = 30.0
     LATENCY_WINDOW = 240  # ~8 s of paint deltas at 30 Hz
 
+    # Bubbled-up state from whichever JsonPushSubscriber is active
+    # (vlm or gaze). The panel connects this to its Receive-LED slot.
+    # Forwarded payloads: "subscribed" / "unsubscribed" / "error: ...".
+    subscriber_state_changed = Signal(str)
+
     def __init__(
         self,
         *,
@@ -301,8 +179,8 @@ class VLMSceneWidget(QWidget):
 
         # Threads (created on start()).
         self._bundle_thread: Optional[_BundleSourceThread] = None
-        self._vlm_subscriber: Optional[_JsonPushSubscriber] = None
-        self._gaze_subscriber: Optional[_JsonPushSubscriber] = None
+        self._vlm_subscriber: Optional[JsonPushSubscriber] = None
+        self._gaze_subscriber: Optional[JsonPushSubscriber] = None
 
         # ── UI ──
         # Lifecycle (start/stop) is driven from the Main tab's VLM
@@ -364,19 +242,25 @@ class VLMSceneWidget(QWidget):
         #    vlm_host=None to skip this — used when GAZE_OR_BACKEND is
         #    set to "legacy" so the panel only subscribes to gaze_runner.
         if self._vlm_host and self._vlm_port:
-            self._vlm_subscriber = _JsonPushSubscriber(
+            self._vlm_subscriber = JsonPushSubscriber(
                 self._vlm_host, self._vlm_port, hz=self.PAINT_HZ,
             )
             self._vlm_subscriber.payload_received.connect(self._on_vlm_payload)
             self._vlm_subscriber.state_changed.connect(self._on_vlm_state)
+            # Forward state to the panel's Receive LED via the widget's
+            # bubbled signal. Either subscriber's state is forwarded —
+            # whichever backend (vlm or gaze) is active is what "Receive"
+            # represents.
+            self._vlm_subscriber.state_changed.connect(self.subscriber_state_changed)
             self._vlm_subscriber.start()
 
         # 3. Gaze push subscriber (optional).
         if self._gaze_host and self._gaze_port:
-            self._gaze_subscriber = _JsonPushSubscriber(
+            self._gaze_subscriber = JsonPushSubscriber(
                 self._gaze_host, int(self._gaze_port), hz=self.PAINT_HZ,
             )
             self._gaze_subscriber.payload_received.connect(self._on_gaze_payload)
+            self._gaze_subscriber.state_changed.connect(self.subscriber_state_changed)
             self._gaze_subscriber.start()
 
         self._paint_timer.start()

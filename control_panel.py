@@ -748,7 +748,7 @@ class ControlPanel(QMainWindow):
         self._set_led(self.lbl_eego, "stopped")
         self._set_led(self.lbl_labrec, "stopped")
         self._set_led(self.lbl_gaze_service, "stopped")
-        self._set_led(self.lbl_vlm_service, "stopped")
+        self._set_led(self.lbl_compute_led, "stopped")
         self._set_led(self.lbl_arduino, "stopped")
 
         # When services are hosted remotely (Linux operator panel pointed at
@@ -997,13 +997,52 @@ class ControlPanel(QMainWindow):
             gaze_telemetry_lbl, self.btn_gaze_service_query,
         ]
 
-        # ===== VLM Service (harmony_vlm subprocess — FastSAM + Depth Pro + Gemini) =====
-        # Three stacked rows: (a) lifecycle + ad-hoc reasoning commands,
-        # (b) frame relay + intake status (kept adjacent to the VLM row
-        # so the operator sees both services at a glance, and merged
-        # into a single line since both are status-only), (c) continuous
-        # segmentation + sequential pair decide.
-        self.lbl_vlm_service = QLabel("●"); self._set_led(self.lbl_vlm_service, "stopped")
+        # ===== Perception Pipeline =====
+        # Three pipeline stages, each with its own LED:
+        #   Send    — local frame_relay (Utils/frame_relay.py), opens Neon
+        #             and ships TCP envelopes. Driven by _poll_relay_status.
+        #   Compute — remote vlm_service.py (or local QProcess in single-
+        #             machine mode). Driven by _apply_remote_status when
+        #             SERVICES_HOSTED_REMOTELY=True, by _start_proc/QProcess
+        #             state in local mode.
+        #   Receive — local Utils/vlm_subscriber.py (instantiated inside
+        #             VLMSceneWidget). Driven by the subscriber's
+        #             state_changed signal, bubbled up via the widget's
+        #             subscriber_state_changed signal.
+        # Layout: row 1 = LEDs with labels, row 2 = action buttons,
+        # row 3 = per-stage detail text. Connect / Disconnect are the
+        # session-lifecycle primary actions (driven by _on_vlm_video_*
+        # in remote mode, or by on_vlm_service_start/stop in local mode
+        # — see _configure_remote_services_ui for the rewire).
+        # The Continuous / Pair row below is VLM-runtime control, kept
+        # separate because it operates on an already-running pipeline.
+        self.lbl_send_led    = QLabel("●"); self._set_led(self.lbl_send_led,    "stopped")
+        self.lbl_compute_led = QLabel("●"); self._set_led(self.lbl_compute_led, "stopped")
+        self.lbl_receive_led = QLabel("●"); self._set_led(self.lbl_receive_led, "stopped")
+
+        # Per-LED inline labels.
+        send_lbl    = QLabel("Send")
+        compute_lbl = QLabel("Compute")
+        receive_lbl = QLabel("Receive")
+
+        leds_box = QHBoxLayout()
+        leds_box.setContentsMargins(0, 0, 0, 0)
+        leds_box.setSpacing(6)
+        for led, lbl in (
+            (self.lbl_send_led,    send_lbl),
+            (self.lbl_compute_led, compute_lbl),
+            (self.lbl_receive_led, receive_lbl),
+        ):
+            leds_box.addWidget(led)
+            leds_box.addWidget(lbl)
+            leds_box.addSpacing(14)
+        leds_box.addStretch(1)
+        leds_holder = _fixed_v(QWidget()); leds_holder.setLayout(leds_box)
+
+        # Action row. btn_vlm_service_start/stop are constructed here
+        # but rebranded to "Connect"/"Disconnect" in remote mode by
+        # _configure_remote_services_ui (which also rewires their
+        # handlers to _on_vlm_video_connect/disconnect).
         self.btn_vlm_service_start  = QPushButton("Start")
         self.btn_vlm_service_stop   = QPushButton("Stop")
         self.btn_vlm_service_status = QPushButton("Status")
@@ -1015,44 +1054,39 @@ class ControlPanel(QMainWindow):
         self.btn_vlm_service_decide.clicked.connect(self.on_vlm_service_decide)
         self.btn_vlm_service_depth.clicked.connect(self.on_vlm_service_depth)
 
-        vlm_actions = QHBoxLayout()
-        vlm_actions.setContentsMargins(0, 0, 0, 0)
+        actions_box = QHBoxLayout()
+        actions_box.setContentsMargins(0, 0, 0, 0)
         for w in (self.btn_vlm_service_start, self.btn_vlm_service_stop,
                   self.btn_vlm_service_status, self.btn_vlm_service_decide,
                   self.btn_vlm_service_depth):
-            vlm_actions.addWidget(w)
-        vlm_actions_holder = _fixed_v(QWidget()); vlm_actions_holder.setLayout(vlm_actions)
-        vlm_lbl_title = QLabel("<b>VLM Service</b>")
-        grid.addWidget(vlm_lbl_title, row, 0)
-        grid.addWidget(self.lbl_vlm_service, row, 1)
-        grid.addWidget(vlm_actions_holder, row, 2, 1, 3)
+            actions_box.addWidget(w)
+        actions_box.addStretch(1)
+        actions_holder = _fixed_v(QWidget()); actions_holder.setLayout(actions_box)
+
+        # Per-stage detail text — one line per stage, separated by ·.
+        # Each is updated independently by its driver.
+        self.lbl_send_text    = QLabel("send: idle")
+        self.lbl_compute_text = QLabel("compute: --")
+        self.lbl_receive_text = QLabel("receive: --")
+        detail_sep_a = QLabel("·"); detail_sep_a.setStyleSheet("color: #888;")
+        detail_sep_b = QLabel("·"); detail_sep_b.setStyleSheet("color: #888;")
+        detail_box = QHBoxLayout()
+        detail_box.setContentsMargins(0, 0, 0, 0)
+        detail_box.setSpacing(8)
+        for w in (self.lbl_send_text, detail_sep_a,
+                  self.lbl_compute_text, detail_sep_b,
+                  self.lbl_receive_text):
+            detail_box.addWidget(w)
+        detail_box.addStretch(1)
+        detail_holder = _fixed_v(QWidget()); detail_holder.setLayout(detail_box)
+
+        pipeline_title = QLabel("<b>Perception Pipeline</b>")
+        grid.addWidget(pipeline_title, row, 0)
+        grid.addWidget(leds_holder,    row, 1, 1, 4)
         row += 1
-
-        # ===== Frame relay + Remote intake (merged into one status row) =====
-        # Sits directly below VLM Service so the two related status badges
-        # share a visual block. The relay portion is shared infra (also
-        # used by gaze_runner in legacy mode); the intake portion is
-        # VLM-specific and gets hidden in legacy mode via
-        # _vlm_row_widgets. See GPU_Service_Host_Architecture_Plan.md §4.7/§4.8.
-        self.lbl_relay_status_led = QLabel("●"); self._set_led(self.lbl_relay_status_led, "stopped")
-        self.lbl_relay_status_text = QLabel("relay: idle")
-        self.lbl_remote_intake_text = QLabel("intake: --")
-        # Faint separator between relay and intake portions so they read
-        # as related-but-distinct. Hidden in legacy mode along with intake.
-        intake_sep = QLabel("·")
-        intake_sep.setStyleSheet("color: #888;")
-
-        relay_text_box = QHBoxLayout()
-        relay_text_box.setContentsMargins(0, 0, 0, 0)
-        relay_text_box.setSpacing(8)
-        relay_text_box.addWidget(self.lbl_relay_status_text)
-        relay_text_box.addWidget(intake_sep)
-        relay_text_box.addWidget(self.lbl_remote_intake_text)
-        relay_text_box.addStretch(1)
-        relay_text_holder = _fixed_v(QWidget()); relay_text_holder.setLayout(relay_text_box)
-        grid.addWidget(QLabel("<b>Frame Relay</b>"), row, 0)
-        grid.addWidget(self.lbl_relay_status_led, row, 1)
-        grid.addWidget(relay_text_holder, row, 2, 1, 3)
+        grid.addWidget(actions_holder, row, 1, 1, 4)
+        row += 1
+        grid.addWidget(detail_holder,  row, 1, 1, 4)
         row += 1
 
         # Continuous segmentation: toggle drives FastSAM @ N Hz on the
@@ -1090,14 +1124,19 @@ class ControlPanel(QMainWindow):
         grid.addWidget(vlm_run_holder, row, 1, 1, 4)
         row += 1
 
-        # Aggregate VLM widgets so backend gating (legacy mode) can hide
-        # them in one shot. Frame Relay row stays visible (relay is shared
-        # infra) but the intake portion of its text is VLM-specific and
-        # gets hidden along with the rest of the VLM block.
+        # Aggregate VLM-specific widgets so backend gating (legacy mode)
+        # can hide them in one shot. The pipeline-block title and the
+        # Send LED/label/text stay visible because the frame_relay is
+        # shared infra (gaze_runner consumes it too); only the
+        # Compute/Receive halves and the VLM-only commands are hidden.
         self._vlm_row_widgets = [
-            vlm_lbl_title, self.lbl_vlm_service, vlm_actions_holder,
+            self.lbl_compute_led, compute_lbl, self.lbl_compute_text,
+            self.lbl_receive_led, receive_lbl, self.lbl_receive_text,
+            self.btn_vlm_service_status,
+            self.btn_vlm_service_decide,
+            self.btn_vlm_service_depth,
+            detail_sep_a, detail_sep_b,
             vlm_run_title, vlm_run_holder,
-            intake_sep, self.lbl_remote_intake_text,
         ]
 
         # ===== Arduino =====
@@ -1334,6 +1373,14 @@ class ControlPanel(QMainWindow):
             relay_dial_port=FRAME_RELAY_PORT,
             embedded_relay=embedded_relay,
         )
+        # Drive the Main-tab Receive LED from whichever JsonPushSubscriber
+        # the widget instantiates (vlm or gaze, by GAZE_OR_BACKEND). The
+        # widget re-emits its inner subscribers' state on a single
+        # bubbled signal so the panel doesn't have to know which one is
+        # active.
+        self.vlm_scene_widget.subscriber_state_changed.connect(
+            self._on_subscriber_state
+        )
         vl.addWidget(self.vlm_scene_widget, 1)
 
     def _on_vlm_video_connect(self) -> None:
@@ -1346,6 +1393,30 @@ class ControlPanel(QMainWindow):
     def _on_vlm_video_disconnect(self) -> None:
         if hasattr(self, "vlm_scene_widget"):
             self.vlm_scene_widget.stop()
+        # Subscriber stop emits "unsubscribed" on its own thread; reset
+        # the Receive LED here too so we don't depend on that signal
+        # arriving (e.g., if stop() is called before the subscriber's
+        # initial subscribe completes the run loop never enters its
+        # exit path that emits "unsubscribed").
+        self._on_subscriber_state("unsubscribed")
+
+    def _on_subscriber_state(self, state: str) -> None:
+        """Slot for VLMSceneWidget.subscriber_state_changed. Translates
+        ``"subscribed"`` / ``"unsubscribed"`` / ``"error: …"`` into the
+        Receive LED + detail-text update. Three-color palette per the
+        operator's clarification (gray = not started, red = error,
+        green = ok); no warning state, only error or ok.
+        """
+        if state == "subscribed":
+            self._set_led(self.lbl_receive_led, "running")
+            self.lbl_receive_text.setText("receive: subscribed")
+        elif state.startswith("error"):
+            self._set_led(self.lbl_receive_led, "error")
+            self.lbl_receive_text.setText(f"receive: {state}")
+        else:
+            # "unsubscribed" or anything we don't recognise — gray.
+            self._set_led(self.lbl_receive_led, "stopped")
+            self.lbl_receive_text.setText(f"receive: {state}")
 
     def _build_runtime_config_tab(self, tabs: QTabWidget):
         rtc = QWidget()
@@ -1932,7 +2003,7 @@ class ControlPanel(QMainWindow):
 
         Local-spawn handlers (on_vlm_service_start/stop) are
         disconnected and replaced with _on_vlm_video_connect/disconnect.
-        The lbl_vlm_service LED keeps its existing semantic — green
+        The lbl_compute_led keeps its existing semantic — green
         when the GPU service is reachable AND has a frame source,
         which is exactly what "connected" should mean here. Status,
         Decide, Depth buttons stay as-is — they're plain UDP queries
@@ -2030,8 +2101,8 @@ class ControlPanel(QMainWindow):
         """
         self._remote_status_in_flight = False
         if resp.get("_unreachable"):
-            self._set_led(self.lbl_vlm_service, "stopped")
-            self.lbl_remote_intake_text.setText("intake: unreachable")
+            self._set_led(self.lbl_compute_led, "stopped")
+            self.lbl_compute_text.setText("compute: unreachable")
             return
         ok = bool(resp.get("ok"))
         connected = bool(resp.get("frame_source_connected"))
@@ -2045,9 +2116,9 @@ class ControlPanel(QMainWindow):
             led_state = "running"
         else:
             led_state = "stopped"
-        self._set_led(self.lbl_vlm_service, led_state)
-        self.lbl_remote_intake_text.setText(
-            f"intake: src={src} connected={connected} frames={frames} age={age_txt}"
+        self._set_led(self.lbl_compute_led, led_state)
+        self.lbl_compute_text.setText(
+            f"compute: src={src} connected={connected} frames={frames} age={age_txt}"
         )
 
     def _poll_relay_status(self) -> None:
@@ -2066,13 +2137,13 @@ class ControlPanel(QMainWindow):
             thread = getattr(widget, "_embedded_relay_thread", None)
             alive = thread is not None and thread.is_alive()
             if alive:
-                self._set_led(self.lbl_relay_status_led, "running")
-                self.lbl_relay_status_text.setText(
-                    f"relay: in-process @ {FRAME_RELAY_BIND_HOST}:{FRAME_RELAY_PORT}"
+                self._set_led(self.lbl_send_led, "running")
+                self.lbl_send_text.setText(
+                    f"send: in-process @ {FRAME_RELAY_BIND_HOST}:{FRAME_RELAY_PORT}"
                 )
             else:
-                self._set_led(self.lbl_relay_status_led, "stopped")
-                self.lbl_relay_status_text.setText("relay: in-process — thread exited")
+                self._set_led(self.lbl_send_led, "stopped")
+                self.lbl_send_text.setText("send: in-process — thread exited")
             return
 
         # External relay (FRAME_RELAY_EMBEDDED=False or remote host) —
@@ -2086,14 +2157,14 @@ class ControlPanel(QMainWindow):
             return
         ping = ctl.ping(timeout_s=0.5)
         if ping.get("ok"):
-            self._set_led(self.lbl_relay_status_led, "running")
-            self.lbl_relay_status_text.setText(
-                f"relay: reachable @ {ping['host']}:{ping['port']}"
+            self._set_led(self.lbl_send_led, "running")
+            self.lbl_send_text.setText(
+                f"send: reachable @ {ping['host']}:{ping['port']}"
             )
         else:
-            self._set_led(self.lbl_relay_status_led, "stopped")
-            self.lbl_relay_status_text.setText(
-                f"relay: unreachable @ {ping['host']}:{ping['port']}"
+            self._set_led(self.lbl_send_led, "stopped")
+            self.lbl_send_text.setText(
+                f"send: unreachable @ {ping['host']}:{ping['port']}"
             )
 
     def _vlm_udp_request(self, payload: dict, timeout_s: float = VLM_QUERY_TIMEOUT_S) -> dict:
@@ -2176,7 +2247,7 @@ class ControlPanel(QMainWindow):
             f'--model {VLM_MODEL} {device_flag} '
             f'{depth_flag} {session_arg} {remote_arg}'
         )
-        self._start_proc(self.vlm_service, self.lbl_vlm_service, "VLM")
+        self._start_proc(self.vlm_service, self.lbl_compute_led, "VLM")
         self._append_log(
             "VLM",
             f"[{self._ts()}] Service start requested "
@@ -2206,7 +2277,7 @@ class ControlPanel(QMainWindow):
             self._vlm_udp_request({"cmd": "stop"}, timeout_s=0.5)
         except Exception:
             pass
-        self._stop_proc(self.vlm_service, self.lbl_vlm_service, "VLM")
+        self._stop_proc(self.vlm_service, self.lbl_compute_led, "VLM")
         # Belt-and-suspenders: reap any surviving orphan regardless.
         _kill_orphan_vlm_service()
         self._on_vlm_video_disconnect()
@@ -3161,7 +3232,7 @@ class ControlPanel(QMainWindow):
             (self.marker, self.lbl_marker, "Marker"),
             (self.gaze_service, self.lbl_gaze_service, "Gaze"),
             (self.gaze_runner, None, "Gaze"),
-            (self.vlm_service, self.lbl_vlm_service, "VLM"),
+            (self.vlm_service, self.lbl_compute_led, "VLM"),
         ):
             try:
                 self._stop_proc(p, led, title)
