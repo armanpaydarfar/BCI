@@ -1373,6 +1373,15 @@ class ControlPanel(QMainWindow):
         self.vlm_scene_widget.subscriber_state_changed.connect(
             self._on_subscriber_state
         )
+        # Send LED is event-driven: the embedded relay fires a signal
+        # the moment its first frame is broadcast to a TCP consumer.
+        # This replaces the polling-cadence approach (2 s _relay_status_timer)
+        # for the once-per-Connect green transition; the periodic
+        # poll still runs to take Send back to gray if the relay
+        # thread dies later.
+        self.vlm_scene_widget.first_publish_observed.connect(
+            self._on_first_publish_observed
+        )
         vl.addWidget(self.vlm_scene_widget, 1)
 
     def _on_vlm_video_connect(self) -> None:
@@ -1392,6 +1401,7 @@ class ControlPanel(QMainWindow):
         actual `cmd=segment` once Compute transitions green; see the
         warmup gate at __init__ for the full rationale.
         """
+        self._append_log("VLM", f"[{self._ts()}] chain: connect armed\n")
         if hasattr(self, "vlm_scene_widget"):
             self.vlm_scene_widget.start()
         if getattr(self, "_relay_status_timer", None) is not None:
@@ -1401,6 +1411,7 @@ class ControlPanel(QMainWindow):
         self._connect_warmup_pending = True
 
     def _on_vlm_video_disconnect(self) -> None:
+        self._append_log("VLM", f"[{self._ts()}] chain: disconnect\n")
         if hasattr(self, "vlm_scene_widget"):
             self.vlm_scene_widget.stop()
         # Cancel any in-flight warmup arming; a fresh Connect will
@@ -1416,18 +1427,57 @@ class ControlPanel(QMainWindow):
         # exit path that emits "unsubscribed").
         self._on_subscriber_state("unsubscribed")
 
+    def _on_first_publish_observed(self, addr) -> None:
+        """Slot for VLMSceneWidget.first_publish_observed. Flips the
+        Send LED green at the moment the embedded relay's first
+        successful TCP broadcast lands — replaces the polling-cadence
+        path (2 s _relay_status_timer) for the once-per-Connect
+        transition. The periodic poll still owns the running→stopped
+        edge if the relay later dies.
+
+        Also kicks _poll_remote_status so Compute follows within one
+        UDP roundtrip rather than waiting up to 1 s for the next
+        timer tick — this is what produces the visible Send → Compute
+        ordering.
+        """
+        try:
+            host, port = (addr[0], int(addr[1]))
+        except (TypeError, ValueError, IndexError):
+            host, port = "?", 0
+        self._set_led(self.lbl_send_led, "running")
+        self.lbl_send_led.setToolTip(
+            f"send: in-process @ {FRAME_RELAY_BIND_HOST}:{FRAME_RELAY_PORT} "
+            f"(first publish to {host}:{port})"
+        )
+        # Tee the chain transition to the VLM channel so the audit
+        # trail is co-located with the compute/receive transitions
+        # (the relay channel already logs its own [frame_relay] line
+        # at the same moment via FrameRelayServer._send_envelope_safe).
+        self._append_log(
+            "VLM",
+            f"[{self._ts()}] chain: send first frame published to {host}:{port}\n",
+        )
+        if SERVICES_HOSTED_REMOTELY and getattr(self, "_remote_status_timer", None) is not None:
+            self._poll_remote_status()
+
     def _on_subscriber_state(self, state: str) -> None:
         """Slot for VLMSceneWidget.subscriber_state_changed. Receive LED
         is gated on actual payload flow per the chain-of-causation
         semantic (green = data arriving, not just handshake done):
-          - "subscribed"   → gray (handshake ok, awaiting first payload)
-          - "receiving"    → green (first push payload arrived)
-          - "error: …"     → red
-          - "unsubscribed" → gray
+          - "subscribed"     → gray (handshake ok, awaiting first payload)
+          - "receiving:<t>"  → green (first push payload arrived; <t> is
+                                the payload ``type`` — vlm_results /
+                                chain_verify)
+          - "error: …"       → red
+          - "unsubscribed"   → gray
         """
-        if state == "receiving":
+        if state.startswith("receiving"):
+            ptype = state.split(":", 1)[1] if ":" in state else "?"
+            self._append_log(
+                "VLM", f"[{self._ts()}] chain: receive first push type={ptype}\n"
+            )
             self._set_led(self.lbl_receive_led, "running")
-            self.lbl_receive_led.setToolTip("receive: payloads arriving")
+            self.lbl_receive_led.setToolTip(f"receive: payloads arriving (first type={ptype})")
         elif state == "subscribed":
             self._set_led(self.lbl_receive_led, "stopped")
             self.lbl_receive_led.setToolTip(
@@ -2163,6 +2213,10 @@ class ControlPanel(QMainWindow):
         # Connect — the pending flag is cleared here and re-armed only
         # by _on_vlm_video_connect.
         if led_state == "running" and self._connect_warmup_pending:
+            self._append_log(
+                "VLM",
+                f"[{self._ts()}] chain: compute green frames_received={frames}\n",
+            )
             self._connect_warmup_pending = False
             self._vlm_command_threaded(
                 {"cmd": "verify_chain"}, 5.0, "verification"

@@ -81,7 +81,7 @@ import sys
 import threading
 import time
 from collections import deque
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -228,6 +228,7 @@ class FrameRelayServer:
         jpeg_quality: int = 75,
         repo_dir: Optional[str] = None,
         reader: Optional[Any] = None,
+        on_first_publish: Optional[Callable[[Tuple[str, int]], None]] = None,
     ) -> None:
         self.bind_host = bind_host
         self.bind_port = int(bind_port)
@@ -254,6 +255,15 @@ class FrameRelayServer:
 
         self._frame_count_published = 0
         self._frame_count_dropped = 0
+        # First-publish event hook. Fired once, on the pump thread, the
+        # first time `_send_envelope_safe` returns True — i.e. the very
+        # first frame the relay actually delivers to a TCP consumer.
+        # Subsequent publishes do not re-fire. Used by the operator
+        # panel to flip the Send LED green at the moment of the event
+        # instead of relying on a 2 s polling timer; see
+        # control_panel.py:_on_first_publish_observed.
+        self._first_publish_fired = False
+        self._on_first_publish = on_first_publish
 
         # Rolling latency samples for the stats line. Each deque is (ms).
         # bundle_age   — Neon scene timestamp → moment we're ready to send
@@ -479,7 +489,7 @@ class FrameRelayServer:
 
                     send_t0 = time.perf_counter()
                     for addr, sock in snapshot:
-                        if not self._send_envelope_safe(sock, envelope):
+                        if not self._send_envelope_safe(sock, addr, envelope):
                             self._drop_client(addr)
                     send_ms = (time.perf_counter() - send_t0) * 1e3
                     self._lat_send_ms.append(send_ms)
@@ -547,12 +557,28 @@ class FrameRelayServer:
             self._frame_count_dropped += 1
             return None
 
-    def _send_envelope_safe(self, sock: socket.socket, envelope: bytes) -> bool:
+    def _send_envelope_safe(
+        self, sock: socket.socket, addr: Tuple[str, int], envelope: bytes
+    ) -> bool:
         """Write a pre-encoded envelope to one client socket. Returns False
-        on socket failure so the pump can drop that client."""
+        on socket failure so the pump can drop that client.
+
+        Fires ``self._on_first_publish(addr)`` exactly once across the
+        relay's lifetime — on the first `sendall` that returns True. The
+        callback runs on this (pump) thread, so it must not block; the
+        panel uses a Qt-signal emit which is thread-safe."""
         try:
             sock.sendall(envelope)
             self._frame_count_published += 1
+            if not self._first_publish_fired:
+                self._first_publish_fired = True
+                _log(f"first frame published to {addr[0]}:{addr[1]}")
+                cb = self._on_first_publish
+                if cb is not None:
+                    try:
+                        cb((addr[0], int(addr[1])))
+                    except Exception as e:
+                        _log(f"on_first_publish callback raised: {e}")
             return True
         except (BrokenPipeError, ConnectionResetError, OSError):
             return False

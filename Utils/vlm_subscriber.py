@@ -69,12 +69,14 @@ class JsonPushSubscriber(QThread):
     """
 
     payload_received = Signal(dict)
-    # State machine: "subscribed" (handshake replied ok) → "receiving"
-    # (first push payload actually arrived) → "unsubscribed" (stop
-    # path) | "error: …". Receivers that want a "real data is flowing"
-    # signal should treat "receiving" as the green-light state and
-    # "subscribed" as still-pending — the handshake by itself doesn't
-    # prove the GPU service is producing output.
+    # State machine: "subscribed" (handshake replied ok) → "receiving:<type>"
+    # (first push payload actually arrived; <type> is the payload's
+    # ``type`` field — e.g. ``vlm_results`` or ``chain_verify``) →
+    # "unsubscribed" (stop path) | "error: …". Receivers that want a
+    # "real data is flowing" signal should treat any state matching
+    # ``startswith("receiving")`` as the green-light state. The type
+    # suffix is informational; it lets the panel log which kind of
+    # push triggered the chain-of-causation transition.
     state_changed = Signal(str)
 
     HEARTBEAT_S = 10.0  # well below vlm_service's 30 s TTL.
@@ -145,7 +147,8 @@ class JsonPushSubscriber(QThread):
                 # producing output).
                 if not self._first_payload_seen:
                     self._first_payload_seen = True
-                    self.state_changed.emit("receiving")
+                    ptype = str(payload.get("type", "?"))
+                    self.state_changed.emit(f"receiving:{ptype}")
 
         # Best-effort unsubscribe so the service prunes immediately.
         if self._subscriber_id:

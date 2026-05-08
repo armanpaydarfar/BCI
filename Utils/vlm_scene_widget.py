@@ -124,6 +124,13 @@ class VLMSceneWidget(QWidget):
     # (vlm or gaze). The panel connects this to its Receive-LED slot.
     # Forwarded payloads: "subscribed" / "unsubscribed" / "error: ...".
     subscriber_state_changed = Signal(str)
+    # Fires once per embedded-relay lifetime, on the pump thread the
+    # first time a frame is broadcast to a TCP consumer. The panel
+    # uses this to flip the Send LED green at the moment of the event
+    # rather than waiting for the next 2 s relay-status poll. Payload
+    # is the (host, port) tuple of the consumer that received the
+    # first frame. See FrameRelayServer.__init__ on_first_publish.
+    first_publish_observed = Signal(tuple)
 
     def __init__(
         self,
@@ -327,6 +334,7 @@ class VLMSceneWidget(QWidget):
                 jpeg_quality=int(cfg.get("jpeg_quality", 75)),
                 repo_dir=cfg.get("repo_dir"),
                 reader=reader,
+                on_first_publish=self._emit_first_publish,
             )
         except Exception as e:
             self.lbl_status.setText(f"Render path: json_local — embedded relay ctor failed: {e}")
@@ -362,6 +370,18 @@ class VLMSceneWidget(QWidget):
         self._embedded_relay_thread.start()
         self.lbl_status.setText("Render path: json_local — embedded relay starting…")
         return True
+
+    def _emit_first_publish(self, addr: Tuple[str, int]) -> None:
+        """Bridge from FrameRelayServer's on_first_publish (pump thread)
+        to the widget's Qt signal. Emit is thread-safe — Qt promotes it
+        to a queued connection automatically when the receiver lives on
+        a different thread."""
+        try:
+            self.first_publish_observed.emit(tuple(addr))
+        except RuntimeError:
+            # Widget already destroyed mid-relay-shutdown. Drop silently
+            # — the panel slot can't run anyway.
+            pass
 
     def recent_paint_latency_ms(self) -> Tuple[float, float, float]:
         """Rolling p50 / p95 / p99 of bundle-arrival → painted deltas in ms.
