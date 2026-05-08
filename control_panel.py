@@ -1070,25 +1070,26 @@ class ControlPanel(QMainWindow):
         self.btn_vlm_decide_pair.clicked.connect(self.on_vlm_decide_pair)
 
         # Row 1: lifecycle (Connect/Disconnect) + stream-seg toggle + cadence.
+        # Each widget gets stretch=1 with no trailing addStretch so the
+        # row fills the col 2-4 span (matches the right edge set by
+        # Robot's "Remove Overrides" / Marker's "Refresh") instead of
+        # clustering on the left.
         actions_row1 = QHBoxLayout()
         actions_row1.setContentsMargins(0, 0, 0, 0)
         for w in (self.btn_vlm_service_start, self.btn_vlm_service_stop,
                   self.btn_vlm_seg_stream, self.spin_vlm_seg_hz):
-            actions_row1.addWidget(w)
-        actions_row1.addStretch(1)
+            actions_row1.addWidget(w, 1)
         actions_row1_holder = _fixed_v(QWidget()); actions_row1_holder.setLayout(actions_row1)
 
         # Row 2: ad-hoc commands (status, decide-once, depth-once,
-        # sequential-pair). All require the Compute LED to be green;
-        # we don't gate them in code, but the operator's flow is to
-        # press these only after Connect resolves.
+        # sequential-pair). Same col span and stretch policy as row 1
+        # so Status sits directly under Connect.
         actions_row2 = QHBoxLayout()
         actions_row2.setContentsMargins(0, 0, 0, 0)
         for w in (self.btn_vlm_service_status, self.btn_vlm_service_decide,
                   self.btn_vlm_service_depth, self.btn_vlm_capture_first,
                   self.btn_vlm_decide_pair, self.lbl_vlm_pair_token):
-            actions_row2.addWidget(w)
-        actions_row2.addStretch(1)
+            actions_row2.addWidget(w, 1)
         actions_row2_holder = _fixed_v(QWidget()); actions_row2_holder.setLayout(actions_row2)
 
         # Title carries the legend so dots-only LED column matches the
@@ -1098,11 +1099,11 @@ class ControlPanel(QMainWindow):
             "<b>Perception Pipeline</b><br>"
             "<i>(send / compute / receive)</i>"
         )
-        grid.addWidget(pipeline_title,    row, 0)
-        grid.addWidget(leds_holder,       row, 1)
+        grid.addWidget(pipeline_title,      row, 0)
+        grid.addWidget(leds_holder,         row, 1)
         grid.addWidget(actions_row1_holder, row, 2, 1, 3)
         row += 1
-        grid.addWidget(actions_row2_holder, row, 1, 1, 4)
+        grid.addWidget(actions_row2_holder, row, 2, 1, 3)
         row += 1
 
         # Aggregate VLM-specific widgets so backend gating (legacy mode)
