@@ -1967,7 +1967,17 @@ class ControlPanel(QMainWindow):
                 resp = self._vlm_udp_request({"cmd": "status"}, timeout_s=0.4)
             except Exception:
                 resp = {"ok": False, "_unreachable": True}
-            self._remote_status_received.emit(resp or {})
+            try:
+                self._remote_status_received.emit(resp or {})
+            except RuntimeError:
+                # Window closed while we were mid-UDP — the underlying
+                # C++ ControlPanel is already gone. Drop the late status
+                # reply silently; the alternative is a noisy traceback
+                # at every shutdown when the GPU host is unreachable.
+                # Other workers route through _append_log_ui's
+                # QTimer.singleShot(self, ...) which Qt auto-cancels;
+                # this one is the lone direct-emit path.
+                pass
 
         threading.Thread(target=_worker, daemon=True,
                          name="panel-remote-status").start()
@@ -3085,6 +3095,24 @@ class ControlPanel(QMainWindow):
 
     # ---------- Close cleanup ----------
     def closeEvent(self, event):
+        # Stop the periodic poll timers up front so no new worker
+        # threads can be spawned during teardown. The
+        # `panel-remote-status` worker calls Signal.emit() directly
+        # (the only place in the panel that bypasses
+        # _append_log_ui's QTimer.singleShot guard), and once the C++
+        # object is destroyed that emit() raises RuntimeError. Qt
+        # auto-cancels QTimer-based slots tied to `self`, so stopping
+        # the timer here closes the spawn window cleanly.
+        for t_attr in (
+            "_remote_status_timer", "_relay_status_timer",
+            "_seg_stream_log_timer", "ui_timer",
+        ):
+            t = getattr(self, t_attr, None)
+            if t is not None:
+                try:
+                    t.stop()
+                except Exception:
+                    pass
         # Stop the overlay reader thread before tearing down its target service,
         # otherwise QProcess teardown logs errors that try to write to widgets
         # Qt has already destroyed.
