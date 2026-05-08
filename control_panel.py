@@ -1369,9 +1369,20 @@ class ControlPanel(QMainWindow):
     def _on_vlm_video_connect(self) -> None:
         """Auto-connect hook invoked from on_vlm_service_start. The
         VLMSceneWidget is also user-startable from its own button —
-        calling start() twice is idempotent."""
+        calling start() twice is idempotent.
+
+        After kicking the local pipeline, we also fire one immediate
+        _poll_remote_status() so the Compute LED gets its first probe
+        at the same moment Receive starts subscribing. Otherwise the
+        1 s _remote_status_timer cadence makes Compute lag Receive by
+        up to a second on a fresh Connect — visually backwards, since
+        Receive depends on Compute being alive (the subscribe handshake
+        is itself an RPC to vlm_service).
+        """
         if hasattr(self, "vlm_scene_widget"):
             self.vlm_scene_widget.start()
+        if SERVICES_HOSTED_REMOTELY and getattr(self, "_remote_status_timer", None) is not None:
+            self._poll_remote_status()
 
     def _on_vlm_video_disconnect(self) -> None:
         if hasattr(self, "vlm_scene_widget"):
