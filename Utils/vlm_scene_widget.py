@@ -305,27 +305,26 @@ class VLMSceneWidget(QWidget):
         self._gaze_subscriber: Optional[_JsonPushSubscriber] = None
 
         # ── UI ──
+        # Lifecycle (start/stop) is driven from the Main tab's VLM
+        # Service row — see control_panel.py:_configure_remote_services_ui
+        # for the remote-mode "Connect"/"Disconnect" rewire and
+        # on_vlm_service_start/stop for the local-mode path. The
+        # widget itself is a passive viewer: it shows the feed when
+        # the pipeline is up and an explanation when it isn't.
         layout = QVBoxLayout(self)
-        ctrl = QHBoxLayout()
-        self.lbl_status = QLabel("Render path: json_local — not started")
+        self.lbl_status = QLabel("Pipeline not started")
         self.lbl_status.setStyleSheet("color: #cccccc;")
-        self.btn_start = QPushButton("Start")
-        self.btn_start.clicked.connect(self.start)
-        self.btn_stop = QPushButton("Stop")
-        self.btn_stop.clicked.connect(self.stop)
-        ctrl.addWidget(self.lbl_status, 1)
-        ctrl.addWidget(self.btn_start)
-        ctrl.addWidget(self.btn_stop)
-        layout.addLayout(ctrl)
+        layout.addWidget(self.lbl_status)
 
         self.lbl_canvas = QLabel()
         self.lbl_canvas.setAlignment(Qt.AlignCenter)
         self.lbl_canvas.setMinimumSize(640, 360)
         self.lbl_canvas.setStyleSheet("background: #111111; color: #666666;")
         self.lbl_canvas.setText(
-            "Click Start to begin streaming.\n\n"
-            "Bundles come from the local frame_relay; detections come from\n"
-            "vlm_service.py via UDP 5589 subscribe."
+            "Pipeline not started.\n\n"
+            "Use Connect on the Main tab's VLM Service row to open the "
+            "Neon device, start the embedded frame_relay, and subscribe "
+            "to vlm_service detections."
         )
         layout.addWidget(self.lbl_canvas, 1)
 

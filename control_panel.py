@@ -1923,21 +1923,56 @@ class ControlPanel(QMainWindow):
     # ----- VLM service handlers -----
 
     def _configure_remote_services_ui(self) -> None:
-        """Hide / disable buttons that would spawn local conda
-        subprocesses when SERVICES_HOSTED_REMOTELY=True. Status queries
-        remain functional — they're plain UDP and travel transparently
-        across the LAN.
+        """When SERVICES_HOSTED_REMOTELY=True, the GPU service runs on
+        another host so spawning a local copy is meaningless. We
+        rebrand the VLM Start/Stop pair to "Connect"/"Disconnect" and
+        rewire them to the local-pipeline lifecycle (Neon reader,
+        embedded frame_relay, push subscribers via VLMSceneWidget) —
+        the user's actual pre-session toggle on this box.
 
-        VLM Start/Stop are hidden outright: their HBox holder reflows
-        cleanly once they're invisible, leaving Status / Decide / Depth
-        sitting flush. Gaze Start variants stay visible-but-disabled so
-        the surrounding grid row keeps its column alignment with the
+        Local-spawn handlers (on_vlm_service_start/stop) are
+        disconnected and replaced with _on_vlm_video_connect/disconnect.
+        The lbl_vlm_service LED keeps its existing semantic — green
+        when the GPU service is reachable AND has a frame source,
+        which is exactly what "connected" should mean here. Status,
+        Decide, Depth buttons stay as-is — they're plain UDP queries
+        that travel across the LAN unchanged.
+
+        Gaze Start variants stay visible-but-disabled so the
+        surrounding grid row keeps its column alignment with the
         other module rows.
         """
-        for btn_name in ("btn_vlm_service_start", "btn_vlm_service_stop"):
-            btn = getattr(self, btn_name, None)
-            if btn is not None:
-                btn.setVisible(False)
+        for btn, new_text, new_handler, old_handler, tip in (
+            (
+                getattr(self, "btn_vlm_service_start", None),
+                "Connect",
+                self._on_vlm_video_connect,
+                self.on_vlm_service_start,
+                "Open Neon over the tailnet, start the embedded "
+                "frame_relay, and subscribe to vlm_service push on "
+                "the GPU host. The GPU service itself runs on a "
+                "different machine and is not started by this button.",
+            ),
+            (
+                getattr(self, "btn_vlm_service_stop", None),
+                "Disconnect",
+                self._on_vlm_video_disconnect,
+                self.on_vlm_service_stop,
+                "Stop the local pipeline (paint loop, push "
+                "subscribers, embedded relay, Neon reader). The GPU "
+                "service is unaffected — it stays up waiting for the "
+                "next client.",
+            ),
+        ):
+            if btn is None:
+                continue
+            try:
+                btn.clicked.disconnect(old_handler)
+            except (RuntimeError, TypeError):
+                pass
+            btn.clicked.connect(new_handler)
+            btn.setText(new_text)
+            btn.setToolTip(tip)
         for btn_name in (
             "btn_gaze_service_headless", "btn_gaze_service_ui",
             "btn_gaze_service_stop",
