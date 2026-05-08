@@ -1170,13 +1170,22 @@ class VLMService:
         if not due:
             return 0
         try:
-            payload = json.dumps(self._build_vlm_results_payload(), default=_json_default).encode("utf-8")
+            payload_dict = self._build_vlm_results_payload()
         except Exception as e:
             # Always log payload build failures — silent failure here used
             # to mask broken cached_dets contents and the panel just kept
             # reporting "intake: connected" with no detections drawn.
             _log(f"results push: payload build failed: {e}")
             return 0
+        if payload_dict is None:
+            # No frame received from the relay yet. Pushing an empty
+            # placeholder (frame_idx=0, detections=[], …) would light
+            # the panel's Receive LED green before any real data has
+            # flowed end-to-end, breaking the chain-of-causation
+            # semantic the operator panel relies on. Skip until we
+            # have a real bundle.
+            return 0
+        payload = json.dumps(payload_dict, default=_json_default).encode("utf-8")
         if len(payload) > 60 * 1024:
             # UDP datagrams >~64 KB get IP-fragmented. Keep payloads small;
             # the panel will fall back to the next tick.
@@ -1191,10 +1200,19 @@ class VLMService:
                 pass
         return sent
 
-    def _build_vlm_results_payload(self) -> dict:
+    def _build_vlm_results_payload(self) -> Optional[dict]:
         """Snapshot the current detection / hit / fixation / decision state
-        as the JSON push payload defined in Render_Layer_Refactor.md §3."""
+        as the JSON push payload defined in Render_Layer_Refactor.md §3.
+
+        Returns ``None`` when no frame has been received yet from the
+        upstream relay (``bundle is None``). The tick-send loop skips
+        the broadcast in that case so subscribers never see a placeholder
+        payload before real data is flowing — the panel's "Receive" LED
+        is gated on actual content under the chain-of-causation semantic.
+        """
         bundle, fix, _ = self._latest()
+        if bundle is None:
+            return None
         with self._render_lock:
             dets = list(self._cached_dets)
             hit_det = self._cached_hit_det
