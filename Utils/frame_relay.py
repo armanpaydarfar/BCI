@@ -271,6 +271,15 @@ class FrameRelayServer:
         self._local_subs_lock = threading.Lock()
         self._local_subs: List[Callable[[Any], None]] = []
 
+    @property
+    def published_count(self) -> int:
+        """Monotonic count of frames successfully broadcast since this
+        relay started. Read by ``control_panel.py:_poll_relay_status``
+        to gate the Send LED on actual data flow rather than just
+        thread liveness — the user's chain-of-causation semantic.
+        """
+        return self._frame_count_published
+
     # ── public API ─────────────────────────────────────────────────────────
 
     def serve_forever(self) -> None:

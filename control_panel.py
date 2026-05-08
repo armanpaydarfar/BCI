@@ -1371,16 +1371,17 @@ class ControlPanel(QMainWindow):
         VLMSceneWidget is also user-startable from its own button —
         calling start() twice is idempotent.
 
-        After kicking the local pipeline, we also fire one immediate
-        _poll_remote_status() so the Compute LED gets its first probe
-        at the same moment Receive starts subscribing. Otherwise the
-        1 s _remote_status_timer cadence makes Compute lag Receive by
-        up to a second on a fresh Connect — visually backwards, since
-        Receive depends on Compute being alive (the subscribe handshake
-        is itself an RPC to vlm_service).
+        Fire one immediate poll on each of the periodic-status timers
+        so the LEDs don't lag the click by a full timer cadence. Each
+        LED still only goes green once its own causal precondition is
+        met (Send: ≥1 frame published; Compute: GPU reports
+        frames_received>0; Receive: first push payload arrived) — the
+        kick just makes the next probe happen now instead of later.
         """
         if hasattr(self, "vlm_scene_widget"):
             self.vlm_scene_widget.start()
+        if getattr(self, "_relay_status_timer", None) is not None:
+            self._poll_relay_status()
         if SERVICES_HOSTED_REMOTELY and getattr(self, "_remote_status_timer", None) is not None:
             self._poll_remote_status()
 
@@ -1395,15 +1396,22 @@ class ControlPanel(QMainWindow):
         self._on_subscriber_state("unsubscribed")
 
     def _on_subscriber_state(self, state: str) -> None:
-        """Slot for VLMSceneWidget.subscriber_state_changed. Translates
-        ``"subscribed"`` / ``"unsubscribed"`` / ``"error: …"`` into the
-        Receive LED colour + tooltip. Three-color palette per the
-        operator's clarification (gray = not started, red = error,
-        green = ok); no warning state, only error or ok.
+        """Slot for VLMSceneWidget.subscriber_state_changed. Receive LED
+        is gated on actual payload flow per the chain-of-causation
+        semantic (green = data arriving, not just handshake done):
+          - "subscribed"   → gray (handshake ok, awaiting first payload)
+          - "receiving"    → green (first push payload arrived)
+          - "error: …"     → red
+          - "unsubscribed" → gray
         """
-        if state == "subscribed":
+        if state == "receiving":
             self._set_led(self.lbl_receive_led, "running")
-            self.lbl_receive_led.setToolTip("receive: subscribed")
+            self.lbl_receive_led.setToolTip("receive: payloads arriving")
+        elif state == "subscribed":
+            self._set_led(self.lbl_receive_led, "stopped")
+            self.lbl_receive_led.setToolTip(
+                "receive: subscribed — awaiting first push payload"
+            )
         elif state.startswith("error"):
             self._set_led(self.lbl_receive_led, "error")
             self.lbl_receive_led.setToolTip(f"receive: {state}")
@@ -2104,9 +2112,15 @@ class ControlPanel(QMainWindow):
         src = resp.get("frame_source", "?")
         age = resp.get("frame_age_s")
         age_txt = f"{float(age):.2f}s" if isinstance(age, (int, float)) else "--"
+        # Compute LED is gated on actual ingestion per chain-of-causation
+        # semantics: the GPU service must (a) be alive, (b) be connected
+        # to its frame source, and (c) have actually received frames.
+        # `connected` alone means "channel is up"; `frames > 0` is what
+        # proves the GPU is consuming our Send. Without it, we'd light
+        # green during the connect-but-no-frames-yet gap.
         if not ok:
             led_state = "error"
-        elif connected:
+        elif connected and frames > 0:
             led_state = "running"
         else:
             led_state = "stopped"
@@ -2130,10 +2144,24 @@ class ControlPanel(QMainWindow):
         if widget is not None and getattr(widget, "_embedded_relay", None) is not None:
             thread = getattr(widget, "_embedded_relay_thread", None)
             alive = thread is not None and thread.is_alive()
-            if alive:
+            relay = widget._embedded_relay
+            published = int(getattr(relay, "published_count", 0) or 0)
+            # Chain-of-causation: green requires (a) the pump thread is
+            # alive AND (b) at least one frame has been broadcast.
+            # Just-started relay with no frames yet stays gray, surfacing
+            # the in-between state in the tooltip rather than lighting
+            # green prematurely.
+            if alive and published > 0:
                 self._set_led(self.lbl_send_led, "running")
                 self.lbl_send_led.setToolTip(
-                    f"send: in-process @ {FRAME_RELAY_BIND_HOST}:{FRAME_RELAY_PORT}"
+                    f"send: in-process @ {FRAME_RELAY_BIND_HOST}:{FRAME_RELAY_PORT} "
+                    f"({published} frames published)"
+                )
+            elif alive:
+                self._set_led(self.lbl_send_led, "stopped")
+                self.lbl_send_led.setToolTip(
+                    f"send: in-process @ {FRAME_RELAY_BIND_HOST}:{FRAME_RELAY_PORT} "
+                    "— awaiting first frame from Neon"
                 )
             else:
                 self._set_led(self.lbl_send_led, "stopped")
