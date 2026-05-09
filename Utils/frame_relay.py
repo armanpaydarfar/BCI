@@ -260,8 +260,11 @@ class FrameRelayServer:
         # first time `_send_envelope_safe` returns True — i.e. the very
         # first frame the relay actually delivers to a TCP consumer.
         # Subsequent publishes do not re-fire. Used by the operator
-        # panel to flip the Send LED green at the moment of the event
-        # instead of relying on a 2 s polling timer; see
+        # panel's per-Connect verification state machine to trigger
+        # the `cmd=verify_chain` RPC once a real frame has been
+        # exercised through the pipeline this Connect cycle (the
+        # Send LED itself is now driven by the earlier handshake
+        # event below, not by this hook). See
         # control_panel.py:_on_first_publish_observed.
         self._first_publish_fired = False
         self._on_first_publish = on_first_publish
@@ -297,8 +300,10 @@ class FrameRelayServer:
     def published_count(self) -> int:
         """Monotonic count of frames successfully broadcast since this
         relay started. Read by ``control_panel.py:_poll_relay_status``
-        to gate the Send LED on actual data flow rather than just
-        thread liveness — the user's chain-of-causation semantic.
+        for the Send-LED tooltip and the relay's running→stopped edge
+        detection. The Send LED's once-per-Connect green flip is owned
+        by the handshake event hook (``on_handshake_sent``) and does
+        not consult this counter.
         """
         return self._frame_count_published
 
