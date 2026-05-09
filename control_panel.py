@@ -2388,10 +2388,17 @@ class ControlPanel(QMainWindow):
             # not require frames_received>0 here — that's the Receive
             # phase's job.
             led_state = "running"
-        else:
-            # Reachable + ok=True but Send hasn't been observed yet.
-            # Hold yellow rather than flipping green prematurely.
+        elif self._connect_token is not None:
+            # Verification in progress (Connect armed) but Send hasn't
+            # been observed yet — hold yellow.
             led_state = "starting"
+        else:
+            # Idle (no Connect armed). The 1 s status poll runs
+            # continuously even before the operator clicks Connect, so
+            # we must NOT paint yellow here — yellow is the "verifying"
+            # state and is reserved for the active Connect cycle. Keep
+            # gray to match the other LEDs in the idle state.
+            led_state = "stopped"
         self._set_led(self.lbl_compute_led, led_state)
         self.lbl_compute_led.setToolTip(
             f"compute: src={src} connected={connected} frames={frames} age={age_txt}"
