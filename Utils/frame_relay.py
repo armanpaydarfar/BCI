@@ -229,6 +229,7 @@ class FrameRelayServer:
         repo_dir: Optional[str] = None,
         reader: Optional[Any] = None,
         on_first_publish: Optional[Callable[[Tuple[str, int]], None]] = None,
+        on_handshake_sent: Optional[Callable[[Tuple[str, int]], None]] = None,
     ) -> None:
         self.bind_host = bind_host
         self.bind_port = int(bind_port)
@@ -264,6 +265,17 @@ class FrameRelayServer:
         # control_panel.py:_on_first_publish_observed.
         self._first_publish_fired = False
         self._on_first_publish = on_first_publish
+        # Handshake-sent event hook. Fired once per relay lifetime, the
+        # first time `_install_client` successfully delivers a handshake
+        # envelope to an accepted TCP consumer. Used by the panel to
+        # flip the Send LED green on the handshake itself rather than
+        # waiting for the SDK to deliver a first scene frame (which can
+        # take >10 s on Pupil Labs Neon). The chain-of-causation
+        # semantic for Send is "the relay can deliver to a consumer",
+        # which the handshake demonstrates without needing real frame
+        # data. See control_panel.py:_on_handshake_observed.
+        self._handshake_fired = False
+        self._on_handshake_sent = on_handshake_sent
 
         # Rolling latency samples for the stats line. Each deque is (ms).
         # bundle_age   — Neon scene timestamp → moment we're ready to send
@@ -424,6 +436,20 @@ class FrameRelayServer:
             self._clients[addr] = conn
             n = len(self._clients)
         _log(f"client connected: {addr} (total clients: {n})")
+        # One-shot handshake event for the panel's Send-LED gate. Fires
+        # only on the first successful handshake of this relay's
+        # lifetime; subsequent client connects do not re-fire. Runs
+        # synchronously on the accept-loop thread, so the callback must
+        # not block — the panel uses a Qt-signal emit which is
+        # thread-safe.
+        if not self._handshake_fired:
+            self._handshake_fired = True
+            cb = self._on_handshake_sent
+            if cb is not None:
+                try:
+                    cb((addr[0], int(addr[1])))
+                except Exception as e:
+                    _log(f"on_handshake_sent callback raised: {e}")
 
     def _close_all_clients(self) -> None:
         with self._client_lock:

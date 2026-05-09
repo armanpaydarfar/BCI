@@ -646,15 +646,24 @@ class ControlPanel(QMainWindow):
         self.resize(1100, 700)
         self.setMinimumSize(700, 500)
         self._remote_status_in_flight = False
-        # One-shot end-to-end warmup gate. Set True on Connect; cleared
-        # by _apply_remote_status when Compute first transitions green,
-        # at which point we fire `cmd=segment` so the GPU runs one
-        # inference and pushes a real vlm_results payload back. That
-        # final push is what flips the Receive LED green — without the
-        # warmup, the operator would have to manually click Stream Seg
-        # / Decide / Segment for Receive to verify, which leaves only
-        # 2 of 3 lights green after a fresh Connect.
-        self._connect_warmup_pending: bool = False
+        # Per-Connect verification state machine. Each Connect generates
+        # a fresh `_connect_token` (time.time_ns()); flags advance as
+        # each phase completes:
+        #   PHASE_SEND     — handshake from relay → _send_observed=True
+        #   PHASE_COMPUTE  — cmd=status reply ok=True → _compute_observed=True
+        #   PHASE_RECEIVE  — relay first publish + GPU has fresh bundle
+        #                    → fire cmd=verify_chain with token
+        #   DONE           — chain_verify push with matching token
+        # Stale GPU-cache pushes from a prior session carry no token
+        # (or an old one), so they cannot trip Receive on a reconnect.
+        # Also tracks `_verify_chain_attempts` for the one-retry
+        # policy on `no_frame` races.
+        self._connect_token: Optional[int] = None
+        self._send_observed: bool = False
+        self._compute_observed: bool = False
+        self._receive_observed: bool = False
+        self._verify_chain_in_flight: bool = False
+        self._verify_chain_attempts: int = 0
         self._remote_status_received.connect(self._apply_remote_status)
 
         # State
@@ -1373,53 +1382,90 @@ class ControlPanel(QMainWindow):
         self.vlm_scene_widget.subscriber_state_changed.connect(
             self._on_subscriber_state
         )
-        # Send LED is event-driven: the embedded relay fires a signal
-        # the moment its first frame is broadcast to a TCP consumer.
-        # This replaces the polling-cadence approach (2 s _relay_status_timer)
-        # for the once-per-Connect green transition; the periodic
-        # poll still runs to take Send back to gray if the relay
-        # thread dies later.
+        # Send LED gates on the relay's TCP handshake to its first
+        # consumer — the relay has demonstrated "send is good" the
+        # moment _install_client successfully delivers the handshake
+        # envelope (Utils/frame_relay.py:_install_client). This is
+        # independent of Pupil Labs SDK first-frame latency.
+        self.vlm_scene_widget.handshake_observed.connect(
+            self._on_handshake_observed
+        )
+        # First-publish event is repurposed: it now triggers the
+        # verify_chain firing path once the GPU has confirmed a
+        # fresh bundle (proving end-to-end traversal of the pipeline
+        # for THIS Connect). It no longer flips the Send LED.
         self.vlm_scene_widget.first_publish_observed.connect(
             self._on_first_publish_observed
+        )
+        # Subscriber payloads are token-checked here so a stale
+        # `chain_verify` from a prior Connect's GPU cache cannot
+        # trip the Receive LED on a fresh Connect.
+        self.vlm_scene_widget.vlm_payload_received.connect(
+            self._on_vlm_payload_received
         )
         vl.addWidget(self.vlm_scene_widget, 1)
 
     def _on_vlm_video_connect(self) -> None:
-        """Auto-connect hook invoked from on_vlm_service_start. The
-        VLMSceneWidget is also user-startable from its own button —
-        calling start() twice is idempotent.
+        """Connect button handler. Drives the per-Connect verification
+        state machine described in __init__:
+          1. Generate a fresh ``_connect_token`` (time.time_ns()).
+          2. Paint Send / Compute / Receive yellow ("starting") so the
+             operator sees the verification is in progress.
+          3. Reset the observed-flags + verify_chain attempt counter so
+             a stale push from a prior session can't satisfy this
+             cycle's verification.
+          4. Start the widget (relay + subscriber threads), kick an
+             immediate cmd=status preflight so Compute responds within
+             one UDP RTT rather than waiting up to 1 s for the next
+             timer tick.
 
-        Fire one immediate poll on each of the periodic-status timers
-        so the LEDs don't lag the click by a full timer cadence. Each
-        LED still only goes green once its own causal precondition is
-        met (Send: ≥1 frame published; Compute: GPU reports
-        frames_received>0; Receive: first push payload arrived) — the
-        kick just makes the next probe happen now instead of later.
-
-        Arm the one-shot end-to-end warmup so Receive can verify
-        without an operator click. _apply_remote_status fires the
-        actual `cmd=segment` once Compute transitions green; see the
-        warmup gate at __init__ for the full rationale.
+        After this call returns, the state machine advances on three
+        Qt-signal-driven events:
+          - handshake_observed → Send green (control_panel.py:_on_handshake_observed)
+          - status reply ok=True (with _send_observed) → Compute green
+          - first_publish_observed + GPU has fresh bundle → fire
+            cmd=verify_chain {token}; matching push → Receive green
         """
-        self._append_log("VLM", f"[{self._ts()}] chain: connect armed\n")
+        self._connect_token = time.time_ns()
+        self._send_observed = False
+        self._compute_observed = False
+        self._receive_observed = False
+        self._verify_chain_in_flight = False
+        self._verify_chain_attempts = 0
+        self._set_led(self.lbl_send_led, "starting")
+        self.lbl_send_led.setToolTip("send: verifying — awaiting handshake")
+        self._set_led(self.lbl_compute_led, "starting")
+        self.lbl_compute_led.setToolTip("compute: verifying — awaiting GPU status reply")
+        self._set_led(self.lbl_receive_led, "starting")
+        self.lbl_receive_led.setToolTip(
+            "receive: verifying — awaiting end-to-end chain_verify response"
+        )
+        self._append_log(
+            "VLM",
+            f"[{self._ts()}] chain: connect armed token={self._connect_token}\n",
+        )
         if hasattr(self, "vlm_scene_widget"):
             self.vlm_scene_widget.start()
         if getattr(self, "_relay_status_timer", None) is not None:
             self._poll_relay_status()
         if SERVICES_HOSTED_REMOTELY and getattr(self, "_remote_status_timer", None) is not None:
             self._poll_remote_status()
-        self._connect_warmup_pending = True
 
     def _on_vlm_video_disconnect(self) -> None:
-        self._append_log("VLM", f"[{self._ts()}] chain: disconnect\n")
+        token = self._connect_token
+        self._append_log("VLM", f"[{self._ts()}] chain: disconnect token={token}\n")
         if hasattr(self, "vlm_scene_widget"):
             self.vlm_scene_widget.stop()
-        # Cancel any in-flight warmup arming; a fresh Connect will
-        # re-arm it. Without this, a Disconnect-before-Compute-green
-        # would leave the gate True and a subsequent Connect would
-        # re-arm to True (still fine), but the explicit clear keeps
-        # the state machine readable.
-        self._connect_warmup_pending = False
+        # Tear down state-machine state so a subsequent Connect starts
+        # fresh. _connect_token=None disqualifies any late-arriving
+        # chain_verify push from the prior session even if it slips
+        # through the subscriber teardown race.
+        self._connect_token = None
+        self._send_observed = False
+        self._compute_observed = False
+        self._receive_observed = False
+        self._verify_chain_in_flight = False
+        self._verify_chain_attempts = 0
         # Subscriber stop emits "unsubscribed" on its own thread; reset
         # the Receive LED here too so we don't depend on that signal
         # arriving (e.g., if stop() is called before the subscriber's
@@ -1427,69 +1473,213 @@ class ControlPanel(QMainWindow):
         # exit path that emits "unsubscribed").
         self._on_subscriber_state("unsubscribed")
 
-    def _on_first_publish_observed(self, addr) -> None:
-        """Slot for VLMSceneWidget.first_publish_observed. Flips the
-        Send LED green at the moment the embedded relay's first
-        successful TCP broadcast lands — replaces the polling-cadence
-        path (2 s _relay_status_timer) for the once-per-Connect
-        transition. The periodic poll still owns the running→stopped
-        edge if the relay later dies.
-
-        Also kicks _poll_remote_status so Compute follows within one
-        UDP roundtrip rather than waiting up to 1 s for the next
-        timer tick — this is what produces the visible Send → Compute
-        ordering.
+    def _on_handshake_observed(self, addr) -> None:
+        """Slot for VLMSceneWidget.handshake_observed. The relay has
+        successfully delivered its handshake envelope to a TCP
+        consumer, so the Send utility is provably operational —
+        independent of how long the SDK takes to deliver the first
+        scene frame. Flip Send green and kick the status RPC so
+        Compute can follow within one UDP roundtrip.
         """
         try:
             host, port = (addr[0], int(addr[1]))
         except (TypeError, ValueError, IndexError):
             host, port = "?", 0
+        self._send_observed = True
         self._set_led(self.lbl_send_led, "running")
         self.lbl_send_led.setToolTip(
-            f"send: in-process @ {FRAME_RELAY_BIND_HOST}:{FRAME_RELAY_PORT} "
-            f"(first publish to {host}:{port})"
+            f"send: handshake delivered to {host}:{port}"
         )
-        # Tee the chain transition to the VLM channel so the audit
-        # trail is co-located with the compute/receive transitions
-        # (the relay channel already logs its own [frame_relay] line
-        # at the same moment via FrameRelayServer._send_envelope_safe).
         self._append_log(
             "VLM",
-            f"[{self._ts()}] chain: send first frame published to {host}:{port}\n",
+            f"[{self._ts()}] chain: send handshake to {host}:{port}\n",
         )
         if SERVICES_HOSTED_REMOTELY and getattr(self, "_remote_status_timer", None) is not None:
             self._poll_remote_status()
 
+    def _on_first_publish_observed(self, addr) -> None:
+        """Slot for VLMSceneWidget.first_publish_observed. The relay
+        has delivered the FIRST real frame envelope to its consumer,
+        so we know the TCP send path is exercised end-to-end with
+        actual data this Connect. Kick a status poll so Compute can
+        confirm a fresh bundle on the GPU side; the verify_chain
+        firing path runs from _apply_remote_status once that fresh
+        bundle is observed.
+
+        The Send LED itself was already flipped on the earlier
+        handshake event (see _on_handshake_observed); this slot does
+        not touch it.
+        """
+        try:
+            host, port = (addr[0], int(addr[1]))
+        except (TypeError, ValueError, IndexError):
+            host, port = "?", 0
+        self._append_log(
+            "VLM",
+            f"[{self._ts()}] chain: first frame published to {host}:{port}\n",
+        )
+        if SERVICES_HOSTED_REMOTELY and getattr(self, "_remote_status_timer", None) is not None:
+            self._poll_remote_status()
+
+    def _on_vlm_payload_received(self, payload: dict) -> None:
+        """Slot for VLMSceneWidget.vlm_payload_received. Token-checks
+        chain_verify responses against the current Connect's token to
+        flip Receive green ONLY for this cycle's verification round-
+        trip. Stale pushes from the GPU's prior-session cache (which
+        survive across reconnects per vlm_service.py:344-353) carry
+        either no token or a stale one and are ignored here for LED
+        purposes — they still hit the video-tab render pipeline via
+        the widget's own _on_vlm_payload handler.
+        """
+        if not isinstance(payload, dict):
+            return
+        if payload.get("type") != "chain_verify":
+            return
+        token = payload.get("token")
+        current = self._connect_token
+        if current is None or token != current:
+            return
+        if not self._compute_observed:
+            # Out-of-order: chain_verify came back before the panel
+            # observed Compute green. Defer the Receive flip — the
+            # next status reply will catch up and we'll re-evaluate.
+            # In practice this is a vanishingly small race window,
+            # but we'd rather hold than violate the order invariant.
+            return
+        self._receive_observed = True
+        self._set_led(self.lbl_receive_led, "running")
+        self.lbl_receive_led.setToolTip(
+            f"receive: end-to-end verified (token={token})"
+        )
+        self._append_log(
+            "VLM",
+            f"[{self._ts()}] chain: receive verified token={token}\n",
+        )
+
     def _on_subscriber_state(self, state: str) -> None:
-        """Slot for VLMSceneWidget.subscriber_state_changed. Receive LED
-        is gated on actual payload flow per the chain-of-causation
-        semantic (green = data arriving, not just handshake done):
-          - "subscribed"     → gray (handshake ok, awaiting first payload)
-          - "receiving:<t>"  → green (first push payload arrived; <t> is
-                                the payload ``type`` — vlm_results /
-                                chain_verify)
+        """Slot for VLMSceneWidget.subscriber_state_changed. Under
+        the new verification model, the Receive LED's green flip is
+        owned by _on_vlm_payload_received (token-matched chain_verify),
+        so this handler only manages the non-running cases:
+          - "subscribed"     → keep yellow (verification in progress)
+          - "receiving:<t>"  → no LED change here; token check decides
           - "error: …"       → red
           - "unsubscribed"   → gray
         """
         if state.startswith("receiving"):
-            ptype = state.split(":", 1)[1] if ":" in state else "?"
-            self._append_log(
-                "VLM", f"[{self._ts()}] chain: receive first push type={ptype}\n"
-            )
-            self._set_led(self.lbl_receive_led, "running")
-            self.lbl_receive_led.setToolTip(f"receive: payloads arriving (first type={ptype})")
-        elif state == "subscribed":
-            self._set_led(self.lbl_receive_led, "stopped")
-            self.lbl_receive_led.setToolTip(
-                "receive: subscribed — awaiting first push payload"
-            )
-        elif state.startswith("error"):
+            return
+        if state == "subscribed":
+            # Don't downgrade from a previously-green Receive (could
+            # happen if the subscriber thread races a token-matched
+            # push). Otherwise hold yellow during verification.
+            return
+        if state.startswith("error"):
             self._set_led(self.lbl_receive_led, "error")
             self.lbl_receive_led.setToolTip(f"receive: {state}")
-        else:
-            # "unsubscribed" or anything we don't recognise — gray.
-            self._set_led(self.lbl_receive_led, "stopped")
-            self.lbl_receive_led.setToolTip(f"receive: {state}")
+            return
+        # "unsubscribed" or anything we don't recognise — gray.
+        self._set_led(self.lbl_receive_led, "stopped")
+        self.lbl_receive_led.setToolTip(f"receive: {state}")
+
+    def _fire_verify_chain(self) -> None:
+        """Send `cmd=verify_chain {token}` to the GPU on a worker
+        thread. The token-matched chain_verify push back to the
+        subscriber is what flips Receive green via
+        _on_vlm_payload_received; this method only initiates the
+        round-trip and handles the failure paths.
+
+        Retries once after 200 ms on `no_frame` (a short race window
+        where the relay's first frame is still in flight to the GPU
+        when verify_chain arrives). Beyond that, paints Receive red.
+
+        Schedules a 5 s deadline check for the case where the GPU
+        replies ok=True with subscribers_notified=0 (subscribe-RPC
+        race) or where the chain_verify push is lost in transit. If
+        no token-matched push has landed by the deadline, Receive
+        goes red.
+        """
+        if self._connect_token is None:
+            return
+        self._verify_chain_in_flight = True
+        self._verify_chain_attempts += 1
+        token = self._connect_token
+        attempt = self._verify_chain_attempts
+        self._append_log(
+            "VLM",
+            f"[{self._ts()}] chain: verify_chain TX token={token} attempt={attempt}\n",
+        )
+        # Receive deadline: per-token guard so an old timer can't
+        # nuke a current-Connect verification.
+        QTimer.singleShot(
+            5000, self,
+            lambda t=token: self._verify_chain_deadline_check(t),
+        )
+
+        def worker():
+            try:
+                resp = self._vlm_udp_request(
+                    {"cmd": "verify_chain", "token": token},
+                    timeout_s=2.0,
+                )
+            except Exception as e:
+                resp = {"ok": False, "error": f"udp_exception: {e}"}
+            try:
+                QTimer.singleShot(
+                    0, self,
+                    lambda r=resp, t=token: self._on_verify_chain_reply(r, t),
+                )
+            except RuntimeError:
+                # Window closed mid-RPC.
+                pass
+
+        threading.Thread(
+            target=worker, daemon=True, name="panel-verify-chain"
+        ).start()
+
+    def _on_verify_chain_reply(self, resp: dict, token: int) -> None:
+        """GUI-thread slot for verify_chain RPC reply. ok=True here
+        means "GPU dispatched the synthetic push" — the actual Receive
+        LED flip waits for the push to land at the subscriber and
+        pass the token check (_on_vlm_payload_received). This handler
+        only covers failure cases.
+        """
+        self._verify_chain_in_flight = False
+        if token != self._connect_token:
+            # Connect changed under us; the response belongs to a
+            # prior cycle. Drop it.
+            return
+        if resp.get("ok"):
+            return  # Success path — push will land on subscriber.
+        err = resp.get("error", "unknown")
+        if err == "no_frame" and self._verify_chain_attempts < 2:
+            QTimer.singleShot(200, self, self._fire_verify_chain)
+            return
+        self._set_led(self.lbl_receive_led, "error")
+        self.lbl_receive_led.setToolTip(
+            f"receive: verify_chain RPC failed: {err}"
+        )
+        self._append_log(
+            "VLM",
+            f"[{self._ts()}] chain: verify_chain FAILED token={token} error={err}\n",
+        )
+
+    def _verify_chain_deadline_check(self, token: int) -> None:
+        """Fired 5 s after _fire_verify_chain. If no token-matched
+        chain_verify push has landed by now, paint Receive red.
+        Token-discriminated so a stale older-Connect timer doesn't
+        revert a successful current verification."""
+        if token != self._connect_token:
+            return
+        if self._receive_observed:
+            return
+        self._set_led(self.lbl_receive_led, "error")
+        self.lbl_receive_led.setToolTip(
+            "receive: verify_chain push did not arrive (timeout)"
+        )
+        self._append_log(
+            "VLM",
+            f"[{self._ts()}] chain: verify_chain TIMEOUT token={token}\n",
+        )
 
     def _build_runtime_config_tab(self, tabs: QTabWidget):
         rtc = QWidget()
@@ -2164,13 +2354,20 @@ class ControlPanel(QMainWindow):
     def _apply_remote_status(self, resp: dict) -> None:
         """GUI-thread slot for _remote_status_received.
 
-        Color semantics on the VLM LED:
-          - gray  (stopped) → unreachable, or reachable but no frame source
-          - red   (error)   → reachable and replied with ok=False
-          - green (running) → reachable, ok, frame source connected
-        Red is reserved for "the service told us something went wrong";
-        an unreachable host is treated as unknown/not-running rather
-        than an error condition, matching the relay LED's behaviour.
+        Compute LED semantic (per the per-Connect verification model):
+          - gray  (stopped)  → unreachable
+          - red   (error)    → reachable but ok=False
+          - green (running)  → reachable AND ok AND _send_observed
+        "Compute green" means "the GPU script is alive and ready to
+        accept data" — explicitly NOT gated on frames_received, since
+        actual data flow is what the Receive verification step proves.
+
+        Side-effect: when this reply confirms a fresh bundle on the
+        GPU side (frame_age < 2 s) AND the verification phase is
+        ready to fire (_send_observed and _compute_observed and a
+        token is armed), trigger cmd=verify_chain with the current
+        token. The token-matched chain_verify push back to the panel
+        is what flips the Receive LED via _on_vlm_payload_received.
         """
         self._remote_status_in_flight = False
         if resp.get("_unreachable"):
@@ -2183,47 +2380,56 @@ class ControlPanel(QMainWindow):
         src = resp.get("frame_source", "?")
         age = resp.get("frame_age_s")
         age_txt = f"{float(age):.2f}s" if isinstance(age, (int, float)) else "--"
-        # Compute LED is gated on actual ingestion per chain-of-causation
-        # semantics: the GPU service must (a) be alive, (b) be connected
-        # to its frame source, and (c) have actually received frames.
-        # `connected` alone means "channel is up"; `frames > 0` is what
-        # proves the GPU is consuming our Send. Without it, we'd light
-        # green during the connect-but-no-frames-yet gap.
         if not ok:
             led_state = "error"
-        elif connected and frames > 0:
+        elif self._send_observed:
+            # User spec: Compute = "GPU script is alive and ready". Send
+            # must already be observed for visible ordering, but we do
+            # not require frames_received>0 here — that's the Receive
+            # phase's job.
             led_state = "running"
         else:
-            led_state = "stopped"
+            # Reachable + ok=True but Send hasn't been observed yet.
+            # Hold yellow rather than flipping green prematurely.
+            led_state = "starting"
         self._set_led(self.lbl_compute_led, led_state)
         self.lbl_compute_led.setToolTip(
             f"compute: src={src} connected={connected} frames={frames} age={age_txt}"
         )
-        # End-to-end chain verification. When Compute first transitions
-        # green after a Connect, fire one `cmd=verify_chain` so the GPU
-        # confirms it has a frame + the detector is loaded + the push
-        # path works, then sends one synthetic `chain_verify` payload
-        # to subscribers. The panel's _on_vlm_payload only paints
-        # vlm_results (Utils/vlm_scene_widget.py:413-415), so this
-        # leaves the video tab clean — no stray segmentation overlay
-        # from a verification action the operator didn't request.
-        # Gated on led_state=running so the GPU has at least one frame
-        # to verify against (verify_chain returns no_frame otherwise;
-        # vlm_service.py:_cmd_verify_chain). Fires exactly once per
-        # Connect — the pending flag is cleared here and re-armed only
-        # by _on_vlm_video_connect.
-        if led_state == "running" and self._connect_warmup_pending:
+        if led_state == "running" and not self._compute_observed:
+            self._compute_observed = True
             self._append_log(
                 "VLM",
-                f"[{self._ts()}] chain: compute green frames_received={frames}\n",
+                f"[{self._ts()}] chain: compute green ok=True frames={frames}\n",
             )
-            self._connect_warmup_pending = False
-            self._vlm_command_threaded(
-                {"cmd": "verify_chain"}, 5.0, "verification"
-            )
+        # End-to-end Receive verification trigger. We need:
+        #   - both Send and Compute observed (predecessor phases done)
+        #   - GPU has a fresh bundle (connected=True, frame_age<2s) so
+        #     verify_chain doesn't return no_frame
+        #   - this Connect's token is armed
+        #   - no in-flight verify_chain already
+        # The verify_chain RPC echoes our token in its push payload;
+        # _on_vlm_payload_received does the matching to flip Receive
+        # green. Stale GPU-cache pushes (no token / old token) cannot
+        # trip Receive on a reconnect.
+        if (self._compute_observed
+                and self._send_observed
+                and connected
+                and self._connect_token is not None
+                and not self._verify_chain_in_flight
+                and self._verify_chain_attempts == 0):
+            self._fire_verify_chain()
 
     def _poll_relay_status(self) -> None:
         """2 s cadence. Reflects whether the frame relay is alive.
+
+        Under the per-Connect verification model, the Send LED's
+        green flip is owned by the handshake event
+        (_on_handshake_observed). This poll therefore only owns the
+        running→stopped edge — i.e. detecting that the relay thread
+        has died after Send was already observed. While verification
+        is in progress (_send_observed=False) this poll is a no-op
+        for the LED; the state machine paints it.
 
         When the panel hosts the relay in-process (FRAME_RELAY_EMBEDDED),
         we ask the widget directly — TCP-pinging localhost would create
@@ -2233,36 +2439,31 @@ class ControlPanel(QMainWindow):
         and the SDK iterator stalls behind that work → visible stutter
         in the local subscriber path).
         """
+        if not self._send_observed:
+            return  # State machine owns Send before handshake.
         widget = getattr(self, "vlm_scene_widget", None)
         if widget is not None and getattr(widget, "_embedded_relay", None) is not None:
             thread = getattr(widget, "_embedded_relay_thread", None)
             alive = thread is not None and thread.is_alive()
             relay = widget._embedded_relay
             published = int(getattr(relay, "published_count", 0) or 0)
-            # Chain-of-causation: green requires (a) the pump thread is
-            # alive AND (b) at least one frame has been broadcast.
-            # Just-started relay with no frames yet stays gray, surfacing
-            # the in-between state in the tooltip rather than lighting
-            # green prematurely.
-            if alive and published > 0:
+            if alive:
+                # Send was observed via handshake; keep green and
+                # surface the published-count in the tooltip for
+                # diagnostics.
                 self._set_led(self.lbl_send_led, "running")
                 self.lbl_send_led.setToolTip(
                     f"send: in-process @ {FRAME_RELAY_BIND_HOST}:{FRAME_RELAY_PORT} "
-                    f"({published} frames published)"
-                )
-            elif alive:
-                self._set_led(self.lbl_send_led, "stopped")
-                self.lbl_send_led.setToolTip(
-                    f"send: in-process @ {FRAME_RELAY_BIND_HOST}:{FRAME_RELAY_PORT} "
-                    "— awaiting first frame from Neon"
+                    f"(published={published})"
                 )
             else:
+                # Relay thread died after Send was observed.
                 self._set_led(self.lbl_send_led, "stopped")
                 self.lbl_send_led.setToolTip("send: in-process — thread exited")
             return
 
         # External relay (FRAME_RELAY_EMBEDDED=False or remote host) —
-        # fall back to the TCP ping.
+        # fall back to the TCP ping for the running→stopped edge.
         try:
             from Utils.perception_clients import FrameRelayController
         except Exception:

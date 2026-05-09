@@ -126,11 +126,24 @@ class VLMSceneWidget(QWidget):
     subscriber_state_changed = Signal(str)
     # Fires once per embedded-relay lifetime, on the pump thread the
     # first time a frame is broadcast to a TCP consumer. The panel
-    # uses this to flip the Send LED green at the moment of the event
-    # rather than waiting for the next 2 s relay-status poll. Payload
-    # is the (host, port) tuple of the consumer that received the
-    # first frame. See FrameRelayServer.__init__ on_first_publish.
+    # uses this to drive the Receive-LED's verify_chain trigger after
+    # confirming GPU has a fresh bundle. Payload is the (host, port)
+    # tuple of the consumer that received the first frame. See
+    # FrameRelayServer.__init__ on_first_publish.
     first_publish_observed = Signal(tuple)
+    # Fires once per embedded-relay lifetime, on the accept-loop
+    # thread, the first time `_install_client` delivers a handshake
+    # envelope to a TCP consumer successfully. The panel uses this
+    # to flip the Send LED green at the moment of the handshake —
+    # independent of Neon SDK first-frame latency. Payload is the
+    # (host, port) tuple of the handshaken consumer. See
+    # FrameRelayServer.__init__ on_handshake_sent.
+    handshake_observed = Signal(tuple)
+    # Bubbled-up payload from the active VLM JsonPushSubscriber. The
+    # panel uses this to token-match `chain_verify` responses against
+    # the current Connect's verification token (so stale GPU-cache
+    # pushes from a prior session don't trip the Receive LED).
+    vlm_payload_received = Signal(dict)
 
     def __init__(
         self,
@@ -259,6 +272,9 @@ class VLMSceneWidget(QWidget):
             # whichever backend (vlm or gaze) is active is what "Receive"
             # represents.
             self._vlm_subscriber.state_changed.connect(self.subscriber_state_changed)
+            # Bubble payloads up to the panel as well so the verification
+            # state machine can token-match `chain_verify` responses.
+            self._vlm_subscriber.payload_received.connect(self.vlm_payload_received)
             self._vlm_subscriber.start()
 
         # 3. Gaze push subscriber (optional).
@@ -335,6 +351,7 @@ class VLMSceneWidget(QWidget):
                 repo_dir=cfg.get("repo_dir"),
                 reader=reader,
                 on_first_publish=self._emit_first_publish,
+                on_handshake_sent=self._emit_handshake,
             )
         except Exception as e:
             self.lbl_status.setText(f"Render path: json_local — embedded relay ctor failed: {e}")
@@ -381,6 +398,15 @@ class VLMSceneWidget(QWidget):
         except RuntimeError:
             # Widget already destroyed mid-relay-shutdown. Drop silently
             # — the panel slot can't run anyway.
+            pass
+
+    def _emit_handshake(self, addr: Tuple[str, int]) -> None:
+        """Bridge from FrameRelayServer's on_handshake_sent (accept-loop
+        thread) to the widget's Qt signal. Same thread-safety reasoning
+        as _emit_first_publish."""
+        try:
+            self.handshake_observed.emit(tuple(addr))
+        except RuntimeError:
             pass
 
     def recent_paint_latency_ms(self) -> Tuple[float, float, float]:

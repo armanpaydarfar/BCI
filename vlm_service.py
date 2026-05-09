@@ -506,7 +506,7 @@ class VLMService:
             "camera_matrix": lambda: self._cmd_camera_matrix(),
             "subscribe": lambda: self._cmd_subscribe(req, addr),
             "unsubscribe": lambda: self._cmd_unsubscribe(req),
-            "verify_chain": lambda: self._cmd_verify_chain(),
+            "verify_chain": lambda: self._cmd_verify_chain(req),
             "stop": lambda: self._cmd_stop(addr),
         }
         handler = handlers.get(cmd)
@@ -1113,7 +1113,7 @@ class VLMService:
             removed = self._subscribers.pop(str(sid), None)
         return {"ok": True, "removed": bool(removed)}
 
-    def _cmd_verify_chain(self) -> dict:
+    def _cmd_verify_chain(self, req: dict) -> dict:
         """End-to-end chain verification, used by the operator panel
         immediately after Connect to flip the Receive LED green
         without firing a real segment that would leave detections on
@@ -1127,6 +1127,12 @@ class VLMService:
         ``_on_vlm_payload`` only paints overlays for ``type="vlm_results"``
         (Utils/vlm_scene_widget.py:413-415), so this push lights
         Receive without any visible artifact on the video tab.
+
+        Echoes any ``token`` field from the request into the pushed
+        payload so the panel can match the response to the specific
+        Connect cycle that issued it. Without the token a stale push
+        from a prior session's GPU cache would be indistinguishable
+        from a fresh one and could trip the Receive LED prematurely.
 
         No state is mutated — ``_cached_dets`` is left untouched, the
         VLM state machine is not bumped, and the regular results-tick
@@ -1143,6 +1149,9 @@ class VLMService:
             "ok": True,
             "ts_send_ns": int(time.time_ns()),
         }
+        token = req.get("token") if isinstance(req, dict) else None
+        if token is not None:
+            payload_dict["token"] = token
         payload = json.dumps(payload_dict).encode("utf-8")
 
         with self._subscribers_lock:
