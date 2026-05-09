@@ -1466,12 +1466,20 @@ class ControlPanel(QMainWindow):
         self._receive_observed = False
         self._verify_chain_in_flight = False
         self._verify_chain_attempts = 0
-        # Subscriber stop emits "unsubscribed" on its own thread; reset
-        # the Receive LED here too so we don't depend on that signal
-        # arriving (e.g., if stop() is called before the subscriber's
-        # initial subscribe completes the run loop never enters its
-        # exit path that emits "unsubscribed").
-        self._on_subscriber_state("unsubscribed")
+        # Reset all three LEDs to gray explicitly. _poll_relay_status
+        # gates on _send_observed and won't repaint Send after we
+        # cleared the flag above (control_panel.py:_poll_relay_status),
+        # so without this Send would remain stuck on its last green
+        # state. Doing the same for Compute and Receive keeps the
+        # idle-state appearance consistent across all three rather
+        # than relying on side-channels (next status poll for Compute,
+        # the "unsubscribed" handler for Receive).
+        self._set_led(self.lbl_send_led, "stopped")
+        self.lbl_send_led.setToolTip("send: idle")
+        self._set_led(self.lbl_compute_led, "stopped")
+        self.lbl_compute_led.setToolTip("compute: idle")
+        self._set_led(self.lbl_receive_led, "stopped")
+        self.lbl_receive_led.setToolTip("receive: idle")
 
     def _on_handshake_observed(self, addr) -> None:
         """Slot for VLMSceneWidget.handshake_observed. The relay has
