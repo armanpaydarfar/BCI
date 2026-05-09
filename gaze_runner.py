@@ -30,12 +30,44 @@ os.environ.setdefault("KMP_AFFINITY", "granularity=fine,compact,1,0")
 import argparse
 import json
 import socket
+import sys
 import threading
 import time
-from typing import Any, Dict, Optional
+import uuid
+from typing import Any, Dict, Optional, Tuple
 
 from Utils.gaze.gaze_system import GazeSystem, GazeConfig
 from Utils.gaze.gaze_ui import GazeUI, UIConfig, RenderInputs
+
+
+def _disable_udp_connreset(sock) -> None:
+    """Call WSAIoctl(SIO_UDP_CONNRESET, FALSE) on a Windows UDP socket so
+    ICMP "port unreachable" replies no longer poison recvfrom() with
+    WSAECONNRESET (10054). Python's stdlib ``socket.ioctl`` only accepts
+    SIO_RCVALL / SIO_KEEPALIVE_VALS / SIO_LOOPBACK_FAST_PATH, so we go
+    around it via ctypes. Raises OSError on failure; caller swallows."""
+    import ctypes
+    from ctypes import wintypes
+
+    SIO_UDP_CONNRESET = 0x9800000C
+    ws2 = ctypes.WinDLL("Ws2_32", use_last_error=True)
+    WSAIoctl = ws2.WSAIoctl
+    WSAIoctl.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    WSAIoctl.restype = ctypes.c_int
+    inbuf = ctypes.c_uint32(0)  # FALSE
+    bytes_returned = wintypes.DWORD(0)
+    rc = WSAIoctl(
+        sock.fileno(), SIO_UDP_CONNRESET,
+        ctypes.byref(inbuf), ctypes.sizeof(inbuf),
+        None, 0, ctypes.byref(bytes_returned), None, None,
+    )
+    if rc != 0:
+        err = ctypes.get_last_error()
+        raise OSError(f"WSAIoctl(SIO_UDP_CONNRESET) failed (WSAGetLastError={err})")
 
 
 
@@ -53,6 +85,7 @@ class GazeUDPServer(threading.Thread):
         *,
         quiet: bool = True,
         allow_shutdown: bool = True,
+        allow_remote_stop: bool = False,
         max_req_bytes: int = 64 * 1024,
         max_resp_bytes: int = 64 * 1024,
         udp_log: bool = False,
@@ -65,6 +98,7 @@ class GazeUDPServer(threading.Thread):
         self.stop_event = stop_event
         self.quiet = quiet
         self.allow_shutdown = allow_shutdown
+        self.allow_remote_stop = bool(allow_remote_stop)
         self.max_req_bytes = int(max_req_bytes)
         self.max_resp_bytes = int(max_resp_bytes)
         self.udp_log = bool(udp_log)
@@ -72,6 +106,15 @@ class GazeUDPServer(threading.Thread):
         self._sock: Optional[socket.socket] = None
 
         self._last_log_t = 0.0
+
+        # Subscribe-mode push (Render_Layer_Refactor.md §3). One tick thread
+        # builds `gaze_results` JSON datagrams and broadcasts to subscribed
+        # panels. Existing request-reply commands keep working unchanged.
+        self._subscribers_lock = threading.Lock()
+        # subscriber_id (uuid hex) → {addr, hz, last_sent_t, expires_at}
+        self._subscribers: Dict[str, Dict[str, Any]] = {}
+        self._tick_thread: Optional[threading.Thread] = None
+        self._push_sock: Optional[socket.socket] = None
 
     def log(self, msg: str):
         if not self.quiet:
@@ -93,7 +136,29 @@ class GazeUDPServer(threading.Thread):
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind((self.host, self.port))
         self._sock.settimeout(0.5)
+        # Windows: disable SIO_UDP_CONNRESET so an ICMP "port unreachable"
+        # bounced back from a dead-or-firewalled previous reply target
+        # doesn't poison the next recvfrom() with WSAECONNRESET (10054)
+        # and silently kill the gaze service. Python's stdlib socket.ioctl
+        # only accepts a fixed set of IOCTLs (SIO_RCVALL, SIO_KEEPALIVE_VALS,
+        # SIO_LOOPBACK_FAST_PATH); call WSAIoctl directly via ctypes.
+        if sys.platform == "win32":
+            try:
+                _disable_udp_connreset(self._sock)
+            except (OSError, ValueError, AttributeError) as e:
+                self.log(
+                    f"WARN: could not disable SIO_UDP_CONNRESET ({e}); "
+                    f"relying on ConnectionResetError catch in recv loop"
+                )
         self.log(f"listening on udp://{self.host}:{self.port}")
+
+        # Tick thread broadcasts gaze_results datagrams to subscribed
+        # clients. Idle when no subscribers — one prune pass per tick.
+        self._push_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._tick_thread = threading.Thread(
+            target=self._results_tick_loop, daemon=True, name="gaze-results-push",
+        )
+        self._tick_thread.start()
 
         try:
             while not self.stop_event.is_set():
@@ -101,8 +166,21 @@ class GazeUDPServer(threading.Thread):
                     data, addr = self._sock.recvfrom(self.max_req_bytes)
                 except socket.timeout:
                     continue
-                except OSError:
-                    break
+                except ConnectionResetError as e:
+                    # WinError 10054 — belt-and-suspenders if SIO_UDP_CONNRESET
+                    # ioctl above isn't honoured. UDP is connectionless; keep
+                    # serving the next request.
+                    self._maybe_log(
+                        f"[gaze_udp] recvfrom WSAECONNRESET ({e}); continuing"
+                    )
+                    continue
+                except OSError as e:
+                    # Real socket failure (e.g. socket closed via stop_event).
+                    # Only break if we're shutting down anyway.
+                    if self.stop_event.is_set():
+                        break
+                    self.log(f"recvfrom OSError ({e}); continuing")
+                    continue
 
                 if not data:
                     continue
@@ -122,7 +200,7 @@ class GazeUDPServer(threading.Thread):
                         f"[gaze_udp] RX cmd={cmd} query_id={qid} bytes={len(data)} from={addr[0]}:{addr[1]}"
                     )
 
-                    resp = self.handle(req)
+                    resp = self.handle(req, addr)
 
                 except Exception as e:
                     resp = {"ok": False, "error": str(e), "cmd": cmd}
@@ -154,9 +232,14 @@ class GazeUDPServer(threading.Thread):
                     self._sock.close()
             except Exception:
                 pass
+            try:
+                if self._push_sock is not None:
+                    self._push_sock.close()
+            except Exception:
+                pass
             self.log("stopped")
 
-    def handle(self, req: Dict[str, Any]) -> Dict[str, Any]:
+    def handle(self, req: Dict[str, Any], addr: Tuple[str, int]) -> Dict[str, Any]:
         """
         Handle an incoming JSON UDP request and return a JSON response.
 
@@ -197,11 +280,159 @@ class GazeUDPServer(threading.Thread):
 
         if cmd == "stop":
             if not self.allow_shutdown:
-                return {"ok": False, "error": "shutdown not allowed"}
+                return {"ok": False, "error": "shutdown not allowed", "cmd": "stop"}
+            # Refuse remote stops by default — protects an unattended GPU
+            # host from being taken offline by an accidental panel click,
+            # which would otherwise force a physical restart.
+            host = addr[0] if addr else ""
+            is_local = isinstance(host, str) and (host == "127.0.0.1" or host.startswith("127."))
+            if not is_local and not self.allow_remote_stop:
+                self.log(f"refusing remote stop from {host}")
+                return {
+                    "ok": False, "cmd": "stop",
+                    "error": "remote_stop_disabled",
+                    "hint": "stop the service locally with Ctrl-C, "
+                            "or restart with --allow-remote-stop to allow this",
+                }
             self.stop_event.set()
             return {"ok": True, "cmd": "stop"}
 
+        if cmd == "subscribe":
+            return self._handle_subscribe(req, addr)
+
+        if cmd == "unsubscribe":
+            return self._handle_unsubscribe(req)
+
         return {"ok": False, "error": f"unknown cmd '{cmd}'"}
+
+    # ── subscribe-mode JSON push (Render_Layer_Refactor.md §3) ────────────
+
+    # Internal tick rate caps the per-subscriber push rate. The gaze
+    # detector itself runs at det_hz (default 3 Hz), so 20 Hz is plenty
+    # to ride on top of cached state without re-running the model.
+    _TICK_HZ: float = 20.0
+    _SUBSCRIBER_TTL_S: float = 30.0
+
+    def _handle_subscribe(self, req: Dict[str, Any], addr: Tuple[str, int]) -> Dict[str, Any]:
+        try:
+            hz = float(req.get("hz", self._TICK_HZ))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "bad_hz", "cmd": "subscribe"}
+        hz = max(0.5, min(hz, self._TICK_HZ))
+        ttl_s = float(req.get("ttl_s", self._SUBSCRIBER_TTL_S))
+        now = time.monotonic()
+        with self._subscribers_lock:
+            existing_id: Optional[str] = None
+            for sid, info in self._subscribers.items():
+                if info.get("addr") == addr:
+                    existing_id = sid
+                    break
+            sid = existing_id or uuid.uuid4().hex[:12]
+            self._subscribers[sid] = {
+                "addr": tuple(addr),
+                "hz": hz,
+                "last_sent_t": 0.0,
+                "expires_at": now + ttl_s,
+            }
+        return {"ok": True, "cmd": "subscribe", "stream": "results",
+                "subscriber_id": sid, "hz": hz}
+
+    def _handle_unsubscribe(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        sid = req.get("subscriber_id")
+        if not sid:
+            return {"ok": False, "error": "missing_subscriber_id", "cmd": "unsubscribe"}
+        with self._subscribers_lock:
+            removed = self._subscribers.pop(str(sid), None)
+        return {"ok": True, "cmd": "unsubscribe", "removed": bool(removed)}
+
+    def _results_tick_loop(self) -> None:
+        period = 1.0 / max(self._TICK_HZ, 1e-6)
+        while not self.stop_event.is_set():
+            t0 = time.monotonic()
+            try:
+                self._tick_send(t0)
+            except Exception as e:
+                if not self.quiet:
+                    print(f"[gaze_udp] tick error: {e}")
+            slept = time.monotonic() - t0
+            remaining = period - slept
+            if remaining > 0:
+                # Honour stop_event quickly so service shutdown isn't blocked
+                # by the tick period.
+                self.stop_event.wait(timeout=remaining)
+
+    def _tick_send(self, now: float) -> None:
+        with self._subscribers_lock:
+            for sid, info in list(self._subscribers.items()):
+                if info["expires_at"] < now:
+                    self._subscribers.pop(sid, None)
+            due = []
+            for sid, info in self._subscribers.items():
+                period = 1.0 / max(info["hz"], 1e-6)
+                if (now - info["last_sent_t"]) >= period:
+                    due.append((sid, info["addr"]))
+                    info["last_sent_t"] = now
+        if not due or self._push_sock is None:
+            return
+        try:
+            payload = json.dumps(self._build_gaze_results_payload(),
+                                 separators=(",", ":")).encode("utf-8")
+        except Exception:
+            return
+        if len(payload) > 60 * 1024:
+            return
+        for _sid, addr in due:
+            try:
+                self._push_sock.sendto(payload, addr)
+            except OSError:
+                pass
+
+    def _build_gaze_results_payload(self) -> Dict[str, Any]:
+        """Assemble a `gaze_results` payload from a fresh non-frame snapshot."""
+        snap = self.system.get_snapshot(include_objects=True, include_frame=False)
+        gaze_px = snap.get("gaze_px") or (None, None)
+        objects = snap.get("objects") or []
+        tracks = []
+        for d in objects:
+            if not isinstance(d, dict):
+                continue
+            xyxy = d.get("xyxy") or d.get("box_xyxy") or []
+            tracks.append({
+                "id": int(d.get("track_id", -1)),
+                "bbox": [float(v) for v in xyxy] if xyxy else None,
+                "label": str(d.get("name", "?")),
+                "score": float(d.get("conf", 0.0)),
+                "age": int(d.get("age", 0)) if "age" in d else None,
+                "lost": int(d.get("lost", 0)) if "lost" in d else None,
+            })
+        gaze_hit = snap.get("gaze_hit")
+        current_hit = None
+        if isinstance(gaze_hit, dict):
+            current_hit = {
+                "track_id": int(gaze_hit.get("track_id", -1)),
+                "name": str(gaze_hit.get("name", "?")),
+                "conf": float(gaze_hit.get("conf", 0.0)),
+            }
+        return {
+            "type": "gaze_results",
+            "ts_send_ns": int(time.time_ns()),
+            "wall_t": float(snap.get("wall_t", time.time())),
+            "worn": bool(snap.get("worn", False)),
+            "gaze_px": [float(gaze_px[0]), float(gaze_px[1])]
+                if (gaze_px[0] is not None and gaze_px[1] is not None) else None,
+            "tracks": tracks,
+            "current_hit": current_hit,
+            "governor": {
+                "cv_enabled": bool(snap.get("gov_enabled", True)),
+                "reason": str(snap.get("gov_reason", "")),
+                "cd_left_s": float(snap.get("gov_cd_left", 0.0)),
+            },
+            "rates": {
+                "loop_hz": float(snap.get("loop_hz", float("nan"))),
+                "video_hz": float(snap.get("video_hz", float("nan"))),
+                "det_hz": float(snap.get("det_hz", float("nan"))),
+            },
+        }
 
 # -------------------------
 # Helpers
@@ -319,6 +550,24 @@ def parse_args():
     p.add_argument("--host", type=str, default="127.0.0.1")
     p.add_argument("--port", type=int, default=5588)
     p.add_argument("--ipc_verbose", action="store_true")
+    p.add_argument("--allow-remote-stop", action="store_true",
+                   dest="allow_remote_stop",
+                   help="Honour cmd=stop from non-loopback addresses (off by default)")
+    p.add_argument("--neon-device-host", type=str, default="",
+                   dest="neon_device_host",
+                   help="Companion app IP for direct connection; empty = mDNS discovery")
+    # Frame-source toggle for the GPU-host migration plan; mirrors the
+    # vlm_service.py flag. Default `local` keeps today's behaviour
+    # (gaze_system opens Neon directly).
+    p.add_argument("--frame-source", choices=["local", "remote"], default="local",
+                   dest="frame_source",
+                   help="local=open Neon directly; remote=consume Utils/frame_relay envelopes")
+    p.add_argument("--remote-frame-host", type=str, default="",
+                   dest="remote_frame_host",
+                   help="Host of the frame_relay server (required when --frame-source=remote)")
+    p.add_argument("--remote-frame-port", type=int, default=5591,
+                   dest="remote_frame_port",
+                   help="Port of the frame_relay server (default 5591)")
     return p.parse_args()
 
 
@@ -328,6 +577,12 @@ def main():
 
     sys_cfg = build_sys_cfg()
     sys_cfg.enable_prints = bool(args.prints)
+    sys_cfg.neon_host = str(args.neon_device_host)
+    sys_cfg.frame_source = str(args.frame_source)
+    sys_cfg.remote_frame_host = str(args.remote_frame_host)
+    sys_cfg.remote_frame_port = int(args.remote_frame_port)
+    if sys_cfg.frame_source == "remote" and not sys_cfg.remote_frame_host:
+        raise SystemExit("--frame-source=remote requires --remote-frame-host")
 
     if args.loop_hz is not None:
         sys_cfg.target_loop_hz = float(args.loop_hz)
@@ -355,6 +610,7 @@ def main():
             stop_event=stop_event,
             quiet=not bool(args.ipc_verbose),
             allow_shutdown=True,
+            allow_remote_stop=bool(getattr(args, "allow_remote_stop", False)),
             udp_log=bool(args.udp_log),
             udp_log_hz=float(args.udp_log_hz),
         )
@@ -363,32 +619,48 @@ def main():
             print(f"[service] UDP on {args.host}:{args.port} | display={args.display}")
     loop_period = 1.0 / max(float(sys_cfg.target_loop_hz), 1e-6)
 
+    # Keep Windows awake while the service runs (no-op on POSIX). Mirrors
+    # the inhibit in vlm_service.py's main(); see Utils/sleep_inhibit.py.
+    try:
+        from Utils.sleep_inhibit import inhibit as _sleep_inhibit, release as _sleep_release
+        _sleep_inhibit()
+    except Exception:
+        _sleep_release = lambda: None  # noqa: E731
+
     try:
         while not stop_event.is_set():
-            t0 = time.time()
+            try:
+                t0 = time.time()
 
-            # In runner mode, UI controls stop condition; in service mode, we run until stop_event
-            if args.mode == "runner" and ui is not None and ui.should_stop():
-                break
-
-            # Key handling (only if UI is present)
-            if ui is not None:
-                k = ui.get_last_key()
-                if k == 27:  # ESC
+                # In runner mode, UI controls stop condition; in service mode, we run until stop_event
+                if args.mode == "runner" and ui is not None and ui.should_stop():
                     break
-                if k in (ord("c"), ord("C")):
-                    system.recenter()
 
-            # Runner needs frames; service typically doesn't.
-            include_frame = bool(ui is not None)
+                # Key handling (only if UI is present)
+                if ui is not None:
+                    k = ui.get_last_key()
+                    if k == 27:  # ESC
+                        break
+                    if k in (ord("c"), ord("C")):
+                        system.recenter()
 
-            snap = system.get_snapshot(include_objects=True, include_frame=include_frame)
-            if not snap.get("ok", False):
-                time.sleep(0.002)
+                # Runner needs frames; service typically doesn't.
+                include_frame = bool(ui is not None)
+
+                snap = system.get_snapshot(include_objects=True, include_frame=include_frame)
+                if not snap.get("ok", False):
+                    time.sleep(0.002)
+                    continue
+
+                if ui is not None:
+                    _publish_ui(ui, sys_cfg, snap)
+            except Exception as e:
+                # Per-iteration error must not kill the service. Log and
+                # continue so the UDP request-reply / push channels stay
+                # alive even if a snapshot read fails transiently.
+                print(f"[gaze_runner] main loop iteration error: {e}", flush=True)
+                time.sleep(0.05)
                 continue
-
-            if ui is not None:
-                _publish_ui(ui, sys_cfg, snap)
 
             # Pace
             dt = time.time() - t0
@@ -399,6 +671,10 @@ def main():
     finally:
         print("Stopping...")
         stop_event.set()
+        try:
+            _sleep_release()
+        except Exception:
+            pass
         try:
             if ui is not None:
                 ui.stop()

@@ -5,8 +5,12 @@ import os
 # =============================================================================
 # Paths and subject
 # =============================================================================
-WORKING_DIR = "/home/arman-admin/Projects/Harmony/"
-DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
+# WORKING_DIR / DATA_DIR are machine-local — set them in config_local.py.
+# The defaults here are sentinels; a fresh checkout still imports cleanly,
+# but realtime code that depends on these paths will fail loudly until
+# config_local.py is created (see config_local.example.py).
+WORKING_DIR = ""
+DATA_DIR = ""
 TRAINING_SUBJECT = "PILOT007"
 
 # =============================================================================
@@ -126,7 +130,14 @@ XGB_TUNE_KL_BINS    = 15
 # =============================================================================
 # Gaze / object-selection experiment
 # =============================================================================
+# Bind vs dial split: GAZE_UDP_IP is the address clients dial (panel +
+# experiment driver). GAZE_BIND_HOST is the address gaze_runner.py binds
+# its UDP socket on. In production, set GAZE_BIND_HOST = "0.0.0.0" on the
+# Windows GPU host and GAZE_UDP_IP = <windows_lan_ip> on Linux. Both
+# default to 127.0.0.1 for the single-machine dev configuration.
+# Machine-local — override in config_local.py.
 GAZE_UDP_IP = "127.0.0.1"
+GAZE_BIND_HOST = "127.0.0.1"
 GAZE_UDP_PORT = 5588
 GAZE_UDP_TIMEOUT = 0.15
 GAZE_SELECTION_WINDOW = 5.0
@@ -135,7 +146,102 @@ GAZE_MIN_DWELL_SEC = 0.75
 GO_NOGO_PROMPT_SEC = 1.25
 GAZE_SAMPLE_WIDTH = 1600.0
 GAZE_SAMPLE_HEIGHT = 1200.0
-POSE_LIBRARY_PATH = os.path.join(WORKING_DIR, "poses_with_gaze_20251202_153040.npz")
+# POSE_LIBRARY_PATH derives from WORKING_DIR — defined at the bottom of
+# this file so it picks up any config_local.py override.
+
+# =============================================================================
+# Pupil Labs Neon — device connection
+# =============================================================================
+# IP address of the phone running the Pupil Labs Companion app.
+# Leave empty ("") to use mDNS auto-discovery, which works on home/hotspot
+# networks but is blocked on most enterprise/IoT VLANs.
+# Find the IP in the Companion app: tap the streaming icon → note the
+# address shown (e.g. "10.42.0.100"). Machine-local — override in
+# config_local.py per network.
+NEON_COMPANION_HOST = ""
+
+# =============================================================================
+# Perception frame source — local Neon vs. remote frame_relay
+# =============================================================================
+# Selects how vlm_service.py and gaze_runner.py acquire scene frames.
+#   "local"  — service opens the Neon device directly (today's behaviour;
+#              works on a single machine that owns the Companion phone).
+#   "remote" — service consumes envelopes from a Utils/frame_relay.py TCP
+#              server. Production topology: Linux runs the relay against
+#              the Neon device, Windows runs the perception services with
+#              --frame-source=remote.
+# Reference: SoftwareDocs/GPU_Service_Host_Architecture_Plan.md §3.4.
+# Machine-local — override in config_local.py.
+PERCEPTION_FRAME_SOURCE = "local"
+
+# Where do the perception services (vlm_service.py, gaze_runner.py) run
+# from this panel's perspective? On the Linux device host this is True
+# (services live on the Windows GPU host); on Windows or single-machine
+# dev this is False. Drives panel UX: when True, Start/Stop buttons that
+# would spawn local conda subprocesses are disabled and replaced with
+# remote-status badges fed by `cmd: status` UDP pings.
+# Machine-local — override in config_local.py.
+SERVICES_HOSTED_REMOTELY = False
+
+# Bind host for the relay server (the machine that owns Neon). 0.0.0.0
+# accepts connections from any LAN peer; 127.0.0.1 keeps it loopback-only
+# for single-machine validation. Machine-local — override in config_local.py.
+FRAME_RELAY_HOST = "127.0.0.1"
+# Dial host for the relay client (the machine that runs the models). Set
+# this to the relay host's LAN IP in production. For loopback validation
+# leave it as 127.0.0.1. Machine-local — override in config_local.py.
+FRAME_RELAY_DIAL_HOST = "127.0.0.1"
+FRAME_RELAY_PORT = 5591
+# Default 15 Hz — chosen to fit a UT IoT / cellular uplink budget. With
+# both vlm_service and gaze_runner pulling concurrently the steady-state
+# wire load is ~36 Mbit/s at q=75 JPEG; comfortable on a typical IoT VLAN
+# or 5G hotspot. Raise to 30.0 on LAN to match Neon's native scene-camera
+# FPS for sharper fixation timing; at 30 Hz both consumers together push
+# ~72 Mbit/s which UT IoT will not carry. The relay can never exceed the
+# Neon producer (~30 Hz), so values above 30 are silently capped.
+FRAME_RELAY_HZ = 15.0
+
+# =============================================================================
+# VLM integration (harmony_vlm subprocess)
+# =============================================================================
+# Gaze/object-recognition backend selector:
+#   "legacy" — our gaze_runner service with YOLO + SORT tracker
+#   "vlm"    — our vlm_service subprocess, which imports harmony_vlm's utils/
+#              (FastSAM + Depth Pro + Gemini) and exposes them over UDP
+GAZE_OR_BACKEND = "vlm"
+
+# Sibling directory holding the harmony_vlm clone. Machine-local —
+# override in config_local.py.
+VLM_REPO_DIR = ""
+
+# Conda env used to launch vlm_service.py. Separate from "lsl" because depth-pro
+# pins numpy<2, which is incompatible with pyriemann and opencv in the BCI stack.
+VLM_CONDA_ENV = "harmony_vlm"
+
+# Gemini model for the VLM reasoner. "gemini-2.5-flash" is free-tier available;
+# "gemini-2.5-pro" requires a paid Google AI account.
+VLM_MODEL = "gemini-2.5-flash"
+
+# Whether to load Depth Pro at service startup. Depth Pro on CPU is slow
+# (~1-3 s per call). Disable to skip scene depth while testing VLM reasoning
+# alone; segment/reason/decide endpoints return without depth fields.
+VLM_ENABLE_DEPTH = True
+
+# UDP endpoint for the vlm_service request-reply protocol. Must differ from
+# GAZE_UDP_PORT (5588) since both services can run concurrently on localhost.
+# Bind vs dial split: VLM_SERVICE_HOST is the dial address (panel /
+# experiment driver). VLM_BIND_HOST is the address vlm_service.py binds on
+# (UDP request socket + TCP overlay socket). In production set
+# VLM_BIND_HOST = "0.0.0.0" on Windows and VLM_SERVICE_HOST = <windows_lan_ip>
+# on Linux. Both default to 127.0.0.1 for single-machine dev.
+# Machine-local — override in config_local.py.
+VLM_SERVICE_HOST = "127.0.0.1"
+VLM_BIND_HOST = "127.0.0.1"
+VLM_SERVICE_PORT = 5589
+VLM_SERVICE_TIMEOUT = 0.5
+
+# VLM_SESSION_ROOT derives from DATA_DIR — defined at the bottom of this
+# file so it picks up any config_local.py override.
 
 # =============================================================================
 # FES
@@ -148,7 +254,10 @@ FES_TIMING_OFFSET = 7  # Seconds before end of movement for motor FES cutoff (su
 # Arduino actuator
 # =============================================================================
 USE_ARDUINO = True
-ARDUINO_PORT = "/dev/ttyACM0"
+# ARDUINO_PORT is the OS-level serial device path; differs between Linux
+# (/dev/ttyACM0) and Windows (COM3 etc.). Machine-local — override in
+# config_local.py.
+ARDUINO_PORT = ""
 ARDUINO_BAUD = 9600
 ARDUINO_CMD_MI   = b"1"
 ARDUINO_CMD_REST = b"0"
@@ -273,3 +382,24 @@ ERRP_CHANNEL_NAMES = ['F3', 'Fz', 'F4', 'FC1', 'FC2', 'C3', 'Cz', 'C4', 'CP1', '
 # Global runtime flags
 # =============================================================================
 SIMULATION_MODE = False
+
+# =============================================================================
+# Machine-local overrides
+# =============================================================================
+# config_local.py is per-machine and gitignored. It supplies real values
+# for paths and network endpoints (WORKING_DIR, DATA_DIR, *_HOST, *_DIAL_*,
+# NEON_COMPANION_HOST, ARDUINO_PORT, VLM_REPO_DIR, PERCEPTION_FRAME_SOURCE,
+# SERVICES_HOSTED_REMOTELY). Bootstrap a new machine by copying
+# config_local.example.py to config_local.py and editing in place.
+try:
+    from config_local import *  # noqa: F401, F403
+except ImportError:
+    pass
+
+# =============================================================================
+# Derived paths — placed AFTER the local-override import so they pick up
+# the per-machine WORKING_DIR / DATA_DIR. Defining these earlier would
+# bake the empty defaults into every consumer.
+# =============================================================================
+POSE_LIBRARY_PATH = os.path.join(WORKING_DIR, "poses_with_gaze_20251202_153040.npz")
+VLM_SESSION_ROOT  = os.path.join(DATA_DIR, "vlm_sessions")

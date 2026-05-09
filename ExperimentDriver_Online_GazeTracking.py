@@ -55,6 +55,8 @@ import Utils.runtime_common as _RC
 
 from Utils.stream_utils import require_marker_stream
 
+from vlm_bridge import VLMBridge
+
 # =========================================================
 # Logger setup
 # =========================================================
@@ -232,6 +234,8 @@ PRETRIAL_WHITE_ORB_SEC = float(getattr(config, "PRETRIAL_WHITE_ORB_SEC", 3.0))
 BASELINE_BEFORE_CUE_SEC = float(getattr(config, "BASELINE_BEFORE_CUE_SEC", 1.0))
 RETRY_RESET_SEC = float(getattr(config, "RETRY_RESET_SEC", 2.0))
 
+GAZE_OR_BACKEND = str(getattr(config, "GAZE_OR_BACKEND", "legacy")).lower()
+
 # =========================================================
 # Drawing helpers
 # =========================================================
@@ -348,6 +352,12 @@ def gaze_udp_request(sock, payload, timeout=GAZE_UDP_TIMEOUT):
     """
     Request a gaze snapshot from `gaze_runner.py` via UDP.
 
+    Delegates to ``Utils.perception_clients.udp_request_using`` for the
+    wire format, while keeping the caller-owned socket so the realtime
+    selection loop doesn't allocate per request (Tier 2 — preserve
+    allocation discipline). Logs and returns ``None`` on transport
+    failure rather than propagating, matching legacy behaviour.
+
     Args:
         sock: UDP socket connected to the gaze runner's request port.
         payload: JSON-serializable dict. Expected keys:
@@ -366,15 +376,11 @@ def gaze_udp_request(sock, payload, timeout=GAZE_UDP_TIMEOUT):
         - `gaze_hit`: None or dict describing the selected tracked object
         - `objects`: list of tracked detections (only present when `include_objects=True`)
     """
-    try:
-        sock.settimeout(timeout)
-        msg = json.dumps(payload).encode("utf-8")
-        sock.sendto(msg, (GAZE_UDP_IP, GAZE_UDP_PORT))
-        data, _ = sock.recvfrom(65535)
-        return json.loads(data.decode("utf-8"))
-    except Exception as e:
-        logger.log_event(f"⚠️ Gaze UDP request failed: {e}")
-        return None
+    from Utils.perception_clients import udp_request_using
+    resp = udp_request_using(sock, GAZE_UDP_IP, GAZE_UDP_PORT, payload, timeout)
+    if resp is None:
+        logger.log_event("⚠️ Gaze UDP request failed (transport error)")
+    return resp
 
 
 def make_object_key(hit):
@@ -395,7 +401,7 @@ def object_display_name(obj_key):
     return obj_key.split("#")[0]
 
 
-def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WINDOW):
+def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WINDOW, vlm_decision=None):
     logger.log_event(f"Starting gaze selection window ({duration_s:.2f}s).")
 
     dwell_sec_by_obj = {}
@@ -404,6 +410,17 @@ def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WI
 
     selection_start = time.time()
     running_window = True
+
+    # In vlm mode the object identity is already resolved by vlm_service.decide()
+    # (called upstream in repeat_until_valid_selection). This window's job is to
+    # collect gaze-pixel samples under the confirmed object so we can average
+    # them for the pose-library lookup, same as legacy.
+    vlm_object_name = None
+    if GAZE_OR_BACKEND == "vlm" and isinstance(vlm_decision, dict):
+        vlm_object_name = vlm_decision.get("object") or "unknown"
+
+    # VLM mode still polls gaze but skips the object-tracker payload.
+    include_objects = GAZE_OR_BACKEND != "vlm"
 
     while running_window:
         eeg_state.update()
@@ -424,7 +441,7 @@ def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WI
             gaze_sock,
             {
                 "cmd": "snapshot",
-                "include_objects": True,
+                "include_objects": include_objects,
                 "query_id": f"sel_{int(now * 1000)}"
             }
         )
@@ -432,20 +449,29 @@ def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WI
         leading_obj_name = None
 
         if snap and snap.get("ok", False):
-            hit = snap.get("gaze_hit", None)
             gaze_px = snap.get("gaze_px", None)
 
-            if hit is not None and gaze_px is not None and len(gaze_px) >= 2:
-                obj_key = make_object_key(hit)
-                # `gaze_px` are raw scene pixels; normalization happens later when mapping to the pose library.
-                x, y = float(gaze_px[0]), float(gaze_px[1])
+            if GAZE_OR_BACKEND == "vlm":
+                if vlm_object_name is not None and gaze_px is not None and len(gaze_px) >= 2:
+                    obj_key = str(vlm_object_name)
+                    x, y = float(gaze_px[0]), float(gaze_px[1])
+                    dwell_sec_by_obj[obj_key] = dwell_sec_by_obj.get(obj_key, 0.0) + dt
+                    valid_samples_by_obj.setdefault(obj_key, []).append((now, x, y))
+                leading_obj_name = vlm_object_name
+            else:
+                hit = snap.get("gaze_hit", None)
 
-                dwell_sec_by_obj[obj_key] = dwell_sec_by_obj.get(obj_key, 0.0) + dt
-                valid_samples_by_obj.setdefault(obj_key, []).append((now, x, y))
+                if hit is not None and gaze_px is not None and len(gaze_px) >= 2:
+                    obj_key = make_object_key(hit)
+                    # `gaze_px` are raw scene pixels; normalization happens later when mapping to the pose library.
+                    x, y = float(gaze_px[0]), float(gaze_px[1])
 
-            if dwell_sec_by_obj:
-                leading_key = max(dwell_sec_by_obj, key=dwell_sec_by_obj.get)
-                leading_obj_name = object_display_name(leading_key)
+                    dwell_sec_by_obj[obj_key] = dwell_sec_by_obj.get(obj_key, 0.0) + dt
+                    valid_samples_by_obj.setdefault(obj_key, []).append((now, x, y))
+
+                if dwell_sec_by_obj:
+                    leading_key = max(dwell_sec_by_obj, key=dwell_sec_by_obj.get)
+                    leading_obj_name = object_display_name(leading_key)
 
         draw_selection_screen(progress=progress, leading_obj_name=leading_obj_name)
 
@@ -517,18 +543,44 @@ def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WI
     }
 
 
-def repeat_until_valid_selection(gaze_sock, eeg_state):
+def repeat_until_valid_selection(gaze_sock, eeg_state, vlm_bridge=None):
     attempt = 0
     while True:
         attempt += 1
         logger.log_event(f"Selection attempt #{attempt} starting.")
-        result = run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WINDOW)
+
+        # VLM backend: resolve object identity up front via one blocking
+        # decide() call against the running vlm_service. The selection window
+        # then confirms-by-dwell on that fixed object, same structure as the
+        # legacy path but with identity already pinned.
+        vlm_decision = None
+        if GAZE_OR_BACKEND == "vlm":
+            if vlm_bridge is None:
+                logger.log_event("❌ GAZE_OR_BACKEND=vlm but no VLMBridge provided.")
+                return None
+            logger.log_event("Calling vlm_service.decide() for this selection attempt…")
+            vlm_decision = vlm_bridge.decide()
+            if vlm_decision is None:
+                logger.log_event("⚠️ VLM decide() returned no response — retrying selection.")
+                continue
+            if not vlm_decision.get("ok"):
+                logger.log_event(f"⚠️ VLM decide() error: {vlm_decision.get('error')} — retrying.")
+                continue
+            logger.log_event(f"VLM decision: object={vlm_decision.get('object')!r}")
+
+        result = run_gaze_selection_window(
+            gaze_sock, eeg_state,
+            duration_s=GAZE_SELECTION_WINDOW,
+            vlm_decision=vlm_decision,
+        )
 
         if result is None:
             return None
 
         if result["selection_attempt_success"]:
             result["selection_attempt"] = attempt
+            if vlm_decision is not None:
+                result["vlm_decision"] = vlm_decision
             return result
 
         logger.log_event(f"Selection attempt #{attempt} failed — repeating selection window.")
@@ -789,6 +841,34 @@ def main():
     gaze_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     logger.log_event(f"Gaze UDP client ready for {GAZE_UDP_IP}:{GAZE_UDP_PORT}")
 
+    # VLM backend: attach a UDP client to the already-running vlm_service. The
+    # driver does NOT spawn the service — that is the control panel's job, same
+    # ownership model as the legacy gaze_runner service (see control_panel.py
+    # L555-576 for the gaze side).
+    vlm_bridge = None
+    if GAZE_OR_BACKEND == "vlm":
+        vlm_bridge = VLMBridge(
+            host=config.VLM_SERVICE_HOST,
+            port=config.VLM_SERVICE_PORT,
+        )
+        status = vlm_bridge.status()
+        if status is None or not status.get("ok"):
+            logger.log_event(
+                f"❌ GAZE_OR_BACKEND=vlm but vlm_service is not responding at "
+                f"{config.VLM_SERVICE_HOST}:{config.VLM_SERVICE_PORT}. "
+                f"Start it from the control panel first."
+            )
+            return
+        if not status.get("neon_connected"):
+            logger.log_event("❌ vlm_service is running but Neon is not connected.")
+            return
+        logger.log_event(
+            f"✅ VLM backend ready — model={status.get('model')}, "
+            f"depth_enabled={status.get('depth_enabled')}"
+        )
+    else:
+        logger.log_event(f"GAZE_OR_BACKEND={GAZE_OR_BACKEND} — using legacy gaze_runner path.")
+
     X_lib, Q_lib, G_lib = load_pose_library(POSE_LIBRARY_PATH)
 
     trial_sequence = generate_trial_sequence(
@@ -815,7 +895,7 @@ def main():
         # ---------------------------------
         # 1. Gaze selection phase
         # ---------------------------------
-        selection_result = repeat_until_valid_selection(gaze_sock, eeg_state)
+        selection_result = repeat_until_valid_selection(gaze_sock, eeg_state, vlm_bridge=vlm_bridge)
         if selection_result is None:
             logger.log_event("Experiment terminated during selection phase.")
             running = False
@@ -1100,6 +1180,12 @@ def main():
         gaze_sock.close()
     except Exception:
         pass
+
+    if vlm_bridge is not None:
+        try:
+            vlm_bridge.close()
+        except Exception:
+            pass
 
     pygame.quit()
 

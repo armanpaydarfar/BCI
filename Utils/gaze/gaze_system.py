@@ -119,8 +119,21 @@ class GazeConfig:
     print_hz: float = 5.0
     topk_log: int = 3
 
-    # Device discovery
+    # Device connection — leave empty to use mDNS auto-discovery (works on home/
+    # hotspot networks but blocked on enterprise/IoT VLANs).  When set, connects
+    # directly via Device(address=neon_host, port=8080), bypassing mDNS entirely.
+    neon_host: str = ""
     discover_timeout_s: int = 10
+
+    # Frame source toggle for the GPU-host migration plan (see SoftwareDocs/
+    # GPU_Service_Host_Architecture_Plan.md §3.4). Default `local` opens the
+    # Neon device directly. `remote` consumes envelopes from a TCP relay
+    # (Utils/frame_relay.py) via Utils/remote_frame_reader.RemoteNeonDevice.
+    # In remote mode gaze + IMU are subsampled to the relay rate (~10 Hz vs
+    # native ~200 Hz); smoothing is therefore coarser.
+    frame_source: str = "local"            # "local" | "remote"
+    remote_frame_host: str = ""
+    remote_frame_port: int = 5591
 
 
 # -----------------------
@@ -246,8 +259,29 @@ class GazeSystem:
         """
         Discover device and start threads.
         """
-        self._log("Looking for the next best device...")
-        self._device = discover_one_device(max_search_duration_seconds=int(self.cfg.discover_timeout_s))
+        if self.cfg.frame_source == "remote":
+            if not self.cfg.remote_frame_host:
+                raise RuntimeError(
+                    "frame_source='remote' requires remote_frame_host to be set"
+                )
+            # Substitute a TCP-relay-backed Device shim. The shim implements
+            # receive_scene_video_frame / receive_gaze_datum / receive_imu_datum
+            # so the three Neon threads below consume it unchanged.
+            from Utils.remote_frame_reader import RemoteNeonDevice
+            self._log(
+                f"Connecting to frame relay tcp://"
+                f"{self.cfg.remote_frame_host}:{self.cfg.remote_frame_port}…"
+            )
+            self._device = RemoteNeonDevice(
+                self.cfg.remote_frame_host, int(self.cfg.remote_frame_port)
+            )
+        elif self.cfg.neon_host:
+            from pupil_labs.realtime_api.simple import Device
+            self._log(f"Connecting directly to Neon at {self.cfg.neon_host}…")
+            self._device = Device(address=self.cfg.neon_host, port=8080)
+        else:
+            self._log("Looking for the next best device...")
+            self._device = discover_one_device(max_search_duration_seconds=int(self.cfg.discover_timeout_s))
         if self._device is None:
             raise RuntimeError("No Pupil Labs Neon device found.")
 
@@ -729,16 +763,22 @@ class GazeSystem:
                 "Missing dependency 'ultralytics'. Install with:\n  pip install ultralytics\n"
             ) from e
 
+        det_device = "cpu"
         try:
             import torch  # type: ignore
             torch.set_num_threads(1)
             torch.set_num_interop_threads(1)
+            # Use CUDA when available — typically the Windows dev box (RTX 4070
+            # Ti). Linux deployment has no NVIDIA driver, so this falls back to
+            # CPU automatically per the CLAUDE.md platform-gating policy.
+            if torch.cuda.is_available():
+                det_device = "cuda"
         except Exception:
             pass
 
         model = YOLO(self.cfg.model_name)
         try:
-            model.to("cpu")
+            model.to(det_device)
         except Exception:
             pass
 
@@ -797,7 +837,7 @@ class GazeSystem:
                 verbose=False,
                 conf=float(self.cfg.det_conf),
                 iou=float(self.cfg.det_iou),
-                device="cpu",
+                device=det_device,
                 max_det=int(self.cfg.det_max_det),
                 classes=self.cfg.det_classes if (self.cfg.det_classes is not None and len(self.cfg.det_classes) > 0) else None,
             )

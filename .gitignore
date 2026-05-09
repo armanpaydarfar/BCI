@@ -42,3 +42,7 @@ ENV/
 
 # Draft exploration documentation (generated/iterative)
 docs/REPO_EXPLORATION_REPORT.md
+
+# Machine-local config overrides (paths, network IPs, USB device paths).
+# Schema lives in config_local.example.py (committed).
+config_local.py

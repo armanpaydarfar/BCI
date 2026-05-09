@@ -6,6 +6,7 @@ The format is **lightweight** (this repo is not strictly semver-tagged). Add bul
 
 ## [Unreleased]
 
+- **Perception Pipeline — per-Connect verification state machine.** The Main-tab Send / Compute / Receive LEDs now report distinct sequential checks per Connect press: Send = relay TCP handshake delivered (no longer waits on Pupil Labs SDK first-frame, which can be >10 s); Compute = GPU `cmd=status` reply with `ok=True` (no longer requires `frames_received>0`); Receive = token-matched `chain_verify` round-trip, where the panel generates a fresh `_connect_token` per Connect and the GPU echoes it in the synthetic push payload. Stale GPU-cache pushes from prior sessions can no longer trip Receive on a reconnect. LEDs paint yellow during verification and reset to gray on Disconnect. New audit-trail lines per Connect cycle are tee'd into `<DATA_DIR>/sub-<SUBJECT>/vlm_logs/vlm_panel_*.log`. See the per-Connect verification state machine row in `Documents/SoftwareDocs/GPU_Service_Cross_Host_Hardening_Notes.md`. Commits `e967d3b`, `3c5fb6c`, `ba18dc9`, `2834546`. Requires the matching `vlm_service.py` on the GPU host (echoes the request token in `_cmd_verify_chain`); panel-only updates do not need a GPU restart.
 - Dataset exploration CLI (`explore_dataset_library.py`) writes under **`~/Documents/exploration_run_001`** by default (outputs stay outside the repo); override with `--out-dir`.
 - Root `.gitignore` no longer lists `exploration_run_001/` (obsolete for in-repo paths).
 - Renamed **`CONFIG_AUDIT.md` → `CHANGELOG.md`** and expanded scope to a project log.
