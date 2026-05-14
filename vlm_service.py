@@ -56,6 +56,26 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 
+# Pull argparse defaults from BCI/config.py (which layers config_local.py over
+# committed defaults). vlm_service.py runs in the `harmony_vlm` conda env with
+# cwd=<harmony_vlm repo>, so config.py is not on sys.path by default — insert
+# the BCI dir explicitly. Falls back to hardcoded safe defaults if the import
+# fails, so a stripped-down deployment without config_local still works.
+_BCI_DIR = Path(__file__).resolve().parent
+if str(_BCI_DIR) not in sys.path:
+    sys.path.insert(0, str(_BCI_DIR))
+try:
+    import config as _bci_config
+except Exception:
+    _bci_config = None
+
+
+def _cfg_default(name: str, fallback):
+    if _bci_config is None:
+        return fallback
+    return getattr(_bci_config, name, fallback)
+
+
 # Live-overlay detection cap. Paint cost on the Linux side is O(N) full-canvas
 # alpha blends (Utils/scene_overlay_renderer.py). Capping N here keeps the
 # overlay budget bounded; one-shot segment/decide command paths intentionally
@@ -164,13 +184,16 @@ def parse_args():
     # TCP overlay socket. Production deployments set this to 0.0.0.0 so the
     # Linux panel/driver can dial in across the LAN; single-machine dev
     # keeps it on 127.0.0.1.
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=5589)
-    p.add_argument("--neon-host", default="", help="Empty string triggers LAN discovery")
-    p.add_argument("--model", default="gemini-2.5-flash", help="VLM model name")
+    p.add_argument("--host", default=_cfg_default("VLM_BIND_HOST", "127.0.0.1"))
+    p.add_argument("--port", type=int, default=_cfg_default("VLM_SERVICE_PORT", 5589))
+    p.add_argument("--neon-host", default=_cfg_default("NEON_COMPANION_HOST", ""),
+                   help="Empty string triggers LAN discovery")
+    p.add_argument("--model", default=_cfg_default("VLM_MODEL", "gemini-2.5-flash"),
+                   help="VLM model name")
     p.add_argument("--seg-model", default="models/FastSAM-s.pt", help="Relative to repo-dir")
     p.add_argument("--device", default="cpu")
-    p.add_argument("--enable-depth", action="store_true")
+    p.add_argument("--enable-depth", action=argparse.BooleanOptionalAction,
+                   default=bool(_cfg_default("VLM_ENABLE_DEPTH", False)))
     p.add_argument("--depth-checkpoint", default="models/depth_pro.pt", help="Relative to repo-dir")
     p.add_argument("--session-dir", default=None, help="Where to save depth PNGs etc.")
     p.add_argument("--verbose", action="store_true")
@@ -178,11 +201,14 @@ def parse_args():
     # GPU_Service_Host_Architecture_Plan.md §3.4). Default `local` preserves
     # today's behaviour (open Neon directly via NeonLiveReader). `remote`
     # consumes envelopes from a Utils/frame_relay.py TCP server instead.
-    p.add_argument("--frame-source", choices=["local", "remote"], default="local",
+    p.add_argument("--frame-source", choices=["local", "remote"],
+                   default=_cfg_default("PERCEPTION_FRAME_SOURCE", "local"),
                    help="local=open Neon directly; remote=consume Utils/frame_relay envelopes")
-    p.add_argument("--remote-frame-host", default=None,
+    p.add_argument("--remote-frame-host",
+                   default=_cfg_default("FRAME_RELAY_DIAL_HOST", None),
                    help="Host of the frame_relay server (required when --frame-source=remote)")
-    p.add_argument("--remote-frame-port", type=int, default=5591,
+    p.add_argument("--remote-frame-port", type=int,
+                   default=_cfg_default("FRAME_RELAY_PORT", 5591),
                    help="Port of the frame_relay server (default 5591)")
     # Remote-stop guard: by default, cmd=stop is honoured only when it
     # arrives from 127.0.0.1. This protects the unattended GPU host from

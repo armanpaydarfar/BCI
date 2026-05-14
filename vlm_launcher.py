@@ -93,8 +93,7 @@ class VLMLauncher:
             "--device", self.device,
             "--session-dir", str(session_dir),
         ]
-        if self.enable_depth:
-            cmd.append("--enable-depth")
+        cmd.append("--enable-depth" if self.enable_depth else "--no-enable-depth")
         if self.enable_overlay:
             cmd.extend(["--enable-overlay", "--overlay-port", str(self.overlay_port)])
         return cmd
