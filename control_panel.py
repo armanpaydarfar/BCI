@@ -41,11 +41,17 @@ import os, sys, shlex, time, re, tempfile, socket, subprocess, json, threading, 
 import serial
 import serial.tools.list_ports
 
-# Import ARDUINO_PORT from config; fallback to default if unavailable
+# Import ARDUINO_PORT and TIAGOBOT_PORT from config; fallback to defaults
+# if unavailable. Both are machine-local keys whose real values live in
+# config_local.py.
 try:
     from config import ARDUINO_PORT
 except ImportError:
     ARDUINO_PORT = ""
+try:
+    from config import TIAGOBOT_PORT
+except ImportError:
+    TIAGOBOT_PORT = ""
 
 from dataclasses import dataclass, field
 from typing import Optional, Dict
@@ -87,6 +93,7 @@ MARKER_PY = os.path.join(ROOT, "UTIL_marker_stream.py")
 DRIVER_ONLINE_PY = os.path.join(ROOT, "ExperimentDriver_Online.py")
 DRIVER_ONLINE_GAZE_PY = os.path.join(ROOT, "ExperimentDriver_Online_GazeTracking.py")
 DRIVER_ONLINE_GLOVE_PY = os.path.join(ROOT, "ExperimentDriver_Online_Glove.py")
+DRIVER_ONLINE_TIAGOBOT_PY = os.path.join(ROOT, "ExperimentDriver_Online_Tiagobot.py")
 DRIVER_BIMANUAL_PY = os.path.join(ROOT, "ExperimentDriver_Bimanual.py")
 DRIVER_OFFLINE_PY = os.path.join(ROOT, "ExperimentDriver_Offline.py")
 DRIVER_ERRP_ONLINE_PY = os.path.join(ROOT, "ExperimentDriver_ErrP_Online.py")
@@ -327,6 +334,7 @@ DRIVERS = [
     "ExperimentDriver_Offline",
     "ExperimentDriver_Online_GazeTracking",
     "ExperimentDriver_Online_Glove",
+    "ExperimentDriver_Online_Tiagobot",
 ]
 
 # ----------------- Config read/write helpers -----------------
@@ -451,6 +459,7 @@ LOCAL_CONFIG_KEYS = frozenset({
     "VLM_REPO_DIR",
     "VLM_SERVICE_HOST", "VLM_BIND_HOST",
     "ARDUINO_PORT",
+    "TIAGOBOT_PORT",
 })
 
 
@@ -595,6 +604,38 @@ def write_arduino_baud_to_config(baud: int):
     write_atomic(CONFIG_PY, new)
 
 
+# Tiagobot: port is machine-local (config_local.py); the use-glove toggle is
+# behavioral (config.py), same shape as FES_toggle.
+TIAGOBOT_USE_GLOVE_RE = re.compile(
+    r"^(\s*TIAGOBOT_USE_GLOVE\s*=\s*)(True|False)(\s*(#.*)?)\s*$", re.M
+)
+
+
+def read_tiagobot_baud_from_config(default: int = 9600) -> int:
+    return _read_int_key("TIAGOBOT_BAUD", default)
+
+
+def read_tiagobot_use_glove(default: bool = False) -> bool:
+    return _read_bool_key("TIAGOBOT_USE_GLOVE", default)
+
+
+def write_tiago_port_to_config(port: str):
+    """TIAGOBOT_PORT is machine-local — routed through the local writer so
+    the value lands in config_local.py rather than the committed default."""
+    _write_assign_rhs_local("TIAGOBOT_PORT", f'"{port}"')
+
+
+def write_tiagobot_use_glove(enabled: bool):
+    rhs = "True" if enabled else "False"
+    txt = read_text(CONFIG_PY)
+    if TIAGOBOT_USE_GLOVE_RE.search(txt):
+        new = TIAGOBOT_USE_GLOVE_RE.sub(rf"\g<1>{rhs}\3", txt, count=1)
+    else:
+        sep = "" if (txt.endswith("\n") or txt == "") else "\n"
+        new = txt + f"{sep}TIAGOBOT_USE_GLOVE = {rhs}\n"
+    write_atomic(CONFIG_PY, new)
+
+
 TRAINING_SCRIPT_ENTRIES = [
     ("Riemannian adaptive → sub-*_model.pkl", "Generate_Riemannian_adaptive.py"),
     ("XGBoost covariance features", "generate_xgboost_cov_features.py"),
@@ -687,6 +728,18 @@ class ControlPanel(QMainWindow):
         except Exception:
             self.serial_baudrate = "9600"
 
+        # Tiagobot serial config (separate Arduino from the glove). Port is
+        # machine-local; baud + use-glove toggle live in config.py.
+        self.tiago_port_name = ""
+        try:
+            self.tiago_baudrate = str(read_tiagobot_baud_from_config(9600))
+        except Exception:
+            self.tiago_baudrate = "9600"
+        try:
+            self.tiago_use_glove = bool(read_tiagobot_use_glove(False))
+        except Exception:
+            self.tiago_use_glove = False
+
         # Procs (QProcess-managed)
         self.marker = Proc("Marker Stream", f'python -u "{MARKER_PY}"', ROOT)
         self.driver = Proc("Experiment Driver", None, ROOT)
@@ -770,6 +823,7 @@ class ControlPanel(QMainWindow):
         self._set_led(self.lbl_gaze_service, "stopped")
         self._set_led(self.lbl_compute_led, "stopped")
         self._set_led(self.lbl_arduino, "stopped")
+        self._set_led(self.lbl_tiago, "stopped")
 
         # When services are hosted remotely (Linux operator panel pointed at
         # a Windows GPU host) the start/stop buttons can't drive local
@@ -1178,6 +1232,65 @@ class ControlPanel(QMainWindow):
         grid.addWidget(arduino_row_holder, row, 2, 1, 3)
         row += 1
 
+        # ===== Tiagobot =====
+        # Second Arduino-class device (mobile-arm: servo + linear actuator).
+        # Mirrors the Arduino row layout but speaks the Tiagobot wire
+        # protocol via Utils.tiagobot. Test runs the sketch's calibration
+        # sweep (~10-15s) and waits for the "Calibration complete." banner
+        # before reporting OK. Send 'E' / Send HOME are manual-test buttons
+        # that re-open the port (incurs a fresh calibration) and emit one
+        # GO or HOME command. The "Also drive glove" checkbox writes
+        # TIAGOBOT_USE_GLOVE to config.py so the Tiagobot driver picks it
+        # up on next launch.
+        self.lbl_tiago = QLabel("●"); self._set_led(self.lbl_tiago, "stopped")
+        self.cmb_tiago_port = QComboBox()
+        self.cmb_tiago_port.currentIndexChanged.connect(self.on_tiago_port_changed)
+        self.btn_tiago_refresh = QPushButton("Refresh")
+        self.btn_tiago_refresh.clicked.connect(self.on_tiago_refresh)
+        self.btn_tiago_test = QPushButton("Test")
+        self.btn_tiago_test.setToolTip(
+            "Open the port, wait for the sketch's 'Calibration complete.' "
+            "banner. The calibration motion is the test."
+        )
+        self.btn_tiago_test.clicked.connect(self.on_tiago_test)
+        self.btn_save_tiago_to_config = QPushButton("Save → config")
+        self.btn_save_tiago_to_config.setToolTip(
+            "Writes TIAGOBOT_PORT to config_local.py (machine-local)."
+        )
+        self.btn_save_tiago_to_config.clicked.connect(self.on_save_tiago_to_config)
+        self.btn_tiago_send_e = QPushButton("Send 'E'")
+        self.btn_tiago_send_e.setToolTip(
+            "Manual test: re-opens the port and sends letter 'E' (mid-position). "
+            "Triggers a calibration sweep first (~15s)."
+        )
+        self.btn_tiago_send_e.clicked.connect(self.on_tiago_send_e)
+        self.btn_tiago_send_home = QPushButton("Send HOME")
+        self.btn_tiago_send_home.setToolTip(
+            "Manual test: re-opens the port and sends 'h\\n' (retract + center)."
+        )
+        self.btn_tiago_send_home.clicked.connect(self.on_tiago_send_home)
+        self.chk_tiago_use_glove = QCheckBox("Also drive glove")
+        self.chk_tiago_use_glove.setToolTip(
+            "When the Tiagobot driver launches, also open ARDUINO_PORT and emit "
+            "ARDUINO_CMD_MI / ARDUINO_CMD_REST on MI / HOME (mirrors the glove driver)."
+        )
+        self.chk_tiago_use_glove.setChecked(self.tiago_use_glove)
+        self.chk_tiago_use_glove.toggled.connect(self.on_tiago_use_glove_toggled)
+
+        tiago_row = QHBoxLayout()
+        tiago_row.setContentsMargins(0, 0, 0, 0)
+        tiago_row.addWidget(self.cmb_tiago_port, 1)
+        for w in (self.btn_tiago_refresh, self.btn_tiago_test,
+                  self.btn_save_tiago_to_config,
+                  self.btn_tiago_send_e, self.btn_tiago_send_home,
+                  self.chk_tiago_use_glove):
+            tiago_row.addWidget(w)
+        tiago_row_holder = _fixed_v(QWidget()); tiago_row_holder.setLayout(tiago_row)
+        grid.addWidget(QLabel("<b>Tiagobot</b>"), row, 0)
+        grid.addWidget(self.lbl_tiago, row, 1)
+        grid.addWidget(tiago_row_holder, row, 2, 1, 3)
+        row += 1
+
         # ===== Driver =====
         # Anchored at the bottom — starting the experiment driver is the
         # last step before a session begins, so keeping it visually
@@ -1300,6 +1413,7 @@ class ControlPanel(QMainWindow):
 
         # Initial serial refresh
         self.on_serial_refresh()
+        self.on_tiago_refresh()
         self.on_refresh_calibration_libs()
         self.on_refresh_training_data_list()
 
@@ -2114,6 +2228,8 @@ class ControlPanel(QMainWindow):
             driver_path = DRIVER_ONLINE_GAZE_PY
         elif self.driver_choice == "ExperimentDriver_Online_Glove":
             driver_path = DRIVER_ONLINE_GLOVE_PY
+        elif self.driver_choice == "ExperimentDriver_Online_Tiagobot":
+            driver_path = DRIVER_ONLINE_TIAGOBOT_PY
         else:
             QMessageBox.warning(self, "Driver", f"Unknown driver selected: {self.driver_choice}")
             return
@@ -2124,6 +2240,11 @@ class ControlPanel(QMainWindow):
             p.env["TRAINING_SUBJECT"] = self.training_subject
             p.env["ARDUINO_PORT"]      = getattr(self, "serial_port_name", "") or ""
             p.env["ARDUINO_BAUD"]      = str(getattr(self, "serial_baudrate", "9600"))
+            # Tiagobot envs are read by Utils.tiagobot.open_port via config
+            # at import — these are belt-and-suspenders for any code path
+            # that prefers env over config (matches the ARDUINO_* pattern).
+            p.env["TIAGOBOT_PORT"]     = getattr(self, "tiago_port_name", "") or ""
+            p.env["TIAGOBOT_BAUD"]     = str(getattr(self, "tiago_baudrate", "9600"))
 
         self._update_robot_buttons_for_mode()
 
@@ -3090,6 +3211,186 @@ class ControlPanel(QMainWindow):
 
     def on_send_arduino_zero(self):
         self._send_arduino_manual_value("0")
+
+    # ----- Tiagobot panel -----
+    def on_tiago_refresh(self):
+        """Enumerate serial ports into the Tiagobot combo. Mirrors
+        on_serial_refresh but tracks self.tiago_port_name instead."""
+        self.cmb_tiago_port.blockSignals(True)
+        self.cmb_tiago_port.clear()
+
+        try:
+            ports = list(serial.tools.list_ports.comports())
+        except Exception as e:
+            self.cmb_tiago_port.blockSignals(False)
+            self._append_log("Panel", f"[{self._ts()}] Error listing serial ports: {e}\n")
+            self._set_led(self.lbl_tiago, "error")
+            return
+
+        if not ports:
+            self.cmb_tiago_port.addItem("No ports found", "")
+            self.tiago_port_name = ""
+            self.cmb_tiago_port.blockSignals(False)
+            self._append_log("Panel", f"[{self._ts()}] No serial ports found\n")
+            self._set_led(self.lbl_tiago, "stopped")
+            return
+
+        for p in ports:
+            desc = p.description or "n/a"
+            text = f"{p.device} ({desc})"
+            self.cmb_tiago_port.addItem(text, p.device)
+
+        idx = -1
+        if self.tiago_port_name:
+            idx = self.cmb_tiago_port.findData(self.tiago_port_name)
+        if idx < 0:
+            idx = self.cmb_tiago_port.findData(TIAGOBOT_PORT)
+        if idx < 0:
+            idx = 0
+
+        self.cmb_tiago_port.setCurrentIndex(idx)
+        self.tiago_port_name = self.cmb_tiago_port.currentData() or ""
+        self.cmb_tiago_port.blockSignals(False)
+
+        self._append_log("Panel", f"[{self._ts()}] Tiagobot ports refreshed. Selected: {self.tiago_port_name or 'None'}\n")
+        self._set_cmds_for_mode_and_driver()
+
+    def on_tiago_port_changed(self, index: int):
+        device = self.cmb_tiago_port.itemData(index)
+        self.tiago_port_name = device or ""
+        self._append_log("Panel", f"[{self._ts()}] Tiagobot port set to: {self.tiago_port_name}\n")
+        self._set_led(self.lbl_tiago, "stopped")
+        self._set_cmds_for_mode_and_driver()
+
+    def _tiago_baud_int(self) -> Optional[int]:
+        try:
+            return int(str(self.tiago_baudrate).strip())
+        except (TypeError, ValueError):
+            return None
+
+    def _tiago_panel_logger(self):
+        """Adapter so Utils.tiagobot.open_port can write into the Panel
+        log buffer. Mirrors LoggerManager.log_event(msg, level=...)."""
+        panel = self
+
+        class _PanelLogger:
+            def log_event(self, msg, level="info"):
+                panel._append_log("Panel", f"[{panel._ts()}] tiago: {msg}\n")
+
+        return _PanelLogger()
+
+    def on_tiago_test(self):
+        """Open the Tiagobot port and wait for the sketch's
+        'Calibration complete.' banner. The calibration sweep is the test."""
+        port = self.tiago_port_name or self.cmb_tiago_port.currentData()
+        if not port:
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot test: no port selected\n")
+            self._set_led(self.lbl_tiago, "error")
+            QMessageBox.information(self, "Tiagobot test", "No serial port selected.")
+            return
+
+        baud = self._tiago_baud_int()
+        if baud is None:
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot test: invalid baudrate {self.tiago_baudrate!r}\n")
+            self._set_led(self.lbl_tiago, "error")
+            QMessageBox.warning(self, "Tiagobot test", "Invalid TIAGOBOT_BAUD.")
+            return
+
+        self._set_led(self.lbl_tiago, "starting")
+        QApplication.processEvents()
+        try:
+            from Utils.tiagobot import open_port as _tiago_open, close_port as _tiago_close
+            ser = _tiago_open(port, baud, self._tiago_panel_logger())
+            if ser is None:
+                # SIMULATION_MODE or empty port — both already logged.
+                self._set_led(self.lbl_tiago, "stopped")
+                return
+            _tiago_close(ser, self._tiago_panel_logger())
+            self.tiago_port_name = port
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot test OK on {port} @ {baud}\n")
+            self._set_led(self.lbl_tiago, "running")
+            self._set_cmds_for_mode_and_driver()
+        except Exception as e:
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot test ERROR: {e}\n")
+            self._set_led(self.lbl_tiago, "error")
+            QMessageBox.warning(self, "Tiagobot test", f"Error opening {port}:\n{e}")
+
+    def _send_tiago_manual(self, action: str):
+        """Manual test send: re-open port, run calibration, then send one
+        GO letter or HOME, then close. action is either a letter in
+        Utils.tiagobot.LOCATIONS or the literal string 'HOME'."""
+        port = self.tiago_port_name or self.cmb_tiago_port.currentData()
+        if not port:
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot send: no port selected\n")
+            self._set_led(self.lbl_tiago, "error")
+            QMessageBox.information(self, "Tiagobot manual test", "No serial port selected.")
+            return
+
+        baud = self._tiago_baud_int()
+        if baud is None:
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot send: invalid baudrate {self.tiago_baudrate!r}\n")
+            self._set_led(self.lbl_tiago, "error")
+            QMessageBox.warning(self, "Tiagobot manual test", "Invalid TIAGOBOT_BAUD.")
+            return
+
+        self._set_led(self.lbl_tiago, "starting")
+        QApplication.processEvents()
+        try:
+            from Utils.tiagobot import (
+                open_port as _tiago_open,
+                send_letter as _tiago_send_letter,
+                send_home as _tiago_send_home,
+                close_port as _tiago_close,
+            )
+            logger = self._tiago_panel_logger()
+            ser = _tiago_open(port, baud, logger)
+            if ser is None:
+                self._set_led(self.lbl_tiago, "stopped")
+                return
+            if action == "HOME":
+                _tiago_send_home(ser, logger)
+            else:
+                _tiago_send_letter(ser, action, logger)
+            # Give the actuator a moment to start moving before we close
+            # the port (close mid-write is harmless but visible motion is
+            # the operator's confirmation).
+            time.sleep(0.5)
+            _tiago_close(ser, logger)
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot manual: sent {action!r} on {port}\n")
+            self._set_led(self.lbl_tiago, "running")
+        except Exception as e:
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot manual ERROR: {e}\n")
+            self._set_led(self.lbl_tiago, "error")
+            QMessageBox.warning(self, "Tiagobot manual test", f"Error sending {action!r} on {port}:\n{e}")
+
+    def on_tiago_send_e(self):
+        self._send_tiago_manual("E")
+
+    def on_tiago_send_home(self):
+        self._send_tiago_manual("HOME")
+
+    def on_save_tiago_to_config(self):
+        port = (self.tiago_port_name or self.cmb_tiago_port.currentData() or "").strip()
+        if not port:
+            QMessageBox.warning(self, "Tiagobot", "Select a serial port first.")
+            return
+        try:
+            write_tiago_port_to_config(port)
+        except Exception as e:
+            QMessageBox.warning(self, "config_local.py", f"Failed to write TIAGOBOT_PORT:\n{e}")
+            return
+        self._append_log("Panel", f"[{self._ts()}] Saved TIAGOBOT_PORT={port} to config_local.py\n")
+        QMessageBox.information(self, "Tiagobot", "TIAGOBOT_PORT saved to config_local.py.")
+
+    def on_tiago_use_glove_toggled(self, checked: bool):
+        self.tiago_use_glove = bool(checked)
+        try:
+            write_tiagobot_use_glove(self.tiago_use_glove)
+        except Exception as e:
+            self._append_log("Panel", f"[{self._ts()}] Failed to write TIAGOBOT_USE_GLOVE: {e}\n")
+            return
+        self._append_log("Panel", f"[{self._ts()}] TIAGOBOT_USE_GLOVE set to {self.tiago_use_glove}\n")
+        self._set_cmds_for_mode_and_driver()
 
     # ----- Harmony calibration / online control -----
     def on_refresh_calibration_libs(self):
