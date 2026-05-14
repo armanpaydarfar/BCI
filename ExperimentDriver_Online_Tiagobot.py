@@ -469,13 +469,9 @@ def main():
         )
 
         # If MI-correct, continue classifying during the actuator move and
-        # then HOME regardless of early-stop (the Tiagobot sketch no longer
-        # auto-retracts at end of GO).
+        # then GRIP → RELEASE → HOME regardless of early-stop (the Tiagobot
+        # sketch no longer auto-retracts at end of GO).
         if should_hold_and_classify:
-            if arduino is not None:
-                arduino.write(config.ARDUINO_CMD_MI)
-                logger.log_event("Glove closing after successful MI.")
-
             logger.log_event("Entering real-time classification window during Tiagobot movement...")
             final_class_robot, robot_probs, robot_earlystop = hold_messages_and_classify(
                 messages=messages,
@@ -501,15 +497,22 @@ def main():
                 phase="ROBOT"
             )
 
+            # Reach complete (TIME_ROB=7s comfortably bounds any A–I motion,
+            # which is ~3-5s worst case). Grip the target.
             if arduino is not None:
-                arduino.write(config.ARDUINO_CMD_REST)
-                logger.log_event("Opening glove.")
+                arduino.write(config.ARDUINO_CMD_MI)
+                logger.log_event("Glove closing — Tiagobot at target.")
 
             # Pre-home fixation only on a clean MI window; on early-stop
             # the time has already been spent on the abort.
             if not robot_earlystop:
                 logger.log_event("Robot fixation period 2s before homing.")
                 display_fixation_period(duration=2, eeg_state=eeg_state)
+
+            # Release before HOME so the object stays at the target.
+            if arduino is not None:
+                arduino.write(config.ARDUINO_CMD_REST)
+                logger.log_event("Glove opening — releasing before retract.")
 
             # Always send HOME — Tiagobot does not auto-retract.
             send_udp_message(
