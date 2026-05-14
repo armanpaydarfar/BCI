@@ -263,6 +263,22 @@ ARDUINO_CMD_MI   = b"1"
 ARDUINO_CMD_REST = b"0"
 
 # =============================================================================
+# Tiagobot (mobile-arm Arduino device; separate from the glove Arduino)
+# =============================================================================
+# TIAGOBOT_PORT is machine-local — set in config_local.py. When both the
+# glove and Tiagobot are connected, /dev/ttyACM0 vs /dev/ttyACM1 enumeration
+# is non-deterministic; prefer the stable /dev/serial/by-id/ path.
+TIAGOBOT_PORT = ""
+TIAGOBOT_BAUD = 9600
+# Pool of preset locations to choose from per MI-success trial (letters
+# defined in Utils/tiagobot.py:LOCATIONS).
+TIAGOBOT_TRAJECTORY = ["A", "B", "C", "D", "E", "F", "G", "H", "I"]
+# Optional glove integration in the Tiagobot driver. When True, the driver
+# also opens config.ARDUINO_PORT and writes ARDUINO_CMD_MI / ARDUINO_CMD_REST
+# on each MI / HOME phase, exactly like ExperimentDriver_Online_Glove.py.
+TIAGOBOT_USE_GLOVE = False
+
+# =============================================================================
 # Display colors (RGB)
 # =============================================================================
 black = (0, 0, 0)

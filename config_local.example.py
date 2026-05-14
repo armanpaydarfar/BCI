@@ -71,7 +71,16 @@ VLM_SERVICE_HOST = "127.0.0.1"
 VLM_BIND_HOST    = "127.0.0.1"
 
 # =============================================================================
-# Arduino USB device path
+# Arduino USB device paths
 # =============================================================================
-# Linux: "/dev/ttyACM0". Windows: "COM3" etc.
+# Glove Arduino. Linux: "/dev/ttyACM0". Windows: "COM3" etc.
 ARDUINO_PORT = ""
+
+# Tiagobot Arduino (mobile-arm device). Used by
+# ExperimentDriver_Online_Tiagobot.py. When both the glove and Tiagobot are
+# plugged in on Linux, /dev/ttyACM0 vs /dev/ttyACM1 enumeration is
+# non-deterministic across reboots — prefer the stable /dev/serial/by-id/
+# path. List the candidates with:
+#   ls -l /dev/serial/by-id/
+# e.g. TIAGOBOT_PORT = "/dev/serial/by-id/usb-Arduino_..._-if00"
+TIAGOBOT_PORT = ""
