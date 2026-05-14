@@ -74,6 +74,7 @@ lost EEG signal). Treat as safety-critical.
 | `UTIL_marker_stream.py` | LSL marker stream output |
 | `Utils/gaze/gaze_tracking.py` | Gaze device data acquisition |
 | `Utils/gaze/gaze_system.py` | Gaze system coordination |
+| `Utils/tiagobot.py` | Tiagobot Arduino serial port (open / send_letter / send_home) |
 
 ### Tier 2 — Realtime Orchestration
 Timing-critical. These files call into Tier 1 and run in closed-loop
@@ -85,6 +86,7 @@ experiment contexts. Changes must preserve timing guarantees.
 | `ExperimentDriver_Bimanual.py` | Bimanual robot experiment loop |
 | `ExperimentDriver_Online_GazeTracking.py` | Gaze-controlled experiment loop |
 | `ExperimentDriver_Online_Glove.py` | Glove + Arduino experiment loop |
+| `ExperimentDriver_Online_Tiagobot.py` | Tiagobot (mobile-arm Arduino) experiment loop, with optional glove |
 | `harmony_online_control.py` | Harmony robot online control |
 | `harmony_calibration_exec.py` | Harmony robot calibration |
 | `Utils/runtime_common.py` | Shared realtime decoder dispatch logic |
@@ -149,6 +151,7 @@ realtime but not in the critical path.
   - `VLM_REPO_DIR`
   - `VLM_SERVICE_HOST`, `VLM_BIND_HOST`
   - `ARDUINO_PORT`
+  - `TIAGOBOT_PORT`
 
 - All other config changes are safe to commit provided they are
   platform-neutral.
