@@ -1,8 +1,11 @@
 # Tiagobot Arduino Sketch
 
-`Final_code.ino` is the firmware for the Tiagobot mobile-arm device (servo +
-linear actuator). Flash from the Arduino IDE (`/usr/local/bin/arduino` on this
-machine; sketchbook at `~/Arduino`).
+`Final_code/Final_code.ino` is the firmware for the Tiagobot mobile-arm
+device (servo + linear actuator). The IDE 1.8.x requires a sketch to live in
+a folder whose name matches the `.ino` filename, hence the nested layout.
+Flash from the Arduino IDE (`/usr/local/bin/arduino` on this machine;
+sketchbook at `~/Arduino`). The only library dependency is `<Servo.h>`,
+which ships with the IDE — no Library Manager install needed.
 
 ## Wire protocol
 
@@ -32,7 +35,7 @@ All hardware-facing routines (`driveServo`, `driveActuator`, `moveToLimit`,
 
 ## Flashing
 
-1. Open `Final_code.ino` in the Arduino IDE.
+1. Open `tools/tiago_arduino/Final_code/Final_code.ino` in the Arduino IDE.
 2. Select board (Arduino Uno or equivalent — match the Tiagobot hardware).
 3. Select the correct serial port. With both Tiagobot and the glove plugged
    in, identify the Tiagobot Arduino via `ls -l /dev/serial/by-id/`.

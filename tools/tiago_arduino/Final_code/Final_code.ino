@@ -2,11 +2,9 @@
  Last Updated 07 JAN 2026
 */
 
-#include <elapsedMillis.h>
 #include <Servo.h>
-elapsedMillis timeElapsed; 
 
-/////////////////     SERVO     ///////////////// 
+/////////////////     SERVO     /////////////////
 // Initiating Servo
 Servo servo1;
 
