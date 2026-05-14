@@ -1196,7 +1196,8 @@ class ControlPanel(QMainWindow):
             self.lbl_vlm_pair_token,
         ]
 
-        # ===== Arduino =====
+        # ===== Glove =====
+        # Arduino-based robotic glove (close/open via 1-byte commands).
         # Single-line layout matching the other module rows. Baud lives in
         # the Runtime config tab (rarely changed); per-test status updates
         # land in the Panel log buffer rather than a dedicated label, and
@@ -1227,14 +1228,14 @@ class ControlPanel(QMainWindow):
                   self.btn_send_1, self.btn_send_0):
             arduino_row.addWidget(w)
         arduino_row_holder = _fixed_v(QWidget()); arduino_row_holder.setLayout(arduino_row)
-        grid.addWidget(QLabel("<b>Arduino</b>"), row, 0)
+        grid.addWidget(QLabel("<b>Glove</b>"), row, 0)
         grid.addWidget(self.lbl_arduino, row, 1)
         grid.addWidget(arduino_row_holder, row, 2, 1, 3)
         row += 1
 
         # ===== Tiagobot =====
         # Second Arduino-class device (mobile-arm: servo + linear actuator).
-        # Mirrors the Arduino row layout but speaks the Tiagobot wire
+        # Mirrors the Glove row layout but speaks the Tiagobot wire
         # protocol via Utils.tiagobot. Test runs the sketch's calibration
         # sweep (~10-15s) and waits for the "Calibration complete." banner
         # before reporting OK. Send 'E' / Send HOME are manual-test buttons
@@ -2181,21 +2182,21 @@ class ControlPanel(QMainWindow):
     def on_save_serial_to_config(self):
         port = (self.serial_port_name or self.cmb_serial_port.currentData() or "").strip()
         if not port:
-            QMessageBox.warning(self, "Serial", "Select a serial port first.")
+            QMessageBox.warning(self, "Glove", "Select a serial port first.")
             return
         try:
             baud = int(str(self.serial_baudrate).strip())
         except ValueError:
-            QMessageBox.warning(self, "Serial", "Baud must be an integer (set it in Runtime config).")
+            QMessageBox.warning(self, "Glove", "Baud must be an integer (set it in Runtime config).")
             return
         try:
             write_arduino_port_to_config(port)
             write_arduino_baud_to_config(baud)
         except Exception as e:
-            QMessageBox.warning(self, "config.py", f"Failed to write Arduino settings:\n{e}")
+            QMessageBox.warning(self, "config.py", f"Failed to write Glove settings:\n{e}")
             return
         self._append_log("Panel", f"[{self._ts()}] Saved ARDUINO_PORT={port} ARDUINO_BAUD={baud} to config.py\n")
-        QMessageBox.information(self, "Serial", "ARDUINO_PORT and ARDUINO_BAUD saved to config.py.")
+        QMessageBox.information(self, "Glove", "ARDUINO_PORT and ARDUINO_BAUD saved to config.py.")
 
     # ---------- LED helper ----------
     def _set_led(self, label: QLabel, state: str):
@@ -3076,7 +3077,7 @@ class ControlPanel(QMainWindow):
         from Utils.perception_clients import udp_request
         return udp_request(GAZE_SERVICE_HOST, int(GAZE_SERVICE_PORT), payload, float(timeout_s))
 
-    # ----- Arduino / Online BCI panel -----
+    # ----- Glove (Arduino) / Online BCI panel -----
     def on_serial_refresh(self):
         self.cmb_serial_port.blockSignals(True)
         self.cmb_serial_port.clear()
@@ -3114,14 +3115,14 @@ class ControlPanel(QMainWindow):
         self.serial_port_name = self.cmb_serial_port.currentData() or ""
         self.cmb_serial_port.blockSignals(False)
 
-        self._append_log("Panel", f"[{self._ts()}] Serial ports refreshed. Selected: {self.serial_port_name or 'None'}\n")
+        self._append_log("Panel", f"[{self._ts()}] Glove ports refreshed. Selected: {self.serial_port_name or 'None'}\n")
 
         self._set_cmds_for_mode_and_driver()
 
     def on_serial_port_changed(self, index: int):
         device = self.cmb_serial_port.itemData(index)
         self.serial_port_name = device or ""
-        self._append_log("Panel", f"[{self._ts()}] Serial port set to: {self.serial_port_name}\n")
+        self._append_log("Panel", f"[{self._ts()}] Glove port set to: {self.serial_port_name}\n")
         # New port not yet validated — clear any prior pass/fail signal.
         self._set_led(self.lbl_arduino, "stopped")
         self._set_cmds_for_mode_and_driver()
@@ -3138,16 +3139,16 @@ class ControlPanel(QMainWindow):
     def on_serial_test(self):
         port = self.serial_port_name or self.cmb_serial_port.currentData()
         if not port:
-            self._append_log("Panel", f"[{self._ts()}] Serial test: no port selected\n")
+            self._append_log("Panel", f"[{self._ts()}] Glove test: no port selected\n")
             self._set_led(self.lbl_arduino, "error")
-            QMessageBox.information(self, "Serial test", "No serial port selected.")
+            QMessageBox.information(self, "Glove test", "No serial port selected.")
             return
 
         baud = self._serial_baud_int()
         if baud is None:
-            self._append_log("Panel", f"[{self._ts()}] Serial test: invalid baudrate {self.serial_baudrate!r}\n")
+            self._append_log("Panel", f"[{self._ts()}] Glove test: invalid baudrate {self.serial_baudrate!r}\n")
             self._set_led(self.lbl_arduino, "error")
-            QMessageBox.warning(self, "Serial test", "Invalid baudrate (set ARDUINO_BAUD in Runtime config).")
+            QMessageBox.warning(self, "Glove test", "Invalid baudrate (set ARDUINO_BAUD in Runtime config).")
             return
 
         self._set_led(self.lbl_arduino, "starting")
@@ -3156,55 +3157,55 @@ class ControlPanel(QMainWindow):
             time.sleep(2)
             if ser.is_open:
                 self.serial_port_name = port
-                self._append_log("Panel", f"[{self._ts()}] Serial test OK on {port} @ {baud}\n")
+                self._append_log("Panel", f"[{self._ts()}] Glove test OK on {port} @ {baud}\n")
                 ser.close()
                 self._set_led(self.lbl_arduino, "running")
                 self._set_cmds_for_mode_and_driver()
             else:
-                self._append_log("Panel", f"[{self._ts()}] Serial test FAILED (not open)\n")
+                self._append_log("Panel", f"[{self._ts()}] Glove test FAILED (not open)\n")
                 self._set_led(self.lbl_arduino, "error")
         except Exception as e:
-            self._append_log("Panel", f"[{self._ts()}] Serial test ERROR: {e}\n")
+            self._append_log("Panel", f"[{self._ts()}] Glove test ERROR: {e}\n")
             self._set_led(self.lbl_arduino, "error")
-            QMessageBox.warning(self, "Serial test", f"Error opening {port}:\n{e}")
+            QMessageBox.warning(self, "Glove test", f"Error opening {port}:\n{e}")
 
     def _send_arduino_manual_value(self, value: str):
         port = self.serial_port_name or self.cmb_serial_port.currentData()
         if not port:
-            self._append_log("Panel", f"[{self._ts()}] Arduino send: no port selected\n")
+            self._append_log("Panel", f"[{self._ts()}] Glove send: no port selected\n")
             self._set_led(self.lbl_arduino, "error")
-            QMessageBox.information(self, "Arduino manual test", "No serial port selected.")
+            QMessageBox.information(self, "Glove manual test", "No serial port selected.")
             return
 
         baud = self._serial_baud_int()
         if baud is None:
-            self._append_log("Panel", f"[{self._ts()}] Arduino send: invalid baudrate {self.serial_baudrate!r}\n")
+            self._append_log("Panel", f"[{self._ts()}] Glove send: invalid baudrate {self.serial_baudrate!r}\n")
             self._set_led(self.lbl_arduino, "error")
-            QMessageBox.warning(self, "Arduino manual test", "Invalid baudrate (set ARDUINO_BAUD in Runtime config).")
+            QMessageBox.warning(self, "Glove manual test", "Invalid baudrate (set ARDUINO_BAUD in Runtime config).")
             return
 
         self._set_led(self.lbl_arduino, "starting")
         try:
             ser = serial.Serial(port, baudrate=baud, timeout=1)
-            self._append_log("Panel", f"[{self._ts()}] Waiting for Arduino reset (2s)...\n")
+            self._append_log("Panel", f"[{self._ts()}] Waiting for Glove (Arduino) reset (2s)...\n")
             QApplication.processEvents()
             time.sleep(2)
 
             if not ser.is_open:
-                self._append_log("Panel", f"[{self._ts()}] Arduino manual: failed to open {port}\n")
+                self._append_log("Panel", f"[{self._ts()}] Glove manual: failed to open {port}\n")
                 self._set_led(self.lbl_arduino, "error")
                 return
 
             ser.write(value.encode("ascii"))
             ser.flush()
-            self._append_log("Panel", f"[{self._ts()}] Arduino manual: sent '{value}' on {port}\n")
+            self._append_log("Panel", f"[{self._ts()}] Glove manual: sent '{value}' on {port}\n")
             self._set_led(self.lbl_arduino, "running")
             ser.close()
 
         except Exception as e:
-            self._append_log("Panel", f"[{self._ts()}] Arduino manual ERROR: {e}\n")
+            self._append_log("Panel", f"[{self._ts()}] Glove manual ERROR: {e}\n")
             self._set_led(self.lbl_arduino, "error")
-            QMessageBox.warning(self, "Arduino manual test", f"Error sending '{value}' on {port}:\n{e}")
+            QMessageBox.warning(self, "Glove manual test", f"Error sending '{value}' on {port}:\n{e}")
 
     def on_send_arduino_one(self):
         self._send_arduino_manual_value("1")
