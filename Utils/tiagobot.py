@@ -16,6 +16,7 @@ not parse it. Realtime hardware errors (port closed mid-experiment, etc.)
 propagate to the caller per the project's fail-fast policy.
 """
 import importlib
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -204,11 +205,59 @@ def open_port(port, baud, logger, yield_callback=None):
     if logger is not None:
         logger.log_event(f"Tiagobot: opening {port} @ {baud} baud...")
 
+    # Disable HUPCL on this tty so closing the port doesn't drop DTR.
+    # Without this, every close-then-reopen across the session triggers
+    # an Arduino auto-reset (DTR low->high edge on next open) and re-runs
+    # the sketch's ~20-30 s calibration sweep. With HUPCL cleared, DTR
+    # stays high between processes; only the very first open after a
+    # fresh USB plug-in actually triggers a calibration.
+    try:
+        subprocess.run(["stty", "-F", port, "-hupcl"],
+                       check=False, timeout=2)
+    except Exception as e:
+        if logger is not None:
+            logger.log_event(f"Tiagobot: could not clear HUPCL on {port}: {e}")
+
     ser = serial.Serial(port, baud, timeout=0.5)
 
-    # The sketch's calibrateServo() + calibrateLinAct() runs full-stroke
-    # on every port open. Read lines until the ready banner appears or
-    # the timeout fires. 2s (the glove driver's wait) is not enough.
+    # Fast-path detection: if the Arduino is already past calibration
+    # (typical when we've previously opened the port with HUPCL=0), the
+    # main loop is silent. Probe for ~2 s — calibration's tight
+    # moveToLimit loop prints continuously, so any output within this
+    # window means we caught a fresh boot. Silence means the sketch is
+    # already in the main loop and ready for commands.
+    quiet_deadline = time.monotonic() + 2.0
+    saw_boot_output = False
+    while time.monotonic() < quiet_deadline:
+        try:
+            line = ser.readline().decode("utf-8", errors="replace").strip()
+        except Exception:
+            line = ""
+        if yield_callback is not None:
+            try:
+                yield_callback()
+            except Exception:
+                pass
+        if line:
+            saw_boot_output = True
+            if logger is not None:
+                logger.log_event(f"Tiagobot[boot]: {line}")
+            if CALIBRATION_READY_MARKER in line:
+                if logger is not None:
+                    logger.log_event("Tiagobot: calibration complete.")
+                return ser
+            # Caught calibration output — switch to the long wait below.
+            break
+
+    if not saw_boot_output:
+        if logger is not None:
+            logger.log_event(
+                "Tiagobot: no boot output within 2 s — assuming already "
+                "initialized (skipping calibration wait)."
+            )
+        return ser
+
+    # Slow path: calibration is running. Wait for the banner.
     deadline = time.monotonic() + CALIBRATION_TIMEOUT_S
     while time.monotonic() < deadline:
         try:

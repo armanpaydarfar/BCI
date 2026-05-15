@@ -23,8 +23,8 @@ int currentAngle;
 
 /////////////////     LIN ACT     /////////////////
 // Initiating Lin Actuator
-int RPWM = 5;   // Extension Pin
-int LPWM = 6;   // Retraction Pin
+int RPWM = 6;   // Extension Pin
+int LPWM = 5;   // Retraction Pin
 int sensorPin = A0;  // Feedback Pin
 
 // Linear Actuator Range
@@ -89,7 +89,18 @@ void loop() {
     // Harmony's GO-then-later-HOME pattern in concept.
     if (input == "h") {
       Serial.println("HOME command received.");
-      servo1.write(s_center);
+      // Sweep servo back to center at a controlled rate rather than
+      // snapping with servo1.write(s_center). At ~50 ms per degree the
+      // full half-arc (s_center to either s_r_max or s_l_max, ~30°)
+      // takes ~1.5 s — slow enough that the mechanism doesn't jolt.
+      const int homeStepDelayMs = 50;
+      int curr = servo1.read();
+      while (curr != s_center) {
+        if (curr > s_center) curr--;
+        else curr++;
+        servo1.write(curr);
+        delay(homeStepDelayMs);
+      }
       currentAngle = s_center;
       delay(500);
       moveToLimit(-1);
@@ -323,5 +334,3 @@ void calibrateLinAct(){
   moveToLimit(1);    // Extend fully : 750
   moveToLimit(-1);   // Retract fully : 350
 }
-
-

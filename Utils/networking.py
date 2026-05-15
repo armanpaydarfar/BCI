@@ -122,6 +122,10 @@ except Exception:
 _marker_sock = None
 _ROBOT_SOCK = None
 _generic_sock = None
+# Once the control socket bind has failed, suppress repeated log lines.
+# Reset back to False on any successful bind so future re-attempts log
+# their first failure again.
+_ROBOT_BIND_FAILED_LOGGED = False
 # Bind robot control socket at import-time (best effort)
 try:
     if not SIMULATION_MODE:
@@ -244,7 +248,7 @@ def _ensure_marker_socket(logger=None):
 
 def _ensure_control_socket(logger=None):
     """Ensure we have a bound control socket; bind now if import-time failed."""
-    global _ROBOT_SOCK
+    global _ROBOT_SOCK, _ROBOT_BIND_FAILED_LOGGED
 
     if SIMULATION_MODE:
         # Absolutely do not touch/bind robot sockets in sim mode.
@@ -262,9 +266,17 @@ def _ensure_control_socket(logger=None):
         s.bind((_BIND_IP, _BIND_PORT))
         s.setblocking(False)
         _ROBOT_SOCK = s
+        _ROBOT_BIND_FAILED_LOGGED = False
         _udp_log(logger, f"[UDP] Control socket bound at {_BIND_IP}:{_BIND_PORT} (late bind).")
     except Exception as e:
-        _udp_log(logger, f"[ERROR] Late bind failed at {_BIND_IP}:{_BIND_PORT}: {e}")
+        # On a machine that doesn't have the Harmony control IP locally
+        # (e.g. Tiagobot-only rig), this bind fails on every send attempt
+        # and floods the log. Log the failure once per session, then
+        # suppress until a successful bind clears the flag.
+        if not _ROBOT_BIND_FAILED_LOGGED:
+            _udp_log(logger, f"[ERROR] Late bind failed at {_BIND_IP}:{_BIND_PORT}: {e}")
+            _udp_log(logger, "[INFO] Suppressing further 'Late bind failed' messages this session.")
+            _ROBOT_BIND_FAILED_LOGGED = True
         _ROBOT_SOCK = None
     return _ROBOT_SOCK
 
