@@ -60,7 +60,7 @@ CLASSIFY_WINDOW = 1000        # EEG window length for classification (ms)
 BASELINE_DURATION = 1         # seconds
 THRESHOLD_MI = 0.6
 THRESHOLD_REST = 0.6
-RELAXATION_RATIO = 0.5
+RELAXATION_RATIO = 0.0
 MIN_PREDICTIONS = 16
 STEP_SIZE = 1/16
 INTEGRATOR_ALPHA = 0.97
@@ -276,7 +276,12 @@ TIAGOBOT_TRAJECTORY = ["A", "B", "C", "D", "E", "F", "G", "H", "I"]
 # Optional glove integration in the Tiagobot driver. When True, the driver
 # also opens config.ARDUINO_PORT and writes ARDUINO_CMD_MI / ARDUINO_CMD_REST
 # on each MI / HOME phase, exactly like ExperimentDriver_Online_Glove.py.
-TIAGOBOT_USE_GLOVE = False
+TIAGOBOT_USE_GLOVE = True
+# Seconds the driver waits after writing ARDUINO_CMD_MI (close glove) and
+# before sending HOME. The glove's mechanical close takes time and HOME
+# starting too early means the actuator retracts mid-grip. Tune to match
+# the glove's actual close duration on this hardware.
+TIAGOBOT_GRIP_HOLD_DURATION = 4
 
 # =============================================================================
 # Display colors (RGB)
@@ -398,15 +403,6 @@ ERRP_CHANNEL_NAMES = ['F3', 'Fz', 'F4', 'FC1', 'FC2', 'C3', 'Cz', 'C4', 'CP1', '
 # Global runtime flags
 # =============================================================================
 SIMULATION_MODE = False
-
-# =============================================================================
-# Machine-local overrides
-# =============================================================================
-# config_local.py is per-machine and gitignored. It supplies real values
-# for paths and network endpoints (WORKING_DIR, DATA_DIR, *_HOST, *_DIAL_*,
-# NEON_COMPANION_HOST, ARDUINO_PORT, VLM_REPO_DIR, PERCEPTION_FRAME_SOURCE,
-# SERVICES_HOSTED_REMOTELY). Bootstrap a new machine by copying
-# config_local.example.py to config_local.py and editing in place.
 try:
     from config_local import *  # noqa: F401, F403
 except ImportError:

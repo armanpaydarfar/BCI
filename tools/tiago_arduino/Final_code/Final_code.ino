@@ -84,26 +84,27 @@ void loop() {
     String input = Serial.readStringUntil('\n');
     input.trim();
 
-    // Discrete HOME command: retract actuator to home and center servo.
-    // Issued by the BCI driver at end of each successful MI trial; mirrors
-    // Harmony's GO-then-later-HOME pattern in concept.
+    // Discrete HOME command: retract actuator + center servo, with the
+    // two motions running simultaneously, mirroring the GO loop's
+    // driveServo+driveActuator pattern. Each iteration steps the servo
+    // one degree toward s_center (paced by `delayTime`, set by the last
+    // GO command) AND drives the retract PWM. Loop exits when the
+    // linear actuator reaches its retracted home (sensorVal <=
+    // minAnalogReading). If the servo hasn't reached s_center by then,
+    // the next GO command's `servo1.write(s_center)` reset (line 123)
+    // takes over — same behavior as the original auto-retract before
+    // we split HOME out as a discrete command.
     if (input == "h") {
       Serial.println("HOME command received.");
-      // Sweep servo back to center at a controlled rate rather than
-      // snapping with servo1.write(s_center). At ~50 ms per degree the
-      // full half-arc (s_center to either s_r_max or s_l_max, ~30°)
-      // takes ~1.5 s — slow enough that the mechanism doesn't jolt.
-      const int homeStepDelayMs = 50;
-      int curr = servo1.read();
-      while (curr != s_center) {
-        if (curr > s_center) curr--;
-        else curr++;
-        servo1.write(curr);
-        delay(homeStepDelayMs);
+      Serial.println("Retracting towards home . . .");
+      sensorVal = analogRead(sensorPin);
+      while (sensorVal > minAnalogReading) {
+        driveServo(s_center, currentAngle);
+        driveActuator(-1, Speed);
+        displayOutput();
+        sensorVal = analogRead(sensorPin);
       }
-      currentAngle = s_center;
-      delay(500);
-      moveToLimit(-1);
+      driveActuator(0, Speed);
       Serial.println("Homed. Waiting for next command.");
       continue;
     }

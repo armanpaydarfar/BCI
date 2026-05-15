@@ -112,7 +112,8 @@ loggable_fields = [
     "LEDOITWOLF", "RECENTERING", "UPDATE_DURING_MOVE",
     # Tiagobot-specific
     "TIAGOBOT_PORT", "TIAGOBOT_BAUD", "TIAGOBOT_TRAJECTORY",
-    "TIAGOBOT_USE_GLOVE", "SIMULATION_MODE",
+    "TIAGOBOT_USE_GLOVE", "TIAGOBOT_GRIP_HOLD_DURATION",
+    "SIMULATION_MODE",
 ]
 config_log_subset = {
     key: getattr(config, key) for key in loggable_fields if hasattr(config, key)
@@ -575,10 +576,12 @@ def main():
                 logger.log_event("Glove closing — gripping target.")
 
             # Grip-hold period: lets the glove finish its close motion
-            # and gives a visible "object held" moment before retract.
-            # 2 s matches the existing pre-home fixation cadence.
+            # before HOME starts retracting (otherwise the actuator pulls
+            # back while the glove is still mid-close). Duration tunable
+            # via config.TIAGOBOT_GRIP_HOLD_DURATION (default 4 s).
             if not robot_earlystop:
-                display_fixation_period(duration=2, eeg_state=eeg_state)
+                grip_hold = float(getattr(config, "TIAGOBOT_GRIP_HOLD_DURATION", 4))
+                display_fixation_period(duration=grip_hold, eeg_state=eeg_state)
 
             # Send HOME — Tiagobot retracts with the gripped object.
             send_udp_message(
