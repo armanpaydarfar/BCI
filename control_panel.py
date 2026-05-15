@@ -739,6 +739,13 @@ class ControlPanel(QMainWindow):
             self.tiago_use_glove = bool(read_tiagobot_use_glove(False))
         except Exception:
             self.tiago_use_glove = False
+        # Cached Tiagobot serial handle. The Test button opens the port,
+        # waits for the sketch's "Calibration complete." banner, and stores
+        # the handle here so subsequent Send buttons can reuse it without
+        # re-triggering Arduino auto-reset (which would re-run the full
+        # ~20-30 s calibration sweep). Cleared by Disconnect or when the
+        # experiment driver is about to launch.
+        self.tiago_ser = None
 
         # Procs (QProcess-managed)
         self.marker = Proc("Marker Stream", f'python -u "{MARKER_PY}"', ROOT)
@@ -1259,17 +1266,34 @@ class ControlPanel(QMainWindow):
             "Writes TIAGOBOT_PORT to config_local.py (machine-local)."
         )
         self.btn_save_tiago_to_config.clicked.connect(self.on_save_tiago_to_config)
-        self.btn_tiago_send_e = QPushButton("Send 'E'")
-        self.btn_tiago_send_e.setToolTip(
-            "Manual test: re-opens the port and sends letter 'E' (mid-position). "
-            "Triggers a calibration sweep first (~15s)."
+        # Letter picker + single Send button. After Test caches the open
+        # port handle, Send writes the selected preset (analog,angle,delay)
+        # in milliseconds. No re-calibration between sends.
+        self.cmb_tiago_letter = QComboBox()
+        self.cmb_tiago_letter.addItems(list("ABCDEFGHI"))
+        self.cmb_tiago_letter.setCurrentText("E")
+        self.cmb_tiago_letter.setMaximumWidth(60)
+        self.cmb_tiago_letter.setToolTip("Preset location letter (A-I).")
+        self.btn_tiago_send_letter = QPushButton("Send")
+        self.btn_tiago_send_letter.setToolTip(
+            "Writes the selected letter's CSV (analog,angle,delay) to the "
+            "cached Tiagobot serial handle. Click Test first to open the "
+            "port; subsequent Sends reuse the connection without "
+            "re-triggering Arduino calibration."
         )
-        self.btn_tiago_send_e.clicked.connect(self.on_tiago_send_e)
-        self.btn_tiago_send_home = QPushButton("Send HOME")
+        self.btn_tiago_send_letter.clicked.connect(self.on_tiago_send_letter)
+        self.btn_tiago_send_home = QPushButton("HOME")
         self.btn_tiago_send_home.setToolTip(
-            "Manual test: re-opens the port and sends 'h\\n' (retract + center)."
+            "Writes 'h\\n' to the cached Tiagobot serial handle (retract + center)."
         )
         self.btn_tiago_send_home.clicked.connect(self.on_tiago_send_home)
+        self.btn_tiago_disconnect = QPushButton("Disconnect")
+        self.btn_tiago_disconnect.setToolTip(
+            "Closes the cached Tiagobot serial handle so the experiment "
+            "driver can claim the port. Auto-fires when the driver starts."
+        )
+        self.btn_tiago_disconnect.clicked.connect(self.on_tiago_disconnect)
+        self.btn_tiago_disconnect.setEnabled(False)  # nothing to disconnect yet
         self.chk_tiago_use_glove = QCheckBox("Also drive glove")
         self.chk_tiago_use_glove.setToolTip(
             "When the Tiagobot driver launches, also open ARDUINO_PORT and emit "
@@ -1283,7 +1307,8 @@ class ControlPanel(QMainWindow):
         tiago_row.addWidget(self.cmb_tiago_port, 1)
         for w in (self.btn_tiago_refresh, self.btn_tiago_test,
                   self.btn_save_tiago_to_config,
-                  self.btn_tiago_send_e, self.btn_tiago_send_home,
+                  self.cmb_tiago_letter, self.btn_tiago_send_letter,
+                  self.btn_tiago_send_home, self.btn_tiago_disconnect,
                   self.chk_tiago_use_glove):
             tiago_row.addWidget(w)
         tiago_row_holder = _fixed_v(QWidget()); tiago_row_holder.setLayout(tiago_row)
@@ -3258,6 +3283,10 @@ class ControlPanel(QMainWindow):
 
     def on_tiago_port_changed(self, index: int):
         device = self.cmb_tiago_port.itemData(index)
+        # Changing the selected port invalidates any cached handle on the
+        # previous port; close it before swapping.
+        if self.tiago_ser is not None:
+            self.on_tiago_disconnect()
         self.tiago_port_name = device or ""
         self._append_log("Panel", f"[{self._ts()}] Tiagobot port set to: {self.tiago_port_name}\n")
         self._set_led(self.lbl_tiago, "stopped")
@@ -3281,8 +3310,18 @@ class ControlPanel(QMainWindow):
         return _PanelLogger()
 
     def on_tiago_test(self):
-        """Open the Tiagobot port and wait for the sketch's
-        'Calibration complete.' banner. The calibration sweep is the test."""
+        """Open the Tiagobot port and wait for the sketch's 'Calibration
+        complete.' banner. The handle is cached on self.tiago_ser so the
+        Send buttons can reuse it without re-triggering the Arduino
+        auto-reset (which would re-run the full calibration sweep).
+
+        The wait blocks for up to CALIBRATION_TIMEOUT_S (60 s) but pumps
+        Qt events via the yield_callback so the GUI stays responsive."""
+        if self.tiago_ser is not None:
+            # Already connected — make this idempotent rather than failing.
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot already connected on {self.tiago_port_name}\n")
+            return
+
         port = self.tiago_port_name or self.cmb_tiago_port.currentData()
         if not port:
             self._append_log("Panel", f"[{self._ts()}] Tiagobot test: no port selected\n")
@@ -3297,78 +3336,106 @@ class ControlPanel(QMainWindow):
             QMessageBox.warning(self, "Tiagobot test", "Invalid TIAGOBOT_BAUD.")
             return
 
+        # Lock the row's interactive controls during the wait so the
+        # operator can't queue up overlapping connect attempts.
+        self._tiago_set_controls_busy(True)
         self._set_led(self.lbl_tiago, "starting")
         QApplication.processEvents()
         try:
-            from Utils.tiagobot import open_port as _tiago_open, close_port as _tiago_close
-            ser = _tiago_open(port, baud, self._tiago_panel_logger())
+            from Utils.tiagobot import open_port as _tiago_open
+            ser = _tiago_open(
+                port,
+                baud,
+                self._tiago_panel_logger(),
+                yield_callback=QApplication.processEvents,
+            )
             if ser is None:
                 # SIMULATION_MODE or empty port — both already logged.
                 self._set_led(self.lbl_tiago, "stopped")
                 return
-            _tiago_close(ser, self._tiago_panel_logger())
+            self.tiago_ser = ser
             self.tiago_port_name = port
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot test OK on {port} @ {baud}\n")
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot connected and calibrated on {port} @ {baud}\n")
             self._set_led(self.lbl_tiago, "running")
             self._set_cmds_for_mode_and_driver()
         except Exception as e:
             self._append_log("Panel", f"[{self._ts()}] Tiagobot test ERROR: {e}\n")
             self._set_led(self.lbl_tiago, "error")
             QMessageBox.warning(self, "Tiagobot test", f"Error opening {port}:\n{e}")
+        finally:
+            self._tiago_set_controls_busy(False)
 
-    def _send_tiago_manual(self, action: str):
-        """Manual test send: re-open port, run calibration, then send one
-        GO letter or HOME, then close. action is either a letter in
-        Utils.tiagobot.LOCATIONS or the literal string 'HOME'."""
-        port = self.tiago_port_name or self.cmb_tiago_port.currentData()
-        if not port:
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot send: no port selected\n")
+    def _tiago_set_controls_busy(self, busy: bool):
+        """Toggle the row's interactive controls during a blocking
+        operation. Disconnect is enabled iff a port is currently cached."""
+        connected = self.tiago_ser is not None
+        for w in (self.btn_tiago_test, self.btn_tiago_refresh,
+                  self.cmb_tiago_port, self.btn_save_tiago_to_config,
+                  self.cmb_tiago_letter, self.btn_tiago_send_letter,
+                  self.btn_tiago_send_home):
+            w.setEnabled(not busy)
+        # Disconnect only available when there's an open handle.
+        self.btn_tiago_disconnect.setEnabled(not busy and connected)
+
+    def _send_tiago_via_cache(self, action: str):
+        """Send one GO letter or HOME using the cached serial handle.
+        Requires Test to have been run first (no implicit open here —
+        opening triggers a 20-30 s calibration sweep, which is not what
+        the operator wants when clicking a Send button)."""
+        if self.tiago_ser is None:
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot send {action!r}: not connected — click Test first.\n")
             self._set_led(self.lbl_tiago, "error")
-            QMessageBox.information(self, "Tiagobot manual test", "No serial port selected.")
+            QMessageBox.information(
+                self, "Tiagobot",
+                "Not connected. Click Test to open the port and run "
+                "the Arduino's calibration sweep (~20-30 s) first.",
+            )
             return
 
-        baud = self._tiago_baud_int()
-        if baud is None:
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot send: invalid baudrate {self.tiago_baudrate!r}\n")
-            self._set_led(self.lbl_tiago, "error")
-            QMessageBox.warning(self, "Tiagobot manual test", "Invalid TIAGOBOT_BAUD.")
-            return
-
-        self._set_led(self.lbl_tiago, "starting")
-        QApplication.processEvents()
         try:
             from Utils.tiagobot import (
-                open_port as _tiago_open,
                 send_letter as _tiago_send_letter,
                 send_home as _tiago_send_home,
-                close_port as _tiago_close,
             )
             logger = self._tiago_panel_logger()
-            ser = _tiago_open(port, baud, logger)
-            if ser is None:
-                self._set_led(self.lbl_tiago, "stopped")
-                return
             if action == "HOME":
-                _tiago_send_home(ser, logger)
+                _tiago_send_home(self.tiago_ser, logger)
             else:
-                _tiago_send_letter(ser, action, logger)
-            # Give the actuator a moment to start moving before we close
-            # the port (close mid-write is harmless but visible motion is
-            # the operator's confirmation).
-            time.sleep(0.5)
-            _tiago_close(ser, logger)
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot manual: sent {action!r} on {port}\n")
+                _tiago_send_letter(self.tiago_ser, action, logger)
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot: sent {action!r}\n")
             self._set_led(self.lbl_tiago, "running")
         except Exception as e:
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot manual ERROR: {e}\n")
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot send ERROR: {e}\n")
             self._set_led(self.lbl_tiago, "error")
-            QMessageBox.warning(self, "Tiagobot manual test", f"Error sending {action!r} on {port}:\n{e}")
+            # On a serial error, assume the cached handle is stale.
+            self.tiago_ser = None
+            self._tiago_set_controls_busy(False)
+            QMessageBox.warning(self, "Tiagobot",
+                                f"Error sending {action!r}:\n{e}\n\n"
+                                "Connection closed; click Test to reconnect.")
 
-    def on_tiago_send_e(self):
-        self._send_tiago_manual("E")
+    def on_tiago_send_letter(self):
+        letter = self.cmb_tiago_letter.currentText()
+        self._send_tiago_via_cache(letter)
 
     def on_tiago_send_home(self):
-        self._send_tiago_manual("HOME")
+        self._send_tiago_via_cache("HOME")
+
+    def on_tiago_disconnect(self):
+        """Close the cached Tiagobot serial handle so the experiment
+        driver (or another tool) can claim the port."""
+        if self.tiago_ser is None:
+            return
+        try:
+            from Utils.tiagobot import close_port as _tiago_close
+            _tiago_close(self.tiago_ser, self._tiago_panel_logger())
+        except Exception as e:
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot disconnect error: {e}\n")
+        finally:
+            self.tiago_ser = None
+            self._set_led(self.lbl_tiago, "stopped")
+            self._tiago_set_controls_busy(False)
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot disconnected.\n")
 
     def on_save_tiago_to_config(self):
         port = (self.tiago_port_name or self.cmb_tiago_port.currentData() or "").strip()
@@ -3457,6 +3524,12 @@ class ControlPanel(QMainWindow):
             if not (self.fes.q and self.fes.q.state() != QProcess.NotRunning):
                 QMessageBox.warning(self, "Gating", "FES is enabled but not running. Start FES first.")
                 return
+        # The panel and the experiment driver can't share the Tiagobot
+        # serial port — release ours before the driver tries to claim it.
+        # No-op if the panel never opened the port.
+        if self.tiago_ser is not None:
+            self._append_log("Panel", f"[{self._ts()}] Releasing Tiagobot port for the experiment driver.\n")
+            self.on_tiago_disconnect()
         self._start_proc(self.driver, self.lbl_driver, "Driver")
 
     def on_driver_stop(self):

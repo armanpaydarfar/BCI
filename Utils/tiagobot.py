@@ -78,21 +78,31 @@ HOME_COMMAND = "h\n"
 
 # Banner printed by the sketch after calibrateServo() + calibrateLinAct().
 # We wait for it on port open so the first letter is not sent into a
-# mid-calibration Arduino.
+# mid-calibration Arduino. Servo sweep alone takes ~10 s; the linear
+# actuator extend+retract adds another 10-30 s depending on stroke length
+# and friction. 60 s leaves comfortable headroom.
 CALIBRATION_READY_MARKER = "Calibration complete."
-CALIBRATION_TIMEOUT_S = 30.0
+CALIBRATION_TIMEOUT_S = 60.0
 
 
 # =========================================================
 # Port lifecycle
 # =========================================================
-def open_port(port, baud, logger):
+def open_port(port, baud, logger, yield_callback=None):
     """Open the Tiagobot Arduino serial port and wait for the sketch's
     `Calibration complete.` banner.
 
     Returns the serial.Serial handle, or None if `port` is empty or
     SIMULATION_MODE is set (the driver still runs in either case; the
     send_* helpers no-op when given None).
+
+    `yield_callback` is an optional zero-arg callable invoked once per
+    serial read iteration during the calibration wait. Use it from a Qt
+    main thread to pump events
+    (e.g. ``yield_callback=QApplication.processEvents``) so the GUI stays
+    responsive across the 15-60 s calibration sweep. The experiment
+    driver passes None — it's already blocked at startup and doesn't
+    need to yield.
 
     Raises serial.SerialException on real open failures (port specified
     but unavailable) — caller decides whether to abort.
@@ -120,6 +130,13 @@ def open_port(port, baud, logger):
             line = ser.readline().decode("utf-8", errors="replace").strip()
         except Exception:
             line = ""
+        if yield_callback is not None:
+            try:
+                yield_callback()
+            except Exception:
+                # Callback errors are non-fatal — keep waiting for the
+                # banner. A flaky GUI shouldn't break hardware setup.
+                pass
         if not line:
             continue
         if logger is not None:
