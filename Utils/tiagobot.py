@@ -77,6 +77,17 @@ LOCATIONS = {
 
 HOME_COMMAND = "h\n"
 
+# Completion markers printed by the sketch after each command. Used by
+# wait_for_completion() so the driver can sync to actual motion end
+# instead of guessing with a fixed timeout — A-I moves vary from ~5 s
+# (shortest, e.g. 'E' at delayTime=80) to ~30+ s (e.g. 'C' at 1150).
+TARGET_REACHED_MARKER = "Target Location Reached."
+HOMED_MARKER = "Homed."
+
+# Default per-motion wait ceiling. Larger than any plausible single move,
+# but bounded so the trial loop doesn't hang forever on a stuck actuator.
+DEFAULT_MOTION_TIMEOUT_S = 60.0
+
 # USB descriptor of the Arduino on the Tiagobot. Used by find_tiagobot_port
 # to disambiguate Tiagobot from the glove Arduino when both are plugged
 # into the same Linux host (where /dev/ttyACM* enumeration is otherwise
@@ -332,3 +343,59 @@ def send_home(ser, logger):
     ser.write(HOME_COMMAND.encode("utf-8"))
     if logger is not None:
         logger.log_event("Tiagobot: sent HOME (h\\n)")
+
+
+def wait_for_completion(ser, marker, timeout=DEFAULT_MOTION_TIMEOUT_S,
+                        logger=None, on_tick=None):
+    """Block until the sketch prints `marker` on the serial port, or
+    `timeout` seconds elapse. Returns True on completion, False on timeout.
+
+    Used by the driver to sync to actual motion-end: after sending a
+    letter, wait for ``TARGET_REACHED_MARKER``; after HOME, wait for
+    ``HOMED_MARKER``. Variable-time moves (5-30+ s depending on the
+    letter's analog/angle/delay triple) are handled correctly — there's
+    no fixed sleep that's either too short (next trial starts mid-motion)
+    or too long (wasted dead time on fast moves).
+
+    ``on_tick`` is an optional zero-arg callable invoked once per
+    readline iteration. Use it from the driver to pump pygame events,
+    update EEG state, refresh the display, etc. — keeps the realtime
+    loop alive during a long wait. Callback errors are silently swallowed.
+
+    No-op (returns True immediately) if `ser` is None (SIMULATION_MODE
+    or unconfigured port) — the SIM-mode driver doesn't have an Arduino
+    to wait for.
+    """
+    if ser is None:
+        if logger is not None:
+            logger.log_event(f"Tiagobot[SIM]: would wait for {marker!r}")
+        return True
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            line = ser.readline().decode("utf-8", errors="replace").strip()
+        except Exception:
+            line = ""
+        if on_tick is not None:
+            try:
+                on_tick()
+            except SystemExit:
+                # Propagate Ctrl+C / window-close cleanly so the driver's
+                # try/finally hardware cleanup can run.
+                raise
+            except Exception:
+                pass
+        if not line:
+            continue
+        if logger is not None:
+            logger.log_event(f"Tiagobot: {line}")
+        if marker in line:
+            return True
+
+    if logger is not None:
+        logger.log_event(
+            f"Tiagobot: timeout after {timeout:.0f}s waiting for {marker!r}",
+            level="error",
+        )
+    return False

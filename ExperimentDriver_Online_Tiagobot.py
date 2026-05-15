@@ -69,6 +69,8 @@ from Utils.tiagobot import (
     close_port as tiago_close_port,
     find_tiagobot_port,
     find_glove_port,
+    wait_for_completion as tiago_wait_for_completion,
+    TARGET_REACHED_MARKER, HOMED_MARKER,
 )
 
 import config
@@ -508,9 +510,11 @@ def main():
             eeg_state=eeg_state
         )
 
-        # If MI-correct, continue classifying during the actuator move and
-        # then GRIP → RELEASE → HOME regardless of early-stop (the Tiagobot
-        # sketch no longer auto-retracts at end of GO).
+        # If MI-correct, continue classifying for the early window, then
+        # wait for the actual Tiagobot motion to complete (variable, 5-30+ s
+        # depending on the chosen letter), grip, retract with the object,
+        # release at home. The Tiagobot sketch has no mid-motion STOP, so
+        # we always wait — even on early-stop the actuator runs to target.
         if should_hold_and_classify:
             logger.log_event("Entering real-time classification window during Tiagobot movement...")
             final_class_robot, robot_probs, robot_earlystop = hold_messages_and_classify(
@@ -537,24 +541,46 @@ def main():
                 phase="ROBOT"
             )
 
-            # Reach complete (TIME_ROB=7s comfortably bounds any A–I motion,
-            # which is ~3-5s worst case). Grip the target.
-            if arduino is not None:
-                arduino.write(config.ARDUINO_CMD_MI)
-                logger.log_event("Glove closing — Tiagobot at target.")
+            # Drive-loop tick: pumped during the variable-time waits to
+            # keep the pygame window responsive, propagate QUIT cleanly,
+            # and stop the LSL EEG buffer from backing up.
+            def _drive_tick():
+                eeg_state.update()
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        pygame.quit()
+                        raise SystemExit
+                pygame.display.flip()
 
-            # Pre-home fixation only on a clean MI window; on early-stop
-            # the time has already been spent on the abort.
+            # Wait for the actual GO motion to finish. The sketch prints
+            # "Target Location Reached." when the extend loop exits; the
+            # serial port has been buffering this line while
+            # hold_messages_and_classify ran, so on a fast move we read
+            # it immediately, on a slow move we wait until it arrives.
+            logger.log_event("Waiting for Tiagobot reach completion...")
+            reached = tiago_wait_for_completion(
+                tiago, TARGET_REACHED_MARKER, timeout=60.0,
+                logger=logger, on_tick=_drive_tick,
+            )
+            if not reached:
+                logger.log_event(
+                    "Tiagobot reach timed out after 60 s — proceeding to grip anyway.",
+                    level="error",
+                )
+
+            # Grip the target. On early-stop we skip the grip entirely
+            # so the operator's "bad MI" interruption doesn't grasp.
+            if not robot_earlystop and arduino is not None:
+                arduino.write(config.ARDUINO_CMD_MI)
+                logger.log_event("Glove closing — gripping target.")
+
+            # Grip-hold period: lets the glove finish its close motion
+            # and gives a visible "object held" moment before retract.
+            # 2 s matches the existing pre-home fixation cadence.
             if not robot_earlystop:
-                logger.log_event("Robot fixation period 2s before homing.")
                 display_fixation_period(duration=2, eeg_state=eeg_state)
 
-            # Release before HOME so the object stays at the target.
-            if arduino is not None:
-                arduino.write(config.ARDUINO_CMD_REST)
-                logger.log_event("Glove opening — releasing before retract.")
-
-            # Always send HOME — Tiagobot does not auto-retract.
+            # Send HOME — Tiagobot retracts with the gripped object.
             send_udp_message(
                 udp_socket_marker,
                 config.UDP_MARKER["IP"],
@@ -563,7 +589,26 @@ def main():
                 logger=logger,
             )
             tiago_send_home(tiago, logger)
-            logger.log_event("Sent HOME to Tiagobot at end of MI trial.")
+            logger.log_event("Sent HOME to Tiagobot — retracting.")
+
+            # Wait for the retract to actually finish before opening
+            # the glove (so the object goes back to the home position
+            # rather than being dropped mid-retract).
+            logger.log_event("Waiting for Tiagobot home completion...")
+            homed = tiago_wait_for_completion(
+                tiago, HOMED_MARKER, timeout=60.0,
+                logger=logger, on_tick=_drive_tick,
+            )
+            if not homed:
+                logger.log_event(
+                    "Tiagobot home timed out after 60 s — releasing glove anyway.",
+                    level="error",
+                )
+
+            # Release at home.
+            if not robot_earlystop and arduino is not None:
+                arduino.write(config.ARDUINO_CMD_REST)
+                logger.log_event("Glove opening — releasing at home.")
 
             display_fixation_period(duration=3, eeg_state=eeg_state)
             logger.log_event("Robot reset fixation (3s) complete.")
