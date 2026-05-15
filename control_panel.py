@@ -3266,11 +3266,24 @@ class ControlPanel(QMainWindow):
             text = f"{p.device} ({desc})"
             self.cmb_tiago_port.addItem(text, p.device)
 
+        # Selection priority:
+        #   1. Operator's prior manual choice in this session
+        #   2. config.TIAGOBOT_PORT (saved via Save → config)
+        #   3. USB auto-detect (Arduino Mega 2560 R3, vid:pid 2341:0042)
+        #   4. First port in the list
         idx = -1
         if self.tiago_port_name:
             idx = self.cmb_tiago_port.findData(self.tiago_port_name)
         if idx < 0:
             idx = self.cmb_tiago_port.findData(TIAGOBOT_PORT)
+        if idx < 0:
+            try:
+                from Utils.tiagobot import find_tiagobot_port
+                auto = find_tiagobot_port(logger=self._tiago_panel_logger())
+            except Exception:
+                auto = None
+            if auto:
+                idx = self.cmb_tiago_port.findData(auto)
         if idx < 0:
             idx = 0
 

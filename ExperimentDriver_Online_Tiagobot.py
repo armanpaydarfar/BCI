@@ -67,6 +67,7 @@ from Utils.tiagobot import (
     send_letter as tiago_send_letter,
     send_home as tiago_send_home,
     close_port as tiago_close_port,
+    find_tiagobot_port,
 )
 
 import config
@@ -188,10 +189,21 @@ except FileNotFoundError:
 # ============================================================
 # TIAGOBOT SETUP (mandatory unless SIMULATION_MODE)
 # ============================================================
+# Resolve the port: explicit config first, fall back to USB-ID scan
+# (Arduino Mega 2560 R3, vid:pid 2341:0042). This lets the driver run
+# with no manual config when only Tiagobot is plugged in (or with both
+# Arduinos as long as the glove isn't also a Mega 2560).
+tiago_port = config.TIAGOBOT_PORT
+if not tiago_port:
+    logger.log_event("TIAGOBOT_PORT is empty — scanning USB for a Mega 2560 R3...")
+    tiago_port = find_tiagobot_port(logger=logger)
+    if tiago_port:
+        logger.log_event(f"Auto-detected Tiagobot port: {tiago_port}")
+
 # open_tiago_port returns None in SIMULATION_MODE or when port is unset.
 # Real open failures raise; we let them propagate per fail-fast policy on
 # Tier 1 hardware paths (CLAUDE.md "Error Handling").
-tiago = open_tiago_port(config.TIAGOBOT_PORT, config.TIAGOBOT_BAUD, logger)
+tiago = open_tiago_port(tiago_port, config.TIAGOBOT_BAUD, logger)
 if tiago is None and not config.SIMULATION_MODE:
     logger.log_event(
         "❌ Tiagobot port unavailable and SIMULATION_MODE is False — aborting.",
