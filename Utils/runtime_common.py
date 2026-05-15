@@ -165,11 +165,15 @@ def display_fixation_period(duration=3, eeg_state=None):
         if eeg_state is not None:
             eeg_state.update()
 
-        # Handle quit events
+        # Handle quit events. Match the pattern in Utils/networking.py:676 —
+        # propagate via SystemExit so the driver's try/finally cleanup
+        # fires and the trial loop doesn't continue calling pygame after
+        # the video subsystem is torn down (which raises
+        # "video system not initialized" on the next display.flip()).
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
-                return
+                raise SystemExit
 
         clock.tick(60)
 
@@ -647,10 +651,11 @@ def hold_messages_and_classify(messages, colors, offsets, duration, mode, udp_so
                 )
                 break
 
+        # See display_fixation_period above for the rationale on SystemExit.
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
-                return None
+                raise SystemExit
 
         clock.tick(60)
 

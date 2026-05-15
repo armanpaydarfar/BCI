@@ -68,6 +68,7 @@ from Utils.tiagobot import (
     send_home as tiago_send_home,
     close_port as tiago_close_port,
     find_tiagobot_port,
+    find_glove_port,
 )
 
 import config
@@ -217,17 +218,24 @@ if tiago is None and not config.SIMULATION_MODE:
 # ============================================================
 arduino = None
 if config.TIAGOBOT_USE_GLOVE:
-    if config.ARDUINO_PORT:
+    glove_port = config.ARDUINO_PORT
+    if not glove_port:
+        logger.log_event("ARDUINO_PORT is empty — scanning USB for an Arduino Uno R3 (glove)...")
+        glove_port = find_glove_port(logger=logger)
+        if glove_port:
+            logger.log_event(f"Auto-detected glove port: {glove_port}")
+
+    if glove_port:
         try:
-            logger.log_event(f"Connecting to Glove (Arduino) on {config.ARDUINO_PORT}...")
-            arduino = serial.Serial(config.ARDUINO_PORT, config.ARDUINO_BAUD, timeout=0.1)
+            logger.log_event(f"Connecting to Glove (Arduino) on {glove_port}...")
+            arduino = serial.Serial(glove_port, config.ARDUINO_BAUD, timeout=0.1)
             time.sleep(2)  # Arduino reset wait
             logger.log_event("✅ Glove connected successfully.")
         except Exception as e:
             logger.log_event(f"❌ Error connecting to Glove: {e}", level="error")
             arduino = None
     else:
-        logger.log_event("ℹ️ TIAGOBOT_USE_GLOVE=True but ARDUINO_PORT is empty — glove disabled.")
+        logger.log_event("ℹ️ TIAGOBOT_USE_GLOVE=True but no glove port available — glove disabled.")
 else:
     logger.log_event("ℹ️ Glove integration disabled (TIAGOBOT_USE_GLOVE=False).")
 
@@ -273,6 +281,26 @@ _RC.Prev_T = Prev_T
 _RC.counter = counter
 _RC.Prev_T_beta = Prev_T_beta
 _RC.counter_beta = counter_beta
+
+
+def _hardware_cleanup():
+    """Best-effort release of the Tiagobot serial port and (if present)
+    the glove port. Runs on every exit path of main() — including
+    SystemExit from runtime_common when the operator closes the pygame
+    window mid-session."""
+    try:
+        tiago_close_port(tiago, logger)
+    except Exception as e:
+        logger.log_event(f"Tiagobot close error: {e}", level="error")
+    if arduino is not None:
+        try:
+            arduino.close()
+        except Exception as e:
+            logger.log_event(f"Glove close error: {e}", level="error")
+    try:
+        pygame.quit()
+    except Exception:
+        pass
 
 
 def main():
@@ -572,16 +600,12 @@ def main():
     log_confusion_matrix_from_trial_summary(logger)
     logger.log_event("run complete")
 
-    # Best-effort hardware cleanup.
-    tiago_close_port(tiago, logger)
-    if arduino is not None:
-        try:
-            arduino.close()
-        except Exception as e:
-            logger.log_event(f"Glove close error: {e}", level="error")
-
-    pygame.quit()
-
 
 if __name__ == "__main__":
-    main()
+    # try/finally so hardware cleanup runs on any exit path: clean
+    # session end, SystemExit raised by runtime_common when the
+    # operator closes the pygame window, KeyboardInterrupt, etc.
+    try:
+        main()
+    finally:
+        _hardware_cleanup()

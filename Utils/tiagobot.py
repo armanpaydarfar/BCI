@@ -83,6 +83,11 @@ HOME_COMMAND = "h\n"
 TIAGOBOT_USB_VID = 0x2341  # Arduino SA
 TIAGOBOT_USB_PID = 0x0042  # Mega 2560 R3
 
+# USB descriptor of the glove Arduino (used by find_glove_port for the
+# same reason as TIAGOBOT_USB_*). The glove is a stock Arduino Uno R3.
+GLOVE_USB_VID = 0x2341  # Arduino SA
+GLOVE_USB_PID = 0x0043  # Uno R3
+
 # Banner printed by the sketch after calibrateServo() + calibrateLinAct().
 # We wait for it on port open so the first letter is not sent into a
 # mid-calibration Arduino. Servo sweep alone takes ~10 s; the linear
@@ -95,6 +100,51 @@ CALIBRATION_TIMEOUT_S = 60.0
 # =========================================================
 # Port lifecycle
 # =========================================================
+def _find_arduino_by_usb_id(vid, pid, role_name, logger=None):
+    """Internal: scan pyserial.tools.list_ports.comports for a device
+    matching `(vid, pid)`. Returns the device path on exactly-one match,
+    None on zero / >1 matches. Shared between Tiagobot (Mega 2560 R3)
+    and glove (Uno R3) auto-detect."""
+    try:
+        import serial.tools.list_ports
+    except Exception as e:
+        if logger is not None:
+            logger.log_event(f"{role_name} auto-detect: pyserial unavailable ({e})")
+        return None
+
+    try:
+        ports = list(serial.tools.list_ports.comports())
+    except Exception as e:
+        if logger is not None:
+            logger.log_event(f"{role_name} auto-detect: comports() failed ({e})")
+        return None
+
+    matches = [p for p in ports if p.vid == vid and p.pid == pid]
+
+    if logger is not None:
+        for p in matches:
+            logger.log_event(
+                f"{role_name} auto-detect: candidate {p.device} "
+                f"({p.description or 'n/a'}, serial={p.serial_number or 'n/a'})"
+            )
+
+    if len(matches) == 1:
+        return matches[0].device
+    if len(matches) == 0:
+        if logger is not None:
+            logger.log_event(
+                f"{role_name} auto-detect: no device with USB ID "
+                f"{vid:04x}:{pid:04x} found."
+            )
+        return None
+    if logger is not None:
+        logger.log_event(
+            f"{role_name} auto-detect: {len(matches)} devices with USB ID "
+            f"{vid:04x}:{pid:04x} found — set the port explicitly to disambiguate."
+        )
+    return None
+
+
 def find_tiagobot_port(logger=None):
     """Scan available serial ports for an Arduino Mega 2560 R3 and return
     its device path, or None if none found / multiple ambiguous.
@@ -107,46 +157,20 @@ def find_tiagobot_port(logger=None):
     Returns None (not raises) on any failure — caller decides whether the
     absence is fatal.
     """
-    try:
-        import serial.tools.list_ports
-    except Exception as e:
-        if logger is not None:
-            logger.log_event(f"Tiagobot auto-detect: pyserial unavailable ({e})")
-        return None
+    return _find_arduino_by_usb_id(
+        TIAGOBOT_USB_VID, TIAGOBOT_USB_PID, "Tiagobot", logger=logger,
+    )
 
-    try:
-        ports = list(serial.tools.list_ports.comports())
-    except Exception as e:
-        if logger is not None:
-            logger.log_event(f"Tiagobot auto-detect: comports() failed ({e})")
-        return None
 
-    matches = [p for p in ports
-               if p.vid == TIAGOBOT_USB_VID and p.pid == TIAGOBOT_USB_PID]
-
-    if logger is not None:
-        for p in matches:
-            logger.log_event(
-                f"Tiagobot auto-detect: candidate {p.device} "
-                f"({p.description or 'n/a'}, serial={p.serial_number or 'n/a'})"
-            )
-
-    if len(matches) == 1:
-        return matches[0].device
-    if len(matches) == 0:
-        if logger is not None:
-            logger.log_event(
-                f"Tiagobot auto-detect: no device with USB ID "
-                f"{TIAGOBOT_USB_VID:04x}:{TIAGOBOT_USB_PID:04x} found."
-            )
-        return None
-    # >1 Mega 2560 R3 on the same host is ambiguous — refuse to guess.
-    if logger is not None:
-        logger.log_event(
-            f"Tiagobot auto-detect: {len(matches)} Mega 2560 R3 devices "
-            "found — set TIAGOBOT_PORT explicitly to disambiguate."
-        )
-    return None
+def find_glove_port(logger=None):
+    """Scan available serial ports for an Arduino Uno R3 (the glove
+    board) and return its device path, or None if none found / multiple
+    ambiguous. Used by the Tiagobot driver and the panel when
+    ARDUINO_PORT is empty and TIAGOBOT_USE_GLOVE is True.
+    """
+    return _find_arduino_by_usb_id(
+        GLOVE_USB_VID, GLOVE_USB_PID, "Glove", logger=logger,
+    )
 
 
 def open_port(port, baud, logger, yield_callback=None):
