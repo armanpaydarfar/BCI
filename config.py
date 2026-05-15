@@ -281,7 +281,7 @@ TIAGOBOT_USE_GLOVE = True
 # before sending HOME. The glove's mechanical close takes time and HOME
 # starting too early means the actuator retracts mid-grip. Tune to match
 # the glove's actual close duration on this hardware.
-TIAGOBOT_GRIP_HOLD_DURATION = 4
+TIAGOBOT_GRIP_HOLD_DURATION = 5
 
 # =============================================================================
 # Display colors (RGB)
