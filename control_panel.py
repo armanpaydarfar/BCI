@@ -324,7 +324,7 @@ def _marker_udp_port() -> int:
     return 12345
 
 # Modes choose which robot tool to launch remotely
-MODES = ["Gaze_Tracking", "MI_Bimanual", "Simulation"]
+MODES = ["Gaze_Tracking", "MI_Bimanual", "MI_Tiagobot", "Simulation"]
 
 # Driver choices
 DRIVERS = [
@@ -2239,6 +2239,9 @@ class ControlPanel(QMainWindow):
         mode_flag = {
             "MI_Bimanual": "--mode mi_bimanual",
             "Gaze_Tracking": "--mode gaze",
+            # Tiagobot driver ignores the flag (no argparse) — kept for
+            # log clarity and so the panel command line is consistent.
+            "MI_Tiagobot": "--mode mi_tiagobot",
             "Simulation": "--mode sim --no-robot",
         }[self.mode]
 
@@ -2275,12 +2278,20 @@ class ControlPanel(QMainWindow):
         self._update_robot_buttons_for_mode()
 
     def _update_robot_buttons_for_mode(self):
-        sim = (self.mode == "Simulation")
-        self.btn_robot_start.setEnabled(not sim)
-        if sim:
-            self.btn_robot_start.setToolTip("Disabled in Simulation mode.")
+        # The Robot SSH button opens a terminal against the Harmony robot
+        # host. It makes no sense in Simulation (no robot) or in
+        # MI_Tiagobot (the "robot" is a local Arduino, not a remote
+        # Harmony at config.UDP_ROBOT["IP"]).
+        harmony_relevant = self.mode in ("MI_Bimanual", "Gaze_Tracking")
+        self.btn_robot_start.setEnabled(harmony_relevant)
+        if not harmony_relevant:
+            self.btn_robot_start.setToolTip(
+                f"Disabled in {self.mode} mode — no remote Harmony to dial."
+            )
         else:
-            self.btn_robot_start.setToolTip("Open SSH terminal running the selected robot tool.")
+            self.btn_robot_start.setToolTip(
+                "Open SSH terminal running the selected robot tool."
+            )
 
     # ---------- Actions ----------
     def on_initialize(self):
