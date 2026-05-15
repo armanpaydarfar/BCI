@@ -2302,6 +2302,16 @@ class ControlPanel(QMainWindow):
         subprocess.Popen(cmd, shell=True)
         QMessageBox.information(self, "Initialize", "Opened initialize_devices.sh in a new terminal.")
 
+    # Modes that imply exactly one experiment driver. When the operator
+    # picks such a mode, auto-switch the Driver dropdown so the wrong
+    # driver can't silently run with the right paradigm flag. Listed
+    # here are only modes with an unambiguous driver pairing — Modes
+    # that work with multiple drivers (e.g. MI_Bimanual, Simulation)
+    # are absent so the operator's driver choice is preserved.
+    _MODE_IMPLIES_DRIVER = {
+        "MI_Tiagobot": "ExperimentDriver_Online_Tiagobot",
+    }
+
     def on_mode_changed(self, text: str):
         self.mode = text
         sim_on = (self.mode == "Simulation")
@@ -2310,6 +2320,15 @@ class ControlPanel(QMainWindow):
             self._append_log("Panel", f"[{self._ts()}] SIMULATION_MODE set to {sim_on}\n")
         except Exception as e:
             self._append_log("Panel", f"[{self._ts()}] Failed to write SIMULATION_MODE: {e}\n")
+
+        implied = self._MODE_IMPLIES_DRIVER.get(self.mode)
+        if implied and self.driver_choice != implied and implied in DRIVERS:
+            self.driver_choice = implied
+            self.cmb_driver.blockSignals(True)
+            self.cmb_driver.setCurrentText(implied)
+            self.cmb_driver.blockSignals(False)
+            self._append_log("Panel",
+                f"[{self._ts()}] Mode {self.mode} → Driver auto-switched to {implied}\n")
 
         self._set_cmds_for_mode_and_driver()
         self._append_log("Panel", f"[{self._ts()}] Mode set to {self.mode}\n")
