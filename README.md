@@ -9,9 +9,10 @@ The Harmony robot itself is not an EEG/BCI system. The “Harmony project”
 in this repo is the software stack that combines:
 
 - **Motor-imagery EEG decoding** for high-level intent (move vs rest),
-  built on a Riemannian-geometry pipeline (Ledoit–Wolf shrinkage
-  covariances → adaptive recentering → tangent space / MDM-class
-  classifiers).
+  built on a Riemannian-geometry pipeline: shrinkage-regularised
+  covariances (Ledoit–Wolf adaptive shrinkage or fixed-parameter
+  `Shrinkage`, selectable via `config.LEDOITWOLF`) → adaptive
+  Riemannian recentering → Minimum-Distance-to-Mean (MDM) classifier.
 - **Real-time experiment drivers** that orchestrate the closed-loop
   trial structure (cue display, decoding, feedback, actuation).
 - **Networking and actuation** layers that translate decoded intent
@@ -32,12 +33,17 @@ appropriate clinical and ethical oversight.
     `FES_toggle`).
 
 - **Experiment Drivers**
-  - `ExperimentDriver_Online.py` — main online motor-imagery loop.
-  - `ExperimentDriver_Offline.py` — offline replay / analysis.
-  - `ExperimentDriver_Bimanual.py` — bimanual variant.
-  - Each driver: connects to EEG via LSL, runs a Pygame-based feedback
-    UI, classifies motor imagery vs rest in real time, and triggers
-    robot/FES actions over UDP.
+  - `ExperimentDriver_Online.py` — main online motor-imagery loop,
+    with full closed-loop BCI feedback.
+  - `ExperimentDriver_Offline.py` — realtime training-data acquisition
+    driver. Runs the same cued trial structure live with the
+    participant, but **without BCI feedback / classification**; emits
+    cue and event markers so the resulting LabRecorder `.xdf` can be
+    used by the training scripts to fit subject-specific decoders.
+  - `ExperimentDriver_Bimanual.py` — bimanual variant of the online
+    driver.
+  - Each driver: connects to EEG via LSL, runs a Pygame-based UI, and
+    talks to the robot/FES/marker stream over UDP.
 
 - **Runtime and utilities (`Utils/`)**
   - `Utils/runtime_common.py` — shared realtime decoder dispatch and
@@ -89,21 +95,30 @@ Key folders and scripts (non-exhaustive):
   tools, and supporting utilities.
 
 - **Experiment drivers (root-level)**
-  - `ExperimentDriver_Online.py` — main online motor-imagery loop.
-  - `ExperimentDriver_Offline.py` — offline replay / analysis driver.
+  - `ExperimentDriver_Online.py` — main online motor-imagery loop with
+    closed-loop BCI feedback.
+  - `ExperimentDriver_Offline.py` — realtime cued data-collection
+    driver run live with the participant; identical trial structure to
+    the online driver but **no classifier and no BCI feedback**. The
+    `.xdf` produced by LabRecorder during these sessions is the input
+    to the training scripts below.
   - `ExperimentDriver_Bimanual.py` — bimanual variant of the online
     driver.
   - `.sh` wrappers (`ExperimentDriver_Online.sh` etc.) — convenience
     launchers used by the control panel.
 
 - **Training / model generation**
-  - `Generate_Riemannian_adaptive.py` — **current canonical training
+  - `Generate_Riemannian_adaptive.py` — **the canonical training
     script.** Builds the adaptive Riemannian decoder used at runtime,
     including the streaming/adaptive recentering transforms. Produces
-    `sub-*_model.pkl` artefacts consumed by the realtime drivers.
-  - `Generate_Riemannian.py` — non-adaptive MDM baseline (kept for
-    comparison; the adaptive version is the load-bearing one).
-  - `Generate_Decoder.py` — legacy LDA baseline (kept for reference).
+    `sub-*_model.pkl` artefacts consumed by the realtime drivers. In
+    practice this is the only training script that gets run; on newer
+    branches the legacy ones below have already been removed.
+  - `Generate_Riemannian.py` — **legacy** non-adaptive MDM trainer,
+    kept here for historical reference only. Not used in current
+    workflows.
+  - `Generate_Decoder.py` — **legacy** LDA trainer, kept here for
+    historical reference only. Not used in current workflows.
 
 - **Analysis and visualisation**
   - `Analyze_online_Decoder_performance.py` — log/performance analysis
@@ -207,11 +222,22 @@ The control panel provides buttons to:
 3. Select `ExperimentDriver_Online` and the desired mode.
 4. Start the driver from the control panel.
 
-### Offline experiment
+### Offline experiment (training-data acquisition)
 
-`ExperimentDriver_Offline.py` replays and analyses previously recorded
-data. It does not control hardware but still relies on `config.py` for
-paths and decoder parameters.
+`ExperimentDriver_Offline.py` is a **realtime** driver run live with
+the participant — it presents the same cued motor-imagery / rest trial
+structure as the online experiment, but **without classifier feedback
+or BCI-driven actuation**. Its purpose is to collect labelled `.xdf`
+recordings (via LabRecorder) that the training scripts then use to fit
+subject-specific decoders. Typical flow:
+
+1. Configure subject and toggles in the control panel.
+2. Start the marker stream (and FES listener if relevant).
+3. Start LabRecorder and arm the EEG + marker streams.
+4. Launch `ExperimentDriver_Offline` from the control panel and run
+   the session.
+5. Use the resulting `.xdf` under `training_data/` as input to
+   `Generate_Riemannian_adaptive.py`.
 
 ### Transform / model generation (offline)
 
