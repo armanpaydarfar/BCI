@@ -298,13 +298,12 @@ guarantees. When developing or modifying:
 
 ## 8. Status / Notes
 
-This branch (`harmony_stable`) is a snapshot of the core online motor-
-imagery + robot pipeline. Active development continues on
-`harmony_dev`, which adds gaze-based selection, Harmony-specific
-calibration / online-control scripts, additional experiment variants
-(glove, gaze-tracking, ErrP), and broader analysis tooling. `main` is
-intended to track stable snapshots suitable for reference and external
-review.
+`main` tracks a stable snapshot of the core online motor-imagery +
+robot pipeline, suitable for reference and external review. Active
+development continues on a separate development branch that adds
+gaze-based selection, Harmony-specific calibration / online-control
+scripts, additional experiment variants (glove, gaze-tracking, ErrP),
+and broader analysis tooling.
 
 - Some scripts (e.g. `Test_TESS.py`, the legacy `Generate_Decoder.py`
   and `Generate_Riemannian.py`) are kept for reference or comparison
