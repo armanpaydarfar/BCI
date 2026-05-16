@@ -4,7 +4,7 @@
 WORKING_DIR = "/home/arman-admin/Projects/Harmony/"
 DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
 
-TRAINING_SUBJECT = "F25CLASS_SUBJ_006"
+TRAINING_SUBJECT = "CLIN_SUBJ_006"
 # EEG Settings
 CAP_TYPE = 32
 LOWCUT = 8  # Hz
@@ -33,8 +33,8 @@ TIMING = True #obsolete
 SHAPE_MAX = 0.7 #maximum fill 
 SHAPE_MIN = 0.5 #minimum fill 
 ROBOT_TRAJECTORY = ["a"] # Not using
-BIG_BROTHER_MODE = True #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
-SEND_PROBS = True
+BIG_BROTHER_MODE = False #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
+SEND_PROBS = False
 
 
 # Early-stop policy: "correct_only" (current behavior) or "either"
@@ -49,7 +49,7 @@ BASELINE_DURATION = 1 #seconds
 ACCURACY_THRESHOLD = 0.6  # OBS Accuracy threshold to determine "Correct" (plan to obsolete)
 THRESHOLD_MI = 0.6 #Threshold for MI "correct"
 THRESHOLD_REST = 0.6 #Threshold for REST "Correct"
-RELAXATION_RATIO = 0.6 # relaxation ratio for sustained MI during movement
+RELAXATION_RATIO = 0.4 # relaxation ratio for sustained MI during movement
 MIN_PREDICTIONS = 8 # Min number of predictions during Online experiment before the decoder can end early
 STEP_SIZE = 1/16
 CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
@@ -70,7 +70,7 @@ SAVE_ADAPTIVE_T = False #this toggle saves "Adaptive_T" to the EEG directory dur
 
 
 # FES Parameters
-FES_toggle = 0
+FES_toggle = 1
 FES_CHANNEL = "red"
 FES_TIMING_OFFSET = 7 
 # above for motor FES, cut out X seconds before the full duration of movement. This should represent when the robot will naturally reach the end of motion (in successful case)
