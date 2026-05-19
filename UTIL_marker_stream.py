@@ -80,30 +80,42 @@ def udp_listener(udp_port):
         except ValueError:
             logging.warning(f"Invalid UDP message: {data}")
 
+def parse_marker_message(message):
+    """Parse a UDP marker payload into ``(marker_value, prob_mi, prob_rest)``.
+
+    Supported wire formats (see module docstring):
+        ``"<marker_int>"``                          → (int, None, None)
+        ``"<marker_int>,<prob_mi>,<prob_rest>"``    → (int, float, float)
+
+    Raises ``ValueError`` for any other arity or unparseable component.
+    Pure function — no I/O, no logging — so the parsing contract can be
+    tested in isolation (Plan §6 #11).
+    """
+    parts = [p.strip() for p in message.strip().split(',')]
+    if len(parts) == 1:
+        return int(parts[0]), None, None
+    if len(parts) == 3:
+        return int(parts[0]), float(parts[1]), float(parts[2])
+    raise ValueError(
+        f"Unexpected UDP marker arity ({len(parts)} parts): {message!r}; "
+        f"expected '<marker>' or '<marker>,<prob_mi>,<prob_rest>'."
+    )
+
+
 def process_udp_messages(eeg_inlet):
     while True:
         message, udp_received_time, addr = message_queue.get()
         logging.info(f"Processing UDP message: {message} from {addr}")
 
         try:
-            parts = message.strip().split(',')
-
-            if len(parts) == 1:
-                marker_value = int(parts[0])
-                timestamp = get_current_eeg_timestamp(eeg_inlet, udp_received_time)
+            marker_value, prob_mi, prob_rest = parse_marker_message(message)
+            timestamp = get_current_eeg_timestamp(eeg_inlet, udp_received_time)
+            if prob_mi is None:
                 send_marker(marker_value, timestamp)
-
-            elif len(parts) == 3:
-                marker_value = int(parts[0])
-                prob_mi = float(parts[1])
-                prob_rest = float(parts[2])
-                timestamp = get_current_eeg_timestamp(eeg_inlet, udp_received_time)
+            else:
                 send_marker(marker_value, timestamp, prob_mi, prob_rest)
 
-            else:
-                logging.warning(f"Unexpected UDP marker format: {message}")
-
-        except Exception as e:
+        except ValueError as e:
             logging.warning(f"Failed to parse UDP marker: {message} | Error: {e}")
 
         message_queue.task_done()
