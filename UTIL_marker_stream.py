@@ -30,32 +30,12 @@ from pathlib import Path
 from pylsl import StreamInfo, StreamOutlet, StreamInlet, resolve_stream, local_clock
 import config
 
-# ─────────────────────────────────────────────────────────
-# SET UP LOGGING INSIDE SUBJECT FOLDER
-# ─────────────────────────────────────────────────────────
-
-subject_log_dir = Path(config.DATA_DIR) / f"sub-{config.TRAINING_SUBJECT}" / "marker_logs"
-subject_log_dir.mkdir(parents=True, exist_ok=True)
-
-timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-log_filename = subject_log_dir / f"marker_utility_{timestamp}.log"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.FileHandler(log_filename, mode='w'),
-        logging.StreamHandler()
-    ]
-)
-
-# ─────────────────────────────────────────────────────────
-# SETUP LSL STREAM
-# ─────────────────────────────────────────────────────────
-
-info = StreamInfo('MarkerStream', 'Markers', 4, 0, 'float32', 'marker_stream_id')
-outlet = StreamOutlet(info)
-
+# Module-level state populated by main(); kept at import so the module can be
+# imported under pytest without creating log directories or opening an LSL
+# outlet on the system. See Harmony_Test_Suite_Plan.md §5.1.a.
+subject_log_dir = None
+log_filename = None
+outlet = None
 message_queue = queue.Queue()
 
 # ─────────────────────────────────────────────────────────
@@ -136,12 +116,39 @@ def handle_udp_requests(eeg_inlet):
 
     logging.info(f"Marker utility started on local port {local_port}.")
 
+def _setup_logging_and_outlet():
+    """Create the subject log directory, attach the file/console log handlers,
+    and open the `MarkerStream` LSL outlet. Side effects deferred to main()
+    so the module can be imported without hardware (Plan §5.1.a)."""
+    global subject_log_dir, log_filename, outlet
+
+    subject_log_dir = Path(config.DATA_DIR) / f"sub-{config.TRAINING_SUBJECT}" / "marker_logs"
+    subject_log_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_filename = subject_log_dir / f"marker_utility_{ts}.log"
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename, mode='w'),
+            logging.StreamHandler()
+        ]
+    )
+
+    info = StreamInfo('MarkerStream', 'Markers', 4, 0, 'float32', 'marker_stream_id')
+    outlet = StreamOutlet(info)
+
+
 def main():
+    _setup_logging_and_outlet()
+
     eeg_inlet = get_eeg_inlet()
     handle_udp_requests(eeg_inlet)
 
     logging.info("Marker utility is running (only streaming markers). Ctrl+C to exit.")
-    
+
     try:
         while True:
             time.sleep(1)
