@@ -1,26 +1,32 @@
 """
-test_gaze_calibration_recorder.py — Phase 2.c test (plan §6.3 #1).
+test_gaze_calibration_recorder.py — Phase 2.c test (plan §6.3 #1) +
+2026-05-19 recorder rework (15-waypoint grid + telemetry thread).
 
 Exercises ``harmony_free_arm_calibration.py``'s pure / IO-free helpers
 without touching real UDP sockets: the snapshot-to-bundle conversion,
-the v2 NPZ writer, and the workspace coverage protocol constant.
+the v2 NPZ writer, the workspace coverage protocol constant, and (new
+this session) the background telemetry thread + auto-home behaviour of
+``run_session`` driven via monkeypatched RobotLink / gaze snapshots.
 
-Hardware-free per Harmony_Test_Suite_Plan.md §3 — the recorder talks
-to two UDP services in production, so this file stays well away from
-``RobotLink``, ``free_arm``, ``capture_pose`` (those need integration
-tests with the real research-interface binary).
+Hardware-free per Harmony_Test_Suite_Plan.md §3.
 
 Citations under test (verified 2026-05-19):
 
-  - harmony_free_arm_calibration.py:213-258 ``bundle_from_snapshot``
-  - harmony_free_arm_calibration.py:471-580 ``write_npz`` (v2 schema)
-  - harmony_free_arm_calibration.py:104-115 ``MANDATORY_GRID``
+  - harmony_free_arm_calibration.py ``bundle_from_snapshot``
+  - harmony_free_arm_calibration.py ``write_npz`` (v2 schema)
+  - harmony_free_arm_calibration.py ``MANDATORY_GRID``
+  - harmony_free_arm_calibration.py ``TelemetryThread``
+  - harmony_free_arm_calibration.py ``run_session``
+  - harmony_free_arm_calibration.py ``_send_auto_home`` (auto-home opcode)
 """
 
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pytest
@@ -31,8 +37,10 @@ import pytest
 # scope, so simply importing is safe.
 import harmony_free_arm_calibration as recorder
 from harmony_free_arm_calibration import (
+    AUTO_HOME_DURATION_S,
     MANDATORY_GRID,
     CaptureBundle,
+    TelemetryThread,
     bundle_from_snapshot,
     write_npz,
 )
@@ -250,3 +258,394 @@ class TestMandatoryGrid:
 
     def test_labels_are_unique(self):
         assert len(set(MANDATORY_GRID)) == len(MANDATORY_GRID)
+
+
+# ─── TelemetryThread + run_session integration ─────────────────────────────
+
+def _make_snap(**overrides) -> Dict[str, Any]:
+    """Mock gaze_snapshot return shape — minimal keys the recorder
+    actually reads via ``bundle_from_snapshot``."""
+    snap = {
+        "ok": True,
+        "worn": True,
+        "gaze_px": (800.0, 600.0),
+        "depth_cm": 75.0,
+        "depth_valid": True,
+        "miss_mm": 3.5,
+        "ipd_mm": 63.0,
+        "imu_angvel": 0.05,
+        "imu_fresh": True,
+        "head_yaw_deg": 0.0,
+        "head_pitch_deg": 0.0,
+        "gaze_yaw_deg": 0.0,
+        "gaze_pitch_deg": 0.0,
+    }
+    snap.update(overrides)
+    return snap
+
+
+class _FakeLink:
+    """Stand-in for ``RobotLink`` that the run_session test drives.
+
+    All methods are non-blocking and record outbound opcodes in
+    ``sent_opcodes`` so the test can assert send order. The fake never
+    binds a real UDP socket.
+    """
+
+    def __init__(self):
+        self.sent_opcodes: List[str] = []
+        self._q = np.zeros(7, dtype=float)
+        self._ee = np.zeros(3, dtype=float)
+        self._closed = False
+
+    # The recorder's run_session does `link.sock.getsockname()` in the
+    # bind log line; expose a minimal stub.
+    class _SockStub:
+        def getsockname(self):
+            return ("0.0.0.0", 8080)
+    sock = _SockStub()
+    robot_addr = ("192.168.2.1", 8080)
+
+    def send(self, msg: str) -> None:
+        self.sent_opcodes.append(msg)
+
+    def recv(self, timeout_s: float) -> Optional[str]:
+        return None
+
+    def send_and_wait_ack(self, msg: str, expect_prefix=None,
+                          timeout: float = 0.35) -> Optional[str]:
+        self.sent_opcodes.append(msg)
+        # All ACKs succeed in the happy-path fake.
+        base = msg.split(";", 1)[0]
+        if base == "m":
+            return "ACK:MASTER_FREE"
+        if base == "h":
+            return "ACK:h"
+        return f"ACK:{base}"
+
+    def query_state(self) -> Optional[Dict[str, Any]]:
+        return {"_t": time.time(), "q": self._q.copy(), "ee": self._ee.copy()}
+
+    def close(self) -> None:
+        self._closed = True
+
+
+def _patch_run_session(monkeypatch, *, snapshot_returns=None,
+                       prompt_responses=None, transit_arm_dwell_s: float = 1.0):
+    """Common patch bundle for run_session tests.
+
+    - ``snapshot_returns``: callable() -> snap dict (defaults to always-ok).
+    - ``prompt_responses``: list of strings consumed in order, one per
+      ``prompt_user`` call. Empty string terminates the free-additions
+      loop.
+    - ``transit_arm_dwell_s``: simulated time the operator spends with
+      the arm free per waypoint. Drives how many transit bundles the
+      thread can accumulate at 20 Hz.
+    """
+    if snapshot_returns is None:
+        snapshot_returns = _make_snap
+
+    if prompt_responses is None:
+        prompt_responses = []
+    # Prepend the recenter prompt + the 15 per-waypoint prompts + an
+    # empty string to end free-additions if the caller did not supply
+    # their own. Each waypoint takes two prompts: the recenter readiness
+    # ("Press Enter when ready to recenter…") and the per-waypoint
+    # "Move the arm and fixate…" prompt. We default to giving the
+    # caller's list verbatim so they can control the full sequence.
+    prompt_iter = iter(prompt_responses)
+
+    def fake_prompt(msg):
+        try:
+            return next(prompt_iter)
+        except StopIteration:
+            # An empty string ends the free-additions loop; default to
+            # empty so missing responses cleanly terminate.
+            return ""
+
+    monkeypatch.setattr(recorder, "prompt_user", fake_prompt)
+    monkeypatch.setattr(recorder, "gaze_recenter", lambda timeout_s=None: True)
+    monkeypatch.setattr(recorder, "gaze_snapshot",
+                        lambda include_objects=False, timeout_s=None: snapshot_returns())
+
+    # Replace settle_and_snapshot and collect_moving_phase with fast
+    # stubs that emit a canonical bundle each. Real implementations
+    # sleep POST_CAPTURE_SETTLE_S (1.0 s) per capture — too slow for
+    # tests. The transit sampler is what we actually want to exercise.
+    def fake_settle(target_label, robot_state):
+        return CaptureBundle(
+            t=time.time(), q=np.zeros(7), ee_mm=np.zeros(3),
+            gaze_x_norm=0.5, gaze_y_norm=0.5, gaze_conf=1.0,
+            depth_cm=75.0, depth_valid=True, miss_mm=3.5, ipd_mm=63.0,
+            imu_w=0.05, imu_fresh=True,
+            head_yaw_deg=0.0, head_pitch_deg=0.0,
+            gaze_yaw_deg=0.0, gaze_pitch_deg=0.0,
+            phase="captured", target_label=target_label,
+        )
+
+    def fake_moving(link, target_label, duration_s):
+        # No moving-phase bundles — they are orthogonal to the transit
+        # behaviour under test.
+        return []
+
+    def fake_capture(link):
+        return {"_t": time.time(), "q": np.zeros(7), "ee": np.zeros(3)}
+
+    def fake_free_arm(link):
+        # Send 'm' so the assertion-on-opcodes test still sees the call.
+        link.send_and_wait_ack("m", expect_prefix="MASTER_FREE")
+        # Sleep ``transit_arm_dwell_s`` to give the telemetry thread a
+        # known window to accumulate samples. This stands in for the
+        # operator reaction-time + arm-motion duration between `m` and
+        # `c`. NOTE: capture-flow waits for prompt_user("Move the arm…")
+        # AFTER free_arm returns, so the dwell happens around the
+        # prompt. We sleep here so the dwell straddles the free→capture
+        # gap deterministically.
+        time.sleep(transit_arm_dwell_s)
+        return True
+
+    monkeypatch.setattr(recorder, "settle_and_snapshot", fake_settle)
+    monkeypatch.setattr(recorder, "collect_moving_phase", fake_moving)
+    monkeypatch.setattr(recorder, "capture_pose", fake_capture)
+    monkeypatch.setattr(recorder, "free_arm", fake_free_arm)
+    # The 4-second sleep inside _send_auto_home would dominate the test
+    # runtime; cut it short. The behaviour we care about (opcode sent
+    # exactly once) is unaffected.
+    real_sleep = time.sleep
+    monkeypatch.setattr(recorder, "AUTO_HOME_DURATION_S", 0.05)
+    monkeypatch.setattr(recorder, "AUTO_HOME_GRACE_S", 0.0)
+
+    return real_sleep
+
+
+class TestTelemetryThreadLifecycle:
+    """Direct unit tests on TelemetryThread without run_session."""
+
+    def test_thread_inert_until_started(self, monkeypatch):
+        # Patch gaze_snapshot to a counter so we can verify no calls
+        # happen before start_after_first_capture().
+        calls = {"n": 0}
+
+        def counting_snap(include_objects=False, timeout_s=None):
+            calls["n"] += 1
+            return _make_snap()
+
+        monkeypatch.setattr(recorder, "gaze_snapshot", counting_snap)
+        link = _FakeLink()
+        bundles: List[CaptureBundle] = []
+        lock = threading.Lock()
+        t = TelemetryThread(link, bundles, lock, sample_hz=50.0)
+        t.start()
+        time.sleep(0.15)  # ~7 ticks at 50 Hz; thread should be idle
+        assert calls["n"] == 0, "telemetry thread sampled before start_after_first_capture()"
+        assert len(bundles) == 0
+        t.stop()
+
+    def test_thread_appends_transit_bundles_after_activation(self, monkeypatch):
+        monkeypatch.setattr(recorder, "gaze_snapshot",
+                            lambda include_objects=False, timeout_s=None: _make_snap())
+        link = _FakeLink()
+        bundles: List[CaptureBundle] = []
+        lock = threading.Lock()
+        t = TelemetryThread(link, bundles, lock, sample_hz=50.0)
+        t.start()
+        t.set_leg("transit_A_to_B")
+        t.start_after_first_capture()
+        time.sleep(0.25)  # ~12 ticks at 50 Hz; expect >= ~8 bundles
+        t.stop()
+        with lock:
+            collected = list(bundles)
+        assert len(collected) >= 5, f"expected several transit bundles, got {len(collected)}"
+        for b in collected:
+            assert b.phase == "transit"
+            assert b.leg_label == "transit_A_to_B"
+            assert b.target_label == ""
+
+    def test_pause_halts_sampling(self, monkeypatch):
+        monkeypatch.setattr(recorder, "gaze_snapshot",
+                            lambda include_objects=False, timeout_s=None: _make_snap())
+        link = _FakeLink()
+        bundles: List[CaptureBundle] = []
+        lock = threading.Lock()
+        t = TelemetryThread(link, bundles, lock, sample_hz=50.0)
+        t.start()
+        t.start_after_first_capture()
+        time.sleep(0.1)
+        n_before_pause = len(bundles)
+        t.pause()
+        time.sleep(0.15)
+        n_after_pause = len(bundles)
+        # Pause should freeze the bundle count (allow one tick of slop).
+        assert n_after_pause - n_before_pause <= 1
+        t.stop()
+
+    def test_escalates_after_consecutive_failures(self, monkeypatch):
+        # Always-None snapshot → telemetry should error_flag after
+        # TELEMETRY_MAX_CONSECUTIVE_FAILURES ticks.
+        monkeypatch.setattr(recorder, "gaze_snapshot",
+                            lambda include_objects=False, timeout_s=None: None)
+        link = _FakeLink()
+        bundles: List[CaptureBundle] = []
+        lock = threading.Lock()
+        t = TelemetryThread(link, bundles, lock, sample_hz=100.0)
+        t.start()
+        t.start_after_first_capture()
+        time.sleep(0.3)
+        assert t.error_flag is True
+        assert "consecutive snapshot/query failures" in t.error_reason
+        t.stop()
+
+
+class TestRunSessionTelemetry:
+    """End-to-end run_session simulation via monkeypatched RobotLink +
+    gaze service. Confirms the captured + transit bundle counts and
+    that no transit bundles cross the home-to-first or final-to-home
+    boundaries.
+    """
+
+    def _build_prompt_responses(self, n_waypoints: int) -> List[str]:
+        # Recenter prompt + (per waypoint: capture prompt) + free-add
+        # terminator (empty string ends the free-additions while-loop).
+        return [""] + [""] * n_waypoints + [""]
+
+    def _run(self, monkeypatch, tmp_path: Path, *,
+             transit_arm_dwell_s: float = 0.2):
+        responses = self._build_prompt_responses(len(MANDATORY_GRID))
+        _patch_run_session(monkeypatch, prompt_responses=responses,
+                            transit_arm_dwell_s=transit_arm_dwell_s)
+        # Replace RobotLink with the fake so run_session does not bind
+        # a real UDP socket.
+        fake = _FakeLink()
+        monkeypatch.setattr(recorder, "RobotLink", lambda: fake)
+        out_path = recorder.run_session(out_dir=str(tmp_path))
+        return out_path, fake
+
+    def test_fifteen_captures_plus_transit_bundles(self, monkeypatch, tmp_path):
+        out_path, fake = self._run(monkeypatch, tmp_path,
+                                     transit_arm_dwell_s=0.2)
+        assert out_path is not None
+        z = np.load(out_path, allow_pickle=True)
+        # 15 captured rows in the legacy block.
+        assert z["Q"].shape[0] == 15
+        # Transit bundles in the _all block. At 20 Hz with ~0.2 s dwell
+        # between 14 transit legs (after first capture, before final
+        # capture), expect at least 14 * 0.2 * 20 * 0.5 = ~28 bundles
+        # accounting for prompt overhead. Use a conservative floor.
+        phases = list(z["Phase_all"])
+        n_transit = sum(1 for p in phases if p == "transit")
+        assert n_transit >= 10, (
+            f"expected >= 10 transit bundles given ~0.2 s × 14 legs at 20 Hz; "
+            f"got {n_transit}"
+        )
+
+    def test_no_transit_bundle_references_home(self, monkeypatch, tmp_path):
+        out_path, _ = self._run(monkeypatch, tmp_path,
+                                  transit_arm_dwell_s=0.15)
+        z = np.load(out_path, allow_pickle=True)
+        leg_labels = list(z["Leg_label_all"])
+        phases = list(z["Phase_all"])
+        # Among transit bundles, no leg label may reference 'home' on
+        # either side of the transition.
+        transit_legs = [lbl for lbl, ph in zip(leg_labels, phases)
+                        if ph == "transit"]
+        for lbl in transit_legs:
+            assert "home_to_" not in lbl, f"transit bundle labelled with home transition: {lbl!r}"
+            assert "_to_home" not in lbl, f"transit bundle labelled with home transition: {lbl!r}"
+            # And the label must be one of the expected mandatory-grid
+            # transit forms: "transit_<from>_to_<to>" with both labels
+            # drawn from MANDATORY_GRID.
+            assert lbl.startswith("transit_"), f"unexpected leg label: {lbl!r}"
+
+
+class TestTelemetryStartsAfterFirstCapture:
+    """The telemetry thread must not emit transit bundles before the
+    first waypoint's `c` ACK completes. The home-to-first-waypoint
+    transition is excluded by construction.
+    """
+
+    def test_no_transit_bundles_before_first_capture(self, monkeypatch, tmp_path):
+        # Same patch bundle as TestRunSessionTelemetry but we instrument
+        # `capture_pose` to record the bundles-list snapshot the first
+        # time it is called, so we can assert the snapshot has zero
+        # transit entries.
+        responses = [""] * 20
+        _patch_run_session(monkeypatch, prompt_responses=responses,
+                            transit_arm_dwell_s=0.1)
+
+        captured_state_at_first_c: Dict[str, Any] = {}
+
+        def instrumenting_capture(link):
+            if "snapshot" not in captured_state_at_first_c:
+                # Take a snapshot of the bundles list at the moment of
+                # the FIRST c call by reaching into the closure later.
+                # The trick: store a sentinel that the test reads after
+                # run_session returns by inspecting the saved file.
+                captured_state_at_first_c["snapshot"] = True
+            return {"_t": time.time(), "q": np.zeros(7), "ee": np.zeros(3)}
+
+        monkeypatch.setattr(recorder, "capture_pose", instrumenting_capture)
+
+        fake = _FakeLink()
+        monkeypatch.setattr(recorder, "RobotLink", lambda: fake)
+        out_path = recorder.run_session(out_dir=str(tmp_path))
+        assert out_path is not None
+        z = np.load(out_path, allow_pickle=True)
+        # Time-order check: in the _all stream, the first 'captured'
+        # row must NOT be preceded by any 'transit' row — the thread
+        # only activates after the first c ACK. (Moving bundles also
+        # do not appear here because the fake collect_moving_phase
+        # returns [].)
+        phases = list(z["Phase_all"])
+        # Find first captured index
+        first_cap = phases.index("captured")
+        before_first = phases[:first_cap]
+        assert "transit" not in before_first, (
+            f"transit bundle(s) emitted before first capture: phases[:first_cap]="
+            f"{before_first}"
+        )
+
+
+class TestAutoHomeOpcode:
+    """The `h` opcode must be sent exactly once, AFTER the final
+    capture, with the dur=4.0 suffix.
+    """
+
+    def test_h_opcode_sent_exactly_once_after_final_capture(self, monkeypatch, tmp_path):
+        responses = [""] * 20
+        _patch_run_session(monkeypatch, prompt_responses=responses,
+                            transit_arm_dwell_s=0.05)
+        fake = _FakeLink()
+        monkeypatch.setattr(recorder, "RobotLink", lambda: fake)
+        out_path = recorder.run_session(out_dir=str(tmp_path))
+        assert out_path is not None
+        # Count `h` opcodes in the sent list. Allow both the bare 'h'
+        # form (legacy) and the dur-suffixed form. Auto-home is the
+        # ONLY caller of `h` in this run; no other path emits it.
+        h_calls = [op for op in fake.sent_opcodes if op.split(";", 1)[0] == "h"]
+        assert len(h_calls) == 1, (
+            f"expected exactly one `h` opcode (auto-home); got {h_calls}"
+        )
+        # The actual opcode should include dur=4.000 (the test patches
+        # AUTO_HOME_DURATION_S to 0.05 to keep the test fast, so we
+        # only assert the dur= prefix is present).
+        assert "dur=" in h_calls[0], (
+            f"auto-home opcode missing dur= suffix: {h_calls[0]!r}"
+        )
+
+        # Auto-home must come AFTER the final `c` (or after the
+        # moving-phase send sequence — but in our fake there is no
+        # 'c' opcode because capture_pose is fully mocked. Use 'm' as
+        # the proxy: there must be at least one 'm' before the 'h'.)
+        h_index = fake.sent_opcodes.index(h_calls[0])
+        m_indices = [i for i, op in enumerate(fake.sent_opcodes) if op == "m"]
+        assert m_indices, "no `m` opcodes recorded — fake setup is wrong"
+        assert max(m_indices) < h_index, (
+            "auto-home `h` opcode landed BEFORE the last `m` — telemetry "
+            "ordering is broken"
+        )
+
+    def test_auto_home_dur_default_is_four_seconds(self):
+        # Independent assertion on the module-level constant — the
+        # patched value used in tests above must not silently mask a
+        # changed default in production.
+        assert AUTO_HOME_DURATION_S == 4.0

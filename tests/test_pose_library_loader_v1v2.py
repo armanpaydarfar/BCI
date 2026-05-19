@@ -268,3 +268,80 @@ class TestVersionDispatch:
         for key in ("Q", "X", "D_cm", "Gaze_yaw_deg", "Gaze_pitch_deg",
                     "Head_yaw_deg", "Head_pitch_deg", "D_valid"):
             assert key in data, f"v2 loader missing {key!r}"
+
+
+# ─── Transit phase + Leg_label_all loader compatibility ───────────────────
+
+class TestTransitPhaseRoundTrip:
+    """Recorder rework (2026-05-19): the v2 NPZ now carries
+    ``phase='transit'`` rows in the ``*_all`` block plus a new
+    ``Leg_label_all`` column. The loaders must round-trip these without
+    raising, and the legacy v1 path (which only reads ``X / Q / G``)
+    must still ignore them.
+    """
+
+    def _write_v2_with_transit(self, path: Path, N_cap: int = 3, N_transit: int = 5) -> None:
+        N_all = N_cap + N_transit
+        np.savez_compressed(
+            str(path),
+            T=np.arange(N_cap, dtype=float),
+            Q=np.zeros((N_cap, 7)),
+            X=np.zeros((N_cap, 3)),
+            G=np.column_stack([np.full(N_cap, 0.5), np.full(N_cap, 0.5),
+                                np.full(N_cap, 1.0)]),
+            D_cm=np.full(N_cap, 75.0),
+            D_valid=np.ones(N_cap, dtype=bool),
+            Miss_mm=np.zeros(N_cap),
+            IPD_mm=np.full(N_cap, 63.0),
+            IMU_w=np.zeros(N_cap),
+            IMU_fresh=np.ones(N_cap, dtype=bool),
+            Head_yaw_deg=np.zeros(N_cap),
+            Head_pitch_deg=np.zeros(N_cap),
+            Gaze_yaw_deg=np.zeros(N_cap),
+            Gaze_pitch_deg=np.zeros(N_cap),
+            Target_label=np.array(["near_R1", "mid_R3", "far_R5"][:N_cap],
+                                   dtype="<U32"),
+            T_all=np.arange(N_all, dtype=float),
+            Q_all=np.zeros((N_all, 7)),
+            X_all=np.zeros((N_all, 3)),
+            G_all=np.zeros((N_all, 3)),
+            D_cm_all=np.full(N_all, 75.0),
+            D_valid_all=np.ones(N_all, dtype=bool),
+            Miss_mm_all=np.zeros(N_all),
+            IPD_mm_all=np.full(N_all, 63.0),
+            IMU_w_all=np.zeros(N_all),
+            IMU_fresh_all=np.ones(N_all, dtype=bool),
+            Head_yaw_deg_all=np.zeros(N_all),
+            Head_pitch_deg_all=np.zeros(N_all),
+            Gaze_yaw_deg_all=np.zeros(N_all),
+            Gaze_pitch_deg_all=np.zeros(N_all),
+            Phase_all=np.array(["captured"] * N_cap + ["transit"] * N_transit,
+                                dtype="<U16"),
+            Target_label_all=np.array(["x"] * N_all, dtype="<U32"),
+            Leg_label_all=np.array([""] * N_cap + ["transit_a_to_b"] * N_transit,
+                                     dtype="<U64"),
+            meta=dict(version=2, side="R",
+                      recorder="harmony_free_arm_calibration.py"),
+        )
+
+    def test_v2_with_transit_loads_via_v2_loader(self, tmp_path: Path):
+        p = tmp_path / "v2_transit.npz"
+        self._write_v2_with_transit(p)
+        data = load_pose_library_v2(str(p))
+        assert "Phase_all" in data
+        assert "Leg_label_all" in data
+        # Validate the phase enum carries the transit label exactly.
+        phases = set(str(x) for x in data["Phase_all"])
+        assert "transit" in phases
+        assert "captured" in phases
+
+    def test_v2_with_transit_does_not_break_v1_loader_keys(self, tmp_path: Path):
+        # Legacy callers read X / Q / G only — the transit rows live
+        # under *_all and must not surface as extra rows in Q/X/G.
+        p = tmp_path / "v2_transit.npz"
+        self._write_v2_with_transit(p, N_cap=3, N_transit=5)
+        z = np.load(str(p), allow_pickle=True)
+        assert z["Q"].shape[0] == 3
+        assert z["X"].shape[0] == 3
+        assert z["G"].shape[0] == 3
+        assert z["Q_all"].shape[0] == 8

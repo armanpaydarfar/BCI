@@ -250,7 +250,11 @@ def gaze_recenter(timeout_s: float = GAZE_RPC_TIMEOUT_S) -> bool:
 # =============================================================================
 @dataclass
 class CaptureBundle:
-    """One captured sample (`phase` is 'captured' or 'moving')."""
+    """One sample. ``phase`` is one of ``'captured'``, ``'moving'``, or
+    ``'transit'``. ``leg_label`` is set on ``'transit'`` bundles only
+    (e.g. ``'transit_near_R2_to_near_R3'``); other phases leave it
+    empty.
+    """
     t: float
     q: np.ndarray
     ee_mm: np.ndarray
@@ -269,14 +273,19 @@ class CaptureBundle:
     gaze_pitch_deg: float
     phase: str
     target_label: str
+    leg_label: str = ""
 
 
 def bundle_from_snapshot(snap: Dict[str, Any], robot_t: float,
                          q: np.ndarray, ee_mm: np.ndarray,
-                         phase: str, target_label: str) -> CaptureBundle:
+                         phase: str, target_label: str,
+                         leg_label: str = "") -> CaptureBundle:
     """Pull every recorder-relevant field out of a gaze_runner snapshot
     and pair it with the most recent robot telemetry. Fields source:
     Utils/gaze/gaze_system.py:623-674 (snapshot contract).
+
+    ``leg_label`` is set only on ``phase='transit'`` bundles and names
+    the current transit leg (e.g. ``'transit_near_R2_to_near_R3'``).
     """
     gaze_px = snap.get("gaze_px") or (float("nan"), float("nan"))
     try:
@@ -317,6 +326,7 @@ def bundle_from_snapshot(snap: Dict[str, Any], robot_t: float,
         gaze_pitch_deg=float(snap.get("gaze_pitch_deg", float("nan"))),
         phase=phase,
         target_label=target_label,
+        leg_label=leg_label,
     )
 
 
@@ -446,6 +456,150 @@ def collect_moving_phase(link: RobotLink, target_label: str,
 
 
 # =============================================================================
+# Background workspace-telemetry thread
+# =============================================================================
+# Max consecutive snapshot-or-query failures before the telemetry thread
+# escalates by setting its ``error_flag`` for the main loop to inspect.
+# 5 ticks at 20 Hz = 0.25 s of dead telemetry, which is well above a
+# single dropped UDP packet but well below an operator-perceptible stall.
+TELEMETRY_MAX_CONSECUTIVE_FAILURES = 5
+
+
+class TelemetryThread(threading.Thread):
+    """Background ~20 Hz sampler that logs gaze + joint telemetry as
+    ``phase='transit'`` bundles while the arm is free between captures.
+
+    Lifecycle is driven from the main loop:
+
+    - ``start_after_first_capture()`` flips an internal Event so the
+      sampling loop begins only after the first waypoint's ``c`` ACK
+      has landed; ticks before that are no-ops.
+    - ``set_leg(label)`` is called each time the main loop advances to
+      a new transit leg, BEFORE sending the next ``m``. The label is
+      written into the bundle's ``leg_label`` field so downstream
+      analysis can group samples by which transit they belong to.
+    - ``pause()`` / ``resume()`` gate sampling around the ``c`` opcode
+      lock and the POST_CAPTURE_SETTLE_S window so the depth /
+      head-pose smoothers (Utils/gaze/gaze_system.py:419-560) converge
+      before we sample again.
+    - ``stop()`` joins cleanly; the main loop calls this before sending
+      the final waypoint's ``c`` (so the home transition is not
+      recorded) and on any error path.
+
+    The thread fails-fast: TELEMETRY_MAX_CONSECUTIVE_FAILURES dead
+    snapshot-or-query cycles in a row sets ``self.error_flag`` and
+    halts the loop. The main loop polls ``error_flag`` between
+    waypoints and decides whether to abort.
+    """
+
+    def __init__(self, link: "RobotLink", bundles: List[CaptureBundle],
+                 bundles_lock: threading.Lock,
+                 sample_hz: float = MOVING_PHASE_SAMPLE_HZ) -> None:
+        super().__init__(name="harmony-telemetry", daemon=True)
+        self._link = link
+        self._bundles = bundles
+        self._bundles_lock = bundles_lock
+        self._period = 1.0 / float(sample_hz)
+        self._stop_event = threading.Event()
+        # _active gates the actual sampling — when clear, the loop
+        # spins-with-sleep but does not query or append. The thread is
+        # created with _active CLEARED so it sits idle until
+        # ``start_after_first_capture()`` is called.
+        self._active = threading.Event()
+        self._leg_label: str = ""
+        self._leg_lock = threading.Lock()
+        self.error_flag: bool = False
+        self.error_reason: str = ""
+        self.consecutive_failures: int = 0
+
+    # ------------------------------------------------------------------
+    # Lifecycle control (called from main loop)
+    # ------------------------------------------------------------------
+    def start_after_first_capture(self) -> None:
+        """Enable sampling. Idempotent."""
+        self._active.set()
+
+    def pause(self) -> None:
+        """Halt sampling without joining the thread. Used around the
+        ``c`` opcode lock and the settle window so the smoothers
+        converge before the next transit sample lands."""
+        self._active.clear()
+
+    def resume(self) -> None:
+        """Re-enable sampling after a pause()."""
+        self._active.set()
+
+    def stop(self) -> None:
+        """Signal the loop to exit. Caller should ``join()`` after."""
+        self._stop_event.set()
+        self._active.set()  # unblock any wait
+        self.join(timeout=2.0)
+
+    def set_leg(self, leg_label: str) -> None:
+        """Update the leg label written into subsequent transit bundles.
+        Called by the main loop BEFORE sending the next ``m``."""
+        with self._leg_lock:
+            self._leg_label = leg_label
+
+    def current_leg(self) -> str:
+        with self._leg_lock:
+            return self._leg_label
+
+    # ------------------------------------------------------------------
+    # Worker loop
+    # ------------------------------------------------------------------
+    def run(self) -> None:  # noqa: D401 — Thread.run
+        next_tick = time.monotonic()
+        while not self._stop_event.is_set():
+            next_tick += self._period
+            if not self._active.is_set():
+                # Idle tick. Reset the failure counter so a pause does
+                # not accumulate dead ticks toward the escalation
+                # threshold.
+                self.consecutive_failures = 0
+                self._sleep_until(next_tick)
+                continue
+
+            leg = self.current_leg()
+            snap = gaze_snapshot(include_objects=False)
+            rstate = self._link.query_state()
+            if snap is None or rstate is None:
+                self.consecutive_failures += 1
+                print(f"[{_ts()}] TELEMETRY WARN: missing "
+                      f"{'snapshot ' if snap is None else ''}"
+                      f"{'robot-query ' if rstate is None else ''}"
+                      f"(streak={self.consecutive_failures}, leg={leg!r})",
+                      flush=True)
+                if self.consecutive_failures >= TELEMETRY_MAX_CONSECUTIVE_FAILURES:
+                    self.error_flag = True
+                    self.error_reason = (
+                        f"telemetry thread saw {self.consecutive_failures} "
+                        f"consecutive snapshot/query failures on leg {leg!r}"
+                    )
+                    print(f"[{_ts()}] TELEMETRY ERROR: {self.error_reason}",
+                          flush=True)
+                    return
+                self._sleep_until(next_tick)
+                continue
+
+            self.consecutive_failures = 0
+            bundle = bundle_from_snapshot(
+                snap, rstate["_t"], rstate["q"], rstate["ee"],
+                phase="transit", target_label="", leg_label=leg,
+            )
+            with self._bundles_lock:
+                self._bundles.append(bundle)
+            self._sleep_until(next_tick)
+
+    def _sleep_until(self, deadline: float) -> None:
+        # Use monotonic clock to keep cadence jitter-tolerant even
+        # under load. If we are already behind, fall straight through.
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+
+
+# =============================================================================
 # Operator interaction
 # =============================================================================
 def prompt_user(message: str) -> str:
@@ -495,11 +649,11 @@ def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
         Gaze_yaw_deg   (N,) float64
         Gaze_pitch_deg (N,) float64
         Target_label   (N,) <U32
-      New (v2 only) — all samples (captured + moving), indexed by phase:
+      New (v2 only) — all samples (captured + moving + transit), indexed by phase:
         T_all, Q_all, X_all, G_all, D_cm_all, D_valid_all,
         Miss_mm_all, IPD_mm_all, IMU_w_all, IMU_fresh_all,
         Head_yaw_deg_all, Head_pitch_deg_all, Gaze_yaw_deg_all,
-        Gaze_pitch_deg_all, Phase_all, Target_label_all
+        Gaze_pitch_deg_all, Phase_all, Target_label_all, Leg_label_all
       meta: dict with `version`, `side`, recorder identifiers.
     """
     captured = [b for b in bundles if b.phase == "captured"]
@@ -554,6 +708,7 @@ def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
     Gaze_pitch_deg_all = stack_field(bundles, "gaze_pitch_deg")
     Phase_all = np.asarray([b.phase for b in bundles], dtype="<U16")
     Target_label_all = np.asarray([b.target_label for b in bundles], dtype="<U32")
+    Leg_label_all = np.asarray([b.leg_label for b in bundles], dtype="<U64")
 
     meta = dict(
         version=2,
@@ -591,6 +746,7 @@ def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
         Head_yaw_deg_all=Head_yaw_deg_all, Head_pitch_deg_all=Head_pitch_deg_all,
         Gaze_yaw_deg_all=Gaze_yaw_deg_all, Gaze_pitch_deg_all=Gaze_pitch_deg_all,
         Phase_all=Phase_all, Target_label_all=Target_label_all,
+        Leg_label_all=Leg_label_all,
         meta=meta,
     )
 
@@ -598,9 +754,54 @@ def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
 # =============================================================================
 # Main session loop
 # =============================================================================
+# Duration baked into the auto-home ``h;dur=...`` opcode. 4.0 s
+# matches the locked-in calibration-recorder home-wait budget; see
+# Documents/SoftwareDocs/Harmony_Gaze_Calibration_Upgrade_Plan.md §6.1
+# (recorder spec rework, 2026-05-19) for the rationale.
+AUTO_HOME_DURATION_S = 4.0
+# Small grace period beyond ``dur`` so the robot has time to settle and
+# emit its terminal ACK before we close the UDP socket.
+AUTO_HOME_GRACE_S = 0.5
+
+
+def _send_auto_home(link: "RobotLink") -> None:
+    """Send the home-with-duration opcode after the final capture and
+    wait long enough for the motion to complete.
+
+    Per CLAUDE.md realtime safety, this is fire-once; no operator
+    confirmation prompt is interposed. The dispatcher prints a clear
+    "stand clear" line before TX so the operator knows the arm is about
+    to move on its own.
+    """
+    print()
+    print(f"[{_ts()}] [done] Robot returning to home — please stand clear of "
+          f"the workspace.")
+    link.send_and_wait_ack(f"h;dur={AUTO_HOME_DURATION_S:.3f}",
+                           expect_prefix="h")
+    time.sleep(AUTO_HOME_DURATION_S + AUTO_HOME_GRACE_S)
+
+
 def run_session(out_dir: str = ".") -> Optional[str]:
     """Run the full free-arm calibration session. Returns the output
-    NPZ path on success, or None if the session was aborted."""
+    NPZ path on success, or None if the session was aborted.
+
+    Bundle phases written into the NPZ:
+
+    - ``'captured'`` — one per accepted waypoint (the locked-in
+      reference sample used by the v2 mapping fit).
+    - ``'moving'`` — pre-capture 1-second window per waypoint (legacy
+      trajectory-history channel, retained for back-compat).
+    - ``'transit'`` — continuous ~20 Hz background telemetry emitted
+      by ``TelemetryThread`` while the arm is free between waypoints,
+      labelled with ``leg_label='transit_<from>_to_<to>'``. Used for
+      workspace-coverage analysis only; the v2 mapping fit ignores
+      this phase.
+
+    The home-to-first-waypoint and final-waypoint-to-home transitions
+    are deliberately NOT recorded as transit: the telemetry thread
+    starts after the first waypoint's ``c`` ACK and stops before the
+    final waypoint's ``c`` is sent.
+    """
     print()
     print("=" * 70)
     print("  HARMONY FREE-ARM GAZE CALIBRATION (Track B)")
@@ -614,6 +815,21 @@ def run_session(out_dir: str = ".") -> Optional[str]:
     print(f"[{_ts()}] Bound UDP socket {link.sock.getsockname()} -> {link.robot_addr}")
 
     bundles: List[CaptureBundle] = []
+    # Shared with the telemetry thread; ALL writes go through the lock.
+    # The lock is cheap (one append per ~50 ms tick) and keeps the
+    # NPZ writer's len(bundles) snapshot consistent.
+    bundles_lock = threading.Lock()
+    telemetry: Optional[TelemetryThread] = None
+
+    def _check_telemetry_health() -> None:
+        """Re-raise telemetry's failure as a session-aborting error.
+        Called between waypoints (never inside a Tier-1 UDP round trip).
+        """
+        if telemetry is not None and telemetry.error_flag:
+            raise RuntimeError(
+                f"Telemetry thread aborted: {telemetry.error_reason}"
+            )
+
     try:
         # Recenter head/gaze offsets relative to the user's neutral pose
         # before any captures. Without this, head_yaw_deg etc. read in
@@ -628,21 +844,38 @@ def run_session(out_dir: str = ".") -> Optional[str]:
             print(f"[{_ts()}] Gaze recentered.")
 
         # Workspace coverage protocol (Phase 1 doc §5 lock-in): mandatory
-        # 3-depth x 3x3 grid, then user-driven free additions.
+        # 3-depth × 5-horizontal grid, then user-driven free additions.
         operator_targets = list(MANDATORY_GRID)
         print(f"[{_ts()}] Mandatory grid has {len(operator_targets)} points.")
         print(f"[{_ts()}] After the grid, you'll be prompted for optional free additions.")
 
+        telemetry = TelemetryThread(link, bundles, bundles_lock)
+        telemetry.start()
+        # The thread is alive but inert — it sits in the "inactive"
+        # branch of its loop until ``start_after_first_capture()`` is
+        # called after the first waypoint's ``c`` ACK below.
+
         idx = 0
         total = len(operator_targets)
+        last_captured_label: Optional[str] = None
         while idx < total:
             target_label = operator_targets[idx]
             announce_target(target_label, idx + 1, total)
+
+            # The leg label is set BEFORE sending `m`: any transit
+            # samples that land during the operator's reading time +
+            # arm motion to ``target_label`` carry the right name.
+            # Skipped only for idx==0, where the telemetry thread is
+            # not yet active.
+            if idx > 0 and last_captured_label is not None:
+                telemetry.set_leg(f"transit_{last_captured_label}_to_{target_label}")
+                telemetry.resume()
 
             # 1) Free the arm.
             if not free_arm(link):
                 print(f"[{_ts()}] ERR: `m` rejected — likely robot is still in MOVING. Retrying after 1s.")
                 time.sleep(1.0)
+                _check_telemetry_health()
                 continue
 
             # 2) Wait for the operator to position the arm. The prompt
@@ -652,57 +885,102 @@ def run_session(out_dir: str = ".") -> Optional[str]:
             if ans.lower() == "s":
                 print(f"[{_ts()}] Operator skipped {target_label}.")
                 idx += 1
+                _check_telemetry_health()
                 continue
 
             # 3) Stream the arm motion as "moving" samples for ~1s prior
             #    to capture — gives the trajectory-based consumers a
             #    short pre-capture history without depending on the
-            #    operator's reaction time.
+            #    operator's reaction time. Pause the transit sampler
+            #    while collect_moving_phase runs so we do not double-
+            #    log the same telemetry under two different phase tags.
+            telemetry.pause()
             moving = collect_moving_phase(link, target_label, duration_s=1.0)
 
-            # 4) Capture.
+            # 4) If this is the final waypoint, the telemetry thread
+            #    must be stopped BEFORE we send `c` — the post-capture
+            #    auto-home transition is explicitly excluded from the
+            #    transit log per the recorder spec.
+            is_final_waypoint = (idx == total - 1)
+            if is_final_waypoint:
+                telemetry.stop()
+                telemetry = None
+
+            # 5) Capture.
             captured_state = capture_pose(link)
             if captured_state is None:
                 print(f"[{_ts()}] ERR: `c` failed at {target_label}. Retrying this target.")
+                # If we just stopped the telemetry thread, re-create it so
+                # a retry of the final waypoint still has transit coverage
+                # on the way back in.
+                if is_final_waypoint:
+                    telemetry = TelemetryThread(link, bundles, bundles_lock)
+                    telemetry.start()
+                    telemetry.start_after_first_capture()
                 continue
 
-            # 5) Settle + sample.
+            # 6) Settle + sample. Telemetry stays paused.
             bundle = settle_and_snapshot(target_label, captured_state)
             if bundle is None:
                 print(f"[{_ts()}] WARN: no gaze snapshot at {target_label}. Skipping.")
-                # Re-free for the next attempt at the same target.
                 idx += 1  # advance anyway — operator will fill via free-additions phase if needed
+                _check_telemetry_health()
                 continue
 
-            bundles.extend(moving)
-            bundles.append(bundle)
+            with bundles_lock:
+                bundles.extend(moving)
+                bundles.append(bundle)
             print(f"[{_ts()}] Captured {target_label}: "
                   f"q={np.round(bundle.q, 3).tolist()}, "
                   f"depth={bundle.depth_cm:.1f}cm (valid={bundle.depth_valid}), "
                   f"head=({bundle.head_yaw_deg:+.1f},{bundle.head_pitch_deg:+.1f})")
+
+            # First successful capture: activate the telemetry thread so
+            # it begins sampling on the next iteration's "free" window.
+            if idx == 0 and telemetry is not None:
+                telemetry.start_after_first_capture()
+
+            last_captured_label = target_label
             idx += 1
+            _check_telemetry_health()
 
         # Free-additions phase.
         print()
         print("=" * 70)
+        captured_count = sum(1 for b in bundles if b.phase == "captured")
+        transit_count = sum(1 for b in bundles if b.phase == "transit")
         print(f"[{_ts()}] Mandatory grid complete ({len(bundles)} bundles, "
-              f"{sum(1 for b in bundles if b.phase == 'captured')} captures).")
+              f"{captured_count} captures, {transit_count} transit).")
         print(f"[{_ts()}] Optional free-additions phase: add reach hotspots.")
         print("=" * 70)
 
+        # Telemetry coverage continues across the free-additions phase.
+        # Restart the thread (the mandatory-grid loop stopped it before
+        # the final `c`) so free-add transit legs are also recorded.
+        telemetry = TelemetryThread(link, bundles, bundles_lock)
+        telemetry.start()
+        telemetry.start_after_first_capture()
+
         free_idx = 0
+        prev_free_label = last_captured_label
         while True:
             free_idx += 1
+            telemetry.pause()
             ans = prompt_user(f"Add free target #{free_idx}? Enter label (e.g. 'mug_handle'), or empty to finish: ")
             if not ans:
                 break
             target_label = f"free_{ans}"
             announce_target(target_label, free_idx, free_idx)
 
+            if prev_free_label is not None:
+                telemetry.set_leg(f"transit_free_{prev_free_label}_to_{target_label}")
+            telemetry.resume()
+
             if not free_arm(link):
                 print(f"[{_ts()}] ERR: `m` rejected. Skipping.")
                 continue
             prompt_user("Move the arm and fixate, then press Enter to capture…")
+            telemetry.pause()
             moving = collect_moving_phase(link, target_label, duration_s=1.0)
             captured_state = capture_pose(link)
             if captured_state is None:
@@ -712,15 +990,22 @@ def run_session(out_dir: str = ".") -> Optional[str]:
             if bundle is None:
                 print(f"[{_ts()}] WARN: no gaze snapshot at {target_label}. Skipping.")
                 continue
-            bundles.extend(moving)
-            bundles.append(bundle)
+            with bundles_lock:
+                bundles.extend(moving)
+                bundles.append(bundle)
             print(f"[{_ts()}] Captured {target_label}.")
+            prev_free_label = target_label
+            _check_telemetry_health()
 
-        # Final home — release the arm into a held position so the user
-        # is not holding it up at session end.
-        print()
-        print(f"[{_ts()}] Returning the arm to home position…")
-        link.send_and_wait_ack("h", expect_prefix="h")
+        # Stop the free-additions telemetry thread before the auto-home
+        # opcode goes out so the home transition is not recorded.
+        if telemetry is not None:
+            telemetry.stop()
+            telemetry = None
+
+        # Auto-home after the final accepted capture (no operator
+        # confirmation prompt — per locked recorder spec).
+        _send_auto_home(link)
 
         # Write the NPZ.
         if not bundles:
@@ -732,12 +1017,19 @@ def run_session(out_dir: str = ".") -> Optional[str]:
         out_path = os.path.join(out_dir, out_name)
         write_npz(bundles, out_path)
         captured_n = sum(1 for b in bundles if b.phase == "captured")
+        moving_n = sum(1 for b in bundles if b.phase == "moving")
+        transit_n = sum(1 for b in bundles if b.phase == "transit")
         print(f"[{_ts()}] Wrote {out_path}")
         print(f"[{_ts()}]   captured samples: {captured_n}")
-        print(f"[{_ts()}]   moving samples:   {len(bundles) - captured_n}")
+        print(f"[{_ts()}]   moving samples:   {moving_n}")
+        print(f"[{_ts()}]   transit samples:  {transit_n}")
         return out_path
 
     finally:
+        # Always reap the telemetry thread before closing the socket so
+        # a stray query_state() does not fire after RobotLink.close().
+        if telemetry is not None:
+            telemetry.stop()
         link.close()
 
 

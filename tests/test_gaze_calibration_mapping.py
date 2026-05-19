@@ -318,3 +318,78 @@ class TestLoaderAndVersionDetect:
         assert "Q" in data
         assert "D_cm" in data
         assert "__files__" in data
+
+
+# ─── Transit-phase filtering ──────────────────────────────────────────────
+
+class TestMappingIgnoresTransitPhase:
+    """GazeCalibrationMappingV2 reads ``Q`` / ``X`` / feature columns
+    directly from the NPZ. The recorder's ``write_npz`` packs only
+    ``phase='captured'`` rows into those legacy keys; all-phase data
+    lives under ``*_all`` keys that the mapping never touches. This
+    test locks that invariant in: a v2 NPZ containing a transit row
+    in ``*_all`` MUST NOT influence the mapping's fit (its captured
+    rows remain the only source of Q / X / features).
+    """
+
+    def test_transit_rows_in_all_keys_do_not_reach_fit(self, tmp_path: Path):
+        # Hand-construct a v2 NPZ that mirrors the recorder's two-block
+        # layout (legacy=captured-only, *_all=mixed phases).
+        N_cap = 4  # 4 captured rows feed the mapping fit
+        N_all = 10  # 4 captured + 6 transit in the all-block
+        p = tmp_path / "v2_with_transit.npz"
+        rng = np.random.default_rng(0)
+        np.savez_compressed(
+            str(p),
+            T=np.zeros(N_cap),
+            Q=rng.standard_normal((N_cap, 7)),
+            X=rng.standard_normal((N_cap, 3)) * 100,
+            G=np.column_stack([np.full(N_cap, 0.5), np.full(N_cap, 0.5),
+                                np.full(N_cap, 1.0)]),
+            D_cm=rng.uniform(30.0, 200.0, N_cap),
+            D_valid=np.ones(N_cap, dtype=bool),
+            Gaze_yaw_deg=rng.standard_normal(N_cap) * 10,
+            Gaze_pitch_deg=rng.standard_normal(N_cap) * 8,
+            Head_yaw_deg=np.zeros(N_cap),
+            Head_pitch_deg=np.zeros(N_cap),
+            Target_label=np.array(["near_R1", "near_R2", "mid_R1", "far_R3"],
+                                   dtype="<U32"),
+            # ALL-block — 4 captured + 6 transit. The transit rows have
+            # WILDLY different gaze/depth values; if the mapping fit
+            # accidentally read them, the Mahalanobis scale would shift.
+            T_all=np.zeros(N_all),
+            Q_all=np.zeros((N_all, 7)),
+            X_all=np.zeros((N_all, 3)),
+            G_all=np.zeros((N_all, 3)),
+            D_cm_all=np.concatenate([np.full(N_cap, 75.0),
+                                       np.full(6, 999.0)]),  # transit poisoned
+            D_valid_all=np.ones(N_all, dtype=bool),
+            Gaze_yaw_deg_all=np.concatenate([np.zeros(N_cap),
+                                                np.full(6, 999.0)]),
+            Gaze_pitch_deg_all=np.zeros(N_all),
+            Head_yaw_deg_all=np.zeros(N_all),
+            Head_pitch_deg_all=np.zeros(N_all),
+            Phase_all=np.array(["captured"] * N_cap + ["transit"] * 6,
+                                dtype="<U16"),
+            Target_label_all=np.array(["x"] * N_all, dtype="<U32"),
+            Leg_label_all=np.array([""] * N_cap + ["transit_a_to_b"] * 6,
+                                     dtype="<U64"),
+            meta=dict(version=2, side="R"),
+        )
+        z = np.load(str(p), allow_pickle=True)
+        m = GazeCalibrationMappingV2(z, use_imu=False,
+                                       require_depth_valid=True)
+        # Fit must have seen ONLY the 4 captured rows.
+        assert m.num_valid_samples == N_cap
+        # And the per-feature scales must reflect the captured-row
+        # distribution, not the 999-poisoned transit rows. The captured
+        # D_cm rows come from rng.uniform(30, 200), so scale should be
+        # comfortably below 200; if the transit rows leaked in, scale
+        # would explode toward 1.4826 * MAD([... 999s]) >> 200.
+        scales = m.feature_scales
+        # feature_keys order: Gaze_yaw_deg, Gaze_pitch_deg, D_cm
+        d_cm_scale = scales[-1]
+        assert d_cm_scale < 200.0, (
+            f"transit-phase rows appear to have leaked into the fit: "
+            f"D_cm scale={d_cm_scale} (would be ~0 if mapping read only captured)"
+        )
