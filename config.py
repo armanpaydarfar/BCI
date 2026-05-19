@@ -200,6 +200,12 @@ FRAME_RELAY_PORT = 5591
 # ~72 Mbit/s which UT IoT will not carry. The relay can never exceed the
 # Neon producer (~30 Hz), so values above 30 are silently capped.
 FRAME_RELAY_HZ = 15.0
+# When True (default) the control panel hosts the frame relay in-process,
+# so launching the panel is sufficient on the Neon machine. Set to False
+# when an out-of-process relay is being run separately (e.g. for testing
+# or when a third machine sits between the Neon owner and the model host).
+# Plain-default key — committable from any machine.
+FRAME_RELAY_EMBEDDED = True
 
 # =============================================================================
 # VLM integration (harmony_vlm subprocess)
