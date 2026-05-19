@@ -268,3 +268,65 @@ class TestVersionDispatch:
         for key in ("Q", "X", "D_cm", "Gaze_yaw_deg", "Gaze_pitch_deg",
                     "Head_yaw_deg", "Head_pitch_deg", "D_valid"):
             assert key in data, f"v2 loader missing {key!r}"
+
+
+# ─── depth_source meta passes through the mapping object ─────────────────
+
+def _write_v2_with_depth_source(path: Path, depth_source: str, *,
+                                   N: int = 8) -> None:
+    """v2 NPZ that explicitly pins meta['depth_source']. Used to lock
+    in the alignment-invariant contract: the mapping must expose the
+    same string the recorder wrote, otherwise the runtime VLM-vs-
+    vergence check at the driver becomes unreliable."""
+    np.savez_compressed(
+        str(path),
+        T=np.arange(N, dtype=float),
+        Q=np.zeros((N, 7)),
+        X=np.zeros((N, 3)),
+        G=np.column_stack([np.full(N, 0.5), np.full(N, 0.5),
+                            np.full(N, 1.0)]),
+        D_cm=np.full(N, 75.0), D_valid=np.ones(N, dtype=bool),
+        Gaze_yaw_deg=np.zeros(N), Gaze_pitch_deg=np.zeros(N),
+        Head_yaw_deg=np.zeros(N), Head_pitch_deg=np.zeros(N),
+        Miss_mm=np.zeros(N), IPD_mm=np.full(N, 63.0),
+        IMU_w=np.zeros(N), IMU_fresh=np.ones(N, dtype=bool),
+        meta=dict(version=2, side="R", depth_source=depth_source,
+                  vlm_service_host="192.168.99.99"
+                                     if depth_source == "vlm_depth_pro"
+                                     else ""),
+    )
+
+
+class TestDepthSourceMetaRoundTrip:
+    """Phase VLM-depth (2026-05-19): the NPZ meta key depth_source must
+    survive the load → mapping construction round trip so the driver
+    can branch on it at startup."""
+
+    def test_vlm_depth_pro_meta_exposed_on_mapping(self, tmp_path: Path):
+        from Utils.gaze.calibration_mapping import GazeCalibrationMappingV2
+        p = tmp_path / "v2_vlm.npz"
+        _write_v2_with_depth_source(p, "vlm_depth_pro")
+        data = load_pose_library_v2(str(p))
+        mapping = GazeCalibrationMappingV2(data, use_imu=False)
+        assert mapping.depth_source == "vlm_depth_pro"
+
+    def test_vergence_meta_exposed_on_mapping(self, tmp_path: Path):
+        from Utils.gaze.calibration_mapping import GazeCalibrationMappingV2
+        p = tmp_path / "v2_vergence.npz"
+        _write_v2_with_depth_source(p, "vergence")
+        data = load_pose_library_v2(str(p))
+        mapping = GazeCalibrationMappingV2(data, use_imu=False)
+        assert mapping.depth_source == "vergence"
+
+    def test_legacy_v2_npz_without_depth_source_defaults_to_vergence(
+            self, tmp_path: Path):
+        # _write_v2 (top of file) writes meta without depth_source —
+        # represents B2-era NPZs. The loader must NOT crash; the
+        # mapping object must default to 'vergence' so legacy data
+        # keeps working without re-recording.
+        from Utils.gaze.calibration_mapping import GazeCalibrationMappingV2
+        p = tmp_path / "v2_legacy.npz"
+        _write_v2(p)
+        data = load_pose_library_v2(str(p))
+        mapping = GazeCalibrationMappingV2(data, use_imu=False)
+        assert mapping.depth_source == "vergence"
