@@ -42,6 +42,8 @@ from harmony_free_arm_calibration import (
     CaptureBundle,
     TelemetryThread,
     bundle_from_snapshot,
+    fetch_vlm_depth_cm,
+    verify_vlm_depth_available,
     write_npz,
 )
 
@@ -372,7 +374,7 @@ def _patch_run_session(monkeypatch, *, snapshot_returns=None,
     # stubs that emit a canonical bundle each. Real implementations
     # sleep POST_CAPTURE_SETTLE_S (1.0 s) per capture — too slow for
     # tests. The transit sampler is what we actually want to exercise.
-    def fake_settle(target_label, robot_state):
+    def fake_settle(target_label, robot_state, vlm_client=None):
         return CaptureBundle(
             t=time.time(), q=np.zeros(7), ee_mm=np.zeros(3),
             gaze_x_norm=0.5, gaze_y_norm=0.5, gaze_conf=1.0,
@@ -649,3 +651,189 @@ class TestAutoHomeOpcode:
         # patched value used in tests above must not silently mask a
         # changed default in production.
         assert AUTO_HOME_DURATION_S == 4.0
+# ─── VLM Depth Pro path (GAZE_CALIBRATION_DEPTH_SOURCE='vlm_depth_pro') ──
+
+class _FakeVLMClient:
+    """Stand-in for Utils.perception_clients.VLMClient. Tests inject
+    arbitrary status / depth payloads or simulate transport failures
+    without touching a real UDP socket."""
+    def __init__(self, *, status_payload=None, depth_payload=None,
+                 status_raises=None, depth_raises=None,
+                 host="127.0.0.1", port=5589):
+        self.host = host
+        self.port = port
+        self._status_payload = status_payload
+        self._depth_payload = depth_payload
+        self._status_raises = status_raises
+        self._depth_raises = depth_raises
+        self.depth_call_count = 0
+
+    def status(self):
+        if self._status_raises is not None:
+            raise self._status_raises
+        return self._status_payload
+
+    def depth(self, *, at_gaze=True, save=False, timeout_s=15.0):
+        self.depth_call_count += 1
+        if self._depth_raises is not None:
+            raise self._depth_raises
+        return self._depth_payload
+
+
+class TestVerifyVlmDepthAvailable:
+    """Startup precondition for vlm_depth_pro mode. The recorder must
+    fail-fast (RuntimeError) for any of: VLM unreachable, ok=False,
+    depth_enabled=False, malformed payload. Silent fallback is
+    explicitly disallowed by the alignment invariant."""
+
+    def test_happy_path_returns_silently(self):
+        c = _FakeVLMClient(status_payload={"ok": True, "depth_enabled": True})
+        # No raise expected.
+        verify_vlm_depth_available(c)
+
+    def test_unreachable_raises(self):
+        c = _FakeVLMClient(status_raises=OSError("connection refused"))
+        with pytest.raises(RuntimeError, match="unreachable"):
+            verify_vlm_depth_available(c)
+
+    def test_ok_false_raises(self):
+        c = _FakeVLMClient(status_payload={"ok": False, "error": "boot"})
+        with pytest.raises(RuntimeError, match="ok=False"):
+            verify_vlm_depth_available(c)
+
+    def test_depth_disabled_raises(self):
+        c = _FakeVLMClient(status_payload={"ok": True, "depth_enabled": False})
+        with pytest.raises(RuntimeError, match="depth_enabled=False"):
+            verify_vlm_depth_available(c)
+
+    def test_missing_depth_enabled_treats_as_disabled(self):
+        # Defensive: if the service forgot to populate the field, treat
+        # as disabled rather than risking calibration with an unknown
+        # depth backend.
+        c = _FakeVLMClient(status_payload={"ok": True})
+        with pytest.raises(RuntimeError, match="depth_enabled=False"):
+            verify_vlm_depth_available(c)
+
+
+class TestFetchVlmDepthCm:
+    """Once vlm_service is verified at startup, per-capture depth
+    requests must (a) convert metres to cm, (b) tag depth_valid=False
+    only when the pixel returned a non-finite Depth Pro value, and
+    (c) fail-fast on transport / protocol error so the recording
+    session aborts rather than mixing depth sources in one NPZ."""
+
+    def test_metres_convert_to_cm(self):
+        c = _FakeVLMClient(depth_payload={"ok": True, "depth_at_gaze_m": 0.55})
+        depth_cm, depth_valid = fetch_vlm_depth_cm(c)
+        assert depth_cm == pytest.approx(55.0)
+        assert depth_valid is True
+
+    def test_non_finite_returns_invalid_but_does_not_raise(self):
+        c = _FakeVLMClient(depth_payload={"ok": True,
+                                            "depth_at_gaze_m": float("nan")})
+        depth_cm, depth_valid = fetch_vlm_depth_cm(c)
+        assert np.isnan(depth_cm)
+        assert depth_valid is False
+
+    def test_transport_error_raises(self):
+        c = _FakeVLMClient(depth_raises=OSError("socket closed"))
+        with pytest.raises(RuntimeError, match="transport"):
+            fetch_vlm_depth_cm(c)
+
+    def test_ok_false_raises(self):
+        c = _FakeVLMClient(depth_payload={"ok": False, "error": "depth_disabled"})
+        with pytest.raises(RuntimeError, match="not ok"):
+            fetch_vlm_depth_cm(c)
+
+    def test_missing_depth_at_gaze_raises(self):
+        c = _FakeVLMClient(depth_payload={"ok": True})
+        with pytest.raises(RuntimeError, match="depth_at_gaze_m"):
+            fetch_vlm_depth_cm(c)
+
+
+class TestSettleAndSnapshotVlmSubstitution:
+    """End-to-end (mocked) test that the captured CaptureBundle ends up
+    with the VLM depth value in place of the vergence depth when a
+    VLMClient is passed. The non-VLM path is already covered by
+    TestBundleFromSnapshot; this case proves the substitution is wired
+    correctly through to bundle_from_snapshot.
+    """
+
+    def _full_snap(self) -> dict:
+        return {
+            "ok": True,
+            "worn": True,
+            "gaze_px": (800.0, 600.0),
+            "depth_cm": 75.0,           # vergence value — must be overwritten
+            "depth_valid": True,
+            "miss_mm": 3.5, "ipd_mm": 63.0,
+            "imu_angvel": 0.05, "imu_fresh": True,
+            "head_yaw_deg": -2.0, "head_pitch_deg": 1.5,
+            "gaze_yaw_deg": 10.0, "gaze_pitch_deg": -5.0,
+        }
+
+    def test_vlm_depth_replaces_vergence_depth(self, monkeypatch):
+        # Patch gaze_snapshot so settle_and_snapshot consumes our snap
+        # without UDP I/O. Make depth_valid streak >= the gate so the
+        # bundle gets recorded normally.
+        snap = self._full_snap()
+        monkeypatch.setattr(recorder, "gaze_snapshot",
+                            lambda include_objects=False: snap)
+        # Skip the settle sleep so the test is fast.
+        monkeypatch.setattr(recorder.time, "sleep", lambda *_: None)
+
+        vlm = _FakeVLMClient(depth_payload={"ok": True,
+                                              "depth_at_gaze_m": 0.55})
+        robot_state = {"_t": 0.0, "q": np.zeros(7), "ee": np.zeros(3)}
+        bundle = recorder.settle_and_snapshot("mid_MC", robot_state,
+                                                vlm_client=vlm)
+        assert bundle is not None
+        # VLM substitution: 0.55 m -> 55.0 cm, depth_valid=True.
+        assert bundle.depth_cm == pytest.approx(55.0)
+        assert bundle.depth_valid is True
+        # And the VLM was hit exactly once (per-capture cadence, not
+        # per-sample).
+        assert vlm.depth_call_count == 1
+
+
+class TestWriteNpzDepthSourceMeta:
+    """The NPZ meta dict carries the alignment-invariant fields so the
+    runtime dispatcher can verify match without consulting config.
+    Tests both branches."""
+
+    def _make_bundle(self) -> CaptureBundle:
+        return CaptureBundle(
+            t=0.0, q=np.arange(7, dtype=float),
+            ee_mm=np.array([1.0, 2.0, 3.0]),
+            gaze_x_norm=0.5, gaze_y_norm=0.5, gaze_conf=1.0,
+            depth_cm=75.0, depth_valid=True, miss_mm=2.0, ipd_mm=63.0,
+            imu_w=0.01, imu_fresh=True,
+            head_yaw_deg=0.0, head_pitch_deg=0.0,
+            gaze_yaw_deg=0.0, gaze_pitch_deg=0.0,
+            phase="captured", target_label="mid_MC",
+        )
+
+    def test_vergence_default_meta(self, monkeypatch, tmp_path: Path):
+        monkeypatch.setattr(recorder.config,
+                            "GAZE_CALIBRATION_DEPTH_SOURCE", "vergence",
+                            raising=False)
+        out = tmp_path / "vergence.npz"
+        write_npz([self._make_bundle()], str(out))
+        meta = np.load(str(out), allow_pickle=True)["meta"].item()
+        assert meta["depth_source"] == "vergence"
+        # vlm_service_host empty when not in VLM mode (so the meta key
+        # cannot be misread as a stale machine-local artifact).
+        assert meta["vlm_service_host"] == ""
+
+    def test_vlm_depth_pro_meta_records_host(self, monkeypatch, tmp_path: Path):
+        monkeypatch.setattr(recorder.config,
+                            "GAZE_CALIBRATION_DEPTH_SOURCE", "vlm_depth_pro",
+                            raising=False)
+        monkeypatch.setattr(recorder.config,
+                            "VLM_SERVICE_HOST", "192.168.99.99",
+                            raising=False)
+        out = tmp_path / "vlm.npz"
+        write_npz([self._make_bundle()], str(out))
+        meta = np.load(str(out), allow_pickle=True)["meta"].item()
+        assert meta["depth_source"] == "vlm_depth_pro"
+        assert meta["vlm_service_host"] == "192.168.99.99"

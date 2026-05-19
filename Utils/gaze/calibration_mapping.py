@@ -183,6 +183,14 @@ class GazeCalibrationMappingV2:
         self._q_lo: np.ndarray = q_min - WORKSPACE_BOUNDS_MARGIN * span
         self._q_hi: np.ndarray = q_max + WORKSPACE_BOUNDS_MARGIN * span
 
+        # Depth source pinned at calibration time. Drives the runtime
+        # alignment check in the driver — the per-trial depth feed
+        # MUST come from the same source as the calibration data, or
+        # the Mahalanobis scale is wrong. Default 'vergence' covers
+        # legacy v2 NPZs from before the meta key existed (the v2
+        # mapping landed before vlm_depth_pro was added).
+        self._depth_source: str = _read_depth_source(npz_data)
+
     # ------------------------------------------------------------------
     # Public lookup
     # ------------------------------------------------------------------
@@ -237,6 +245,16 @@ class GazeCalibrationMappingV2:
     def workspace_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
         """(q_lo, q_hi) — the clamp envelope for diagnostic logs."""
         return self._q_lo.copy(), self._q_hi.copy()
+
+    @property
+    def depth_source(self) -> str:
+        """Depth source pinned at calibration time. ``'vergence'`` for
+        legacy v2 NPZs (and for the Pupil Labs binocular vergence path);
+        ``'vlm_depth_pro'`` for NPZs recorded with Depth Pro substitution.
+        Drives the runtime alignment check — see
+        ``ExperimentDriver_Online_GazeTracking._load_v2_mapping_if_enabled``.
+        """
+        return self._depth_source
 
     # ------------------------------------------------------------------
     # Internals
@@ -311,6 +329,18 @@ def detect_pose_library_version(npz_data: Any) -> int:
     if "D_cm" in keys and "Gaze_yaw_deg" in keys:
         return 2
     return 1
+
+
+def _read_depth_source(npz_data: Any) -> str:
+    """Pull ``meta['depth_source']`` out of an NPZ dict / NpzFile.
+    Defaults to ``'vergence'`` for legacy v2 NPZs that pre-date the
+    meta key (and for v1 NPZs, where the field is irrelevant — those
+    never reach the v2 mapping constructor anyway).
+    """
+    meta = _peek_meta(npz_data)
+    if not isinstance(meta, dict):
+        return "vergence"
+    return str(meta.get("depth_source", "vergence"))
 
 
 def _peek_meta(npz_data: Any) -> Optional[Dict[str, Any]]:

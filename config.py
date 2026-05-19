@@ -167,6 +167,28 @@ GAZE_CALIBRATION_VERSION = 1
 # Gaze_Calibration_Sensor_Characterization.md §5).
 GAZE_CALIBRATION_USE_IMU = False
 
+# Depth source for v2 calibration capture. The Mahalanobis NN over
+# (gaze_yaw_deg, gaze_pitch_deg, depth_cm) treats depth as a feature
+# whose distribution is learned from the calibration NPZ; mixing
+# vergence (binocular convergence, ~25-100 cm) with Depth Pro
+# (monocular scene depth in m → cm) within or across NPZs breaks the
+# metric because the two sources have different scales and noise
+# distributions. Therefore the source is BAKED INTO the NPZ at
+# calibration time (via meta["depth_source"]) and the runtime
+# (resolve_robot_target_from_gaze) reads it back from NPZ meta — this
+# flag controls ONLY the recorder's capture-time choice.
+#   "vergence"      — read depth_cm from the gaze snapshot
+#                     (Utils/gaze/gaze_system.py vergence path; CPU only,
+#                     no VLM dependency). Default — matches the current
+#                     B2-landed v2 NPZs.
+#   "vlm_depth_pro" — fetch depth at gaze from vlm_service (Depth Pro
+#                     monocular model). Requires the VLM service running
+#                     with --enable-depth; recorder and driver fail-fast
+#                     at startup if unreachable or depth_enabled=False.
+# Override per machine in config_local.py if the VLM service is
+# reachable and Depth Pro is loaded.
+GAZE_CALIBRATION_DEPTH_SOURCE = "vergence"
+
 # =============================================================================
 # Pupil Labs Neon — device connection
 # =============================================================================

@@ -393,3 +393,46 @@ class TestMappingIgnoresTransitPhase:
             f"transit-phase rows appear to have leaked into the fit: "
             f"D_cm scale={d_cm_scale} (would be ~0 if mapping read only captured)"
         )
+# ─── depth_source attribute on the mapping (alignment invariant) ─────────
+
+class TestMappingDepthSourceAttribute:
+    """The mapping object must always expose .depth_source — the driver
+    branches on it at runtime to decide whether to fetch VLM depth.
+    Default for legacy NPZs (no meta key) is 'vergence'; explicit
+    meta['depth_source'] passes through unchanged."""
+
+    def _make_data(self, *, with_meta=None) -> _ShimNpz:
+        data = _make_npz(N=16, seed=1, with_imu=True)
+        if with_meta is not None:
+            data["meta"] = np.array(with_meta, dtype=object)
+        return data
+
+    def test_default_is_vergence_when_no_meta(self):
+        # No meta key at all — covers legacy v2 NPZs from before the
+        # depth_source field was added.
+        m = GazeCalibrationMappingV2(self._make_data(), use_imu=False)
+        assert isinstance(m.depth_source, str)
+        assert m.depth_source == "vergence"
+
+    def test_default_is_vergence_when_meta_lacks_depth_source(self):
+        # Meta dict present but missing depth_source.
+        data = self._make_data(with_meta={"version": 2, "side": "R"})
+        m = GazeCalibrationMappingV2(data, use_imu=False)
+        assert m.depth_source == "vergence"
+
+    def test_vlm_depth_pro_meta_round_trips(self):
+        data = self._make_data(with_meta={
+            "version": 2, "side": "R",
+            "depth_source": "vlm_depth_pro",
+            "vlm_service_host": "192.168.99.99",
+        })
+        m = GazeCalibrationMappingV2(data, use_imu=False)
+        assert m.depth_source == "vlm_depth_pro"
+
+    def test_attribute_exists_regardless_of_use_imu(self):
+        # Sanity: attribute is set for both Pass-1 and Pass-2 mappings.
+        data = self._make_data(with_meta={"depth_source": "vergence"})
+        m1 = GazeCalibrationMappingV2(data, use_imu=False)
+        m2 = GazeCalibrationMappingV2(data, use_imu=True)
+        assert m1.depth_source == "vergence"
+        assert m2.depth_source == "vergence"

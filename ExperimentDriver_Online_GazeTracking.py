@@ -406,6 +406,14 @@ def _sensor_sample_from_snap(snap):
     gaze_runner snapshot. v1 ignores everything in this dict; v2 reads
     every key. Plan §8.1 (extend per-sample accumulation).
 
+    Note: ``depth_cm`` here is the gaze_runner vergence value. When the
+    loaded v2 mapping has ``depth_source='vlm_depth_pro'`` the trial-end
+    path in ``main`` overwrites the averaged ``depth_cm`` with one VLM
+    Depth Pro reading before calling ``resolve_robot_target_from_gaze``,
+    so the per-sample vergence value is effectively ignored. The
+    per-sample field stays populated so the selection-window log and
+    the dwell-by-object accumulator do not need a branch.
+
     Returns a dict — missing keys default to NaN so the averaging step
     can apply ``np.nanmean`` without checking for absence.
     """
@@ -694,6 +702,11 @@ def _load_v2_mapping_if_enabled(path):
     Raises if v=2 is requested but the NPZ at ``path`` is v1 — the
     operator should either flip the flag back to 1 or point
     ``POSE_LIBRARY_PATH`` at a v2 NPZ.
+
+    When the loaded NPZ pins ``depth_source='vlm_depth_pro'``, also
+    verifies vlm_service is reachable with depth_enabled=True; refuses
+    to load otherwise (silent fallback to vergence at runtime would
+    break the Mahalanobis NN's per-feature scale assumptions).
     """
     calibration_version = int(getattr(config, "GAZE_CALIBRATION_VERSION", 1))
     if calibration_version < 2:
@@ -719,13 +732,76 @@ def _load_v2_mapping_if_enabled(path):
         )
     use_imu = bool(getattr(config, "GAZE_CALIBRATION_USE_IMU", False))
     mapping = GazeCalibrationMappingV2(data, use_imu=use_imu)
+
+    # Alignment invariant: the depth source baked into the NPZ at
+    # calibration time governs the runtime feed. If the NPZ was
+    # recorded against VLM Depth Pro, the driver must be able to
+    # reach vlm_service with depth enabled — otherwise the v2 query
+    # would be fed vergence depth at trial-end and the Mahalanobis
+    # distance metric would be off-scale.
+    if mapping.depth_source == "vlm_depth_pro":
+        from Utils.perception_clients import VLMClient
+        probe = VLMClient(config)
+        try:
+            status = probe.status()
+        except OSError as e:
+            raise RuntimeError(
+                f"NPZ depth_source='vlm_depth_pro' but vlm_service unreachable "
+                f"at {probe.host}:{probe.port} ({e}). Start vlm_service.py with "
+                f"--enable-depth before launching the driver, or re-record the "
+                f"calibration NPZ with GAZE_CALIBRATION_DEPTH_SOURCE='vergence'."
+            ) from e
+        if not isinstance(status, dict) or not status.get("ok", False):
+            raise RuntimeError(
+                f"NPZ depth_source='vlm_depth_pro' but vlm_service status not ok: "
+                f"{status!r}"
+            )
+        if not bool(status.get("depth_enabled", False)):
+            raise RuntimeError(
+                f"NPZ depth_source='vlm_depth_pro' but vlm_service reports "
+                f"depth_enabled=False at {probe.host}:{probe.port}; restart it "
+                f"with --enable-depth."
+            )
+
     logger.log_event(
         f"v2 calibration mapping loaded from {path} — "
         f"features={mapping.feature_keys}, "
         f"valid_samples={mapping.num_valid_samples}, "
-        f"use_imu={use_imu}"
+        f"use_imu={use_imu}, "
+        f"depth_source={mapping.depth_source}"
     )
     return mapping
+
+
+def fetch_vlm_depth_cm_at_gaze(vlm_client):
+    """Trial-end VLM Depth Pro fetch. Returns depth_cm (float).
+
+    Called by ``main`` exactly once per GO-trial selection, just
+    before ``resolve_robot_target_from_gaze``, so the per-trial
+    overhead is one UDP round-trip rather than one per sample
+    (selection windows run ~5 s at ~20 Hz = ~100 samples; per-sample
+    VLM calls would saturate the Depth Pro CPU on a single-machine
+    setup). Per-sample averaging stays on the vergence depth in the
+    snapshot — but the v2 query consumes only the substituted
+    trial-end value when depth_source='vlm_depth_pro'.
+
+    Fail-fast policy: any VLM error propagates. The driver catches
+    in main() and surfaces it; no silent fallback to vergence (would
+    break the Mahalanobis NN's per-feature scale calibration).
+    """
+    resp = vlm_client.depth(at_gaze=True)
+    if not isinstance(resp, dict) or not resp.get("ok", False):
+        raise RuntimeError(f"VLM depth response not ok: {resp!r}")
+    if "depth_at_gaze_m" not in resp:
+        raise RuntimeError(
+            f"VLM depth response missing depth_at_gaze_m: {resp!r}"
+        )
+    depth_m = float(resp["depth_at_gaze_m"])
+    if not np.isfinite(depth_m):
+        raise RuntimeError(
+            f"VLM depth returned non-finite value at gaze pixel: {depth_m!r}"
+        )
+    return depth_m * 100.0
 
 
 def resolve_robot_target_from_gaze(avg_px, selected_name, X_lib, Q_lib, G_lib,
@@ -1040,6 +1116,23 @@ def main():
     X_lib, Q_lib, G_lib = load_pose_library(POSE_LIBRARY_PATH)
     v2_mapping = _load_v2_mapping_if_enabled(POSE_LIBRARY_PATH)
 
+    # When the v2 mapping was calibrated against VLM Depth Pro, the
+    # driver fetches one Depth Pro reading at trial-end and feeds it
+    # into the Mahalanobis NN's depth feature — the per-sample vergence
+    # values accumulated during the selection window are then ignored
+    # for the depth feature. Per-sample VLM calls would saturate Depth
+    # Pro CPU on a single-machine setup; once-per-trial is sufficient
+    # because the user is fixating on the chosen object by the time we
+    # commit to a robot waypoint.
+    vlm_depth_client = None
+    if v2_mapping is not None and v2_mapping.depth_source == "vlm_depth_pro":
+        from Utils.perception_clients import VLMClient
+        vlm_depth_client = VLMClient(config)
+        logger.log_event(
+            f"v2 mapping pinned to vlm_depth_pro — driver will fetch one "
+            f"VLM depth reading per trial-end before resolve_robot_target_from_gaze."
+        )
+
     trial_sequence = generate_trial_sequence(
         total_trials=config.TOTAL_TRIALS,
         max_repeats=config.MAX_REPEATS
@@ -1147,6 +1240,23 @@ def main():
                 messages = ["Confirmed", f"Move to {selected_name}"]
                 colors = [config.green, config.green]
                 offsets = [-100, 100]
+
+                # Trial-end VLM Depth Pro fetch (runtime cadence locked
+                # in plan §"Depth source selection"): one UDP round-trip
+                # per resolved GO trial, NOT per sample. avg_sensor is
+                # mutated here so the downstream resolve sees a coherent
+                # (gaze_yaw, gaze_pitch, depth_cm) triple sourced from
+                # the same depth pipeline as the calibration NPZ.
+                if vlm_depth_client is not None and avg_sensor is not None:
+                    avg_sensor = dict(avg_sensor)  # never mutate the
+                                                     # selection result
+                    vlm_depth_cm = fetch_vlm_depth_cm_at_gaze(vlm_depth_client)
+                    avg_sensor["depth_cm"] = vlm_depth_cm
+                    avg_sensor["depth_valid"] = True
+                    logger.log_event(
+                        f"Trial-end VLM depth fetched: depth_cm={vlm_depth_cm:.1f} "
+                        f"(replacing vergence-averaged depth before v2 resolve)"
+                    )
 
                 target_info = resolve_robot_target_from_gaze(
                     avg_px=avg_px,
