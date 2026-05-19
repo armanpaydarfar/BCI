@@ -602,6 +602,59 @@ def main():
         print(f"[{ts()}] [v2] mapping ready — features={v2_mapping.feature_keys}, "
               f"valid_samples={v2_mapping.num_valid_samples}, use_imu={use_imu}")
 
+    # Alignment invariant (mirrors ExperimentDriver_Online_GazeTracking.py
+    # _load_v2_mapping_if_enabled at commit d36711b): when the NPZ pins
+    # depth_source='vlm_depth_pro', the REPL must be able to reach
+    # vlm_service with --enable-depth at startup. Otherwise the vision-
+    # mode v2 query would silently fall back to vergence depth and
+    # poison the Mahalanobis distance metric (per-feature scale was
+    # calibrated against Depth Pro readings, not vergence).
+    vlm_client = None
+    if v2_mapping is not None and v2_mapping.depth_source == "vlm_depth_pro":
+        from Utils.perception_clients import VLMClient
+        if not getattr(config, "VLM_SERVICE_HOST", None):
+            raise RuntimeError(
+                "NPZ depth_source='vlm_depth_pro' but config.VLM_SERVICE_HOST "
+                "is unset. Set it in config_local.py (the Windows GPU host's "
+                "LAN IP) or re-record the NPZ with "
+                "GAZE_CALIBRATION_DEPTH_SOURCE='vergence'."
+            )
+        if not getattr(config, "VLM_SERVICE_PORT", None):
+            raise RuntimeError(
+                "NPZ depth_source='vlm_depth_pro' but config.VLM_SERVICE_PORT "
+                "is unset. Set it in config_local.py or re-record the NPZ "
+                "with GAZE_CALIBRATION_DEPTH_SOURCE='vergence'."
+            )
+        vlm_client = VLMClient(config)
+        try:
+            status = vlm_client.status()
+        except OSError as e:
+            raise RuntimeError(
+                f"NPZ depth_source='vlm_depth_pro' but vlm_service unreachable "
+                f"at {vlm_client.host}:{vlm_client.port} ({e}). Start "
+                f"vlm_service.py with --enable-depth, or set "
+                f"GAZE_CALIBRATION_DEPTH_SOURCE='vergence' in config_local.py "
+                f"and re-record the NPZ."
+            ) from e
+        if not isinstance(status, dict) or not status.get("ok", False):
+            raise RuntimeError(
+                f"NPZ depth_source='vlm_depth_pro' but vlm_service status not "
+                f"ok at {vlm_client.host}:{vlm_client.port}: {status!r}. Start "
+                f"vlm_service.py with --enable-depth, or set "
+                f"GAZE_CALIBRATION_DEPTH_SOURCE='vergence' in config_local.py "
+                f"and re-record the NPZ."
+            )
+        if not bool(status.get("depth_enabled", False)):
+            raise RuntimeError(
+                f"NPZ depth_source='vlm_depth_pro' but vlm_service reports "
+                f"depth_enabled=False at {vlm_client.host}:{vlm_client.port}. "
+                f"Restart vlm_service.py with --enable-depth, or set "
+                f"GAZE_CALIBRATION_DEPTH_SOURCE='vergence' in config_local.py "
+                f"and re-record the NPZ."
+            )
+        print(f"[{ts()}] [v2] depth_source=vlm_depth_pro "
+              f"(host={vlm_client.host}:{vlm_client.port}, depth_enabled=True)")
+
     # Initialize gaze stream if we have gaze-enabled library
     gaze_stream = None
     if has_gaze:
@@ -697,10 +750,50 @@ def main():
                           f"or flip config.GAZE_CALIBRATION_VERSION back to 1.")
                     continue
                 use_imu = bool(getattr(config, "GAZE_CALIBRATION_USE_IMU", False))
+
+                # Depth source selection: when the NPZ pins
+                # depth_source='vlm_depth_pro' the v2 query MUST be fed a
+                # Depth Pro reading (the calibration data set the per-
+                # feature scale used by the Mahalanobis metric). One UDP
+                # round-trip per target press is fine here — the REPL is
+                # human-paced and only commits a robot waypoint once per
+                # 'v' invocation. Fail-fast on any VLM error: silently
+                # substituting vergence depth would corrupt the metric
+                # without any visible signal.
+                if v2_mapping.depth_source == "vlm_depth_pro":
+                    try:
+                        depth_resp = vlm_client.depth(at_gaze=True)
+                    except OSError as e:
+                        print(f"[{ts()}] [v2] VLM depth request failed "
+                              f"({vlm_client.host}:{vlm_client.port}): {e}. "
+                              f"No robot command sent.")
+                        continue
+                    if not isinstance(depth_resp, dict) or not depth_resp.get("ok", False):
+                        print(f"[{ts()}] [v2] VLM depth response not ok "
+                              f"({vlm_client.host}:{vlm_client.port}): "
+                              f"{depth_resp!r}. No robot command sent.")
+                        continue
+                    if "depth_at_gaze_m" not in depth_resp:
+                        print(f"[{ts()}] [v2] VLM depth response missing "
+                              f"depth_at_gaze_m ({vlm_client.host}:"
+                              f"{vlm_client.port}): {depth_resp!r}. No robot "
+                              f"command sent.")
+                        continue
+                    depth_at_gaze_m = float(depth_resp["depth_at_gaze_m"])
+                    if not np.isfinite(depth_at_gaze_m):
+                        print(f"[{ts()}] [v2] VLM depth returned non-finite "
+                              f"value at gaze pixel ({vlm_client.host}:"
+                              f"{vlm_client.port}): {depth_at_gaze_m!r}. No "
+                              f"robot command sent.")
+                        continue
+                    depth_cm = depth_at_gaze_m * 100.0
+                else:
+                    depth_cm = float(snap.get("depth_cm", float("nan")))
+
                 features = {
                     "Gaze_yaw_deg": float(snap.get("gaze_yaw_deg", float("nan"))),
                     "Gaze_pitch_deg": float(snap.get("gaze_pitch_deg", float("nan"))),
-                    "D_cm": float(snap.get("depth_cm", float("nan"))),
+                    "D_cm": depth_cm,
                 }
                 if use_imu:
                     features["Head_yaw_deg"] = float(snap.get("head_yaw_deg", float("nan")))
