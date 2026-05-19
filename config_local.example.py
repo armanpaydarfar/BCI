@@ -84,3 +84,13 @@ ARDUINO_PORT = ""
 #   ls -l /dev/serial/by-id/
 # e.g. TIAGOBOT_PORT = "/dev/serial/by-id/usb-Arduino_..._-if00"
 TIAGOBOT_PORT = ""
+
+# =============================================================================
+# Tiagobot gaze calibration
+# =============================================================================
+# Path to the NPZ produced by tiago_gaze_calibration_exec.py. Consumed
+# by ExperimentDriver_Online_Tiagobot_Gaze.py to map gaze samples to
+# one of the 9 A-I letters. Usually a per-subject file under
+# {DATA_DIR}/sub-{TRAINING_SUBJECT}/gaze/gaze_to_letter_<stamp>.npz.
+# Empty string disables the gaze driver (fail-fast at startup).
+TIAGOBOT_GAZE_CALIBRATION_PATH = ""

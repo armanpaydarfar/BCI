@@ -283,6 +283,33 @@ TIAGOBOT_USE_GLOVE = True
 # the glove's actual close duration on this hardware.
 TIAGOBOT_GRIP_HOLD_DURATION = 5
 
+# Tiagobot gaze calibration NPZ produced by tiago_gaze_calibration_exec.py.
+# Consumed by ExperimentDriver_Online_Tiagobot_Gaze.py to map averaged
+# gaze samples to one of the 9 A-I letters per
+# Documents/SoftwareDocs/Tiagobot_Gaze_AI_Layout.md. Empty string means
+# "no calibration available" — the gaze driver fails at startup in that
+# case (fail-fast on Tier 2 paths per CLAUDE.md). Default empty so the
+# global config can ship platform-neutral; set the real path per machine
+# in config_local.py.
+TIAGOBOT_GAZE_CALIBRATION_PATH = ""
+# Per-trial gaze accumulation window (seconds) used by the gaze driver
+# to collect samples before classifying to a letter. Matches the
+# structure of GAZE_SELECTION_WINDOW used in the Harmony gaze driver,
+# but tuned independently for the rudimentary 9-letter classifier.
+TIAGOBOT_GAZE_SELECTION_WINDOW = 4.0
+# Minimum gaze confidence (Pupil Labs Neon) for a sample to count in
+# the per-trial average. Matches harmony_calibration_exec.py:43
+# (GAZE_CONFIDENCE_THRESHOLD = 0.7) for symmetry between calibration
+# and online operation.
+TIAGOBOT_GAZE_CONFIDENCE_THRESHOLD = 0.7
+# Optional Euclidean-distance ceiling in normalized [0,1] units. If the
+# best-match centroid is farther than this from the averaged gaze, the
+# classifier returns None and the driver skips the GO (logs and waits).
+# None disables the check (always pick the nearest letter). 0.2 is a
+# reasonable default for a 0.25-spaced grid — the gaze needs to be
+# within ~half a cell of the centroid.
+TIAGOBOT_GAZE_MAX_DIST_NORM = 0.2
+
 # =============================================================================
 # Display colors (RGB)
 # =============================================================================
