@@ -401,6 +401,51 @@ def object_display_name(obj_key):
     return obj_key.split("#")[0]
 
 
+def _sensor_sample_from_snap(snap):
+    """Pull the per-sample sensor channels the v2 mapping needs from a
+    gaze_runner snapshot. v1 ignores everything in this dict; v2 reads
+    every key. Plan §8.1 (extend per-sample accumulation).
+
+    Returns a dict — missing keys default to NaN so the averaging step
+    can apply ``np.nanmean`` without checking for absence.
+    """
+    return {
+        "depth_cm": float(snap.get("depth_cm", float("nan"))),
+        "depth_valid": bool(snap.get("depth_valid", False)),
+        "head_yaw_deg": float(snap.get("head_yaw_deg", float("nan"))),
+        "head_pitch_deg": float(snap.get("head_pitch_deg", float("nan"))),
+        "gaze_yaw_deg": float(snap.get("gaze_yaw_deg", float("nan"))),
+        "gaze_pitch_deg": float(snap.get("gaze_pitch_deg", float("nan"))),
+    }
+
+
+def _average_sensor_records(records):
+    """Reduce a list of per-sample sensor records into one averaged
+    record. Uses ``np.nanmean`` so transient NaN samples (e.g. blink
+    during a depth_valid=False frame) don't drag the average toward
+    NaN; instead, NaN slips out of the mean for that channel.
+    Returns a dict with the same keys as ``_sensor_sample_from_snap``;
+    ``depth_valid`` collapses to True iff at least one input sample had
+    valid depth.
+    """
+    if not records:
+        return {
+            "depth_cm": float("nan"),
+            "depth_valid": False,
+            "head_yaw_deg": float("nan"),
+            "head_pitch_deg": float("nan"),
+            "gaze_yaw_deg": float("nan"),
+            "gaze_pitch_deg": float("nan"),
+        }
+    out = {}
+    for key in ("depth_cm", "head_yaw_deg", "head_pitch_deg",
+                "gaze_yaw_deg", "gaze_pitch_deg"):
+        vals = np.asarray([r[key] for r in records], dtype=float)
+        out[key] = float(np.nanmean(vals)) if np.any(np.isfinite(vals)) else float("nan")
+    out["depth_valid"] = any(bool(r.get("depth_valid")) for r in records)
+    return out
+
+
 def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WINDOW, vlm_decision=None):
     logger.log_event(f"Starting gaze selection window ({duration_s:.2f}s).")
 
@@ -451,12 +496,19 @@ def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WI
         if snap and snap.get("ok", False):
             gaze_px = snap.get("gaze_px", None)
 
+            # Phase 4 (plan §8.1): the per-sample record now carries the
+            # depth / IMU / head-pose fields so the v2 mapping can
+            # average them at end-of-window without re-querying the
+            # gaze service. v1 still consumes (t, x, y); v2 consumes
+            # the dict variant via _sample_record_dict_v2.
+            sensor_record = _sensor_sample_from_snap(snap)
+
             if GAZE_OR_BACKEND == "vlm":
                 if vlm_object_name is not None and gaze_px is not None and len(gaze_px) >= 2:
                     obj_key = str(vlm_object_name)
                     x, y = float(gaze_px[0]), float(gaze_px[1])
                     dwell_sec_by_obj[obj_key] = dwell_sec_by_obj.get(obj_key, 0.0) + dt
-                    valid_samples_by_obj.setdefault(obj_key, []).append((now, x, y))
+                    valid_samples_by_obj.setdefault(obj_key, []).append((now, x, y, sensor_record))
                 leading_obj_name = vlm_object_name
             else:
                 hit = snap.get("gaze_hit", None)
@@ -467,7 +519,7 @@ def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WI
                     x, y = float(gaze_px[0]), float(gaze_px[1])
 
                     dwell_sec_by_obj[obj_key] = dwell_sec_by_obj.get(obj_key, 0.0) + dt
-                    valid_samples_by_obj.setdefault(obj_key, []).append((now, x, y))
+                    valid_samples_by_obj.setdefault(obj_key, []).append((now, x, y, sensor_record))
 
                 if dwell_sec_by_obj:
                     leading_key = max(dwell_sec_by_obj, key=dwell_sec_by_obj.get)
@@ -511,7 +563,7 @@ def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WI
     recent_cutoff = end_t - GAZE_AVG_WINDOW
 
     all_samples = valid_samples_by_obj.get(selected_key, [])
-    recent_samples = [(t, x, y) for (t, x, y) in all_samples if t >= recent_cutoff]
+    recent_samples = [rec for rec in all_samples if rec[0] >= recent_cutoff]
     samples_for_avg = recent_samples if len(recent_samples) > 0 else all_samples
 
     if len(samples_for_avg) == 0:
@@ -525,8 +577,12 @@ def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WI
             "selection_attempt_success": False,
         }
 
-    avg_x = sum(x for _, x, _ in samples_for_avg) / len(samples_for_avg)
-    avg_y = sum(y for _, _, y in samples_for_avg) / len(samples_for_avg)
+    # Tuple shape: (t, x_px, y_px, sensor_record dict). Sensor record
+    # carries depth / IMU / head-pose for the v2 mapping; v1 only needs
+    # the pixel pair.
+    avg_x = sum(rec[1] for rec in samples_for_avg) / len(samples_for_avg)
+    avg_y = sum(rec[2] for rec in samples_for_avg) / len(samples_for_avg)
+    avg_sensor = _average_sensor_records([rec[3] for rec in samples_for_avg])
 
     logger.log_event(
         f"Gaze selection success — object={selected_name}, dwell={selected_dwell:.3f}s, "
@@ -537,6 +593,7 @@ def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WI
         "selected_key": selected_key,
         "selected_name": selected_name,
         "avg_px": (avg_x, avg_y),
+        "avg_sensor": avg_sensor,
         "dwell_sec_by_obj": dwell_sec_by_obj,
         "samples_used": len(samples_for_avg),
         "selection_attempt_success": True,
@@ -628,7 +685,68 @@ def build_joint_command(q_target, dur_s):
     return ",".join(f"{v:.6f}" for v in np.asarray(q_target).tolist()) + f";dur={dur_s:.3f}"
 
 
-def resolve_robot_target_from_gaze(avg_px, selected_name, X_lib, Q_lib, G_lib):
+def _load_v2_mapping_if_enabled(path):
+    """Construct the v2 Mahalanobis mapping once at startup if
+    ``config.GAZE_CALIBRATION_VERSION >= 2``. Returns None otherwise so
+    the v1 path runs unchanged. Plan §8.1: load once, dispatch per
+    trial via ``resolve_robot_target_from_gaze``.
+
+    Raises if v=2 is requested but the NPZ at ``path`` is v1 — the
+    operator should either flip the flag back to 1 or point
+    ``POSE_LIBRARY_PATH`` at a v2 NPZ.
+    """
+    calibration_version = int(getattr(config, "GAZE_CALIBRATION_VERSION", 1))
+    if calibration_version < 2:
+        logger.log_event(
+            f"GAZE_CALIBRATION_VERSION={calibration_version} — using legacy v1 NN."
+        )
+        return None
+
+    # Lazy import to avoid circular dependency at module load.
+    from Utils.gaze.calibration_mapping import (
+        GazeCalibrationMappingV2,
+        detect_pose_library_version,
+        load_pose_library_v2,
+    )
+    data = load_pose_library_v2(path)
+    detected = detect_pose_library_version(data)
+    if detected < 2:
+        raise ValueError(
+            f"GAZE_CALIBRATION_VERSION=2 but POSE_LIBRARY_PATH={path!r} "
+            f"is a v{detected} NPZ. Either flip the flag back to 1 or "
+            f"point POSE_LIBRARY_PATH at a v2 NPZ produced by "
+            f"harmony_free_arm_calibration.py."
+        )
+    use_imu = bool(getattr(config, "GAZE_CALIBRATION_USE_IMU", False))
+    mapping = GazeCalibrationMappingV2(data, use_imu=use_imu)
+    logger.log_event(
+        f"v2 calibration mapping loaded from {path} — "
+        f"features={mapping.feature_keys}, "
+        f"valid_samples={mapping.num_valid_samples}, "
+        f"use_imu={use_imu}"
+    )
+    return mapping
+
+
+def resolve_robot_target_from_gaze(avg_px, selected_name, X_lib, Q_lib, G_lib,
+                                    avg_sensor=None, v2_mapping=None):
+    """Dispatch on config.GAZE_CALIBRATION_VERSION:
+
+    - v=1: legacy 2-D NN on normalised pixels (unchanged path through
+      ``nearest_idx_gaze``).
+    - v=2: Mahalanobis NN on (gaze_yaw_deg, gaze_pitch_deg, depth_cm)
+      [Pass-1] or that triple plus (head_yaw_deg, head_pitch_deg)
+      [Pass-2] via the pre-built ``v2_mapping``
+      (``Utils.gaze.calibration_mapping.GazeCalibrationMappingV2``).
+
+    The driver constructs ``v2_mapping`` once at startup so the hot
+    loop does not pay the fit cost per trial; that follows the same
+    pattern as ``model`` / ``X_lib`` etc. loaded once at module init.
+
+    Plan §8.1 (Harmony_Gaze_Calibration_Upgrade_Plan.md): dispatch goes
+    through this single function so a future revert is a one-line flag
+    change at ``config.GAZE_CALIBRATION_VERSION``.
+    """
     if avg_px is None or len(avg_px) < 2:
         raise ValueError("avg_px is invalid for pose lookup.")
 
@@ -636,6 +754,55 @@ def resolve_robot_target_from_gaze(avg_px, selected_name, X_lib, Q_lib, G_lib):
     x_norm = x_px / GAZE_SAMPLE_WIDTH
     y_norm = y_px / GAZE_SAMPLE_HEIGHT
 
+    calibration_version = int(getattr(config, "GAZE_CALIBRATION_VERSION", 1))
+
+    if calibration_version >= 2:
+        if v2_mapping is None:
+            raise ValueError(
+                "config.GAZE_CALIBRATION_VERSION>=2 but the driver did not "
+                "construct a v2_mapping at startup; check that POSE_LIBRARY_PATH "
+                "points to a v2 NPZ."
+            )
+        if avg_sensor is None:
+            raise ValueError(
+                "v2 mapping requires avg_sensor; the selection window must "
+                "publish it via run_gaze_selection_window."
+            )
+        use_imu = bool(getattr(config, "GAZE_CALIBRATION_USE_IMU", False))
+        features = {
+            "Gaze_yaw_deg": avg_sensor["gaze_yaw_deg"],
+            "Gaze_pitch_deg": avg_sensor["gaze_pitch_deg"],
+            "D_cm": avg_sensor["depth_cm"],
+        }
+        if use_imu:
+            features["Head_yaw_deg"] = avg_sensor["head_yaw_deg"]
+            features["Head_pitch_deg"] = avg_sensor["head_pitch_deg"]
+        result = v2_mapping.query(features)
+        q_target = result.q_target
+        x_target = result.x_target
+        joint_cmd = build_joint_command(q_target, ROBOT_MOVE_DUR)
+
+        clamp_note = " (CLAMPED)" if result.clamped else ""
+        logger.log_event(
+            f"Gaze v2 lookup — object={selected_name}, "
+            f"features={features}, "
+            f"idx={result.idx}, dist={result.dist:.4f}{clamp_note}, "
+            f"x_target={np.round(x_target, 1).tolist()}"
+        )
+
+        return {
+            "version": 2,
+            "idx": result.idx,
+            "dist": result.dist,
+            "gaze_norm": (x_norm, y_norm),
+            "features": features,
+            "clamped": result.clamped,
+            "q_target": q_target,
+            "x_target": x_target,
+            "joint_cmd": joint_cmd,
+        }
+
+    # v1 legacy path (unchanged behaviour).
     idx, dist = nearest_idx_gaze(G_lib, (x_norm, y_norm))
     q_target = Q_lib[idx]
     x_target = X_lib[idx]
@@ -650,6 +817,7 @@ def resolve_robot_target_from_gaze(avg_px, selected_name, X_lib, Q_lib, G_lib):
     )
 
     return {
+        "version": 1,
         "idx": idx,
         "dist": dist,
         "gaze_norm": (x_norm, y_norm),
@@ -870,6 +1038,7 @@ def main():
         logger.log_event(f"GAZE_OR_BACKEND={GAZE_OR_BACKEND} — using legacy gaze_runner path.")
 
     X_lib, Q_lib, G_lib = load_pose_library(POSE_LIBRARY_PATH)
+    v2_mapping = _load_v2_mapping_if_enabled(POSE_LIBRARY_PATH)
 
     trial_sequence = generate_trial_sequence(
         total_trials=config.TOTAL_TRIALS,
@@ -903,6 +1072,7 @@ def main():
 
         selected_name = selection_result["selected_name"]
         avg_px = selection_result["avg_px"]
+        avg_sensor = selection_result.get("avg_sensor")  # v2 only; v1 ignores
         selection_attempt = selection_result["selection_attempt"]
 
         logger.log_event(
@@ -984,6 +1154,8 @@ def main():
                     X_lib=X_lib,
                     Q_lib=Q_lib,
                     G_lib=G_lib,
+                    avg_sensor=avg_sensor,
+                    v2_mapping=v2_mapping,
                 )
 
                 udp_messages = [target_info["joint_cmd"], config.ROBOT_OPCODES["GO"]]

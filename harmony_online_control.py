@@ -19,6 +19,9 @@ import matplotlib.pyplot as plt
 from datetime import datetime, timezone
 from pylsl import StreamInlet, resolve_stream  # For gaze LSL
 
+import config
+from Utils.perception_clients import udp_request as _gaze_udp_request
+
 ROBOT_IP, ROBOT_PORT = "192.168.2.1", 8080
 CONTROL_IP, CONTROL_PORT = "0.0.0.0", 8080
 
@@ -268,6 +271,30 @@ def flush_gaze_buffer(inlet):
                 break
         except Exception:
             break
+
+
+def _fetch_v2_snapshot():
+    """Pull a fresh gaze_runner snapshot for the v2 mapping. Returns
+    a dict with the keys the v2 mapping needs (Gaze_yaw_deg, etc.) or
+    None if the snapshot is unavailable / not OK.
+
+    The REPL's GazeStream path uses LSL directly which does not carry
+    depth / IMU; the v2 mapping needs the gaze_runner snapshot. When
+    v=2 in this REPL the caller must have a gaze_runner service
+    running at config.GAZE_UDP_IP:GAZE_UDP_PORT.
+    """
+    host = str(getattr(config, "GAZE_UDP_IP", "127.0.0.1"))
+    port = int(getattr(config, "GAZE_UDP_PORT", 5588))
+    timeout_s = float(getattr(config, "GAZE_UDP_TIMEOUT", 0.8) or 0.8)
+    try:
+        snap = _gaze_udp_request(host, port,
+                                  {"cmd": "snapshot", "include_objects": False},
+                                  timeout_s)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(snap, dict) or not snap.get("ok", False):
+        return None
+    return snap
 
 
 def nearest_idx_gaze(G, gaze_xy):
@@ -551,6 +578,30 @@ def main():
     else:
         print(f"[{ts()}] Library has no gaze entries (G). Vision mode 'v' will be disabled.")
 
+    # Phase 4 (plan §8.1): construct the v2 mapping once at startup if
+    # config.GAZE_CALIBRATION_VERSION >= 2. If the loaded NPZ is v1 the
+    # constructor raises — the REPL refuses to limp through with an
+    # inconsistent state, per CLAUDE.md "Surface real errors".
+    v2_mapping = None
+    if int(getattr(config, "GAZE_CALIBRATION_VERSION", 1)) >= 2:
+        from Utils.gaze.calibration_mapping import (
+            GazeCalibrationMappingV2,
+            detect_pose_library_version,
+            load_pose_library_v2,
+        )
+        data = load_pose_library_v2(sys.argv[1])
+        detected = detect_pose_library_version(data)
+        if detected < 2:
+            raise ValueError(
+                f"GAZE_CALIBRATION_VERSION>=2 but {sys.argv[1]!r} is a v{detected} NPZ. "
+                f"Either flip the flag back to 1 or use a v2 NPZ from "
+                f"harmony_free_arm_calibration.py."
+            )
+        use_imu = bool(getattr(config, "GAZE_CALIBRATION_USE_IMU", False))
+        v2_mapping = GazeCalibrationMappingV2(data, use_imu=use_imu)
+        print(f"[{ts()}] [v2] mapping ready — features={v2_mapping.feature_keys}, "
+              f"valid_samples={v2_mapping.num_valid_samples}, use_imu={use_imu}")
+
     # Initialize gaze stream if we have gaze-enabled library
     gaze_stream = None
     if has_gaze:
@@ -630,9 +681,43 @@ def main():
                 continue
 
             print(f"[{ts()}] Gaze median (x_norm, y_norm) = ({g_avg[0]:.3f}, {g_avg[1]:.3f})")
-            idx_g, d_g = nearest_idx_gaze(G, g_avg)
-            q_target = Q[idx_g]
-            goal = X[idx_g]  # EE position (mm) for logging/plots
+
+            # Phase 4 dispatch (plan §8.1): if v=2, query the v2
+            # Mahalanobis mapping with depth + head-pose pulled from a
+            # fresh gaze_runner snapshot. The REPL's LSL path does not
+            # carry those fields, so the v2 dispatch fails fast (per
+            # CLAUDE.md "Prefer fail-fast in realtime loops") rather
+            # than silently falling back to v1.
+            if v2_mapping is not None:
+                snap = _fetch_v2_snapshot()
+                if snap is None:
+                    print(f"[{ts()}] [v2] gaze_runner snapshot unavailable — "
+                          f"start gaze_runner.py --mode service on "
+                          f"{config.GAZE_UDP_IP}:{config.GAZE_UDP_PORT}, "
+                          f"or flip config.GAZE_CALIBRATION_VERSION back to 1.")
+                    continue
+                use_imu = bool(getattr(config, "GAZE_CALIBRATION_USE_IMU", False))
+                features = {
+                    "Gaze_yaw_deg": float(snap.get("gaze_yaw_deg", float("nan"))),
+                    "Gaze_pitch_deg": float(snap.get("gaze_pitch_deg", float("nan"))),
+                    "D_cm": float(snap.get("depth_cm", float("nan"))),
+                }
+                if use_imu:
+                    features["Head_yaw_deg"] = float(snap.get("head_yaw_deg", float("nan")))
+                    features["Head_pitch_deg"] = float(snap.get("head_pitch_deg", float("nan")))
+                if not all(np.isfinite(v) for v in features.values()):
+                    print(f"[{ts()}] [v2] snapshot has NaN feature(s): {features}. Try again.")
+                    continue
+                result = v2_mapping.query(features)
+                q_target = result.q_target
+                goal = result.x_target
+                idx_g, d_g = result.idx, result.dist
+                clamp_note = " (CLAMPED)" if result.clamped else ""
+                print(f"[{ts()}] [v2] features={features}{clamp_note}")
+            else:
+                idx_g, d_g = nearest_idx_gaze(G, g_avg)
+                q_target = Q[idx_g]
+                goal = X[idx_g]  # EE position (mm) for logging/plots
 
             print(f"[{ts()}] Nearest library entry in gaze space: idx {idx_g}, dist {d_g:.4f}")
             print(f"[{ts()}] Target EE (mm): {np.round(goal, 1).tolist()}")
