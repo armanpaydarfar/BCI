@@ -9,9 +9,10 @@ operator (or the participant) physically moves the active arm of the
 Harmony robot to gaze-targeted positions; the recorder sends ``m`` to
 release the arm, ``c`` to capture the bundle of (joint angles, EE
 position, gaze, depth, IMU, head pose), and ``m`` again to free it for
-the next target. Coverage is hybrid: a mandatory 3-depth x 3x3 angular
-grid = 27 capture points (3 depths x 9 angular cells) plus optional
-free additions.
+the next target. Coverage is hybrid: a mandatory 3-depth × 5-horizontal
+grid = 15 capture points (rightmost-first sweep R1→R5 per depth band)
+plus optional free additions. Between captures a background telemetry
+thread streams workspace-coverage "transit" samples at ~20 Hz.
 
 The recorder talks to two services:
 
@@ -106,19 +107,18 @@ MOVING_PHASE_SAMPLE_HZ = 20.0
 # Hybrid coverage protocol — locked per
 # Gaze_Calibration_Sensor_Characterization.md §5
 # =============================================================================
-# 3 depth bands x 3x3 angular grid = 9 mandatory points; user labels are
-# semantic so the analysis script can group by depth band when fitting
-# the Mahalanobis metric.
+# 3 depth bands × 5 horizontal positions = 15 mandatory capture points.
+# Horizontal labels R1..R5 sweep rightmost-first (R1 = participant's
+# right, R5 = participant's left); within each depth band the operator
+# walks R1 → R5 before advancing to the next depth band. This pattern
+# was reduced from the prior 3×3 grid (27 pts) to cut operator workload
+# in half while keeping the same three depth bands; the new background
+# telemetry thread covers vertical/intermediate workspace samples as
+# transit data.
 MANDATORY_GRID: List[str] = [
-    "near_TL", "near_TC", "near_TR",
-    "near_ML", "near_MC", "near_MR",
-    "near_BL", "near_BC", "near_BR",
-    "mid_TL",  "mid_TC",  "mid_TR",
-    "mid_ML",  "mid_MC",  "mid_MR",
-    "mid_BL",  "mid_BC",  "mid_BR",
-    "far_TL",  "far_TC",  "far_TR",
-    "far_ML",  "far_MC",  "far_MR",
-    "far_BL",  "far_BC",  "far_BR",
+    "near_R1", "near_R2", "near_R3", "near_R4", "near_R5",
+    "mid_R1",  "mid_R2",  "mid_R3",  "mid_R4",  "mid_R5",
+    "far_R1",  "far_R2",  "far_R3",  "far_R4",  "far_R5",
 ]
 
 

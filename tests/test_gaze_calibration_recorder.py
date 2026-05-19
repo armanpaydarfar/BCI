@@ -222,21 +222,31 @@ class TestWriteNPZ:
 # ─── MANDATORY_GRID constant ──────────────────────────────────────────────
 
 class TestMandatoryGrid:
-    def test_size_is_three_depths_times_3x3(self):
-        # 3 depth bands x 9 angular bins = 27.
-        assert len(MANDATORY_GRID) == 27
+    def test_size_is_three_depths_times_five_horizontal(self):
+        # 3 depth bands × 5 horizontal positions = 15.
+        assert len(MANDATORY_GRID) == 15
 
     def test_depth_band_prefixes_are_exhaustive(self):
         depths = {lbl.split("_")[0] for lbl in MANDATORY_GRID}
         assert depths == {"near", "mid", "far"}
 
-    def test_angular_bins_are_3x3(self):
-        # Each depth band must hit all 9 angular labels.
-        cells = {"TL", "TC", "TR", "ML", "MC", "MR", "BL", "BC", "BR"}
+    def test_horizontal_bins_are_R1_through_R5(self):
+        # Each depth band must hit all 5 horizontal labels.
+        cells = {"R1", "R2", "R3", "R4", "R5"}
         for depth in ("near", "mid", "far"):
             band_cells = {lbl.split("_")[1] for lbl in MANDATORY_GRID
                           if lbl.startswith(f"{depth}_")}
             assert band_cells == cells, f"depth {depth!r}: missing {cells - band_cells}"
+
+    def test_sweep_order_rightmost_first_per_depth(self):
+        # Within each depth band the sweep must walk R1 → R5 before
+        # moving to the next depth band, and depths order near → mid → far.
+        expected = [
+            "near_R1", "near_R2", "near_R3", "near_R4", "near_R5",
+            "mid_R1",  "mid_R2",  "mid_R3",  "mid_R4",  "mid_R5",
+            "far_R1",  "far_R2",  "far_R3",  "far_R4",  "far_R5",
+        ]
+        assert list(MANDATORY_GRID) == expected
 
     def test_labels_are_unique(self):
         assert len(set(MANDATORY_GRID)) == len(MANDATORY_GRID)
