@@ -46,4 +46,13 @@ if [[ "$need_readme_hint" == true && "$readme_staged" != true ]]; then
   warn "Setup or entry-point behavior may have changed. If users need new steps, update README.md."
 fi
 
+# Hard gate: run the fast pytest suite (Harmony_Test_Suite_Plan.md §5.3).
+# The standalone script is kept under tools/ so it can be invoked manually
+# too. Failure here aborts the commit.
+repo_root="$(git rev-parse --show-toplevel)"
+pytest_hook="${repo_root}/tools/pre-commit-pytest.sh"
+if [[ -x "$pytest_hook" ]]; then
+  "$pytest_hook" || exit $?
+fi
+
 exit 0
