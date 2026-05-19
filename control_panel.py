@@ -94,6 +94,7 @@ DRIVER_ONLINE_PY = os.path.join(ROOT, "ExperimentDriver_Online.py")
 DRIVER_ONLINE_GAZE_PY = os.path.join(ROOT, "ExperimentDriver_Online_GazeTracking.py")
 DRIVER_ONLINE_GLOVE_PY = os.path.join(ROOT, "ExperimentDriver_Online_Glove.py")
 DRIVER_ONLINE_TIAGOBOT_PY = os.path.join(ROOT, "ExperimentDriver_Online_Tiagobot.py")
+DRIVER_ONLINE_TIAGOBOT_GAZE_PY = os.path.join(ROOT, "ExperimentDriver_Online_Tiagobot_Gaze.py")
 DRIVER_BIMANUAL_PY = os.path.join(ROOT, "ExperimentDriver_Bimanual.py")
 DRIVER_OFFLINE_PY = os.path.join(ROOT, "ExperimentDriver_Offline.py")
 DRIVER_ERRP_ONLINE_PY = os.path.join(ROOT, "ExperimentDriver_ErrP_Online.py")
@@ -324,7 +325,7 @@ def _marker_udp_port() -> int:
     return 12345
 
 # Modes choose which robot tool to launch remotely
-MODES = ["Gaze_Tracking", "MI_Bimanual", "MI_Tiagobot", "Simulation"]
+MODES = ["Gaze_Tracking", "MI_Bimanual", "MI_Tiagobot", "MI_Tiagobot_Gaze", "Simulation"]
 
 # Driver choices
 DRIVERS = [
@@ -335,6 +336,7 @@ DRIVERS = [
     "ExperimentDriver_Online_GazeTracking",
     "ExperimentDriver_Online_Glove",
     "ExperimentDriver_Online_Tiagobot",
+    "ExperimentDriver_Online_Tiagobot_Gaze",
 ]
 
 # ----------------- Config read/write helpers -----------------
@@ -2239,9 +2241,10 @@ class ControlPanel(QMainWindow):
         mode_flag = {
             "MI_Bimanual": "--mode mi_bimanual",
             "Gaze_Tracking": "--mode gaze",
-            # Tiagobot driver ignores the flag (no argparse) — kept for
+            # Tiagobot drivers ignore the flag (no argparse) — kept for
             # log clarity and so the panel command line is consistent.
             "MI_Tiagobot": "--mode mi_tiagobot",
+            "MI_Tiagobot_Gaze": "--mode mi_tiagobot_gaze",
             "Simulation": "--mode sim --no-robot",
         }[self.mode]
 
@@ -2259,6 +2262,8 @@ class ControlPanel(QMainWindow):
             driver_path = DRIVER_ONLINE_GLOVE_PY
         elif self.driver_choice == "ExperimentDriver_Online_Tiagobot":
             driver_path = DRIVER_ONLINE_TIAGOBOT_PY
+        elif self.driver_choice == "ExperimentDriver_Online_Tiagobot_Gaze":
+            driver_path = DRIVER_ONLINE_TIAGOBOT_GAZE_PY
         else:
             QMessageBox.warning(self, "Driver", f"Unknown driver selected: {self.driver_choice}")
             return
@@ -2280,8 +2285,8 @@ class ControlPanel(QMainWindow):
     def _update_robot_buttons_for_mode(self):
         # The Robot SSH button opens a terminal against the Harmony robot
         # host. It makes no sense in Simulation (no robot) or in
-        # MI_Tiagobot (the "robot" is a local Arduino, not a remote
-        # Harmony at config.UDP_ROBOT["IP"]).
+        # MI_Tiagobot / MI_Tiagobot_Gaze (the "robot" is a local Arduino,
+        # not a remote Harmony at config.UDP_ROBOT["IP"]).
         harmony_relevant = self.mode in ("MI_Bimanual", "Gaze_Tracking")
         self.btn_robot_start.setEnabled(harmony_relevant)
         if not harmony_relevant:
@@ -2310,6 +2315,7 @@ class ControlPanel(QMainWindow):
     # are absent so the operator's driver choice is preserved.
     _MODE_IMPLIES_DRIVER = {
         "MI_Tiagobot": "ExperimentDriver_Online_Tiagobot",
+        "MI_Tiagobot_Gaze": "ExperimentDriver_Online_Tiagobot_Gaze",
     }
 
     def on_mode_changed(self, text: str):
