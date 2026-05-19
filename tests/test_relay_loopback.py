@@ -17,7 +17,7 @@ envelopes (using the same private send helper) and then connects both
 
 Run from the BCI root with the harmony_vlm conda env (cv2 + numpy):
 
-    C:/Users/arman/miniconda3/envs/harmony_vlm/python.exe tools/test_relay_loopback.py
+    C:/Users/arman/miniconda3/envs/harmony_vlm/python.exe tests/test_relay_loopback.py
 
 Exit code 0 = all checks passed. Non-zero = one or more checks failed
 (stderr names the failing assertion).
