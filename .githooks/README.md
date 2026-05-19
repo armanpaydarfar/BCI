@@ -1,6 +1,17 @@
 # Git hooks (optional)
 
-Harmony ships a **non-destructive** `pre-commit` hook: it only prints **hints** when you stage changes under common config/runtime paths but do **not** stage `CHANGELOG.md` (and sometimes `README.md`). It does **not** rewrite files or append commits.
+Harmony ships a `pre-commit` hook with two pieces:
+
+1. **Soft hints** when you stage changes under common config/runtime
+   paths but do **not** stage `CHANGELOG.md` (and sometimes `README.md`).
+   These never block the commit.
+2. **Hard pytest gate** (via `tools/pre-commit-pytest.sh`) — runs
+   `pytest tests/ -m "not slow" -q` and blocks the commit if any test
+   fails. Bypass with `git commit --no-verify` (never on `main` /
+   `master`).
+
+See `Documents/SoftwareDocs/Harmony_Test_Suite_Plan.md` §5.3 for the
+test gate's history and policy.
 
 Enable for this repository:
 
