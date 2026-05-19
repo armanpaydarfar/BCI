@@ -10,7 +10,8 @@ Harmony robot to gaze-targeted positions; the recorder sends ``m`` to
 release the arm, ``c`` to capture the bundle of (joint angles, EE
 position, gaze, depth, IMU, head pose), and ``m`` again to free it for
 the next target. Coverage is hybrid: a mandatory 3-depth x 3x3 angular
-grid (9 points) plus optional free additions.
+grid = 27 capture points (3 depths x 9 angular cells) plus optional
+free additions.
 
 The recorder talks to two services:
 
