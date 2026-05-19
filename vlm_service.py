@@ -191,9 +191,19 @@ def parse_args():
     p.add_argument("--model", default=_cfg_default("VLM_MODEL", "gemini-2.5-flash"),
                    help="VLM model name")
     p.add_argument("--seg-model", default="models/FastSAM-s.pt", help="Relative to repo-dir")
-    p.add_argument("--device", default="cpu")
+    # Default "auto" resolves to cuda if torch.cuda.is_available(), else cpu
+    # (see main()). Hosts without a usable GPU degrade gracefully to CPU,
+    # matching CLAUDE.md's "platform-specific optimisations must be gated on
+    # torch.cuda.is_available()" rule.
+    p.add_argument("--device", default="auto",
+                   help="Compute device: 'auto' (default; cuda if available, "
+                        "else cpu), 'cuda', or 'cpu'.")
+    # Depth is on by default; pass --no-enable-depth to disable. Loading
+    # depth_pro.pt adds ~1-2 s and ~1 GB of VRAM on cuda (or ~3 GB RAM on cpu),
+    # but the downstream panel/driver consumes depth whenever perception runs,
+    # so the right default is "on" — opt-out rather than opt-in.
     p.add_argument("--enable-depth", action=argparse.BooleanOptionalAction,
-                   default=bool(_cfg_default("VLM_ENABLE_DEPTH", False)))
+                   default=bool(_cfg_default("VLM_ENABLE_DEPTH", True)))
     p.add_argument("--depth-checkpoint", default="models/depth_pro.pt", help="Relative to repo-dir")
     p.add_argument("--session-dir", default=None, help="Where to save depth PNGs etc.")
     p.add_argument("--verbose", action="store_true")
@@ -1467,6 +1477,14 @@ def main() -> None:
     # .env at repo root holds GOOGLE_API_KEY / OPENAI_API_KEY for IntentReasoner.
     # Change cwd so relative model paths (FastSAM-s.pt, depth_pro.pt) resolve correctly.
     os.chdir(repo_dir)
+
+    # Resolve --device=auto now that repo_dir is set up but before any model
+    # loading. Gated on torch.cuda.is_available() so the same default works on
+    # GPU hosts (cuda) and CPU-only Linux hosts (cpu).
+    if args.device == "auto":
+        import torch as _torch_probe
+        args.device = "cuda" if _torch_probe.cuda.is_available() else "cpu"
+        _log(f"--device auto-resolved to {args.device}")
 
     # Read .env values and force-set them in os.environ so that a pre-existing
     # empty-string value inherited from the parent process doesn't shadow the file.
