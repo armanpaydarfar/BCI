@@ -149,6 +149,24 @@ GAZE_SAMPLE_HEIGHT = 1200.0
 # POSE_LIBRARY_PATH derives from WORKING_DIR — defined at the bottom of
 # this file so it picks up any config_local.py override.
 
+# Gaze calibration mapping version, dispatched at runtime by
+# ExperimentDriver_Online_GazeTracking.resolve_robot_target_from_gaze
+# and harmony_online_control's vision branch:
+#   1 = legacy 2D NN on (gaze_x_norm, gaze_y_norm)
+#   2 = depth/IMU-aware mapping over (gaze_yaw_deg, gaze_pitch_deg,
+#       depth_cm) with optional head-pose features behind
+#       GAZE_CALIBRATION_USE_IMU (Mahalanobis NN — plan §6.2 Option I).
+# Default 1 until v2 is hardware-validated, per
+# Harmony_Gaze_Calibration_Upgrade_Plan.md §8.1.
+GAZE_CALIBRATION_VERSION = 1
+
+# Whether the v2 mapping consumes head_yaw/head_pitch as additional
+# features (plan §5.5 Pass-2). Default False — keep IMU out of the
+# production path until Pass-2 measurably beats Pass-1 by >= 10%
+# reduction in held-out joint MSE (decision rule locked in
+# Gaze_Calibration_Sensor_Characterization.md §5).
+GAZE_CALIBRATION_USE_IMU = False
+
 # =============================================================================
 # Pupil Labs Neon — device connection
 # =============================================================================
