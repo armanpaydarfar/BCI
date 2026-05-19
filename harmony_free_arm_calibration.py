@@ -56,7 +56,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 import config
-from Utils.perception_clients import udp_request
+from Utils.perception_clients import VLMClient, udp_request
 
 
 # =============================================================================
@@ -246,6 +246,80 @@ def gaze_recenter(timeout_s: float = GAZE_RPC_TIMEOUT_S) -> bool:
 
 
 # =============================================================================
+# VLM depth (Depth Pro) — opt-in via config.GAZE_CALIBRATION_DEPTH_SOURCE
+# =============================================================================
+def verify_vlm_depth_available(vlm_client: VLMClient) -> None:
+    """Fail-fast precondition for `GAZE_CALIBRATION_DEPTH_SOURCE='vlm_depth_pro'`.
+
+    The Mahalanobis NN treats depth as a learned-distribution feature;
+    silently falling back to vergence mid-session would poison the metric
+    by mixing two scales (CLAUDE.md §"Realtime Safety Constraints" plus
+    user instruction in the §"Depth source selection" plan addition).
+    This function raises RuntimeError if vlm_service is unreachable or
+    has Depth Pro disabled — the caller aborts the recording session.
+    """
+    try:
+        status = vlm_client.status()
+    except OSError as e:
+        raise RuntimeError(
+            f"VLM service unreachable at {vlm_client.host}:{vlm_client.port} ({e}); "
+            f"refusing to record with GAZE_CALIBRATION_DEPTH_SOURCE='vlm_depth_pro'. "
+            f"Start vlm_service.py with --enable-depth from the control panel first."
+        ) from e
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"VLM service at {vlm_client.host}:{vlm_client.port} returned a malformed "
+            f"status reply ({e}); refusing to record with "
+            f"GAZE_CALIBRATION_DEPTH_SOURCE='vlm_depth_pro'."
+        ) from e
+    if not isinstance(status, dict) or not status.get("ok", False):
+        raise RuntimeError(
+            f"VLM service at {vlm_client.host}:{vlm_client.port} returned ok=False "
+            f"on status ({status!r}); refusing to record."
+        )
+    if not bool(status.get("depth_enabled", False)):
+        raise RuntimeError(
+            f"VLM service at {vlm_client.host}:{vlm_client.port} reports "
+            f"depth_enabled=False; restart it with --enable-depth (and ensure "
+            f"the Depth Pro model loaded successfully) before recording with "
+            f"GAZE_CALIBRATION_DEPTH_SOURCE='vlm_depth_pro'."
+        )
+
+
+def fetch_vlm_depth_cm(vlm_client: VLMClient) -> Tuple[float, bool]:
+    """Fetch one (depth_cm, depth_valid) pair from vlm_service at the
+    current gaze fixation. Converts the service's `depth_at_gaze_m`
+    (Depth Pro is metric) to cm so the recorded NPZ field matches the
+    vergence schema in scale; the source distinction is preserved via
+    `meta["depth_source"]` and consumers must NOT mix sources.
+
+    Fail-fast policy: any transport failure / not-ok response /
+    malformed payload raises RuntimeError. The caller aborts the
+    recording session rather than logging a synthetic vergence value.
+    """
+    try:
+        resp = vlm_client.depth(at_gaze=True)
+    except OSError as e:
+        raise RuntimeError(f"VLM depth request failed (transport: {e})") from e
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"VLM depth response malformed ({e})") from e
+    if not isinstance(resp, dict) or not resp.get("ok", False):
+        raise RuntimeError(f"VLM depth response not ok: {resp!r}")
+    if "depth_at_gaze_m" not in resp:
+        raise RuntimeError(
+            f"VLM depth response missing depth_at_gaze_m field: {resp!r} "
+            f"(did the request omit at_gaze=True somewhere?)"
+        )
+    depth_m = float(resp["depth_at_gaze_m"])
+    if not np.isfinite(depth_m):
+        # The pixel under gaze produced a non-finite depth (rare; e.g.
+        # extreme background pixel). Mark invalid so the calibration
+        # filter (D_valid in calibration_mapping) drops the row.
+        return float("nan"), False
+    return depth_m * 100.0, True
+
+
+# =============================================================================
 # Capture bundle
 # =============================================================================
 @dataclass
@@ -372,7 +446,9 @@ def capture_pose(link: RobotLink) -> Optional[Dict[str, np.ndarray]]:
 
 
 def settle_and_snapshot(target_label: str,
-                        robot_state: Dict[str, np.ndarray]) -> Optional[CaptureBundle]:
+                        robot_state: Dict[str, np.ndarray],
+                        vlm_client: Optional[VLMClient] = None
+                        ) -> Optional[CaptureBundle]:
     """Wait POST_CAPTURE_SETTLE_S after a `c` lock, then sample the
     gaze snapshot. Returns the bundle, or None if we cannot find a
     snapshot with DEPTH_VALID_MIN_CONSECUTIVE consecutive valid depth
@@ -382,6 +458,13 @@ def settle_and_snapshot(target_label: str,
     first sample after a worn-transition under-reports. The settle
     plus the consecutive-valid gate together protect against logging
     a stale value.
+
+    When ``vlm_client`` is not None, the recorded bundle's `depth_cm`
+    and `depth_valid` are overwritten with the VLM Depth Pro reading
+    at the same fixation — depth_source must equal the runtime source
+    or the Mahalanobis NN scale assumptions break. Any VLM failure
+    bubbles up to abort the recording session (fail-fast per CLAUDE.md
+    §"Error Handling"); we never silently fall back to vergence.
     """
     print(f"[{_ts()}] Settling {POST_CAPTURE_SETTLE_S:.2f}s before snapshot…")
     time.sleep(POST_CAPTURE_SETTLE_S)
@@ -413,7 +496,22 @@ def settle_and_snapshot(target_label: str,
         print(f"[{_ts()}] WARN: depth_valid streak {consecutive_valid} "
               f"< required {DEPTH_VALID_MIN_CONSECUTIVE} — recording bundle anyway "
               f"(Pass-1 IMU path tolerates NaN depth; Pass-2 will drop)")
-    return bundle_from_snapshot(last_snap, robot_state["_t"], robot_state["q"],
+
+    # VLM-depth path overwrites the vergence depth fields BEFORE
+    # bundle construction so the rest of the pipeline (writer,
+    # diagnostics) sees a single coherent source per row. We do this
+    # via a dict copy because the snapshot is the gaze_runner's owned
+    # data structure.
+    if vlm_client is not None:
+        snap_for_bundle = dict(last_snap)
+        depth_cm, depth_valid = fetch_vlm_depth_cm(vlm_client)
+        snap_for_bundle["depth_cm"] = depth_cm
+        snap_for_bundle["depth_valid"] = depth_valid
+        print(f"[{_ts()}] VLM depth at gaze: {depth_cm:.1f}cm (valid={depth_valid})")
+    else:
+        snap_for_bundle = last_snap
+
+    return bundle_from_snapshot(snap_for_bundle, robot_state["_t"], robot_state["q"],
                                 robot_state["ee"], phase="captured",
                                 target_label=target_label)
 
@@ -555,6 +653,16 @@ def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
     Phase_all = np.asarray([b.phase for b in bundles], dtype="<U16")
     Target_label_all = np.asarray([b.target_label for b in bundles], dtype="<U32")
 
+    # depth_source pins the calibration-time depth pipeline; the v2
+    # runtime dispatch in ExperimentDriver_Online_GazeTracking refuses
+    # to load an NPZ whose runtime source disagrees, since mixing
+    # vergence and Depth Pro within the Mahalanobis NN breaks the
+    # learned per-feature scales.
+    depth_source = str(getattr(config, "GAZE_CALIBRATION_DEPTH_SOURCE",
+                                "vergence"))
+    vlm_service_host = (str(getattr(config, "VLM_SERVICE_HOST", ""))
+                        if depth_source == "vlm_depth_pro" else "")
+
     meta = dict(
         version=2,
         side=ACTIVE_SIDE,
@@ -566,6 +674,8 @@ def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
         gaze_sample_height=float(getattr(config, "GAZE_SAMPLE_HEIGHT", 1200.0)),
         post_capture_settle_s=POST_CAPTURE_SETTLE_S,
         depth_valid_min_consecutive=DEPTH_VALID_MIN_CONSECUTIVE,
+        depth_source=depth_source,
+        vlm_service_host=vlm_service_host,
         units=dict(X="mm", Q="rad", G="normalized_0_to_1",
                    D_cm="cm", Miss_mm="mm", IPD_mm="mm",
                    IMU_w="rad/s", Head_yaw_deg="deg",
@@ -608,6 +718,27 @@ def run_session(out_dir: str = ".") -> Optional[str]:
     print(f"[{_ts()}] Active side: {ACTIVE_SIDE}")
     print(f"[{_ts()}] Robot endpoint: {ROBOT_IP}:{ROBOT_PORT}")
     print(f"[{_ts()}] Gaze service:  {GAZE_HOST}:{GAZE_PORT}")
+
+    # Resolve depth-source preflight BEFORE binding the robot socket so
+    # a misconfigured VLM host does not leave the robot link orphaned.
+    # Fail-fast policy: the recorder refuses to start if vlm_depth_pro
+    # is requested but the service is unreachable or has depth disabled.
+    depth_source = str(getattr(config, "GAZE_CALIBRATION_DEPTH_SOURCE",
+                                "vergence"))
+    vlm_client: Optional[VLMClient] = None
+    if depth_source == "vlm_depth_pro":
+        vlm_client = VLMClient(config)
+        verify_vlm_depth_available(vlm_client)
+        print(f"[{_ts()}] [recorder] depth source: vlm_depth_pro "
+              f"(host={vlm_client.host}, depth_enabled=True)")
+    elif depth_source == "vergence":
+        print(f"[{_ts()}] [recorder] depth source: vergence "
+              f"(gaze_runner vergence path)")
+    else:
+        raise RuntimeError(
+            f"Unknown GAZE_CALIBRATION_DEPTH_SOURCE={depth_source!r}; "
+            f"must be 'vergence' or 'vlm_depth_pro'."
+        )
     print()
 
     link = RobotLink()
@@ -667,7 +798,8 @@ def run_session(out_dir: str = ".") -> Optional[str]:
                 continue
 
             # 5) Settle + sample.
-            bundle = settle_and_snapshot(target_label, captured_state)
+            bundle = settle_and_snapshot(target_label, captured_state,
+                                          vlm_client=vlm_client)
             if bundle is None:
                 print(f"[{_ts()}] WARN: no gaze snapshot at {target_label}. Skipping.")
                 # Re-free for the next attempt at the same target.
@@ -708,7 +840,8 @@ def run_session(out_dir: str = ".") -> Optional[str]:
             if captured_state is None:
                 print(f"[{_ts()}] ERR: `c` failed at {target_label}. Skipping.")
                 continue
-            bundle = settle_and_snapshot(target_label, captured_state)
+            bundle = settle_and_snapshot(target_label, captured_state,
+                                          vlm_client=vlm_client)
             if bundle is None:
                 print(f"[{_ts()}] WARN: no gaze snapshot at {target_label}. Skipping.")
                 continue
