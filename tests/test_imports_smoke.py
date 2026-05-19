@@ -121,6 +121,9 @@ _SAFE_IMPORT_MODULES = [
     "Utils.vlm_subscriber",
     "Utils.xgb_feature_pipeline",
     "Utils.xgb_train_eval",
+    # Tiagobot serial layer (Tier 1) + pure-function gaze helpers
+    "Utils.tiagobot",
+    "Utils.tiagobot_gaze",
     # Gaze submodules (pure per their docstrings)
     "Utils.gaze.gaze_math",
     "Utils.gaze.gaze_render",
