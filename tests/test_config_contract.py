@@ -55,6 +55,8 @@ DRIVER_FILES = sorted(REPO_ROOT.glob("ExperimentDriver_*.py")) + [
 # test_local_keys_list_matches_hook happy, this set mirrors the hook
 # exactly. When the hook is updated upstream to add TIAGOBOT_PORT,
 # update this set in the same commit.
+# TIAGOBOT_GAZE_CALIBRATION_PATH was added to both CLAUDE.md and the
+# hook in the 2026-05-19 polish run (critic I1), so it lives here too.
 _LOCAL_KEYS = {
     "WORKING_DIR", "DATA_DIR",
     "GAZE_UDP_IP", "GAZE_BIND_HOST",
@@ -64,6 +66,7 @@ _LOCAL_KEYS = {
     "VLM_REPO_DIR",
     "VLM_SERVICE_HOST", "VLM_BIND_HOST",
     "ARDUINO_PORT",
+    "TIAGOBOT_GAZE_CALIBRATION_PATH",
 }
 
 # Mirror of ~/.claude/hooks/config-py-guard.sh SAFE_RHS, expressed as

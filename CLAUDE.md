@@ -152,6 +152,7 @@ realtime but not in the critical path.
   - `VLM_SERVICE_HOST`, `VLM_BIND_HOST`
   - `ARDUINO_PORT`
   - `TIAGOBOT_PORT`
+  - `TIAGOBOT_GAZE_CALIBRATION_PATH`
 
 - All other config changes are safe to commit provided they are
   platform-neutral.
