@@ -1,6 +1,6 @@
 """
 calibration_mapping.py — v2 gaze -> joint-target lookup
-(plan §6.2 Option I, per Harmony_Gaze_Calibration_Upgrade_Plan.md).
+(plan §6.2 Option I, per Harmony_Gaze_Calibration_REV01_Plan.md).
 
 The v1 mapping in ``ExperimentDriver_Online_GazeTracking.nearest_idx_gaze``
 (file:609-624 of that driver) is a flat 2-D NN over normalised scene
@@ -18,6 +18,12 @@ The v2 mapping is a Mahalanobis NN over a richer feature vector:
 Per-feature scales are learned from the calibration NPZ via the
 robust 1.4826*MAD estimator (a stddev surrogate that ignores
 outliers from blinks / off-screen fixations).
+
+REV01 (Plan §3.4): REV01 NPZs include transit-phase rows in the
+fit-relevant ``Q/X/feature`` block, growing ``num_valid_samples`` from
+~15 to ~hundreds per session. The mapping reads those keys directly
+and needs no code change to consume the richer table; the workspace
+clamp envelope widens automatically.
 
 This module also exposes the workspace-bounds clamp locked in
 Gaze_Calibration_Sensor_Characterization.md §5: every commanded joint
@@ -191,6 +197,16 @@ class GazeCalibrationMappingV2:
         # mapping landed before vlm_depth_pro was added).
         self._depth_source: str = _read_depth_source(npz_data)
 
+        # REV01 (Plan §3.4): the per-session affine map fitted by
+        # tools/fit_vergence_affine.py (Step 7) lives on meta and is
+        # populated POST-recording. ``None`` means "no fit yet" — under
+        # the hybrid NPZ the runtime falls back to raw vergence in that
+        # case, which is wrong-but-safe (vergence has a per-subject
+        # offset; runtime would log a corrupted scale rather than send
+        # the robot somewhere unsafe).
+        self._affine_map: Optional[Tuple[float, float]] = _read_affine_map(
+            npz_data)
+
     # ------------------------------------------------------------------
     # Public lookup
     # ------------------------------------------------------------------
@@ -250,11 +266,63 @@ class GazeCalibrationMappingV2:
     def depth_source(self) -> str:
         """Depth source pinned at calibration time. ``'vergence'`` for
         legacy v2 NPZs (and for the Pupil Labs binocular vergence path);
-        ``'vlm_depth_pro'`` for NPZs recorded with Depth Pro substitution.
+        ``'vlm_depth_pro'`` for REV00 NPZs recorded with Depth Pro
+        substitution; ``'hybrid_anchor_vlm_transit_vergence'`` for
+        REV01 NPZs (anchors=Depth Pro, transit=vergence, with a
+        per-session affine map fitting them into one scale — see
+        ``runtime_depth_pipeline``).
+
         Drives the runtime alignment check — see
-        ``ExperimentDriver_Online_GazeTracking._load_v2_mapping_if_enabled``.
+        ``ExperimentDriver_Online_GazeTracking._load_v2_mapping_if_enabled``
+        and the REPL probe at ``harmony_online_control.main``.
         """
         return self._depth_source
+
+    @property
+    def affine_map(self) -> Optional[Tuple[float, float]]:
+        """REV01 per-session affine coefficients ``(a, b)`` mapping
+        vergence depth into the Depth Pro scale (``D_vlm ≈ a · D_vergence + b``).
+        ``None`` for pre-REV01 NPZs and for REV01 NPZs that have not yet
+        run ``tools/fit_vergence_affine.py``.
+        """
+        if self._affine_map is None:
+            return None
+        return (self._affine_map[0], self._affine_map[1])
+
+    @property
+    def runtime_depth_pipeline(self) -> str:
+        """REV01 dispatch hint for the runtime depth feed.
+
+        Returns one of:
+          - ``"vergence_affine"`` — the NPZ is a REV01 hybrid AND has a
+            fitted ``meta["affine_map"]``. The runtime pulls
+            ``depth_cm`` from the snapshot, applies
+            ``d_runtime = a · depth_cm + b``, and feeds the result into
+            the v2 query so the Mahalanobis NN sees a feature in the
+            same scale as the calibration data.
+          - ``"vlm_depth_pro"`` — the NPZ is a REV00 vlm_depth_pro
+            recording with no transit promotion and no affine map. The
+            runtime fetches one Depth Pro reading per trial-end.
+          - ``"vergence"`` — every other case, including legacy v1/v2
+            NPZs and REV01 NPZs whose affine fit has not yet been run.
+
+        Alignment invariant: a REV01 NPZ pairs Depth Pro anchor
+        measurements with a per-session affine scaling that maps
+        vergence into the Depth Pro scale. Runtime applies this scaling
+        to every per-sample vergence reading so the Mahalanobis NN sees
+        a feature in the same scale as the calibration data. If
+        ``affine_map`` is missing the dispatch falls back to raw
+        vergence and the per-feature scale will be wrong; the offline
+        fit script must run before the NPZ is used at runtime. The
+        driver-side and REPL-side probes raise ``RuntimeError`` on this
+        misconfiguration rather than silently mis-scaling.
+        """
+        if (self._depth_source == "hybrid_anchor_vlm_transit_vergence"
+                and self._affine_map is not None):
+            return "vergence_affine"
+        if self._depth_source == "vlm_depth_pro":
+            return "vlm_depth_pro"
+        return "vergence"
 
     # ------------------------------------------------------------------
     # Internals
@@ -341,6 +409,35 @@ def _read_depth_source(npz_data: Any) -> str:
     if not isinstance(meta, dict):
         return "vergence"
     return str(meta.get("depth_source", "vergence"))
+
+
+def _read_affine_map(npz_data: Any) -> Optional[Tuple[float, float]]:
+    """REV01 (Plan §3.4): pull the ``(a, b)`` affine coefficients out
+    of ``meta['affine_map']``. Returns ``None`` if the NPZ predates
+    REV01, if no fit has been run yet (placeholder still ``None``), or
+    if the meta dict is malformed in any way the runtime cannot trust.
+
+    The nested ``affine_map`` dict round-trips through
+    ``np.savez_compressed`` inside the outer ``meta`` object array;
+    ``_peek_meta`` already unwraps the outer ``.item()``, so reading
+    ``meta['affine_map']`` here returns the inner dict directly.
+    """
+    meta = _peek_meta(npz_data)
+    if not isinstance(meta, dict):
+        return None
+    raw = meta.get("affine_map")
+    if not isinstance(raw, dict):
+        return None
+    if "a" not in raw or "b" not in raw:
+        return None
+    try:
+        a = float(raw["a"])
+        b = float(raw["b"])
+    except (TypeError, ValueError):
+        return None
+    if not (np.isfinite(a) and np.isfinite(b)):
+        return None
+    return (a, b)
 
 
 def _peek_meta(npz_data: Any) -> Optional[Dict[str, Any]]:

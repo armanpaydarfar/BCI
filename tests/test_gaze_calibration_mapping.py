@@ -436,3 +436,84 @@ class TestMappingDepthSourceAttribute:
         m2 = GazeCalibrationMappingV2(data, use_imu=True)
         assert m1.depth_source == "vergence"
         assert m2.depth_source == "vergence"
+
+
+# ─── REV01 runtime_depth_pipeline (Plan §3.4, Step 4) ──────────────────────
+
+class TestRuntimeDepthPipeline:
+    """REV01 (Plan §3.4): the mapping exposes a ``runtime_depth_pipeline``
+    property that the REPL and the EEG-gated driver dispatch on at
+    startup. Three branches:
+
+      - ``"vergence_affine"`` when meta["depth_source"] ==
+        "hybrid_anchor_vlm_transit_vergence" AND meta["affine_map"]
+        carries a fitted ``(a, b)``.
+      - ``"vlm_depth_pro"`` for REV00 vlm_depth_pro NPZs (legacy).
+      - ``"vergence"`` everywhere else, including REV01 NPZs whose
+        affine fit has not been run yet (graceful degrade; the
+        driver-side probe must still surface this as an error via
+        the alignment invariant).
+    """
+
+    def _make_data(self, *, with_meta=None) -> _ShimNpz:
+        # Reuse the same shim fixture as the other tests in this file.
+        data = _make_npz(N=16, seed=1, with_imu=True)
+        if with_meta is not None:
+            data["meta"] = np.array(with_meta, dtype=object)
+        return data
+
+    def test_legacy_no_meta_yields_vergence(self):
+        m = GazeCalibrationMappingV2(self._make_data(), use_imu=False)
+        assert m.runtime_depth_pipeline == "vergence"
+        assert m.affine_map is None
+
+    def test_v2_vergence_npz_yields_vergence(self):
+        data = self._make_data(with_meta={"version": 2, "side": "R",
+                                            "depth_source": "vergence"})
+        m = GazeCalibrationMappingV2(data, use_imu=False)
+        assert m.runtime_depth_pipeline == "vergence"
+        assert m.affine_map is None
+
+    def test_v2_vlm_only_npz_yields_vlm_depth_pro(self):
+        # Legacy REV00 vlm_depth_pro NPZ: no transit promotion, no
+        # affine map; runtime must keep the per-trial VLM fetch path.
+        data = self._make_data(with_meta={
+            "version": 2, "side": "R",
+            "depth_source": "vlm_depth_pro",
+            "vlm_service_host": "192.168.99.99",
+        })
+        m = GazeCalibrationMappingV2(data, use_imu=False)
+        assert m.runtime_depth_pipeline == "vlm_depth_pro"
+        assert m.affine_map is None
+
+    def test_rev01_with_affine_map_yields_vergence_affine(self):
+        # REV01 hybrid NPZ with a populated affine_map: runtime applies
+        # a · d + b to the snapshot's vergence depth.
+        data = self._make_data(with_meta={
+            "version": 2, "side": "R",
+            "depth_source": "hybrid_anchor_vlm_transit_vergence",
+            "affine_map": {"a": 1.25, "b": -10.0, "R2": 0.92,
+                            "max_abs_residual_cm": 4.1},
+        })
+        m = GazeCalibrationMappingV2(data, use_imu=False)
+        assert m.runtime_depth_pipeline == "vergence_affine"
+        am = m.affine_map
+        assert am is not None
+        a, b = am
+        assert a == pytest.approx(1.25)
+        assert b == pytest.approx(-10.0)
+
+    def test_rev01_without_affine_map_falls_back_to_vergence(self):
+        # REV01 NPZ before the offline affine fit has run — meta says
+        # hybrid but affine_map is the None placeholder. The property
+        # falls back to "vergence" so the runtime is wrong-but-safe;
+        # the driver/REPL probe raises RuntimeError on this state to
+        # force the operator to run the fit script.
+        data = self._make_data(with_meta={
+            "version": 2, "side": "R",
+            "depth_source": "hybrid_anchor_vlm_transit_vergence",
+            "affine_map": None,
+        })
+        m = GazeCalibrationMappingV2(data, use_imu=False)
+        assert m.runtime_depth_pipeline == "vergence"
+        assert m.affine_map is None
