@@ -320,79 +320,109 @@ class TestLoaderAndVersionDetect:
         assert "__files__" in data
 
 
-# ─── Transit-phase filtering ──────────────────────────────────────────────
+# ─── REV01 transit-phase inclusion (Plan §3.2, Step 5) ──────────────────────
 
-class TestMappingIgnoresTransitPhase:
-    """GazeCalibrationMappingV2 reads ``Q`` / ``X`` / feature columns
-    directly from the NPZ. The recorder's ``write_npz`` packs only
-    ``phase='captured'`` rows into those legacy keys; all-phase data
-    lives under ``*_all`` keys that the mapping never touches. This
-    test locks that invariant in: a v2 NPZ containing a transit row
-    in ``*_all`` MUST NOT influence the mapping's fit (its captured
-    rows remain the only source of Q / X / features).
+class TestMappingIncludesTransitPhase:
+    """REV01 (Plan §3.2): the recorder's ``write_npz`` now packs
+    captured + transit rows into the legacy ``Q/X/feature`` block so
+    the v2 Mahalanobis NN trains on the full workspace cloud, not just
+    the 15 anchors. The mapping is unchanged structurally — it reads
+    those keys directly — but the contract inverts vs the pre-REV01
+    ``TestMappingIgnoresTransitPhase`` test that this class replaces
+    (Plan §6.4 #5: delete and replace, do not rename-and-flip).
+
+    Coverage:
+      - ``num_valid_samples == N_captured + N_transit_valid`` when the
+        NPZ contains both phases in the legacy block.
+      - ``feature_scales`` reflect the mixed distribution (captured +
+        transit), not just the captured subset.
     """
 
-    def test_transit_rows_in_all_keys_do_not_reach_fit(self, tmp_path: Path):
-        # Hand-construct a v2 NPZ that mirrors the recorder's two-block
-        # layout (legacy=captured-only, *_all=mixed phases).
-        N_cap = 4  # 4 captured rows feed the mapping fit
-        N_all = 10  # 4 captured + 6 transit in the all-block
-        p = tmp_path / "v2_with_transit.npz"
+    def test_transit_rows_in_legacy_block_reach_fit(self, tmp_path: Path):
+        # Hand-construct a REV01 NPZ that mirrors the recorder's REV01
+        # layout: legacy block holds captured + transit, the *_all
+        # block carries every phase. The recorder's Step 3 writer does
+        # exactly this; we exercise the mapping against that schema.
+        N_cap, N_trans = 4, 6
+        N_fit = N_cap + N_trans
+        N_all = N_fit + 2  # plus 2 moving rows that stay out of the fit
+        p = tmp_path / "rev01_legacy_includes_transit.npz"
         rng = np.random.default_rng(0)
+        # Wide-range captured D_cm; tight-range transit D_cm — if the
+        # mapping read both, the MAD scale must rise above what the
+        # captured-only subset alone would produce.
+        captured_d_cm = rng.uniform(30.0, 200.0, N_cap)
+        transit_d_cm = np.full(N_trans, 110.0)
+        legacy_d_cm = np.concatenate([captured_d_cm, transit_d_cm])
         np.savez_compressed(
             str(p),
-            T=np.zeros(N_cap),
-            Q=rng.standard_normal((N_cap, 7)),
-            X=rng.standard_normal((N_cap, 3)) * 100,
-            G=np.column_stack([np.full(N_cap, 0.5), np.full(N_cap, 0.5),
-                                np.full(N_cap, 1.0)]),
-            D_cm=rng.uniform(30.0, 200.0, N_cap),
-            D_valid=np.ones(N_cap, dtype=bool),
-            Gaze_yaw_deg=rng.standard_normal(N_cap) * 10,
-            Gaze_pitch_deg=rng.standard_normal(N_cap) * 8,
-            Head_yaw_deg=np.zeros(N_cap),
-            Head_pitch_deg=np.zeros(N_cap),
-            Target_label=np.array(["near_R1", "near_R2", "mid_R1", "far_R3"],
-                                   dtype="<U32"),
-            # ALL-block — 4 captured + 6 transit. The transit rows have
-            # WILDLY different gaze/depth values; if the mapping fit
-            # accidentally read them, the Mahalanobis scale would shift.
+            T=np.zeros(N_fit),
+            Q=rng.standard_normal((N_fit, 7)),
+            X=rng.standard_normal((N_fit, 3)) * 100,
+            G=np.column_stack([np.full(N_fit, 0.5), np.full(N_fit, 0.5),
+                                np.full(N_fit, 1.0)]),
+            D_cm=legacy_d_cm,
+            D_valid=np.ones(N_fit, dtype=bool),
+            Gaze_yaw_deg=rng.standard_normal(N_fit) * 10,
+            Gaze_pitch_deg=rng.standard_normal(N_fit) * 8,
+            Head_yaw_deg=np.zeros(N_fit),
+            Head_pitch_deg=np.zeros(N_fit),
+            Target_label=np.array(["near_R1", "near_R2", "mid_R1", "far_R3"]
+                                   + [""] * N_trans, dtype="<U32"),
+            Depth_source=np.array(["vlm_depth_pro"] * N_cap
+                                    + ["vergence"] * N_trans, dtype="<U64"),
+            D_cm_vergence=np.concatenate([np.full(N_cap, 70.0),
+                                           np.full(N_trans, float("nan"))]),
+            # *_all block carries the moving rows too (excluded from
+            # the fit-relevant block).
             T_all=np.zeros(N_all),
             Q_all=np.zeros((N_all, 7)),
             X_all=np.zeros((N_all, 3)),
             G_all=np.zeros((N_all, 3)),
-            D_cm_all=np.concatenate([np.full(N_cap, 75.0),
-                                       np.full(6, 999.0)]),  # transit poisoned
+            D_cm_all=np.concatenate([legacy_d_cm, np.full(2, 80.0)]),
             D_valid_all=np.ones(N_all, dtype=bool),
-            Gaze_yaw_deg_all=np.concatenate([np.zeros(N_cap),
-                                                np.full(6, 999.0)]),
+            Gaze_yaw_deg_all=np.zeros(N_all),
             Gaze_pitch_deg_all=np.zeros(N_all),
             Head_yaw_deg_all=np.zeros(N_all),
             Head_pitch_deg_all=np.zeros(N_all),
-            Phase_all=np.array(["captured"] * N_cap + ["transit"] * 6,
-                                dtype="<U16"),
+            Phase_all=np.array(["captured"] * N_cap + ["transit"] * N_trans
+                                + ["moving"] * 2, dtype="<U16"),
             Target_label_all=np.array(["x"] * N_all, dtype="<U32"),
-            Leg_label_all=np.array([""] * N_cap + ["transit_a_to_b"] * 6,
-                                     dtype="<U64"),
-            meta=dict(version=2, side="R"),
+            Leg_label_all=np.array([""] * N_cap + ["transit_a_to_b"] * N_trans
+                                     + [""] * 2, dtype="<U64"),
+            Depth_source_all=np.array(["vlm_depth_pro"] * N_cap
+                                       + ["vergence"] * N_trans
+                                       + ["vergence"] * 2, dtype="<U64"),
+            meta=dict(version=2, side="R",
+                      depth_source="hybrid_anchor_vlm_transit_vergence",
+                      affine_map=None),
         )
         z = np.load(str(p), allow_pickle=True)
         m = GazeCalibrationMappingV2(z, use_imu=False,
                                        require_depth_valid=True)
-        # Fit must have seen ONLY the 4 captured rows.
-        assert m.num_valid_samples == N_cap
-        # And the per-feature scales must reflect the captured-row
-        # distribution, not the 999-poisoned transit rows. The captured
-        # D_cm rows come from rng.uniform(30, 200), so scale should be
-        # comfortably below 200; if the transit rows leaked in, scale
-        # would explode toward 1.4826 * MAD([... 999s]) >> 200.
-        scales = m.feature_scales
-        # feature_keys order: Gaze_yaw_deg, Gaze_pitch_deg, D_cm
-        d_cm_scale = scales[-1]
-        assert d_cm_scale < 200.0, (
-            f"transit-phase rows appear to have leaked into the fit: "
-            f"D_cm scale={d_cm_scale} (would be ~0 if mapping read only captured)"
+        # REV01 contract: fit sees both captured + transit rows.
+        assert m.num_valid_samples == N_fit, (
+            f"REV01: fit must include captured + transit rows "
+            f"({N_cap} + {N_trans} = {N_fit}); got {m.num_valid_samples}"
         )
+
+        # Behavioural check via .query: ask for one of the transit
+        # rows' exact features and confirm the mapping returns a row
+        # in the transit range [N_cap, N_cap+N_trans). If the mapping
+        # had filtered transit out, the closest match would be a
+        # captured row at a totally different idx.
+        transit_idx_global = N_cap  # first transit row
+        gaze_yaw = float(z["Gaze_yaw_deg"][transit_idx_global])
+        gaze_pitch = float(z["Gaze_pitch_deg"][transit_idx_global])
+        d_cm = float(z["D_cm"][transit_idx_global])
+        r = m.query({"Gaze_yaw_deg": gaze_yaw,
+                      "Gaze_pitch_deg": gaze_pitch,
+                      "D_cm": d_cm})
+        assert N_cap <= r.idx < N_cap + N_trans, (
+            f"REV01: querying a transit row's features must return a "
+            f"transit-block idx ({N_cap}..{N_cap + N_trans - 1}); got {r.idx}"
+        )
+        assert r.dist == pytest.approx(0.0, abs=1e-9)
 # ─── depth_source attribute on the mapping (alignment invariant) ─────────
 
 class TestMappingDepthSourceAttribute:
