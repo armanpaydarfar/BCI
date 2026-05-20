@@ -763,15 +763,19 @@ class VLMService:
             self._seg_stream_stats["active"] = False
 
     def _cmd_depth(self, req: dict) -> dict:
+        at_gaze = bool(req.get("at_gaze", True))
+        save = bool(req.get("save", False))
         if self.depth_estimator is None:
+            _log("depth: depth_disabled (start vlm_service with --enable-depth)")
             return {"ok": False, "error": "depth_disabled"}
         bundle, _, _ = self._latest()
         if bundle is None:
+            _log("depth: no_frame")
             return {"ok": False, "error": "no_frame"}
 
-        at_gaze = bool(req.get("at_gaze", True))
-        save = bool(req.get("save", False))
         gaze_xy = (float(bundle.gaze.x), float(bundle.gaze.y))
+        _log(f"depth IN: gaze=({gaze_xy[0]:.0f},{gaze_xy[1]:.0f}) "
+             f"at_gaze={at_gaze} save={save}")
 
         t0 = time.time()
         prev_save = self.depth_estimator.save_path
@@ -793,11 +797,19 @@ class VLMService:
             "depth_max_m": float(depth_map.max()),
             "depth_median_m": float(np.median(depth_map)),
         }
+        gaze_str = ""
         if at_gaze:
             h, w = depth_map.shape[:2]
             gx = int(np.clip(round(gaze_xy[0]), 0, w - 1))
             gy = int(np.clip(round(gaze_xy[1]), 0, h - 1))
             resp["depth_at_gaze_m"] = float(depth_map[gy, gx])
+            gaze_str = f" at_gaze={resp['depth_at_gaze_m']:.2f}m"
+        _log(f"depth OUT: shape={depth_map.shape[0]}x{depth_map.shape[1]} "
+             f"median={resp['depth_median_m']:.2f}m "
+             f"range=[{resp['depth_min_m']:.2f},{resp['depth_max_m']:.2f}]m"
+             f"{gaze_str}"
+             f"{' saved' if saved_path else ''} "
+             f"elapsed={elapsed * 1000.0:.0f}ms")
         return resp
 
     def _cmd_reason(self, req: dict) -> dict:
@@ -839,9 +851,11 @@ class VLMService:
         waypoints_out: list[dict] = []
         depth_at_gaze_m: Optional[float] = None
         if self.depth_estimator is not None:
+            _depth_t0 = time.time()
             depth_map, _ = self.depth_estimator.estimate(
                 bundle.video.bgr, f_px=self._focal_px(), gaze_xy=gaze_xy,
             )
+            _depth_elapsed_ms = (time.time() - _depth_t0) * 1000.0
             K = self.reader.camera_matrix
             wps = compute_3d_waypoints(dets, depth_map, K)
             waypoints_out = [
@@ -857,6 +871,8 @@ class VLMService:
             gx = int(np.clip(round(gaze_xy[0]), 0, w - 1))
             gy = int(np.clip(round(gaze_xy[1]), 0, h - 1))
             depth_at_gaze_m = float(depth_map[gy, gx])
+            _log(f"  depth (in-decide): shape={depth_map.shape[0]}x{depth_map.shape[1]} "
+                 f"at_gaze={depth_at_gaze_m:.2f}m elapsed={_depth_elapsed_ms:.0f}ms")
 
         # Pick the waypoint whose detection bounding box contains the gaze px
         hit_det = None
@@ -917,9 +933,11 @@ class VLMService:
         waypoints_out: list[dict] = []
         depth_at_gaze: Optional[float] = None
         if self.depth_estimator is not None:
+            _depth_t0 = time.time()
             depth_map, _ = self.depth_estimator.estimate(
                 frame_bgr, f_px=self._focal_px(), gaze_xy=gaze_xy,
             )
+            _depth_elapsed_ms = (time.time() - _depth_t0) * 1000.0
             wps = compute_3d_waypoints(dets, depth_map, self.reader.camera_matrix)
             waypoints_out = [
                 {
@@ -934,6 +952,8 @@ class VLMService:
             gx = int(np.clip(round(gaze_xy[0]), 0, w - 1))
             gy = int(np.clip(round(gaze_xy[1]), 0, h - 1))
             depth_at_gaze = float(depth_map[gy, gx])
+            _log(f"  depth (in-frame): shape={depth_map.shape[0]}x{depth_map.shape[1]} "
+                 f"at_gaze={depth_at_gaze:.2f}m elapsed={_depth_elapsed_ms:.0f}ms")
 
         hit_det = None
         hit_waypoint: Optional[dict] = None
