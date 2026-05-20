@@ -214,6 +214,41 @@ class TestFitVergenceAffine:
         with pytest.raises(KeyError, match="D_cm_vergence"):
             fva.main([str(in_path)])
 
+    def test_reject_does_not_write_npz(self, tmp_path: Path):
+        # Critic-rev01 finding #4 (plan §6.4): a rejected fit must NOT
+        # leave an _affine.npz on disk. The runtime probe accepts any
+        # finite (a, b) regardless of R², so a silently-written bad fit
+        # would mislead an operator who manually points
+        # POSE_LIBRARY_PATH at the output. Verify both the missing
+        # output file AND that the original NPZ is byte-identical
+        # before/after the rejected run.
+        verg = np.linspace(40.0, 160.0, 15)
+        rng = np.random.default_rng(0)
+        # Same non-linear data as test_non_linear_data_exits_non_zero —
+        # guaranteed to trip --min-r2 / --max-residual-cm.
+        vlm = 80.0 + 40.0 * rng.standard_normal(size=verg.shape)
+        in_path = tmp_path / "reject.npz"
+        _make_hybrid_npz(in_path, d_vergence_anchors=verg,
+                          d_vlm_anchors=vlm)
+
+        # Snapshot the input bytes before the run.
+        in_bytes_before = in_path.read_bytes()
+        out_path = in_path.with_name("reject_affine.npz")
+        assert not out_path.exists(), "tmp_path must start clean"
+
+        rc = fva.main([str(in_path)])
+        assert rc in (2, 3), f"Expected non-zero exit; got {rc}"
+
+        # The rewrite must not have run — no _affine.npz on disk.
+        assert not out_path.exists(), (
+            "Rejected fit produced an _affine.npz; gate must precede rewrite")
+        # And the input is byte-identical (defensive — _rewrite_npz
+        # writes to out_path not in_path, but verifying the original
+        # survives the run catches any future regression that writes
+        # back over the input).
+        assert in_path.read_bytes() == in_bytes_before, (
+            "Input NPZ was modified by a rejected fit")
+
     def test_rewrite_preserves_unrelated_keys(self, tmp_path: Path):
         verg = np.array([40.0, 80.0, 120.0])
         vlm = 1.2 * verg + 5.0

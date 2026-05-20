@@ -247,6 +247,19 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  R²:                  {r2:.4f}")
     print(f"  max |Δ| (residual):  {max_abs_residual_cm:.4f} cm")
 
+    # Gate on the accept thresholds (Plan §6.4 #2) BEFORE rewriting the
+    # NPZ. A rejected fit must not leave an _affine.npz on disk — an
+    # operator who manually points POSE_LIBRARY_PATH at the output
+    # without checking the exit code would otherwise load a bad fit
+    # (runtime accepts any finite (a, b) regardless of R²).
+    if r2 < args.min_r2:
+        print(f"REJECT: R² {r2:.4f} < --min-r2 {args.min_r2}", file=sys.stderr)
+        return 2
+    if max_abs_residual_cm > args.max_residual_cm:
+        print(f"REJECT: max |Δ| {max_abs_residual_cm:.4f} cm > "
+              f"--max-residual-cm {args.max_residual_cm}", file=sys.stderr)
+        return 3
+
     out_path = args.out if args.out is not None else _derive_out_path(args.input)
     _rewrite_npz(args.input, out_path, a=a, b=b, r2=r2,
                   max_abs_residual_cm=max_abs_residual_cm)
@@ -258,15 +271,6 @@ def main(argv: list[str] | None = None) -> int:
                      out_path=args.plot)
         print(f"  plot:  {args.plot}")
 
-    # Gate on the accept thresholds (Plan §6.4 #2). Exits non-zero so
-    # the operator's calling script can branch on this.
-    if r2 < args.min_r2:
-        print(f"REJECT: R² {r2:.4f} < --min-r2 {args.min_r2}", file=sys.stderr)
-        return 2
-    if max_abs_residual_cm > args.max_residual_cm:
-        print(f"REJECT: max |Δ| {max_abs_residual_cm:.4f} cm > "
-              f"--max-residual-cm {args.max_residual_cm}", file=sys.stderr)
-        return 3
     return 0
 
 
