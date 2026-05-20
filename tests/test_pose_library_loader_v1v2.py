@@ -415,9 +415,9 @@ class TestHybridMetaRoundTrip:
     nested ``meta["affine_map"]`` dict (post-fit) or None (pre-fit).
     Both must survive the ``np.savez_compressed`` -> ``np.load`` object-
     array round trip via the ``.item()`` unwrap pattern that
-    ``_peek_meta`` (calibration_mapping.py:346-362) already uses. Loading
-    from disk catches missing-``.item()`` unwrap bugs that an in-memory
-    test would silently pass.
+    ``_peek_meta`` (Utils/gaze/calibration_mapping.py:443-459) already
+    uses. Loading from disk catches missing-``.item()`` unwrap bugs that
+    an in-memory test would silently pass.
     """
 
     def _write_hybrid_npz(self, path: Path, *,
