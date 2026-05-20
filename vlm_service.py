@@ -190,6 +190,16 @@ def parse_args():
                    help="Empty string triggers LAN discovery")
     p.add_argument("--model", default=_cfg_default("VLM_MODEL", "gemini-2.5-flash"),
                    help="VLM model name")
+    # IntentReasoner's upstream default (harmony_vlm) is max_tokens=1024,
+    # which truncates the JSON response on scenes with many candidates
+    # (each candidate is ~50-100 output tokens; 18 dets already overflows).
+    # 8192 gives ~4-5x headroom for typical scenes and is well under
+    # Gemini 2.5 Flash's 65,536 output-token ceiling. Billing is per emitted
+    # token, not per cap, so raising it costs nothing when responses are short.
+    p.add_argument("--max-output-tokens", type=int,
+                   default=int(_cfg_default("VLM_MAX_OUTPUT_TOKENS", 8192)),
+                   help="Cap for the VLM JSON response in tokens. Override "
+                        "with VLM_MAX_OUTPUT_TOKENS in config. Default 8192.")
     p.add_argument("--seg-model", default="models/FastSAM-s.pt", help="Relative to repo-dir")
     # Default "auto" resolves to cuda if torch.cuda.is_available(), else cpu
     # (see main()). Hosts without a usable GPU degrade gracefully to CPU,
@@ -1562,7 +1572,11 @@ def main() -> None:
         )
 
     _log(f"loading reasoner: {args.model}…")
-    reasoner = IntentReasoner(api_key=api_key, model=args.model)
+    reasoner = IntentReasoner(
+        api_key=api_key,
+        model=args.model,
+        max_tokens=args.max_output_tokens,
+    )
     fix_det = FixationDetector()
 
     service = VLMService(
