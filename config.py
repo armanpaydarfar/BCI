@@ -284,7 +284,9 @@ VLM_ENABLE_DEPTH = True
 VLM_SERVICE_HOST = "127.0.0.1"
 VLM_BIND_HOST = "127.0.0.1"
 VLM_SERVICE_PORT = 5589
-VLM_SERVICE_TIMEOUT = 0.5
+VLM_SERVICE_TIMEOUT = 5.0  # bumped 2026-05-20: Depth Pro takes 1-3s cold,
+                            # 0.3-0.5s warm (vlm_service.py:36); the prior 0.5s
+                            # default tripped on the first depth call.
 
 # VLM_SESSION_ROOT derives from DATA_DIR — defined at the bottom of this
 # file so it picks up any config_local.py override.
