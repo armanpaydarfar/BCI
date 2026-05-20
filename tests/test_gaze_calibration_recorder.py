@@ -837,3 +837,119 @@ class TestWriteNpzDepthSourceMeta:
         meta = np.load(str(out), allow_pickle=True)["meta"].item()
         assert meta["depth_source"] == "vlm_depth_pro"
         assert meta["vlm_service_host"] == "192.168.99.99"
+
+
+# ─── REV01 per-bundle depth_source tagging (Plan §3.2, Step 2) ──────────────
+
+class TestDepthSourceField:
+    """REV01 (Plan §3.2): every CaptureBundle carries a ``depth_source``
+    field and a ``depth_cm_vergence`` parallel reading. The recorder is
+    the only producer; the offline affine-fit script may later rewrite
+    transit rows to ``"vergence_affine"``.
+
+    Coverage:
+      - settle_and_snapshot under VLM substitution → captured anchor
+        tagged ``"vlm_depth_pro"`` and ``depth_cm_vergence`` preserves
+        the pre-substitution vergence value.
+      - settle_and_snapshot without VLM → captured anchor tagged
+        ``"vergence"`` and ``depth_cm_vergence`` is NaN (no parallel
+        reading needed when vergence is already in ``depth_cm``).
+      - TelemetryThread → transit bundles tag ``"vergence"`` with NaN
+        ``depth_cm_vergence``.
+      - collect_moving_phase → moving bundles tag ``"vergence"`` (the
+        default; moving samples are not anchors).
+    """
+
+    def _full_snap(self) -> dict:
+        return {
+            "ok": True,
+            "worn": True,
+            "gaze_px": (800.0, 600.0),
+            "depth_cm": 75.0,           # vergence value
+            "depth_valid": True,
+            "miss_mm": 3.5, "ipd_mm": 63.0,
+            "imu_angvel": 0.05, "imu_fresh": True,
+            "head_yaw_deg": 0.0, "head_pitch_deg": 0.0,
+            "gaze_yaw_deg": 0.0, "gaze_pitch_deg": 0.0,
+        }
+
+    def test_captured_with_vlm_tags_vlm_and_preserves_vergence(self, monkeypatch):
+        # settle_and_snapshot must (a) overwrite depth_cm with the VLM
+        # reading, (b) tag depth_source="vlm_depth_pro", and (c) preserve
+        # the original vergence depth on depth_cm_vergence so the offline
+        # affine fit has both columns to regress.
+        snap = self._full_snap()
+        monkeypatch.setattr(recorder, "gaze_snapshot",
+                            lambda include_objects=False: snap)
+        monkeypatch.setattr(recorder.time, "sleep", lambda *_: None)
+
+        vlm = _FakeVLMClient(depth_payload={"ok": True,
+                                              "depth_at_gaze_m": 0.55})
+        robot_state = {"_t": 0.0, "q": np.zeros(7), "ee": np.zeros(3)}
+        bundle = recorder.settle_and_snapshot("mid_R3", robot_state,
+                                                vlm_client=vlm)
+        assert bundle is not None
+        assert bundle.depth_source == "vlm_depth_pro"
+        assert bundle.depth_cm == pytest.approx(55.0)
+        assert bundle.depth_cm_vergence == pytest.approx(75.0)
+
+    def test_captured_without_vlm_tags_vergence_and_nan_mirror(self, monkeypatch):
+        snap = self._full_snap()
+        monkeypatch.setattr(recorder, "gaze_snapshot",
+                            lambda include_objects=False: snap)
+        monkeypatch.setattr(recorder.time, "sleep", lambda *_: None)
+
+        robot_state = {"_t": 0.0, "q": np.zeros(7), "ee": np.zeros(3)}
+        bundle = recorder.settle_and_snapshot("mid_R3", robot_state,
+                                                vlm_client=None)
+        assert bundle is not None
+        assert bundle.depth_source == "vergence"
+        assert bundle.depth_cm == pytest.approx(75.0)
+        # No parallel VLM reading on the vergence-mode anchor.
+        assert np.isnan(bundle.depth_cm_vergence)
+
+    def test_transit_bundle_tags_vergence(self, monkeypatch):
+        # TelemetryThread emits phase="transit" bundles whose
+        # depth_source must always be "vergence"; depth_cm_vergence
+        # stays NaN (no parallel VLM reading).
+        monkeypatch.setattr(recorder, "gaze_snapshot",
+                            lambda include_objects=False, timeout_s=None: _make_snap())
+        link = _FakeLink()
+        bundles: List[CaptureBundle] = []
+        lock = threading.Lock()
+        t = TelemetryThread(link, bundles, lock, sample_hz=50.0)
+        t.start()
+        t.set_leg("transit_near_R1_to_near_R2")
+        t.start_after_first_capture()
+        time.sleep(0.2)
+        t.stop()
+        with lock:
+            collected = list(bundles)
+        assert collected, "expected at least one transit bundle"
+        for b in collected:
+            assert b.phase == "transit"
+            assert b.depth_source == "vergence"
+            assert np.isnan(b.depth_cm_vergence)
+
+    def test_moving_phase_tags_vergence_default(self):
+        # collect_moving_phase calls bundle_from_snapshot without an
+        # explicit depth_source kwarg; the default "vergence" must be
+        # what lands on the bundle.
+        snap = self._full_snap()
+        b = bundle_from_snapshot(snap, robot_t=0.0, q=np.zeros(7),
+                                  ee_mm=np.zeros(3), phase="moving",
+                                  target_label="mid_R3")
+        assert b.depth_source == "vergence"
+        assert np.isnan(b.depth_cm_vergence)
+
+    def test_bundle_from_snapshot_passes_kwargs_through(self):
+        # Direct unit test on the helper: explicit kwargs must reach the
+        # bundle unaltered.
+        snap = self._full_snap()
+        b = bundle_from_snapshot(snap, robot_t=0.0, q=np.zeros(7),
+                                  ee_mm=np.zeros(3), phase="captured",
+                                  target_label="mid_R3",
+                                  depth_source="vlm_depth_pro",
+                                  depth_cm_vergence=42.5)
+        assert b.depth_source == "vlm_depth_pro"
+        assert b.depth_cm_vergence == pytest.approx(42.5)

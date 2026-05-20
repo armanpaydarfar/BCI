@@ -328,6 +328,21 @@ class CaptureBundle:
     ``'transit'``. ``leg_label`` is set on ``'transit'`` bundles only
     (e.g. ``'transit_near_R2_to_near_R3'``); other phases leave it
     empty.
+
+    REV01 (per Harmony_Gaze_Calibration_REV01_Plan.md §3.2):
+
+    - ``depth_source`` names the depth pipeline that produced
+      ``depth_cm``: ``"vergence"`` for transit / moving / vergence-mode
+      anchors, ``"vlm_depth_pro"`` for VLM-substituted anchors. The
+      offline affine-fit script may later rewrite transit rows to
+      ``"vergence_affine"``; the recorder itself emits only the first
+      two values.
+    - ``depth_cm_vergence`` preserves the live vergence reading at VLM
+      anchors so the offline affine fit can solve
+      ``D_vlm = a · D_vergence + b`` without re-reading the snapshot
+      JSON. ``nan`` on transit and moving rows (no parallel VLM
+      reading) and on vergence-mode anchors (vergence is already in
+      ``depth_cm``).
     """
     t: float
     q: np.ndarray
@@ -348,18 +363,28 @@ class CaptureBundle:
     phase: str
     target_label: str
     leg_label: str = ""
+    depth_source: str = "vergence"
+    depth_cm_vergence: float = float("nan")
 
 
 def bundle_from_snapshot(snap: Dict[str, Any], robot_t: float,
                          q: np.ndarray, ee_mm: np.ndarray,
                          phase: str, target_label: str,
-                         leg_label: str = "") -> CaptureBundle:
+                         leg_label: str = "",
+                         depth_source: str = "vergence",
+                         depth_cm_vergence: float = float("nan")
+                         ) -> CaptureBundle:
     """Pull every recorder-relevant field out of a gaze_runner snapshot
     and pair it with the most recent robot telemetry. Fields source:
     Utils/gaze/gaze_system.py:623-674 (snapshot contract).
 
     ``leg_label`` is set only on ``phase='transit'`` bundles and names
     the current transit leg (e.g. ``'transit_near_R2_to_near_R3'``).
+
+    REV01 (Plan §3.2): ``depth_source`` and ``depth_cm_vergence`` are
+    passed straight through to the returned ``CaptureBundle``. Callers
+    set ``depth_source="vlm_depth_pro"`` for VLM-substituted anchors;
+    transit and moving rows keep the ``"vergence"`` default.
     """
     gaze_px = snap.get("gaze_px") or (float("nan"), float("nan"))
     try:
@@ -401,6 +426,8 @@ def bundle_from_snapshot(snap: Dict[str, Any], robot_t: float,
         phase=phase,
         target_label=target_label,
         leg_label=leg_label,
+        depth_source=depth_source,
+        depth_cm_vergence=depth_cm_vergence,
     )
 
 
@@ -512,18 +539,30 @@ def settle_and_snapshot(target_label: str,
     # diagnostics) sees a single coherent source per row. We do this
     # via a dict copy because the snapshot is the gaze_runner's owned
     # data structure.
+    #
+    # REV01 (Plan §3.3): when VLM substitutes, preserve the live
+    # vergence reading on the bundle's ``depth_cm_vergence`` field so
+    # the offline affine fit script can solve
+    # ``D_vlm = a · D_vergence + b`` from the NPZ alone.
     if vlm_client is not None:
         snap_for_bundle = dict(last_snap)
+        vergence_depth_cm = float(last_snap.get("depth_cm", float("nan")))
         depth_cm, depth_valid = fetch_vlm_depth_cm(vlm_client)
         snap_for_bundle["depth_cm"] = depth_cm
         snap_for_bundle["depth_valid"] = depth_valid
         print(f"[{_ts()}] VLM depth at gaze: {depth_cm:.1f}cm (valid={depth_valid})")
-    else:
-        snap_for_bundle = last_snap
+        return bundle_from_snapshot(
+            snap_for_bundle, robot_state["_t"], robot_state["q"],
+            robot_state["ee"], phase="captured",
+            target_label=target_label,
+            depth_source="vlm_depth_pro",
+            depth_cm_vergence=vergence_depth_cm,
+        )
 
-    return bundle_from_snapshot(snap_for_bundle, robot_state["_t"], robot_state["q"],
+    return bundle_from_snapshot(last_snap, robot_state["_t"], robot_state["q"],
                                 robot_state["ee"], phase="captured",
-                                target_label=target_label)
+                                target_label=target_label,
+                                depth_source="vergence")
 
 
 def collect_moving_phase(link: RobotLink, target_label: str,
@@ -684,6 +723,7 @@ class TelemetryThread(threading.Thread):
             bundle = bundle_from_snapshot(
                 snap, rstate["_t"], rstate["q"], rstate["ee"],
                 phase="transit", target_label="", leg_label=leg,
+                depth_source="vergence",
             )
             with self._bundles_lock:
                 self._bundles.append(bundle)
