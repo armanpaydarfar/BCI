@@ -714,7 +714,7 @@ def announce_target(target_label: str, idx: int, total: int) -> None:
     print()
     print("=" * 70)
     print(f"[{_ts()}] TARGET {idx}/{total}: {target_label}")
-    print(f"[{_ts()}] >>> LOOK AT THE TARGET. MOVE THE ARM THERE BY HAND. <<<")
+    print(f"[{_ts()}] >>> LOOK AT THE END EFFECTOR <<<")
     print(f"[{_ts()}] Press Enter when arm is positioned and you are fixating.")
     print("=" * 70)
 
