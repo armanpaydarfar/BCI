@@ -8,9 +8,10 @@ Synthetic-data coverage for ``tools/fit_depth_interpolation.py``:
      rewritten D_cm equals the nearest anchor's D_cm.
   2. Per-row Depth_source on transit rows is "vlm_interpolated_nearest_anchor"
      (and on the *_all block too).
-  3. Metadata round-trip: meta["affine_map"] is None after the rewrite
-     so the runtime falls back to raw vergence; depth_source string is
-     unchanged.
+  3. Metadata round-trip: meta["affine_map"] is None and
+     meta["depth_source"] is "vergence" after the rewrite so the
+     runtime alignment-invariant probe accepts the NPZ as vergence-
+     only (per-row Depth_source still records the backup provenance).
 
 Hardware-free; the script is pure numpy + scipy KDTree.
 
@@ -217,7 +218,13 @@ class TestFitDepthInterpolation:
                          allow_pickle=True)
         meta_out = z_out["meta"].item()
         assert meta_out["affine_map"] is None
+        # Critic-rev01 finding #1 (plan §1.3): the backup script also
+        # rewrites meta["depth_source"] from the hybrid literal to
+        # "vergence" so the runtime alignment-invariant probe accepts
+        # the file. Without this, the hybrid+None combination raises
+        # RuntimeError at startup and the operator cannot ship the
+        # backup NPZ to the runtime.
+        assert meta_out["depth_source"] == "vergence"
         # Unrelated meta keys preserved.
-        assert meta_out["depth_source"] == "hybrid_anchor_vlm_transit_vergence"
         assert meta_out["recorder"] == "harmony_free_arm_calibration.py"
         assert meta_out["vlm_service_host"] == "192.168.99.99"

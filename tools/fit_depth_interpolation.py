@@ -21,11 +21,20 @@ The script:
    ``D_cm`` (the VLM Depth Pro reading at that anchor).
 5. Updates ``Depth_source`` and ``Depth_source_all`` on transit rows to
    ``"vlm_interpolated_nearest_anchor"``.
-6. Sets ``meta["affine_map"] = None`` so the runtime's
-   ``runtime_depth_pipeline`` falls back to ``"vergence"`` — runtime
-   will use raw vergence (wrong-but-safe; per-subject offset will be
-   off by an unknown factor). The proper fix is to re-record with
-   better Depth Pro coverage.
+6. Sets ``meta["affine_map"] = None`` AND
+   ``meta["depth_source"] = "vergence"`` so the runtime's alignment-
+   invariant probe accepts the rewritten NPZ (the hybrid+None
+   combination raises ``RuntimeError`` at startup; tagging the meta
+   string as plain ``"vergence"`` keeps the file runtime-loadable per
+   Plan §1.3 design intent). Runtime then uses raw vergence — wrong-
+   but-safe; per-subject offset will be off by an unknown factor. The
+   proper fix is to re-record with better Depth Pro coverage.
+
+After this rewrite, an ``_interp.npz`` is distinguishable from a
+vergence-only recording only by per-row ``Depth_source`` tags
+(``"vlm_interpolated_nearest_anchor"`` on transit rows; the legacy
+vergence-only path leaves every row as ``"vergence"``). The meta
+``depth_source`` string is identical in both cases.
 
 Limitation (Plan §3.3): the runtime does NOT apply the per-row
 interpolation. Extending runtime would require a new EE-position feed
@@ -93,8 +102,10 @@ def _interpolate_transit_depths(X: np.ndarray, d_cm: np.ndarray,
 
 def _rewrite_npz(in_path: str, out_path: str) -> None:
     """Load, interpolate, rewrite. ``meta["affine_map"]`` is forced to
-    ``None`` so the runtime knows this NPZ uses the backup pipeline
-    (runtime will fall back to raw vergence)."""
+    ``None`` and ``meta["depth_source"]`` to ``"vergence"`` so the
+    runtime accepts the rewritten NPZ via the legacy vergence path
+    (the hybrid+None combination raises at startup; see module
+    docstring)."""
     z = np.load(in_path, allow_pickle=True)
     try:
         anchor_mask, transit_mask = _select_anchors_and_transit(z)
@@ -130,6 +141,11 @@ def _rewrite_npz(in_path: str, out_path: str) -> None:
             )
         meta = dict(meta)
         meta["affine_map"] = None
+        # Tag as vergence so the runtime alignment-invariant probe
+        # accepts the file (hybrid + None affine_map raises at startup
+        # by design). Per-row Depth_source still records the backup
+        # provenance for offline analysis.
+        meta["depth_source"] = "vergence"
         fields["meta"] = meta
 
         np.savez_compressed(out_path, **fields)
@@ -160,7 +176,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"REV01 backup NN-over-EE depth interpolation:")
     print(f"  wrote: {out_path}")
-    print(f"  meta['affine_map'] = None — runtime falls back to raw vergence")
+    print(f"  meta['depth_source'] = 'vergence', meta['affine_map'] = None")
+    print(f"  runtime accepts as vergence-only NPZ; transit rows tagged via")
+    print(f"  per-row Depth_source for offline analysis.")
     print(f"  (re-record for primary affine-fit path if quality is critical)")
     return 0
 
