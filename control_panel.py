@@ -809,6 +809,13 @@ class ControlPanel(QMainWindow):
         self._seg_stream_log_timer.timeout.connect(self._poll_seg_stream_stats)
         # Suppress duplicate emissions when last_emit_t hasn't advanced.
         self._last_seg_stream_emit_t: float = 0.0
+        # In-flight counter for synchronous VLM commands (decide, capture_first,
+        # depth, ...). The seg-stream stats poll uses this to skip its tick
+        # while a long command is occupying the server's single-threaded
+        # request loop (vlm_service.py:403-437), since the resulting status
+        # timeout would only mean "busy", not "unreachable".
+        self._vlm_inflight_lock = threading.Lock()
+        self._vlm_inflight_count: int = 0
 
     # ---------- UI build ----------
     def _build_ui(self):
@@ -2705,15 +2712,21 @@ class ControlPanel(QMainWindow):
         self._append_log("VLM", f"[{self._ts()}] {label} TX -> {VLM_SERVICE_HOST}:{VLM_SERVICE_PORT}\n")
 
         def worker():
+            with self._vlm_inflight_lock:
+                self._vlm_inflight_count += 1
             t0 = time.time()
             try:
-                resp = self._vlm_udp_request(payload, timeout_s=timeout_s)
-                dt_ms = (time.time() - t0) * 1000.0
-                pretty = json.dumps(resp, indent=2, sort_keys=True)
-                self._append_log_ui("VLM", f"[{self._ts()}] {label} RX OK ({dt_ms:.0f} ms)\n{pretty}\n")
-            except Exception as e:
-                dt_ms = (time.time() - t0) * 1000.0
-                self._append_log_ui("VLM", f"[{self._ts()}] {label} RX ERROR ({dt_ms:.0f} ms): {e}\n")
+                try:
+                    resp = self._vlm_udp_request(payload, timeout_s=timeout_s)
+                    dt_ms = (time.time() - t0) * 1000.0
+                    pretty = json.dumps(resp, indent=2, sort_keys=True)
+                    self._append_log_ui("VLM", f"[{self._ts()}] {label} RX OK ({dt_ms:.0f} ms)\n{pretty}\n")
+                except Exception as e:
+                    dt_ms = (time.time() - t0) * 1000.0
+                    self._append_log_ui("VLM", f"[{self._ts()}] {label} RX ERROR ({dt_ms:.0f} ms): {e}\n")
+            finally:
+                with self._vlm_inflight_lock:
+                    self._vlm_inflight_count -= 1
 
         _threading.Thread(target=worker, daemon=True).start()
 
@@ -2763,12 +2776,19 @@ class ControlPanel(QMainWindow):
         use; we run it on a worker thread so a slow GPU host (or a service
         that just died) cannot stall the GUI thread."""
         def worker():
+            # Skip the poll if a synchronous VLM command (decide, depth,
+            # capture_first, ...) is in flight. The server's request loop
+            # (vlm_service.py:403-437) is single-threaded, so a 500 ms status
+            # probe issued while decide blocks on Gemini will time out — even
+            # though seg-stream itself is on its own thread and still healthy.
+            # Reporting that as "unreachable" was misleading.
+            if self._vlm_inflight_count > 0:
+                return
             try:
                 resp = self._vlm_udp_request({"cmd": "status"}, timeout_s=0.5)
             except Exception as e:
-                # Timer is short-lived; if status is unreachable while the
-                # stream is supposedly on, surface that — most likely the
-                # service died and the toggle is stale.
+                # No command in flight, so a status timeout actually does
+                # suggest the service or host is gone — surface it.
                 self._append_log_ui(
                     "VLM",
                     f"[{self._ts()}] seg-stream status: unreachable ({e})\n",
