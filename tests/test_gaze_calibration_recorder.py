@@ -527,14 +527,21 @@ class TestRunSessionTelemetry:
                                      transit_arm_dwell_s=0.2)
         assert out_path is not None
         z = np.load(out_path, allow_pickle=True)
-        # 15 captured rows in the legacy block.
-        assert z["Q"].shape[0] == 15
+        # REV01 (Plan §3.2): the legacy block now includes transit rows
+        # alongside the 15 captured anchors. Total fit-row count >= 15
+        # + the number of transit ticks the telemetry thread emitted
+        # during arm dwell.
+        phases = list(z["Phase_all"])
+        n_transit = sum(1 for p in phases if p == "transit")
+        assert z["Q"].shape[0] == 15 + n_transit, (
+            f"REV01: legacy Q block must hold captured + transit rows "
+            f"(15 captured + {n_transit} transit = {15 + n_transit}); "
+            f"got Q.shape[0]={z['Q'].shape[0]}"
+        )
         # Transit bundles in the _all block. At 20 Hz with ~0.2 s dwell
         # between 14 transit legs (after first capture, before final
         # capture), expect at least 14 * 0.2 * 20 * 0.5 = ~28 bundles
         # accounting for prompt overhead. Use a conservative floor.
-        phases = list(z["Phase_all"])
-        n_transit = sum(1 for p in phases if p == "transit")
         assert n_transit >= 10, (
             f"expected >= 10 transit bundles given ~0.2 s × 14 legs at 20 Hz; "
             f"got {n_transit}"
@@ -826,6 +833,11 @@ class TestWriteNpzDepthSourceMeta:
         assert meta["vlm_service_host"] == ""
 
     def test_vlm_depth_pro_meta_records_host(self, monkeypatch, tmp_path: Path):
+        # REV01 (Plan §3.2 item 4): when the recorder runs with
+        # GAZE_CALIBRATION_DEPTH_SOURCE="vlm_depth_pro" the meta string
+        # is the hybrid literal (anchors=VLM, transit=vergence). The
+        # vlm_service_host is recorded so consumers can audit which
+        # Depth Pro instance produced the anchor depths.
         monkeypatch.setattr(recorder.config,
                             "GAZE_CALIBRATION_DEPTH_SOURCE", "vlm_depth_pro",
                             raising=False)
@@ -835,7 +847,7 @@ class TestWriteNpzDepthSourceMeta:
         out = tmp_path / "vlm.npz"
         write_npz([self._make_bundle()], str(out))
         meta = np.load(str(out), allow_pickle=True)["meta"].item()
-        assert meta["depth_source"] == "vlm_depth_pro"
+        assert meta["depth_source"] == "hybrid_anchor_vlm_transit_vergence"
         assert meta["vlm_service_host"] == "192.168.99.99"
 
 
@@ -953,3 +965,193 @@ class TestDepthSourceField:
                                   depth_cm_vergence=42.5)
         assert b.depth_source == "vlm_depth_pro"
         assert b.depth_cm_vergence == pytest.approx(42.5)
+
+
+# ─── REV01 hybrid NPZ writer (Plan §3.2, Step 3) ────────────────────────────
+
+class TestHybridNpzWriter:
+    """REV01 (Plan §3.2): the writer now packs captured + transit rows
+    into the legacy block so the v2 Mahalanobis NN trains on the full
+    workspace cloud. The all-block stays as-is (every phase, in time
+    order). Two new per-row columns surface provenance: ``Depth_source``
+    in the fit block and ``Depth_source_all`` in the all block.
+    ``meta["depth_source"]`` is the new hybrid string when VLM is the
+    anchor source; ``meta["affine_map"]`` is a None placeholder filled
+    in later by the offline affine-fit script.
+
+    Coverage:
+      - hybrid meta literal when GAZE_CALIBRATION_DEPTH_SOURCE='vlm_depth_pro'
+      - Q/X/G/D_cm grow to N_captured + N_transit rows
+      - Depth_source per-row reflects the bundle's source
+      - Depth_source_all covers every row (captured + moving + transit)
+      - D_cm_vergence is finite on VLM anchors and NaN on transit rows
+      - vergence-only path keeps the pre-REV01 ``"vergence"`` meta literal
+      - meta["affine_map"] is None at recorder write time
+    """
+
+    def _make_captured(self, *, target_label: str = "mid_R3",
+                        depth_source: str = "vlm_depth_pro",
+                        depth_cm: float = 55.0,
+                        depth_cm_vergence: float = 70.0) -> CaptureBundle:
+        return CaptureBundle(
+            t=0.0, q=np.zeros(7), ee_mm=np.zeros(3),
+            gaze_x_norm=0.5, gaze_y_norm=0.5, gaze_conf=1.0,
+            depth_cm=depth_cm, depth_valid=True, miss_mm=2.0, ipd_mm=63.0,
+            imu_w=0.0, imu_fresh=True,
+            head_yaw_deg=0.0, head_pitch_deg=0.0,
+            gaze_yaw_deg=0.0, gaze_pitch_deg=0.0,
+            phase="captured", target_label=target_label,
+            depth_source=depth_source,
+            depth_cm_vergence=depth_cm_vergence,
+        )
+
+    def _make_transit(self, *, leg_label: str = "transit_a_to_b",
+                       depth_cm: float = 65.0) -> CaptureBundle:
+        return CaptureBundle(
+            t=1.0, q=np.zeros(7), ee_mm=np.zeros(3),
+            gaze_x_norm=0.5, gaze_y_norm=0.5, gaze_conf=1.0,
+            depth_cm=depth_cm, depth_valid=True, miss_mm=2.0, ipd_mm=63.0,
+            imu_w=0.0, imu_fresh=True,
+            head_yaw_deg=0.0, head_pitch_deg=0.0,
+            gaze_yaw_deg=0.0, gaze_pitch_deg=0.0,
+            phase="transit", target_label="", leg_label=leg_label,
+            depth_source="vergence",
+            depth_cm_vergence=float("nan"),
+        )
+
+    def _make_moving(self) -> CaptureBundle:
+        return CaptureBundle(
+            t=2.0, q=np.zeros(7), ee_mm=np.zeros(3),
+            gaze_x_norm=0.5, gaze_y_norm=0.5, gaze_conf=1.0,
+            depth_cm=80.0, depth_valid=True, miss_mm=2.0, ipd_mm=63.0,
+            imu_w=0.0, imu_fresh=True,
+            head_yaw_deg=0.0, head_pitch_deg=0.0,
+            gaze_yaw_deg=0.0, gaze_pitch_deg=0.0,
+            phase="moving", target_label="mid_R3",
+            depth_source="vergence",
+            depth_cm_vergence=float("nan"),
+        )
+
+    def test_hybrid_meta_string_when_vlm_anchor_source(self, monkeypatch,
+                                                         tmp_path: Path):
+        monkeypatch.setattr(recorder.config,
+                            "GAZE_CALIBRATION_DEPTH_SOURCE", "vlm_depth_pro",
+                            raising=False)
+        out = tmp_path / "hybrid.npz"
+        bundles = [self._make_captured(), self._make_transit()]
+        write_npz(bundles, str(out))
+        meta = np.load(str(out), allow_pickle=True)["meta"].item()
+        assert meta["depth_source"] == "hybrid_anchor_vlm_transit_vergence"
+        # affine_map is a None placeholder that the offline fit script
+        # fills in post-hoc.
+        assert meta["affine_map"] is None
+
+    def test_legacy_block_grows_to_captured_plus_transit(self, monkeypatch,
+                                                           tmp_path: Path):
+        monkeypatch.setattr(recorder.config,
+                            "GAZE_CALIBRATION_DEPTH_SOURCE", "vlm_depth_pro",
+                            raising=False)
+        N_cap, N_trans, N_mov = 3, 5, 2
+        bundles = (
+            [self._make_captured(target_label=f"near_R{i+1}")
+             for i in range(N_cap)]
+            + [self._make_transit(leg_label=f"transit_leg_{i}")
+               for i in range(N_trans)]
+            + [self._make_moving() for _ in range(N_mov)]
+        )
+        out = tmp_path / "grow.npz"
+        write_npz(bundles, str(out))
+        z = np.load(str(out), allow_pickle=True)
+        # Legacy / fit block: captured + transit only.
+        assert z["Q"].shape[0] == N_cap + N_trans
+        assert z["X"].shape[0] == N_cap + N_trans
+        assert z["G"].shape[0] == N_cap + N_trans
+        assert z["D_cm"].shape[0] == N_cap + N_trans
+        # All-block: everything in original order.
+        assert z["Q_all"].shape[0] == N_cap + N_trans + N_mov
+        assert list(z["Phase_all"]) == (
+            ["captured"] * N_cap + ["transit"] * N_trans + ["moving"] * N_mov
+        )
+
+    def test_depth_source_per_row_reflects_bundle_source(self, monkeypatch,
+                                                          tmp_path: Path):
+        monkeypatch.setattr(recorder.config,
+                            "GAZE_CALIBRATION_DEPTH_SOURCE", "vlm_depth_pro",
+                            raising=False)
+        # 2 VLM anchors + 3 transit (vergence) + 1 moving (excluded from
+        # legacy block).
+        bundles = (
+            [self._make_captured(target_label="near_R1"),
+             self._make_captured(target_label="near_R2")]
+            + [self._make_transit() for _ in range(3)]
+            + [self._make_moving()]
+        )
+        out = tmp_path / "depth_source.npz"
+        write_npz(bundles, str(out))
+        z = np.load(str(out), allow_pickle=True)
+
+        # Depth_source column on the fit block: 2 vlm_depth_pro + 3 vergence.
+        ds = list(z["Depth_source"])
+        assert ds == ["vlm_depth_pro", "vlm_depth_pro",
+                       "vergence", "vergence", "vergence"]
+
+        # Depth_source_all covers every row, including moving (default
+        # vergence). Verifies the longest expected value
+        # ("vlm_interpolated_nearest_anchor", 32 chars) fits without
+        # truncation by writing a synthetic long string and reading
+        # back unchanged.
+        ds_all = list(z["Depth_source_all"])
+        assert ds_all == ["vlm_depth_pro", "vlm_depth_pro",
+                           "vergence", "vergence", "vergence", "vergence"]
+
+    def test_depth_source_dtype_handles_longest_expected_value(self,
+                                                                tmp_path: Path):
+        # Build a bundle whose depth_source is the longest string we
+        # might write — "vlm_interpolated_nearest_anchor" (32 chars).
+        # The writer's <U64 dtype must hold it without truncation.
+        long_source = "vlm_interpolated_nearest_anchor"
+        b = self._make_captured()
+        b.depth_source = long_source
+        out = tmp_path / "long_dtype.npz"
+        write_npz([b, self._make_transit()], str(out))
+        z = np.load(str(out), allow_pickle=True)
+        # Fit block's first row keeps the full string.
+        assert str(z["Depth_source"][0]) == long_source
+
+    def test_d_cm_vergence_finite_on_anchors_nan_on_transit(self, monkeypatch,
+                                                              tmp_path: Path):
+        monkeypatch.setattr(recorder.config,
+                            "GAZE_CALIBRATION_DEPTH_SOURCE", "vlm_depth_pro",
+                            raising=False)
+        bundles = [
+            self._make_captured(depth_cm_vergence=72.5),
+            self._make_transit(),
+            self._make_captured(depth_cm_vergence=68.0),
+        ]
+        out = tmp_path / "verg.npz"
+        write_npz(bundles, str(out))
+        z = np.load(str(out), allow_pickle=True)
+        dvg = z["D_cm_vergence"]
+        # First anchor row finite, transit row NaN, second anchor row finite.
+        assert dvg[0] == pytest.approx(72.5)
+        assert np.isnan(dvg[1])
+        assert dvg[2] == pytest.approx(68.0)
+
+    def test_vergence_anchor_path_keeps_pre_rev01_meta(self, monkeypatch,
+                                                         tmp_path: Path):
+        # Vergence-only path (no VLM at anchors). meta["depth_source"]
+        # must stay as the pre-REV01 "vergence" literal so legacy
+        # readers do not need to learn the new hybrid string.
+        monkeypatch.setattr(recorder.config,
+                            "GAZE_CALIBRATION_DEPTH_SOURCE", "vergence",
+                            raising=False)
+        bundles = [
+            self._make_captured(depth_source="vergence",
+                                  depth_cm_vergence=float("nan")),
+            self._make_transit(),
+        ]
+        out = tmp_path / "vergence_only.npz"
+        write_npz(bundles, str(out))
+        meta = np.load(str(out), allow_pickle=True)["meta"].item()
+        assert meta["depth_source"] == "vergence"
+        assert meta["affine_map"] is None

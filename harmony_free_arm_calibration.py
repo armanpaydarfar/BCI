@@ -763,19 +763,27 @@ def announce_target(target_label: str, idx: int, total: int) -> None:
 # Output writer — v2 NPZ schema (plan §6.1 Track A step 2; Track B reuses)
 # =============================================================================
 def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
-    """Materialise CaptureBundle list as v2 NPZ. Legacy keys T/Q/X/G
-    are populated from captured (phase='captured') samples only, so
-    legacy v1 consumers see exactly the same content shape they
-    expected — the new keys are additive. Moving-phase bundles are
-    written under the *_all keys for trajectory-based consumers.
+    """Materialise CaptureBundle list as v2 NPZ.
 
-    Output contract (v2):
-      Legacy (v1-compatible) — captured samples only:
+    REV01 (Plan §3.2): the legacy block (``T/Q/X/G/D_cm/...``) now
+    contains captured + transit rows so the v2 Mahalanobis NN sees the
+    full transit cloud as training data. Moving-phase bundles stay out
+    of the legacy block (they would be a redundant subset of transit)
+    and live under the ``*_all`` keys only. Two new per-row columns:
+    ``Depth_source`` (per fit-row provenance,
+    ``"vlm_depth_pro" | "vergence" | "vergence_affine"``) and
+    ``D_cm_vergence`` (parallel vergence reading at VLM anchors; NaN
+    on transit). The offline ``tools/fit_vergence_affine.py`` script
+    rewrites transit rows to ``"vergence_affine"`` and fills
+    ``meta["affine_map"]`` post-hoc.
+
+    Output contract (REV01):
+      Legacy (v1-compatible) — captured + transit fit rows:
         T: (N,) float64           timestamps (s)
         Q: (N, 7) float64         joint angles (rad)
         X: (N, 3) float64         EE positions (mm)
         G: (N, 3) float64         (gaze_x_norm, gaze_y_norm, gaze_conf)
-      New (v2 only) — captured samples:
+      New (v2 only) — captured + transit fit rows:
         D_cm           (N,) float64
         D_valid        (N,) bool
         Miss_mm        (N,) float64
@@ -787,16 +795,27 @@ def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
         Gaze_yaw_deg   (N,) float64
         Gaze_pitch_deg (N,) float64
         Target_label   (N,) <U32
+        Depth_source   (N,) <U64
+        D_cm_vergence  (N,) float64   NaN on transit rows
       New (v2 only) — all samples (captured + moving + transit), indexed by phase:
         T_all, Q_all, X_all, G_all, D_cm_all, D_valid_all,
         Miss_mm_all, IPD_mm_all, IMU_w_all, IMU_fresh_all,
         Head_yaw_deg_all, Head_pitch_deg_all, Gaze_yaw_deg_all,
-        Gaze_pitch_deg_all, Phase_all, Target_label_all, Leg_label_all
-      meta: dict with `version`, `side`, recorder identifiers.
+        Gaze_pitch_deg_all, Phase_all, Target_label_all, Leg_label_all,
+        Depth_source_all
+      meta: dict with ``version``, ``side``, ``depth_source``,
+        ``affine_map`` (placeholder ``None``; filled by the offline
+        affine-fit script), and recorder identifiers.
     """
     captured = [b for b in bundles if b.phase == "captured"]
     if not captured:
         raise RuntimeError("Refusing to write NPZ with zero captured samples.")
+
+    # REV01 (Plan §3.2 item 1): the fit-relevant block now includes
+    # transit ticks alongside the captured anchors. Moving rows stay
+    # out (they are a ~1 s pre-capture trajectory tail, redundant with
+    # the surrounding transit cloud).
+    fit_rows = [b for b in bundles if b.phase in ("captured", "transit")]
 
     def stack_field(items, attr, dtype=float):
         return np.asarray([getattr(b, attr) for b in items], dtype=dtype)
@@ -804,26 +823,33 @@ def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
     def vstack_field(items, attr):
         return np.vstack([getattr(b, attr) for b in items])
 
-    T = stack_field(captured, "t")
-    Q = vstack_field(captured, "q")
-    X = vstack_field(captured, "ee_mm")
+    T = stack_field(fit_rows, "t")
+    Q = vstack_field(fit_rows, "q")
+    X = vstack_field(fit_rows, "ee_mm")
     G = np.column_stack([
-        stack_field(captured, "gaze_x_norm"),
-        stack_field(captured, "gaze_y_norm"),
-        stack_field(captured, "gaze_conf"),
+        stack_field(fit_rows, "gaze_x_norm"),
+        stack_field(fit_rows, "gaze_y_norm"),
+        stack_field(fit_rows, "gaze_conf"),
     ])
 
-    D_cm = stack_field(captured, "depth_cm")
-    D_valid = stack_field(captured, "depth_valid", dtype=bool)
-    Miss_mm = stack_field(captured, "miss_mm")
-    IPD_mm = stack_field(captured, "ipd_mm")
-    IMU_w = stack_field(captured, "imu_w")
-    IMU_fresh = stack_field(captured, "imu_fresh", dtype=bool)
-    Head_yaw_deg = stack_field(captured, "head_yaw_deg")
-    Head_pitch_deg = stack_field(captured, "head_pitch_deg")
-    Gaze_yaw_deg = stack_field(captured, "gaze_yaw_deg")
-    Gaze_pitch_deg = stack_field(captured, "gaze_pitch_deg")
-    Target_label = np.asarray([b.target_label for b in captured], dtype="<U32")
+    D_cm = stack_field(fit_rows, "depth_cm")
+    D_valid = stack_field(fit_rows, "depth_valid", dtype=bool)
+    Miss_mm = stack_field(fit_rows, "miss_mm")
+    IPD_mm = stack_field(fit_rows, "ipd_mm")
+    IMU_w = stack_field(fit_rows, "imu_w")
+    IMU_fresh = stack_field(fit_rows, "imu_fresh", dtype=bool)
+    Head_yaw_deg = stack_field(fit_rows, "head_yaw_deg")
+    Head_pitch_deg = stack_field(fit_rows, "head_pitch_deg")
+    Gaze_yaw_deg = stack_field(fit_rows, "gaze_yaw_deg")
+    Gaze_pitch_deg = stack_field(fit_rows, "gaze_pitch_deg")
+    Target_label = np.asarray([b.target_label for b in fit_rows], dtype="<U32")
+
+    # REV01 (Plan §3.2 items 2, 3): per-row provenance + the parallel
+    # vergence reading preserved at VLM anchors (NaN on transit). <U64
+    # over-provisions for the longest expected value
+    # "vlm_interpolated_nearest_anchor" (32 chars) without truncation.
+    Depth_source = np.asarray([b.depth_source for b in fit_rows], dtype="<U64")
+    D_cm_vergence = stack_field(fit_rows, "depth_cm_vergence")
 
     # "All" arrays — captured + moving, in time order.
     T_all = stack_field(bundles, "t")
@@ -847,22 +873,31 @@ def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
     Phase_all = np.asarray([b.phase for b in bundles], dtype="<U16")
     Target_label_all = np.asarray([b.target_label for b in bundles], dtype="<U32")
     Leg_label_all = np.asarray([b.leg_label for b in bundles], dtype="<U64")
+    Depth_source_all = np.asarray([b.depth_source for b in bundles],
+                                    dtype="<U64")
 
-    # depth_source pins the calibration-time depth pipeline; the v2
-    # runtime dispatch in ExperimentDriver_Online_GazeTracking refuses
-    # to load an NPZ whose runtime source disagrees, since mixing
-    # vergence and Depth Pro within the Mahalanobis NN breaks the
-    # learned per-feature scales.
-    depth_source = str(getattr(config, "GAZE_CALIBRATION_DEPTH_SOURCE",
-                                "vergence"))
+    # REV01 (Plan §3.2 item 4): when the recorder is driven with
+    # GAZE_CALIBRATION_DEPTH_SOURCE="vlm_depth_pro", the NPZ is a
+    # hybrid — VLM Depth Pro at the 15 anchors, vergence at every
+    # transit tick — and meta["depth_source"] pins that.  The
+    # vergence-only path keeps the legacy "vergence" literal so a v2
+    # NPZ recorded without VLM stays a degenerate-but-valid hybrid
+    # (anchors and transit both vergence) without forcing the
+    # operator to think about a new string.
+    config_depth_source = str(getattr(config, "GAZE_CALIBRATION_DEPTH_SOURCE",
+                                       "vergence"))
+    if config_depth_source == "vlm_depth_pro":
+        depth_source = "hybrid_anchor_vlm_transit_vergence"
+    else:
+        depth_source = config_depth_source
     vlm_service_host = (str(getattr(config, "VLM_SERVICE_HOST", ""))
-                        if depth_source == "vlm_depth_pro" else "")
+                        if config_depth_source == "vlm_depth_pro" else "")
 
     meta = dict(
         version=2,
         side=ACTIVE_SIDE,
         recorder="harmony_free_arm_calibration.py",
-        plan_reference="Harmony_Gaze_Calibration_Upgrade_Plan.md §6.1 Track B",
+        plan_reference="Harmony_Gaze_Calibration_REV00_Plan.md §6.1 Track B",
         cpp_branch="feature/research-interface-onboard/free-arm @ 01d91ea",
         wire_protocol="HARMONY-UNIT-4 tools/wire_protocol.md (m/c rows)",
         gaze_sample_width=float(getattr(config, "GAZE_SAMPLE_WIDTH", 1600.0)),
@@ -871,6 +906,13 @@ def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
         depth_valid_min_consecutive=DEPTH_VALID_MIN_CONSECUTIVE,
         depth_source=depth_source,
         vlm_service_host=vlm_service_host,
+        # REV01 (Plan §3.2 item 6 / §3.3): the offline affine-fit script
+        # rewrites this placeholder to {"a", "b", "R2",
+        # "max_abs_residual_cm"} after solving the per-session
+        # D_vlm = a · D_vergence + b regression at the anchors. None
+        # here means "no fit yet" — the runtime falls back to raw
+        # vergence under that condition.
+        affine_map=None,
         units=dict(X="mm", Q="rad", G="normalized_0_to_1",
                    D_cm="cm", Miss_mm="mm", IPD_mm="mm",
                    IMU_w="rad/s", Head_yaw_deg="deg",
@@ -880,14 +922,17 @@ def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
 
     np.savez_compressed(
         out_path,
-        # legacy v1 keys
+        # legacy v1 keys (REV01: now captured + transit, not captured-only)
         T=T, Q=Q, X=X, G=G,
-        # v2 captured-only keys
+        # v2 fit-block (captured + transit) keys
         D_cm=D_cm, D_valid=D_valid, Miss_mm=Miss_mm, IPD_mm=IPD_mm,
         IMU_w=IMU_w, IMU_fresh=IMU_fresh,
         Head_yaw_deg=Head_yaw_deg, Head_pitch_deg=Head_pitch_deg,
         Gaze_yaw_deg=Gaze_yaw_deg, Gaze_pitch_deg=Gaze_pitch_deg,
         Target_label=Target_label,
+        # REV01 (Plan §3.2 items 2, 3): per-row provenance and the
+        # parallel vergence reading on anchor rows.
+        Depth_source=Depth_source, D_cm_vergence=D_cm_vergence,
         # v2 all-phase keys
         T_all=T_all, Q_all=Q_all, X_all=X_all, G_all=G_all,
         D_cm_all=D_cm_all, D_valid_all=D_valid_all,
@@ -897,6 +942,10 @@ def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
         Gaze_yaw_deg_all=Gaze_yaw_deg_all, Gaze_pitch_deg_all=Gaze_pitch_deg_all,
         Phase_all=Phase_all, Target_label_all=Target_label_all,
         Leg_label_all=Leg_label_all,
+        # REV01 (Plan §3.2 item 2): every-row provenance for the
+        # *_all block, padded to "vergence" for phase="moving" rows
+        # because moving samples never receive VLM substitution.
+        Depth_source_all=Depth_source_all,
         meta=meta,
     )
 
