@@ -468,3 +468,162 @@ class TestVlmDepthProMidLoopFailure:
             "Non-finite VLM depth must not produce a robot command")
         out = capsys.readouterr().out
         assert "non-finite" in out
+
+
+# ─── REV01 runtime_depth_pipeline dispatch (Plan §3.5, Step 6) ──────────────
+
+def _write_rev01_hybrid_npz(path: Path, *, affine_map: Any, N: int = 8) -> None:
+    """Write a REV01 hybrid NPZ with meta['depth_source']='hybrid_..._vergence'
+    and meta['affine_map'] populated as given. Mirrors the recorder's
+    Step 3 layout closely enough for the REPL's v2_mapping loader."""
+    meta = dict(version=2, side="R",
+                depth_source="hybrid_anchor_vlm_transit_vergence",
+                affine_map=affine_map)
+    np.savez_compressed(
+        str(path),
+        T=np.arange(N, dtype=float),
+        Q=np.zeros((N, 7)),
+        X=np.zeros((N, 3)),
+        G=np.column_stack([np.full(N, 0.5), np.full(N, 0.5), np.full(N, 1.0)]),
+        D_cm=np.full(N, 75.0),
+        D_valid=np.ones(N, dtype=bool),
+        Miss_mm=np.zeros(N),
+        IPD_mm=np.full(N, 63.0),
+        IMU_w=np.zeros(N),
+        IMU_fresh=np.ones(N, dtype=bool),
+        Head_yaw_deg=np.zeros(N),
+        Head_pitch_deg=np.zeros(N),
+        Gaze_yaw_deg=np.zeros(N),
+        Gaze_pitch_deg=np.zeros(N),
+        Target_label=np.array(["mid_R3"] * N, dtype="<U32"),
+        meta=meta,
+    )
+
+
+class TestRuntimeDepthPipelineDispatch:
+    """REV01 (Plan §3.5): the REPL dispatches on
+    ``v2_mapping.runtime_depth_pipeline`` instead of branching on
+    ``depth_source == "vlm_depth_pro"`` directly. Three cases:
+
+    1. ``vergence_affine`` path applies ``a * d + b`` to the snapshot's
+       depth_cm before the v2 query (no VLM call).
+    2. ``vlm_depth_pro`` path unchanged from REV00 (regression test).
+    3. ``hybrid_..._vergence`` NPZ with ``affine_map=None`` raises
+       RuntimeError at startup with the NPZ path in the message
+       (fail-fast on the missing-fit misconfiguration).
+    """
+
+    def test_vergence_affine_applies_linear_map(self, tmp_path: Path,
+                                                 monkeypatch):
+        mod = _import_module()
+        monkeypatch.setattr(mod.config, "GAZE_CALIBRATION_VERSION", 2,
+                             raising=False)
+        monkeypatch.setattr(mod.config, "GAZE_CALIBRATION_USE_IMU", False,
+                             raising=False)
+
+        npz = tmp_path / "rev01_fitted.npz"
+        # Picked coefficients so the apply step is unambiguous: with
+        # snapshot depth_cm=80, runtime should produce
+        # 1.5 * 80 + (-10) = 110.0.
+        _write_rev01_hybrid_npz(npz, affine_map={
+            "a": 1.5, "b": -10.0, "R2": 0.92, "max_abs_residual_cm": 4.0,
+        })
+
+        captured: Dict[str, Any] = {}
+        from Utils.gaze.calibration_mapping import GazeCalibrationMappingV2
+        real_query = GazeCalibrationMappingV2.query
+
+        def spy_query(self, feats):
+            captured["features"] = dict(feats)
+            return real_query(self, feats)
+
+        monkeypatch.setattr(GazeCalibrationMappingV2, "query", spy_query)
+
+        # Snapshot returns raw vergence depth_cm=80; runtime must
+        # apply a*d+b before the query lands.
+        snapshot = {
+            "ok": True, "gaze_yaw_deg": 0.0, "gaze_pitch_deg": 0.0,
+            "depth_cm": 80.0, "head_yaw_deg": 0.0, "head_pitch_deg": 0.0,
+        }
+        sent, instances, raised = _run_main_one_vision_then_quit(
+            monkeypatch, mod, npz, snapshot=snapshot)
+
+        assert raised is None, f"main() raised unexpectedly: {raised!r}"
+        # No VLM construction in the vergence_affine path.
+        assert instances == [], (
+            "vergence_affine must not instantiate VLMClient at runtime")
+        # The query received the affine-mapped depth, not the raw 80.0.
+        assert captured["features"]["D_cm"] == pytest.approx(110.0)
+        # And a robot command was emitted.
+        joint_cmds = [m for m in sent if ";dur=" in m]
+        assert len(joint_cmds) == 1
+
+    def test_vlm_depth_pro_path_unchanged(self, tmp_path: Path, monkeypatch):
+        # Regression: pre-REV00 vlm_depth_pro NPZ (no transit promotion,
+        # no affine_map). The REPL must still construct VLMClient,
+        # probe at startup, and call depth(at_gaze=True) per target.
+        mod = _import_module()
+        monkeypatch.setattr(mod.config, "GAZE_CALIBRATION_VERSION", 2,
+                             raising=False)
+        monkeypatch.setattr(mod.config, "GAZE_CALIBRATION_USE_IMU", False,
+                             raising=False)
+        monkeypatch.setattr(mod.config, "VLM_SERVICE_HOST", "192.168.99.99",
+                             raising=False)
+        monkeypatch.setattr(mod.config, "VLM_SERVICE_PORT", 5589,
+                             raising=False)
+
+        npz = tmp_path / "v2_vlm_only.npz"
+        _write_v2_npz(npz, depth_source="vlm_depth_pro")
+
+        captured: Dict[str, Any] = {}
+        from Utils.gaze.calibration_mapping import GazeCalibrationMappingV2
+        real_query = GazeCalibrationMappingV2.query
+
+        def spy_query(self, feats):
+            captured["features"] = dict(feats)
+            return real_query(self, feats)
+
+        monkeypatch.setattr(GazeCalibrationMappingV2, "query", spy_query)
+
+        sent, instances, raised = _run_main_one_vision_then_quit(
+            monkeypatch, mod, npz, vlm_client_factory=_FakeVLMClient)
+
+        assert raised is None, f"main() raised unexpectedly: {raised!r}"
+        assert len(instances) == 1
+        client = instances[0]
+        assert client.status_calls == 1
+        assert len(client.depth_calls) == 1
+        # VLM reports 0.75 m -> D_cm == 75.0.
+        assert captured["features"]["D_cm"] == pytest.approx(75.0)
+
+    def test_hybrid_without_affine_map_raises_at_startup(self, tmp_path: Path,
+                                                          monkeypatch):
+        # Plan §3.5 alignment invariant: a REV01 NPZ pinned to the
+        # hybrid string but with affine_map=None must fail-fast at
+        # startup. Otherwise the runtime would silently fall back to
+        # raw vergence and the per-feature Mahalanobis scale would be
+        # off by the missing affine factor.
+        mod = _import_module()
+        monkeypatch.setattr(mod.config, "GAZE_CALIBRATION_VERSION", 2,
+                             raising=False)
+        monkeypatch.setattr(mod.config, "GAZE_CALIBRATION_USE_IMU", False,
+                             raising=False)
+
+        npz = tmp_path / "rev01_no_fit.npz"
+        _write_rev01_hybrid_npz(npz, affine_map=None)
+
+        sent, instances, raised = _run_main_one_vision_then_quit(
+            monkeypatch, mod, npz)
+
+        assert isinstance(raised, RuntimeError), (
+            f"REV01 hybrid + None affine_map must raise; got {raised!r}")
+        # Message must reference the NPZ path and tools/fit_vergence_affine.py
+        # so the operator can act on it.
+        msg = str(raised)
+        assert str(npz) in msg, (
+            f"RuntimeError must name the NPZ path; got: {msg!r}")
+        assert "fit_vergence_affine.py" in msg, (
+            f"RuntimeError must point the operator at the fit script; got: {msg!r}")
+        # And nothing got past the probe to the robot.
+        joint_cmds = [m for m in sent if ";dur=" in m]
+        assert joint_cmds == []

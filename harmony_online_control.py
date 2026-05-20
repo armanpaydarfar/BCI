@@ -602,15 +602,32 @@ def main():
         print(f"[{ts()}] [v2] mapping ready — features={v2_mapping.feature_keys}, "
               f"valid_samples={v2_mapping.num_valid_samples}, use_imu={use_imu}")
 
-    # Alignment invariant (mirrors ExperimentDriver_Online_GazeTracking.py
-    # _load_v2_mapping_if_enabled at commit d36711b): when the NPZ pins
-    # depth_source='vlm_depth_pro', the REPL must be able to reach
-    # vlm_service with --enable-depth at startup. Otherwise the vision-
-    # mode v2 query would silently fall back to vergence depth and
-    # poison the Mahalanobis distance metric (per-feature scale was
-    # calibrated against Depth Pro readings, not vergence).
+    # Alignment invariant dispatch (REV01 Plan §3.5): the runtime depth
+    # feed must match the source baked into the calibration NPZ, or the
+    # Mahalanobis NN's per-feature scale is wrong by an unknown factor.
+    # The mapping exposes a single dispatch hint via
+    # ``runtime_depth_pipeline`` derived from meta["depth_source"] and
+    # meta["affine_map"]; the REPL and the EEG-gated driver both
+    # dispatch on it identically.
     vlm_client = None
-    if v2_mapping is not None and v2_mapping.depth_source == "vlm_depth_pro":
+    pipeline = (v2_mapping.runtime_depth_pipeline
+                if v2_mapping is not None else "vergence")
+    if v2_mapping is not None:
+        # Fail-fast on the missing-affine-map misconfiguration: the
+        # recorder pinned meta["depth_source"]=hybrid but the offline
+        # affine-fit script was never run, so meta["affine_map"] is
+        # None and the runtime would silently fall back to raw
+        # vergence. Per CLAUDE.md "Prefer fail-fast" and Plan §3.5's
+        # alignment invariant, refuse to start with this NPZ.
+        if (v2_mapping.depth_source == "hybrid_anchor_vlm_transit_vergence"
+                and v2_mapping.affine_map is None):
+            raise RuntimeError(
+                f"NPZ at {sys.argv[1]!r} pins meta['depth_source']="
+                f"'hybrid_anchor_vlm_transit_vergence' but meta['affine_map'] "
+                f"is None. Run tools/fit_vergence_affine.py on the NPZ first "
+                f"so the runtime can map vergence into the Depth Pro scale."
+            )
+    if pipeline == "vlm_depth_pro":
         from Utils.perception_clients import VLMClient
         if not getattr(config, "VLM_SERVICE_HOST", None):
             raise RuntimeError(
@@ -652,8 +669,17 @@ def main():
                 f"GAZE_CALIBRATION_DEPTH_SOURCE='vergence' in config_local.py "
                 f"and re-record the NPZ."
             )
-        print(f"[{ts()}] [v2] depth_source=vlm_depth_pro "
+        print(f"[{ts()}] [v2] runtime_depth_pipeline=vlm_depth_pro "
               f"(host={vlm_client.host}:{vlm_client.port}, depth_enabled=True)")
+    elif pipeline == "vergence_affine":
+        # REV01 (Plan §3.5): vergence with the per-session affine map
+        # applied. No VLM probe needed — runtime is VLM-independent
+        # once the offline fit has been run. Log the coefficients so
+        # the operator can correlate runtime behaviour against the
+        # diagnostic plot tools/fit_vergence_affine.py produced.
+        a, b = v2_mapping.affine_map
+        print(f"[{ts()}] [v2] runtime_depth_pipeline=vergence_affine "
+              f"(a={a:.4f}, b={b:.4f})")
 
     # Initialize gaze stream if we have gaze-enabled library
     gaze_stream = None
@@ -751,16 +777,14 @@ def main():
                     continue
                 use_imu = bool(getattr(config, "GAZE_CALIBRATION_USE_IMU", False))
 
-                # Depth source selection: when the NPZ pins
-                # depth_source='vlm_depth_pro' the v2 query MUST be fed a
-                # Depth Pro reading (the calibration data set the per-
-                # feature scale used by the Mahalanobis metric). One UDP
-                # round-trip per target press is fine here — the REPL is
-                # human-paced and only commits a robot waypoint once per
-                # 'v' invocation. Fail-fast on any VLM error: silently
-                # substituting vergence depth would corrupt the metric
-                # without any visible signal.
-                if v2_mapping.depth_source == "vlm_depth_pro":
+                # REV01 (Plan §3.5): dispatch on the mapping's runtime
+                # depth pipeline. ``vlm_depth_pro`` is the legacy REV00
+                # per-trial Depth Pro fetch. ``vergence_affine`` applies
+                # the per-session affine map fitted by
+                # tools/fit_vergence_affine.py to the snapshot's
+                # vergence depth (runtime is VLM-independent). Plain
+                # ``vergence`` is the pre-v2-depth default.
+                if pipeline == "vlm_depth_pro":
                     try:
                         depth_resp = vlm_client.depth(at_gaze=True)
                     except OSError as e:
@@ -787,6 +811,10 @@ def main():
                               f"robot command sent.")
                         continue
                     depth_cm = depth_at_gaze_m * 100.0
+                elif pipeline == "vergence_affine":
+                    a, b = v2_mapping.affine_map
+                    raw_depth_cm = float(snap.get("depth_cm", float("nan")))
+                    depth_cm = a * raw_depth_cm + b
                 else:
                     depth_cm = float(snap.get("depth_cm", float("nan")))
 

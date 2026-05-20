@@ -733,13 +733,24 @@ def _load_v2_mapping_if_enabled(path):
     use_imu = bool(getattr(config, "GAZE_CALIBRATION_USE_IMU", False))
     mapping = GazeCalibrationMappingV2(data, use_imu=use_imu)
 
-    # Alignment invariant: the depth source baked into the NPZ at
-    # calibration time governs the runtime feed. If the NPZ was
-    # recorded against VLM Depth Pro, the driver must be able to
-    # reach vlm_service with depth enabled — otherwise the v2 query
-    # would be fed vergence depth at trial-end and the Mahalanobis
-    # distance metric would be off-scale.
-    if mapping.depth_source == "vlm_depth_pro":
+    # Alignment invariant dispatch (REV01 Plan §3.5): the runtime depth
+    # feed must match the source baked into the calibration NPZ. The
+    # mapping exposes ``runtime_depth_pipeline`` derived from
+    # meta["depth_source"] and meta["affine_map"]; the driver and the
+    # REPL dispatch on it identically. Fail-fast on the
+    # hybrid-without-affine-map combination so the operator runs
+    # tools/fit_vergence_affine.py before launching the experiment.
+    if (mapping.depth_source == "hybrid_anchor_vlm_transit_vergence"
+            and mapping.affine_map is None):
+        raise RuntimeError(
+            f"NPZ at {path!r} pins meta['depth_source']="
+            f"'hybrid_anchor_vlm_transit_vergence' but meta['affine_map'] "
+            f"is None. Run tools/fit_vergence_affine.py on the NPZ first "
+            f"so the runtime can map vergence into the Depth Pro scale."
+        )
+
+    pipeline = mapping.runtime_depth_pipeline
+    if pipeline == "vlm_depth_pro":
         from Utils.perception_clients import VLMClient
         probe = VLMClient(config)
         try:
@@ -762,13 +773,21 @@ def _load_v2_mapping_if_enabled(path):
                 f"depth_enabled=False at {probe.host}:{probe.port}; restart it "
                 f"with --enable-depth."
             )
+    elif pipeline == "vergence_affine":
+        a, b = mapping.affine_map
+        logger.log_event(
+            f"v2 runtime_depth_pipeline=vergence_affine — applying "
+            f"d_runtime = {a:.4f} * d_vergence + {b:.4f} to the trial-end "
+            f"vergence depth before the v2 query."
+        )
 
     logger.log_event(
         f"v2 calibration mapping loaded from {path} — "
         f"features={mapping.feature_keys}, "
         f"valid_samples={mapping.num_valid_samples}, "
         f"use_imu={use_imu}, "
-        f"depth_source={mapping.depth_source}"
+        f"depth_source={mapping.depth_source}, "
+        f"runtime_depth_pipeline={pipeline}"
     )
     return mapping
 
@@ -1116,16 +1135,19 @@ def main():
     X_lib, Q_lib, G_lib = load_pose_library(POSE_LIBRARY_PATH)
     v2_mapping = _load_v2_mapping_if_enabled(POSE_LIBRARY_PATH)
 
-    # When the v2 mapping was calibrated against VLM Depth Pro, the
-    # driver fetches one Depth Pro reading at trial-end and feeds it
-    # into the Mahalanobis NN's depth feature — the per-sample vergence
-    # values accumulated during the selection window are then ignored
-    # for the depth feature. Per-sample VLM calls would saturate Depth
-    # Pro CPU on a single-machine setup; once-per-trial is sufficient
-    # because the user is fixating on the chosen object by the time we
-    # commit to a robot waypoint.
+    # REV01 (Plan §3.5): runtime depth pipeline dispatch — same shape
+    # as the REPL probe but the construction happens here so the
+    # selection-window hot loop sees a pre-built client / pre-resolved
+    # affine coefficients. ``vlm_depth_pro`` keeps the legacy
+    # once-per-trial Depth Pro fetch (per-sample VLM calls would
+    # saturate Depth Pro CPU; the user is fixating on the chosen
+    # object by the time we commit to a waypoint). ``vergence_affine``
+    # uses the per-session affine map fitted offline; no VLM client
+    # needed at runtime. ``vergence`` is the pre-v2-depth default.
     vlm_depth_client = None
-    if v2_mapping is not None and v2_mapping.depth_source == "vlm_depth_pro":
+    runtime_depth_pipeline = (v2_mapping.runtime_depth_pipeline
+                                if v2_mapping is not None else "vergence")
+    if runtime_depth_pipeline == "vlm_depth_pro":
         from Utils.perception_clients import VLMClient
         vlm_depth_client = VLMClient(config)
         logger.log_event(
@@ -1241,21 +1263,37 @@ def main():
                 colors = [config.green, config.green]
                 offsets = [-100, 100]
 
-                # Trial-end VLM Depth Pro fetch (runtime cadence locked
-                # in plan §"Depth source selection"): one UDP round-trip
-                # per resolved GO trial, NOT per sample. avg_sensor is
-                # mutated here so the downstream resolve sees a coherent
-                # (gaze_yaw, gaze_pitch, depth_cm) triple sourced from
-                # the same depth pipeline as the calibration NPZ.
-                if vlm_depth_client is not None and avg_sensor is not None:
-                    avg_sensor = dict(avg_sensor)  # never mutate the
-                                                     # selection result
+                # REV01 (Plan §3.5): trial-end depth substitution.
+                # ``vlm_depth_pro`` does one UDP round-trip per resolved
+                # GO trial. ``vergence_affine`` applies the offline-fit
+                # affine map to the vergence-averaged depth in place —
+                # no network call, no VLM dependency at runtime.
+                # ``vergence`` leaves avg_sensor["depth_cm"] alone.
+                # avg_sensor is mutated via a dict copy so the upstream
+                # selection result stays immutable.
+                if (runtime_depth_pipeline == "vlm_depth_pro"
+                        and vlm_depth_client is not None
+                        and avg_sensor is not None):
+                    avg_sensor = dict(avg_sensor)
                     vlm_depth_cm = fetch_vlm_depth_cm_at_gaze(vlm_depth_client)
                     avg_sensor["depth_cm"] = vlm_depth_cm
                     avg_sensor["depth_valid"] = True
                     logger.log_event(
                         f"Trial-end VLM depth fetched: depth_cm={vlm_depth_cm:.1f} "
                         f"(replacing vergence-averaged depth before v2 resolve)"
+                    )
+                elif (runtime_depth_pipeline == "vergence_affine"
+                        and avg_sensor is not None
+                        and v2_mapping is not None):
+                    avg_sensor = dict(avg_sensor)
+                    a, b = v2_mapping.affine_map
+                    raw_depth_cm = float(avg_sensor["depth_cm"])
+                    avg_sensor["depth_cm"] = a * raw_depth_cm + b
+                    logger.log_event(
+                        f"Trial-end vergence_affine applied: "
+                        f"depth_cm {raw_depth_cm:.1f} -> "
+                        f"{avg_sensor['depth_cm']:.1f} "
+                        f"(a={a:.4f}, b={b:.4f})"
                     )
 
                 target_info = resolve_robot_target_from_gaze(
