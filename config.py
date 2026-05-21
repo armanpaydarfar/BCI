@@ -157,7 +157,7 @@ GAZE_SAMPLE_HEIGHT = 1200.0
 #       depth_cm) with optional head-pose features behind
 #       GAZE_CALIBRATION_USE_IMU (Mahalanobis NN — plan §6.2 Option I).
 # Default 1 until v2 is hardware-validated, per
-# Harmony_Gaze_Calibration_Upgrade_Plan.md §8.1.
+# Harmony_Gaze_Calibration_REV00_Plan.md §8.1.
 GAZE_CALIBRATION_VERSION = 1
 
 # Whether the v2 mapping consumes head_yaw/head_pitch as additional

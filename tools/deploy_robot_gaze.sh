@@ -19,7 +19,7 @@
 #   - one "ok: <name> md5=<hash>" line per binary after rsync completes
 #   - non-zero exit on md5 mismatch, with both md5s and the bak name
 #
-# Plan ref: Harmony_Gaze_Calibration_Upgrade_Plan.md §4.5; see also
+# Plan ref: Harmony_Gaze_Calibration_REV00_Plan.md §4.5; see also
 # Documents/SoftwareDocs/Reports/Harmony_Gaze_Calibration_CPP_Report.md
 # "Deploy script completion (2026-05-19)".
 

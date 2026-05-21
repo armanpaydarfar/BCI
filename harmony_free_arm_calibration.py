@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 harmony_free_arm_calibration.py — Free-arm gaze-calibration recorder
-(Phase 2.a Track B, per Harmony_Gaze_Calibration_Upgrade_Plan.md §6.1).
+(Phase 2.a Track B, per Harmony_Gaze_Calibration_REV00_Plan.md §6.1).
 
 Replaces the preset-visit flow used by ``harmony_calibration_exec.py``
 with the user-driven free-arm paradigm described in plan §5.3. The
@@ -955,7 +955,7 @@ def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
 # =============================================================================
 # Duration baked into the auto-home ``h;dur=...`` opcode. 4.0 s
 # matches the locked-in calibration-recorder home-wait budget; see
-# Documents/SoftwareDocs/Harmony_Gaze_Calibration_Upgrade_Plan.md §6.1
+# Documents/SoftwareDocs/Harmony_Gaze_Calibration_REV00_Plan.md §6.1
 # (recorder spec rework, 2026-05-19) for the rationale.
 AUTO_HOME_DURATION_S = 4.0
 # Small grace period beyond ``dur`` so the robot has time to settle and
