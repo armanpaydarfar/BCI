@@ -36,10 +36,14 @@ def _write_calibration_npz(
     *,
     include_letters: bool = True,
 ) -> None:
-    """Helper: write a calibration NPZ with the documented schema."""
+    """Helper: write a calibration NPZ with the documented schema.
+
+    `centroids` is expected to be (9, 3): [x_norm, y_norm, depth_cm].
+    The depth column may contain NaN per-row; the loader treats those
+    as "2D-only" centroids."""
     arrays = dict(
         T=np.array([0.0], dtype=np.float64),
-        G=np.zeros((1, 3), dtype=np.float32),
+        G=np.zeros((1, 4), dtype=np.float32),
         labels=np.array(["A"], dtype="S1"),
         centroids=centroids.astype(np.float32),
         meta=dict(version=1),
@@ -53,18 +57,19 @@ def _write_calibration_npz(
 def fixture_centroids():
     """A deterministic set of centroids — each letter offset from its
     nominal grid position so we can verify the loader preserves the
-    exact values, not the nominal fallback."""
+    exact values, not the nominal fallback. Depth varies per letter so
+    a row-swap bug surfaces in the depth column too."""
     base = np.array(
         [
-            [0.25, 0.25],
-            [0.50, 0.25],
-            [0.75, 0.25],
-            [0.25, 0.50],
-            [0.50, 0.50],
-            [0.75, 0.50],
-            [0.25, 0.75],
-            [0.50, 0.75],
-            [0.75, 0.75],
+            [0.25, 0.25, 50.0],
+            [0.50, 0.25, 52.0],
+            [0.75, 0.25, 54.0],
+            [0.25, 0.50, 56.0],
+            [0.50, 0.50, 58.0],
+            [0.75, 0.50, 60.0],
+            [0.25, 0.75, 62.0],
+            [0.50, 0.75, 64.0],
+            [0.75, 0.75, 66.0],
         ],
         dtype=np.float64,
     )
@@ -82,13 +87,16 @@ def test_round_trip_preserves_values(tmp_path, fixture_centroids):
     loaded = load_centroids(npz_path)
     assert set(loaded.keys()) == set(LETTERS)
     for i, ch in enumerate(LETTERS):
-        gx, gy = loaded[ch]
+        gx, gy, gz = loaded[ch]
         # float32 round-trip tolerance.
         assert abs(gx - fixture_centroids[i, 0]) < 1e-5, (
             f"{ch}: x mismatch {gx} vs {fixture_centroids[i, 0]}"
         )
         assert abs(gy - fixture_centroids[i, 1]) < 1e-5, (
             f"{ch}: y mismatch {gy} vs {fixture_centroids[i, 1]}"
+        )
+        assert abs(gz - fixture_centroids[i, 2]) < 1e-4, (
+            f"{ch}: depth mismatch {gz} vs {fixture_centroids[i, 2]}"
         )
 
 
@@ -145,12 +153,27 @@ def test_missing_centroids_key_raises(tmp_path):
 
 
 def test_wrong_shape_centroids_raises(tmp_path):
-    """A (8, 2) centroids array (one letter short) -> ValueError, not
+    """A (8, 3) centroids array (one letter short) -> ValueError, not
     silent truncation."""
     npz_path = tmp_path / "wrong_shape.npz"
     _write_calibration_npz(
         npz_path,
-        centroids=np.zeros((8, 2), dtype=np.float64),
+        centroids=np.zeros((8, 3), dtype=np.float64),
+        include_letters=False,
+    )
+    with pytest.raises(ValueError, match="expected"):
+        load_centroids(npz_path)
+
+
+def test_old_2d_centroids_rejected(tmp_path):
+    """Old (9, 2) NPZs (pre-depth, before 2026-05-20) must be rejected
+    with a clear message — silently loading them with a NaN depth
+    column would let a depth-aware classifier run with no depth
+    information, hiding the schema mismatch."""
+    npz_path = tmp_path / "legacy_2d.npz"
+    _write_calibration_npz(
+        npz_path,
+        centroids=np.zeros((9, 2), dtype=np.float64),
         include_letters=False,
     )
     with pytest.raises(ValueError, match="expected"):
@@ -195,6 +218,6 @@ def test_calibration_with_all_letters_missing_returns_empty(tmp_path):
     Loaded dict is empty; runtime classification on empty dict returns
     None (verified in test_region_classifier.py)."""
     npz_path = tmp_path / "all_nan.npz"
-    _write_calibration_npz(npz_path, np.full((9, 2), np.nan, dtype=np.float64))
+    _write_calibration_npz(npz_path, np.full((9, 3), np.nan, dtype=np.float64))
     loaded = load_centroids(npz_path)
     assert loaded == {}

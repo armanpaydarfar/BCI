@@ -315,6 +315,25 @@ TIAGOBOT_GAZE_CONFIDENCE_THRESHOLD = 0.7
 # reasonable default for a 0.25-spaced grid — the gaze needs to be
 # within ~half a cell of the centroid.
 TIAGOBOT_GAZE_MAX_DIST_NORM = 0.2
+# Scale factor that maps vergence depth (cm) into the same numerical
+# range as the normalized [0, 1] gaze axes so the 3D classifier's
+# Euclidean distance is meaningful. 0.01 means 10 cm of depth contributes
+# 0.1 units of distance — roughly comparable to one grid cell. Set
+# to 0 to disable the depth axis (pure 2D classification, same as the
+# pre-2026-05-20 behaviour). Bench-tuned against an oblique seating
+# angle where row centroids collapse on the y axis but separate on
+# depth; raise if the depth measurement is reliable and you want it
+# to dominate the decision.
+TIAGOBOT_GAZE_DEPTH_WEIGHT_CM_INV = 0.01
+# Ceiling on the Mahalanobis distance returned by
+# `classify_gaze_mahalanobis`. None always picks the closest letter
+# (no skip), which is fine when the user is reliably looking at *some*
+# letter on the board. Set to a chi-squared critical value if you'd
+# rather skip trials where no letter is plausible: ~7.81 for p<0.05
+# with 3 DOF, ~11.34 for p<0.01. Has no effect on the centroid
+# classifier (`classify_gaze_to_letter`), which still uses
+# `TIAGOBOT_GAZE_MAX_DIST_NORM`.
+TIAGOBOT_GAZE_MAX_MAHAL_DIST = None
 
 # =============================================================================
 # Display colors (RGB)
