@@ -14,13 +14,14 @@
 #   • Move to that sample's X/Q.
 
 import sys, socket, json, time, os
+import threading
+from typing import Any, Optional, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime, timezone
-from pylsl import StreamInlet, resolve_stream  # For gaze LSL
 
 import config
-from Utils.perception_clients import udp_request as _gaze_udp_request
+from Utils.remote_frame_reader import RemoteFrameReader
 
 ROBOT_IP, ROBOT_PORT = "192.168.2.1", 8080
 CONTROL_IP, CONTROL_PORT = "0.0.0.0", 8080
@@ -195,106 +196,230 @@ def nearest_idx(X, x):
     d = np.linalg.norm(X - x[None, :], axis=1)
     return int(np.argmin(d)), float(np.min(d))
 
-# ---------------- Gaze (LSL) helpers ----------------
+# ---------------- Gaze (frame_relay) helpers ----------------
+# The REPL no longer dials an LSL gaze stream — gaze (x, y) comes from
+# the same frame_relay path the recorder used at calibration time. The
+# RelayGaze class wraps the module-level runtime relay consumer with the
+# same average_gaze_over_window API the old GazeStream exposed, so the
+# vision-mode call sites stay byte-identical.
 
-class GazeStream:
-    def __init__(self, confidence_threshold=GAZE_CONFIDENCE_THRESHOLD):
-        self.inlet = None
-        self.confidence_threshold = confidence_threshold
 
-    def connect(self):
-        print(f"[{ts()}] [GAZE] Searching for Neon LSL stream...")
-        try:
-            streams = resolve_stream('type', 'Gaze')
-            if not streams:
-                print(f"[{ts()}] [GAZE] ERROR: No gaze stream found.")
-                return False
-            self.inlet = StreamInlet(streams[0])
-            print(f"[{ts()}] [GAZE] Connected to: {streams[0].name()}")
-            return True
-        except Exception as e:
-            print(f"[{ts()}] [GAZE] ERROR: {e}")
-            return False
+class RelayGaze:
+    """Median-gaze collector over a fixed window, backed by the runtime
+    frame_relay consumer. Only counts distinct relay bundles (avoids
+    over-weighting the latest bundle when polling faster than the
+    relay's publish rate).
+    """
 
-    def average_gaze_over_window(self, dur_s=1.0):
+    def __init__(self):
+        # Started lazily so the first vision-mode press triggers the
+        # handshake wait once, then re-uses the warm connection.
+        self._consumer = None
+
+    def connect(self) -> bool:
+        self._consumer = _ensure_runtime_relay()
+        return self._consumer is not None
+
+    def average_gaze_over_window(self, dur_s: float = 1.0):
+        """Collect distinct relay bundles over dur_s, normalize gaze_px
+        to [0,1] via (GAZE_SAMPLE_WIDTH, GAZE_SAMPLE_HEIGHT), return
+        (median_x_norm, median_y_norm) or None if no valid samples
+        arrived. ``worn=False`` bundles are dropped.
         """
-        For dur_s seconds, accumulate valid gaze samples and return
-        (x_norm_median, y_norm_median) in [0,1] if any valid samples exist,
-        otherwise return None.
-
-        Normalization matches harmony_gaze_calibration.py:
-          x_norm = sample[0] / 1600.0
-          y_norm = sample[1] / 1200.0
-
-        Uses median instead of mean for robustness to outliers.
-        """
-        if self.inlet is None:
+        if self._consumer is None:
             return None
-
-        t0 = time.time()
+        last_ts = -1.0
         xs, ys = [], []
+        t0 = time.time()
+        poll_dt = 0.05  # 20 Hz poll; relay publishes ~10 Hz, so we'll
+                       # see each bundle twice but dedupe by t_recv.
         while time.time() - t0 < dur_s:
-            try:
-                sample, _ = self.inlet.pull_sample(timeout=GAZE_TIMEOUT_S)
-            except Exception:
-                sample = None
-            if not sample:
+            bundle, t_recv = self._consumer.latest()
+            if bundle is None or t_recv == last_ts:
+                time.sleep(poll_dt)
                 continue
-
+            last_ts = t_recv
             try:
-                x_raw = float(sample[0])
-                y_raw = float(sample[1])
-                conf  = float(sample[15])
-
-                x_norm = x_raw / GAZE_SAMPLE_WIDTH
-                y_norm = y_raw / GAZE_SAMPLE_HEIGHT
-            except Exception:
+                gx = float(bundle.gaze.x)
+                gy = float(bundle.gaze.y)
+                worn = bool(getattr(bundle, "worn", True))
+            except (AttributeError, TypeError, ValueError):
+                time.sleep(poll_dt)
                 continue
-
-            if conf >= self.confidence_threshold:
-                xs.append(x_norm)
-                ys.append(y_norm)
-
-        if len(xs) == 0:
+            if not (worn and np.isfinite(gx) and np.isfinite(gy)):
+                time.sleep(poll_dt)
+                continue
+            xs.append(gx / GAZE_SAMPLE_WIDTH)
+            ys.append(gy / GAZE_SAMPLE_HEIGHT)
+            time.sleep(poll_dt)
+        if not xs:
             return None
         return float(np.median(xs)), float(np.median(ys))
 
 
-def flush_gaze_buffer(inlet):
-    """Empty all pending samples from an LSL inlet."""
-    if inlet is None:
-        return
-    while True:
+# ---------------- Frame relay consumer (v2 features) ----------------
+# The v2 Mahalanobis mapping needs per-query gaze yaw/pitch. Older builds
+# pulled those from gaze_runner UDP; this build computes them locally
+# from frame_relay bundles (gaze_px + camera_matrix). The runtime mirrors
+# what harmony_free_arm_calibration.py does at calibration time so the
+# query features match the calibration feature space exactly.
+
+_RELAY_HOST = str(getattr(config, "FRAME_RELAY_DIAL_HOST", "127.0.0.1"))
+_RELAY_PORT = int(getattr(config, "FRAME_RELAY_PORT", 5591))
+_MAX_BUNDLE_AGE_S = 0.25
+
+
+class _RuntimeRelayConsumer(threading.Thread):
+    """Background frame_relay consumer used to source gaze features for
+    the v2 mapping at runtime. Single instance lives module-level so
+    successive REPL queries share one TCP connection.
+    """
+
+    def __init__(self, dial_host: str, dial_port: int) -> None:
+        super().__init__(name="repl-relay-consumer", daemon=True)
+        self._reader: Optional[RemoteFrameReader] = None
+        self._dial_host = dial_host
+        self._dial_port = dial_port
+        self._latest: Optional[Any] = None
+        self._latest_t: float = 0.0
+        self._first = threading.Event()
+        self._stop = threading.Event()
+        self.error_flag = False
+        self.error_reason = ""
+
+    def run(self) -> None:
         try:
-            sample, _ = inlet.pull_sample(timeout=0.0)
-            if not sample:
-                break
-        except Exception:
-            break
+            self._reader = RemoteFrameReader(
+                host=self._dial_host, port=self._dial_port,
+                wait_for_handshake_s=5.0, auto_reconnect=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            self.error_flag = True
+            self.error_reason = f"relay dial failed: {e}"
+            self._first.set()
+            return
+        try:
+            for bundle in self._reader:
+                if self._stop.is_set():
+                    break
+                self._latest = bundle
+                self._latest_t = time.time()
+                if not self._first.is_set():
+                    self._first.set()
+        except Exception as e:  # noqa: BLE001
+            self.error_flag = True
+            self.error_reason = f"relay reader raised: {e}"
+            self._first.set()
+
+    @property
+    def camera_matrix(self) -> np.ndarray:
+        if self._reader is None:
+            return np.array(
+                [[1490.0, 0.0, 800.0],
+                 [0.0, 1490.0, 600.0],
+                 [0.0, 0.0, 1.0]], dtype=np.float64)
+        return self._reader.camera_matrix
+
+    def latest(self) -> Tuple[Optional[Any], float]:
+        return self._latest, self._latest_t
+
+    def wait_first(self, timeout_s: float) -> bool:
+        return self._first.wait(timeout=timeout_s)
+
+    def stop_consumer(self) -> None:
+        self._stop.set()
+        if self._reader is not None:
+            try:
+                self._reader.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+_RUNTIME_RELAY: Optional[_RuntimeRelayConsumer] = None
+
+
+def _ensure_runtime_relay() -> Optional[_RuntimeRelayConsumer]:
+    """Start the runtime relay consumer on first use. Returns the
+    consumer on success, or None if the relay didn't hand-shake in
+    time (caller logs and skips the query).
+    """
+    global _RUNTIME_RELAY
+    if _RUNTIME_RELAY is not None:
+        return _RUNTIME_RELAY if not _RUNTIME_RELAY.error_flag else None
+    consumer = _RuntimeRelayConsumer(_RELAY_HOST, _RELAY_PORT)
+    consumer.start()
+    if not consumer.wait_first(timeout_s=6.0):
+        print(f"[{ts()}] [v2] frame_relay handshake timed out at "
+              f"{_RELAY_HOST}:{_RELAY_PORT}; start the control panel "
+              f"(which embeds the relay) or `python -m Utils.frame_relay` "
+              f"first.")
+        consumer.stop_consumer()
+        return None
+    if consumer.error_flag:
+        print(f"[{ts()}] [v2] frame_relay consumer error: "
+              f"{consumer.error_reason}")
+        return None
+    _RUNTIME_RELAY = consumer
+    return consumer
+
+
+def _gaze_px_to_yaw_pitch_deg(gx_px: float, gy_px: float,
+                                K: np.ndarray) -> Tuple[float, float]:
+    """Camera-frame gaze yaw/pitch in degrees, matching the recorder's
+    convention at harmony_free_arm_calibration.py.
+    """
+    if not (np.isfinite(gx_px) and np.isfinite(gy_px)):
+        return float("nan"), float("nan")
+    try:
+        ray = np.linalg.inv(K) @ np.array([gx_px, gy_px, 1.0], dtype=np.float64)
+    except np.linalg.LinAlgError:
+        return float("nan"), float("nan")
+    norm = float(np.linalg.norm(ray))
+    if norm <= 0.0 or not np.isfinite(norm):
+        return float("nan"), float("nan")
+    ray = ray / norm
+    yaw = float(np.degrees(np.arctan2(ray[0], ray[2])))
+    pitch = float(np.degrees(np.arctan2(-ray[1], np.sqrt(ray[0] ** 2 + ray[2] ** 2))))
+    return yaw, pitch
 
 
 def _fetch_v2_snapshot():
-    """Pull a fresh gaze_runner snapshot for the v2 mapping. Returns
-    a dict with the keys the v2 mapping needs (Gaze_yaw_deg, etc.) or
-    None if the snapshot is unavailable / not OK.
-
-    The REPL's GazeStream path uses LSL directly which does not carry
-    depth / IMU; the v2 mapping needs the gaze_runner snapshot. When
-    v=2 in this REPL the caller must have a gaze_runner service
-    running at config.GAZE_UDP_IP:GAZE_UDP_PORT.
+    """Return a snapshot dict with the keys the v2 mapping needs
+    (Gaze_yaw_deg, Gaze_pitch_deg, optional depth_cm, head pose NaN).
+    Sources gaze pixel + camera_matrix from a background frame_relay
+    consumer; computes yaw/pitch locally — same convention as the
+    recorder so the v2 features match the calibration data.
     """
-    host = str(getattr(config, "GAZE_UDP_IP", "127.0.0.1"))
-    port = int(getattr(config, "GAZE_UDP_PORT", 5588))
-    timeout_s = float(getattr(config, "GAZE_UDP_TIMEOUT", 0.8) or 0.8)
+    consumer = _ensure_runtime_relay()
+    if consumer is None:
+        return None
+    bundle, t_recv = consumer.latest()
+    if bundle is None:
+        return None
+    if time.time() - t_recv > _MAX_BUNDLE_AGE_S:
+        return None
     try:
-        snap = _gaze_udp_request(host, port,
-                                  {"cmd": "snapshot", "include_objects": False},
-                                  timeout_s)
-    except (OSError, json.JSONDecodeError):
+        gx_px = float(bundle.gaze.x)
+        gy_px = float(bundle.gaze.y)
+    except (AttributeError, TypeError, ValueError):
         return None
-    if not isinstance(snap, dict) or not snap.get("ok", False):
+    if not (np.isfinite(gx_px) and np.isfinite(gy_px)):
         return None
-    return snap
+    yaw_deg, pitch_deg = _gaze_px_to_yaw_pitch_deg(gx_px, gy_px,
+                                                     consumer.camera_matrix)
+    return {
+        "ok": True,
+        "gaze_px": (gx_px, gy_px),
+        "worn": bool(getattr(bundle, "worn", True)),
+        # depth_cm is filled by the caller via VLM Depth Pro (vlm_depth_pro
+        # pipeline) — for vergence_affine the caller does a vergence call,
+        # which this build no longer supports.
+        "depth_cm": float("nan"),
+        "gaze_yaw_deg": yaw_deg,
+        "gaze_pitch_deg": pitch_deg,
+        "head_yaw_deg": float("nan"),
+        "head_pitch_deg": float("nan"),
+    }
 
 
 def nearest_idx_gaze(G, gaze_xy):
@@ -681,13 +806,14 @@ def main():
         print(f"[{ts()}] [v2] runtime_depth_pipeline=vergence_affine "
               f"(a={a:.4f}, b={b:.4f})")
 
-    # Initialize gaze stream if we have gaze-enabled library
-    gaze_stream = None
+    # Initialize the relay-backed gaze collector. The first vision-mode
+    # press will trigger the relay handshake wait via _ensure_runtime_relay.
+    gaze_stream: Optional[RelayGaze] = None
     if has_gaze:
-        gaze_stream = GazeStream()
-        if not gaze_stream.connect():
-            print(f"[{ts()}] WARNING: Could not connect to gaze stream. Vision mode 'v' disabled.")
-            gaze_stream = None
+        gaze_stream = RelayGaze()
+        print(f"[{ts()}] [GAZE] vision mode will pull gaze from frame_relay "
+              f"({_RELAY_HOST}:{_RELAY_PORT}) — relay handshake happens on the "
+              f"first 'v' press.")
 
     while True:
         mode, goal, dur = ask_goal_and_duration()
@@ -744,16 +870,16 @@ def main():
                 continue
 
             print(f"[{ts()}] Vision mode: hold gaze on desired target.")
-            print(f"[{ts()}] Flushing gaze buffer...")
-            flush_gaze_buffer(gaze_stream.inlet)
+            # Lazy-start the relay consumer on first vision press.
+            if not gaze_stream.connect():
+                print(f"[{ts()}] Relay unavailable. Try again after the panel "
+                      f"reconnects.")
+                continue
 
             print(f"[{ts()}] Waiting 2.0s before sampling gaze...")
             time.sleep(2.0)
 
-            print(f"[{ts()}] Flushing gaze buffer before averaging...")
-            flush_gaze_buffer(gaze_stream.inlet)
-
-            print(f"[{ts()}] Averaging gaze for 1.0s...")
+            print(f"[{ts()}] Averaging gaze for 1.0s from frame_relay...")
             g_avg = gaze_stream.average_gaze_over_window(dur_s=1.0)
             if g_avg is None:
                 print(f"[{ts()}] No valid gaze samples collected. Try again.")
@@ -761,19 +887,15 @@ def main():
 
             print(f"[{ts()}] Gaze median (x_norm, y_norm) = ({g_avg[0]:.3f}, {g_avg[1]:.3f})")
 
-            # Phase 4 dispatch (plan §8.1): if v=2, query the v2
-            # Mahalanobis mapping with depth + head-pose pulled from a
-            # fresh gaze_runner snapshot. The REPL's LSL path does not
-            # carry those fields, so the v2 dispatch fails fast (per
-            # CLAUDE.md "Prefer fail-fast in realtime loops") rather
-            # than silently falling back to v1.
+            # v2 mapping query: pulls gaze yaw/pitch (and worn) from the
+            # same frame_relay consumer the median above used, so the
+            # snapshot is one bundle from the same source. Depth comes
+            # from VLM Depth Pro at the gaze pixel.
             if v2_mapping is not None:
                 snap = _fetch_v2_snapshot()
                 if snap is None:
-                    print(f"[{ts()}] [v2] gaze_runner snapshot unavailable — "
-                          f"start gaze_runner.py --mode service on "
-                          f"{config.GAZE_UDP_IP}:{config.GAZE_UDP_PORT}, "
-                          f"or flip config.GAZE_CALIBRATION_VERSION back to 1.")
+                    print(f"[{ts()}] [v2] frame_relay snapshot unavailable — "
+                          f"the panel may have disconnected. Try again.")
                     continue
                 use_imu = bool(getattr(config, "GAZE_CALIBRATION_USE_IMU", False))
 

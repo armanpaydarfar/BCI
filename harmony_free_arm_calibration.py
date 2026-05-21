@@ -1,45 +1,65 @@
 #!/usr/bin/env python3
 """
-harmony_free_arm_calibration.py — Free-arm gaze-calibration recorder
-(Phase 2.a Track B, per Harmony_Gaze_Calibration_REV00_Plan.md §6.1).
+harmony_free_arm_calibration.py — Interactive free-arm gaze-calibration
+recorder. Operator-paced; each phase transition is gated on an explicit
+Enter so the operator can read the terminal between captures without
+poisoning the data.
 
-Replaces the preset-visit flow used by ``harmony_calibration_exec.py``
-with the user-driven free-arm paradigm described in plan §5.3. The
-operator (or the participant) physically moves the active arm of the
-Harmony robot to gaze-targeted positions; the recorder sends ``m`` to
-release the arm, ``c`` to capture the bundle of (joint angles, EE
-position, gaze, depth, IMU, head pose), and ``m`` again to free it for
-the next target. Coverage is hybrid: a mandatory 3-depth × 5-horizontal
-grid = 15 capture points (rightmost-first sweep R1→R5 per depth band)
-plus optional free additions. Between captures a background telemetry
-thread streams workspace-coverage "transit" samples at ~20 Hz.
+Data flow (vlm-only operation):
 
-The recorder talks to two services:
+- Gaze (x, y), worn, and IMU come from ``Utils.frame_relay`` on Linux
+  loopback (the panel's embedded relay or a standalone
+  ``python -m Utils.frame_relay`` — only one Neon SDK subscription can
+  exist at a time). ``Utils.remote_frame_reader.RemoteFrameReader``
+  yields ``FrameBundleStub`` objects; the recorder maintains the
+  latest bundle in a background ``RelayBundleConsumer`` thread.
+- Depth (cm) at calibration anchors comes from the VLM Depth Pro
+  service on Windows over UDP (``Utils.perception_clients.VLMClient``).
+  Transit rows leave ``depth_cm = NaN``; the offline
+  ``tools/fit_depth_interpolation.py`` fills them post-hoc with a
+  leg-aware bracketed linear interpolation from the anchor depths.
+- Gaze yaw/pitch (degrees) are computed locally from
+  ``(gaze_px, camera_matrix)`` via a standard pixel-unprojection,
+  giving camera-frame angles. Head yaw/pitch are NaN (Pass-2 features
+  remain off by default; the IMU pipeline can be added back later).
+- ``GAZE_CALIBRATION_DEPTH_SOURCE`` MUST be ``"vlm_depth_pro"``; the
+  recorder no longer supports the gaze_runner vergence path.
 
-- The robot research interface running ``Gaze_Tracking`` with the
-  ``m``/``c`` opcodes (HARMONY-UNIT-4 branch
-  ``feature/research-interface-onboard/free-arm`` head ``01d91ea`` or
-  later, per
-  ``Documents/SoftwareDocs/Reports/Harmony_Gaze_Calibration_CPP_Report.md``
-  §2). Standalone UDP socket bound to ``0.0.0.0:8080``, dial
-  ``192.168.2.1:8080`` (same wire as
-  ``harmony_calibration_exec.py:21-27, 85-88``).
-- ``gaze_runner.py`` in ``--mode service`` on the gaze UDP port
-  (``config.GAZE_UDP_IP:GAZE_UDP_PORT``). Snapshots include depth /
-  IMU / head pose per ``Utils/gaze/gaze_system.py:636-647`` and the
-  wire route at ``gaze_runner.py:265-270``.
+Per-waypoint cycle (steady state, WP2+):
 
-Output: ``poses_with_gaze_<UTC>_v2_freearm.npz`` with v2 schema —
-legacy keys ``T, Q, X, G`` preserved (so v1 readers keep working when
-they ignore unknown keys); new keys ``D_cm, D_valid, Miss_mm, IPD_mm,
-IMU_w, IMU_fresh, Head_yaw_deg, Head_pitch_deg, Gaze_yaw_deg,
-Gaze_pitch_deg, Phase, Target_label`` carry the new sensor channels;
-``meta`` carries ``version=2``.
+1. [telemetry paused] Prompt: "Ready to move? Enter to unlock + begin
+   transit recording."
+2. ↓ Enter → send ``m``, ``telemetry.resume()`` (transit recording on).
+3. Operator hand-guides arm to next position while fixating EE.
+4. ↓ Enter → ``telemetry.pause()``, send ``c`` (arm locks), stash
+   (q, ee) from the C++ telemetry payload.
+5. [telemetry paused] Prompt: "Locked. Enter when fixating EE to
+   record anchor."
+6. ↓ Enter → depth_valid streak poll + (if VLM) Depth Pro at gaze →
+   append anchor bundle.
 
-CLAUDE.md alignment: fail-fast on Tier-1-adjacent UDP I/O; no silent
-suppression; no scope creep beyond plan §6.1 Track B and §5.7 Phase 1
-decision rules (hybrid coverage, capture IMU even when Pass-1 is
-active).
+WP1 is special: no transit recording on the home→WP1 leg, so the cycle
+has 2 Enter presses instead of 3 (skip step 1, telemetry stays inert).
+
+Waypoints are anonymous (``wp01``, ``wp02``, ...). The operator decides
+how many to record; Ctrl+C at any prompt exits cleanly — the finally
+block locks the arm if currently free, sends auto-home, and writes the
+NPZ with whatever bundles were collected.
+
+Wire interfaces (unchanged from prior design):
+
+- Robot research interface running ``Gaze_Tracking`` with the
+  ``m``/``c``/``h;dur=`` opcodes. UDP socket bound to ``0.0.0.0:8080``,
+  dial ``192.168.2.1:8080``.
+- ``gaze_runner.py`` in ``--mode service`` on
+  ``config.GAZE_UDP_IP:GAZE_UDP_PORT``. Snapshots carry gaze, depth,
+  IMU, and head pose.
+
+Output: ``poses_with_gaze_<UTC>_v2_freearm.npz`` with the v2/REV01
+schema — captured anchors and transit telemetry both contribute to the
+fit-relevant block; ``meta["depth_source"]`` records the depth pipeline
+(``"vergence"`` or ``"hybrid_anchor_vlm_transit_vergence"`` per
+``config.GAZE_CALIBRATION_DEPTH_SOURCE``).
 """
 
 from __future__ import annotations
@@ -57,7 +77,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 import config
-from Utils.perception_clients import VLMClient, udp_request
+from Utils.perception_clients import VLMClient
+from Utils.remote_frame_reader import RemoteFrameReader
 
 
 # =============================================================================
@@ -71,12 +92,17 @@ ACK_TIMEOUT_S = 0.35
 TEL_TIMEOUT_S = 0.60
 CMD_PROCESS_GRACE_S = 0.40
 
-# Gaze service endpoint comes from config (so a single config_local.py
-# edit moves the recorder to a remote gaze_runner host without code
-# changes).
-GAZE_HOST = str(getattr(config, "GAZE_UDP_IP", "127.0.0.1"))
-GAZE_PORT = int(getattr(config, "GAZE_UDP_PORT", 5588))
-GAZE_RPC_TIMEOUT_S = float(getattr(config, "GAZE_UDP_TIMEOUT", 0.8) or 0.8)
+# Frame relay endpoint — the recorder dials this as a second TCP
+# consumer alongside vlm_service (on Windows) and any panel-embedded
+# relay (loopback). config.FRAME_RELAY_DIAL_HOST is the host clients
+# dial; on Linux this defaults to loopback because the panel's
+# embedded relay binds 0.0.0.0:FRAME_RELAY_PORT.
+RELAY_HOST = str(getattr(config, "FRAME_RELAY_DIAL_HOST", "127.0.0.1"))
+RELAY_PORT = int(getattr(config, "FRAME_RELAY_PORT", 5591))
+# Wait this many seconds for the first relay handshake before declaring
+# the relay unreachable. The panel's embedded relay handshakes within
+# ~100 ms of the first frame; 5 s is generous.
+RELAY_HANDSHAKE_TIMEOUT_S = 5.0
 
 
 # =============================================================================
@@ -86,40 +112,26 @@ ACTIVE_SIDE = os.getenv("HARMONY_ACTIVE_SIDE", "R").upper()
 if ACTIVE_SIDE not in ("L", "R"):
     raise ValueError(f"HARMONY_ACTIVE_SIDE must be 'L' or 'R'; got {ACTIVE_SIDE!r}")
 
-# Settle window — discard the first N seconds after a `c` capture is
-# committed so the depth/angle smoothers (`_depth_smoother`,
-# `_head_yaw_smoother`, etc. in Utils/gaze/gaze_system.py:419-560) have
-# converged before we sample the snapshot. Phase 1 doc §8 follow-up #3.
-POST_CAPTURE_SETTLE_S = 1.0
+# Reject a relay bundle older than this when sampling for snapshots
+# (transit telemetry + anchor capture poll). The panel relay publishes
+# at ~10 Hz so a bundle older than 250 ms means the relay has stalled.
+MAX_BUNDLE_AGE_S = 0.25
 
-# How many consecutive depth_valid=True snapshots we need before we
-# accept a capture. Guards against the recorder logging stale NaN
-# depth from a momentary unworn transition.
-DEPTH_VALID_MIN_CONSECUTIVE = 5
+# How many consecutive valid (worn=True, finite gaze) bundles we need
+# before we accept an anchor capture. Guards against logging a sample
+# during a blink or an unworn moment. The new interactive flow has no
+# implicit settle — the operator paces the "ready for anchor?" gate
+# manually — but the worn streak still protects the anchor sample.
+WORN_STREAK_MIN_CONSECUTIVE = 5
+# Legacy alias kept so the NPZ meta and any external consumers keep
+# seeing the same key.
+DEPTH_VALID_MIN_CONSECUTIVE = WORN_STREAK_MIN_CONSECUTIVE
 
-# Sample rate for the "moving" phase log (gaze samples while the user
-# moves the arm). 20 Hz mirrors the gaze_runner internal loop cap
-# (gaze_runner.py:496 target_loop_hz=20.0); no point asking faster.
-MOVING_PHASE_SAMPLE_HZ = 20.0
-
-
-# =============================================================================
-# Hybrid coverage protocol — locked per
-# Gaze_Calibration_Sensor_Characterization.md §5
-# =============================================================================
-# 3 depth bands × 5 horizontal positions = 15 mandatory capture points.
-# Horizontal labels R1..R5 sweep rightmost-first (R1 = participant's
-# right, R5 = participant's left); within each depth band the operator
-# walks R1 → R5 before advancing to the next depth band. This pattern
-# was reduced from the prior 3×3 grid (27 pts) to cut operator workload
-# in half while keeping the same three depth bands; the new background
-# telemetry thread covers vertical/intermediate workspace samples as
-# transit data.
-MANDATORY_GRID: List[str] = [
-    "near_R1", "near_R2", "near_R3", "near_R4", "near_R5",
-    "mid_R1",  "mid_R2",  "mid_R3",  "mid_R4",  "mid_R5",
-    "far_R1",  "far_R2",  "far_R3",  "far_R4",  "far_R5",
-]
+# Sample rate for the background transit-telemetry thread and the
+# poll cadence inside the anchor depth-valid wait. 20 Hz mirrors the
+# gaze_runner internal loop cap (gaze_runner.py:496 target_loop_hz=20.0);
+# no point asking faster.
+SAMPLE_HZ = 20.0
 
 
 # =============================================================================
@@ -216,33 +228,184 @@ class RobotLink:
             pass
 
 
-def gaze_snapshot(include_objects: bool = False,
-                  timeout_s: float = GAZE_RPC_TIMEOUT_S) -> Optional[Dict[str, Any]]:
-    """Pull a fresh snapshot from gaze_runner. Returns the dict on
-    success or None on transport failure / not-ok response. ``ok=False``
-    snapshots are surfaced as None so the recorder treats them the
-    same as transport failure (caller will retry / abort)."""
+# Module-level relay consumer, initialised at the top of run_session.
+# gaze_snapshot() reads from this; module-level state keeps the
+# call sites in TelemetryThread and capture_anchor unchanged in shape.
+_RELAY_CONSUMER: Optional["RelayBundleConsumer"] = None
+
+
+def _gaze_px_to_yaw_pitch_deg(gx_px: float, gy_px: float,
+                                K: np.ndarray) -> Tuple[float, float]:
+    """Unproject a gaze pixel through the camera matrix to a ray in the
+    camera frame, then convert to (yaw, pitch) in degrees. Yaw is
+    rotation about Y (positive right of the optical axis); pitch is
+    rotation about X (positive up). Camera optical axis is +Z.
+
+    Yields camera-frame angles, NOT world-frame — gaze_system.py's
+    ``gaze_yaw_deg`` is world-frame (IMU-rotated). The recorder writes
+    these camera-frame angles into the NPZ; the runtime consumer must
+    compute features with the same convention for the v2 Mahalanobis
+    NN to align.
+    """
+    if not (np.isfinite(gx_px) and np.isfinite(gy_px)):
+        return float("nan"), float("nan")
     try:
-        snap = udp_request(GAZE_HOST, GAZE_PORT,
-                           {"cmd": "snapshot", "include_objects": include_objects},
-                           timeout_s)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(snap, dict) or not snap.get("ok", False):
-        return None
-    return snap
+        ray = np.linalg.inv(K) @ np.array([gx_px, gy_px, 1.0], dtype=np.float64)
+    except np.linalg.LinAlgError:
+        return float("nan"), float("nan")
+    norm = float(np.linalg.norm(ray))
+    if norm <= 0.0 or not np.isfinite(norm):
+        return float("nan"), float("nan")
+    ray = ray / norm
+    yaw = float(np.degrees(np.arctan2(ray[0], ray[2])))
+    pitch = float(np.degrees(np.arctan2(-ray[1], np.sqrt(ray[0] ** 2 + ray[2] ** 2))))
+    return yaw, pitch
 
 
-def gaze_recenter(timeout_s: float = GAZE_RPC_TIMEOUT_S) -> bool:
-    """Call `cmd: recenter` on gaze_runner. Used at the start of a
-    session to zero out the head_yaw/pitch offsets relative to the
-    user's neutral pose (Utils/gaze/gaze_system.py:334-356).
+def _make_snapshot_from_bundle(bundle: Any, camera_matrix: np.ndarray,
+                                 t_recv: float) -> Optional[Dict[str, Any]]:
+    """Build a snapshot dict in the same shape ``bundle_from_snapshot``
+    expects, sourced from a frame_relay ``FrameBundleStub``. Returns
+    None if the gaze sample in the bundle is non-finite (the relay
+    forwards NaN gaze during blinks).
     """
     try:
-        resp = udp_request(GAZE_HOST, GAZE_PORT, {"cmd": "recenter"}, timeout_s)
-    except (OSError, json.JSONDecodeError):
-        return False
-    return bool(isinstance(resp, dict) and resp.get("ok", False))
+        gx_px = float(bundle.gaze.x)
+        gy_px = float(bundle.gaze.y)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not (np.isfinite(gx_px) and np.isfinite(gy_px)):
+        return None
+    yaw_deg, pitch_deg = _gaze_px_to_yaw_pitch_deg(gx_px, gy_px, camera_matrix)
+    return {
+        "ok": True,
+        "gaze_px": (gx_px, gy_px),
+        "worn": bool(getattr(bundle, "worn", True)),
+        # Depth is filled per-anchor by fetch_vlm_depth_cm; transit
+        # rows leave this NaN and are filled offline by
+        # tools/fit_depth_interpolation.py.
+        "depth_cm": float("nan"),
+        "depth_valid": False,
+        "miss_mm": float("nan"),
+        "ipd_mm": float("nan"),
+        "imu_angvel": float("nan"),
+        "imu_fresh": bool(getattr(bundle, "imu", None) is not None),
+        "head_yaw_deg": float("nan"),
+        "head_pitch_deg": float("nan"),
+        "gaze_yaw_deg": yaw_deg,
+        "gaze_pitch_deg": pitch_deg,
+        "t_recv": t_recv,
+    }
+
+
+class RelayBundleConsumer(threading.Thread):
+    """Background TCP consumer of the frame_relay envelope stream. Wraps
+    ``Utils.remote_frame_reader.RemoteFrameReader`` and maintains the
+    most recent ``FrameBundleStub`` plus the camera_matrix from the
+    handshake. Thread-safe ``latest()`` accessor returns the bundle and
+    its receive timestamp; callers gate on
+    ``MAX_BUNDLE_AGE_S`` to avoid logging stale state.
+
+    The recorder requires a working relay before any waypoint is
+    accepted — ``run_session`` calls ``wait_for_first_bundle()`` after
+    starting the thread and aborts if the timeout elapses.
+    """
+
+    def __init__(self, dial_host: str, dial_port: int,
+                 handshake_timeout_s: float = RELAY_HANDSHAKE_TIMEOUT_S) -> None:
+        super().__init__(name="recorder-relay-consumer", daemon=True)
+        self._dial_host = dial_host
+        self._dial_port = dial_port
+        self._handshake_timeout_s = handshake_timeout_s
+        self._reader: Optional[RemoteFrameReader] = None
+        self._latest: Optional[Any] = None
+        self._latest_t_recv: float = 0.0
+        self._latest_lock = threading.Lock()
+        self._first_bundle = threading.Event()
+        self._stop_event = threading.Event()
+        self.error_flag: bool = False
+        self.error_reason: str = ""
+
+    def run(self) -> None:  # noqa: D401 — Thread.run
+        try:
+            self._reader = RemoteFrameReader(
+                host=self._dial_host,
+                port=self._dial_port,
+                wait_for_handshake_s=self._handshake_timeout_s,
+                auto_reconnect=True,
+            )
+        except Exception as e:  # noqa: BLE001 — surface any setup failure
+            self.error_flag = True
+            self.error_reason = f"relay dial failed: {e}"
+            self._first_bundle.set()  # unblock waiters; they should re-check error_flag
+            return
+        try:
+            for bundle in self._reader:
+                if self._stop_event.is_set():
+                    break
+                with self._latest_lock:
+                    self._latest = bundle
+                    self._latest_t_recv = time.time()
+                if not self._first_bundle.is_set():
+                    self._first_bundle.set()
+        except Exception as e:  # noqa: BLE001
+            self.error_flag = True
+            self.error_reason = f"relay reader raised: {e}"
+            self._first_bundle.set()
+
+    def latest(self) -> Tuple[Optional[Any], float]:
+        with self._latest_lock:
+            return self._latest, self._latest_t_recv
+
+    @property
+    def camera_matrix(self) -> np.ndarray:
+        if self._reader is None:
+            # Pre-handshake fallback — RemoteFrameReader returns the
+            # Neon defaults when its handshake hasn't landed yet.
+            return np.array(
+                [[1490.0, 0.0, 800.0],
+                 [0.0, 1490.0, 600.0],
+                 [0.0, 0.0, 1.0]],
+                dtype=np.float64,
+            )
+        return self._reader.camera_matrix
+
+    def wait_for_first_bundle(self, timeout_s: float) -> bool:
+        """Block until the first envelope arrives or the timeout
+        elapses. Returns True on first-bundle, False on timeout.
+        """
+        return self._first_bundle.wait(timeout=timeout_s)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._reader is not None:
+            try:
+                self._reader.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self.join(timeout=2.0)
+
+
+def gaze_snapshot(include_objects: bool = False) -> Optional[Dict[str, Any]]:
+    """Return a snapshot dict built from the most recent frame_relay
+    bundle, or None if the bundle is missing / too stale / has a NaN
+    gaze sample. ``include_objects`` is accepted for legacy API
+    compatibility but ignored — the recorder never consumed object
+    detections.
+
+    Module-level ``_RELAY_CONSUMER`` must be initialised by
+    ``run_session`` before any call (the TelemetryThread and
+    ``capture_anchor`` both invoke this).
+    """
+    if _RELAY_CONSUMER is None:
+        return None
+    bundle, t_recv = _RELAY_CONSUMER.latest()
+    if bundle is None:
+        return None
+    age = time.time() - t_recv
+    if age > MAX_BUNDLE_AGE_S:
+        return None
+    return _make_snapshot_from_bundle(bundle, _RELAY_CONSUMER.camera_matrix, t_recv)
 
 
 # =============================================================================
@@ -482,114 +645,66 @@ def capture_pose(link: RobotLink) -> Optional[Dict[str, np.ndarray]]:
     return None
 
 
-def settle_and_snapshot(target_label: str,
-                        robot_state: Dict[str, np.ndarray],
-                        vlm_client: Optional[VLMClient] = None
-                        ) -> Optional[CaptureBundle]:
-    """Wait POST_CAPTURE_SETTLE_S after a `c` lock, then sample the
-    gaze snapshot. Returns the bundle, or None if we cannot find a
-    snapshot with DEPTH_VALID_MIN_CONSECUTIVE consecutive valid depth
-    samples inside a bounded retry window.
+def capture_anchor(target_label: str,
+                   robot_state: Dict[str, np.ndarray],
+                   vlm_client: VLMClient
+                   ) -> Optional[CaptureBundle]:
+    """Sample a snapshot at the current locked pose and build the
+    anchor bundle. Operator paces fixation via the "Ready for anchor?"
+    Enter gate; the worn-streak gate (below) protects against logging
+    a sample mid-blink or while the headset is briefly unworn.
 
-    Phase 1 doc §8 follow-up #3: the depth smoother is an EMA, so the
-    first sample after a worn-transition under-reports. The settle
-    plus the consecutive-valid gate together protect against logging
-    a stale value.
+    Returns the bundle, or None if no valid snapshot was obtained at
+    all inside the bounded retry window.
 
-    When ``vlm_client`` is not None, the recorded bundle's `depth_cm`
-    and `depth_valid` are overwritten with the VLM Depth Pro reading
-    at the same fixation — depth_source must equal the runtime source
-    or the Mahalanobis NN scale assumptions break. Any VLM failure
-    bubbles up to abort the recording session (fail-fast per CLAUDE.md
-    §"Error Handling"); we never silently fall back to vergence.
+    Anchor depth is fetched from VLM Depth Pro at the current gaze
+    pixel; ``depth_source="vlm_depth_pro"`` is pinned on the row. The
+    VLM call is mandatory in this build — the vergence pipeline is no
+    longer running.
     """
-    print(f"[{_ts()}] Settling {POST_CAPTURE_SETTLE_S:.2f}s before snapshot…")
-    time.sleep(POST_CAPTURE_SETTLE_S)
-
-    consecutive_valid = 0
+    consecutive_worn = 0
     last_snap: Optional[Dict[str, Any]] = None
-    poll_dt = 1.0 / MOVING_PHASE_SAMPLE_HZ
+    poll_dt = 1.0 / SAMPLE_HZ
     deadline = time.time() + 2.0  # bounded retry; never spin forever
     while time.time() < deadline:
-        snap = gaze_snapshot(include_objects=False)
+        snap = gaze_snapshot()
         if snap is None:
-            consecutive_valid = 0
+            consecutive_worn = 0
             time.sleep(poll_dt)
             continue
         last_snap = snap
-        if bool(snap.get("depth_valid", False)):
-            consecutive_valid += 1
-            if consecutive_valid >= DEPTH_VALID_MIN_CONSECUTIVE:
+        if bool(snap.get("worn", False)):
+            consecutive_worn += 1
+            if consecutive_worn >= WORN_STREAK_MIN_CONSECUTIVE:
                 break
         else:
-            consecutive_valid = 0
+            consecutive_worn = 0
         time.sleep(poll_dt)
 
     if last_snap is None:
-        print(f"[{_ts()}] No gaze snapshot available for capture {target_label}")
+        print(f"[{_ts()}] No relay bundle available for capture {target_label} "
+              f"(relay stalled, gaze NaN, or first handshake not yet landed).")
         return None
 
-    if consecutive_valid < DEPTH_VALID_MIN_CONSECUTIVE:
-        print(f"[{_ts()}] WARN: depth_valid streak {consecutive_valid} "
-              f"< required {DEPTH_VALID_MIN_CONSECUTIVE} — recording bundle anyway "
-              f"(Pass-1 IMU path tolerates NaN depth; Pass-2 will drop)")
+    if consecutive_worn < WORN_STREAK_MIN_CONSECUTIVE:
+        print(f"[{_ts()}] WARN: worn streak {consecutive_worn} "
+              f"< required {WORN_STREAK_MIN_CONSECUTIVE} — recording bundle "
+              f"anyway, but verify the headset is seated correctly.")
 
-    # VLM-depth path overwrites the vergence depth fields BEFORE
-    # bundle construction so the rest of the pipeline (writer,
-    # diagnostics) sees a single coherent source per row. We do this
-    # via a dict copy because the snapshot is the gaze_runner's owned
-    # data structure.
-    #
-    # REV01 (Plan §3.3): when VLM substitutes, preserve the live
-    # vergence reading on the bundle's ``depth_cm_vergence`` field so
-    # the offline affine fit script can solve
-    # ``D_vlm = a · D_vergence + b`` from the NPZ alone.
-    if vlm_client is not None:
-        snap_for_bundle = dict(last_snap)
-        vergence_depth_cm = float(last_snap.get("depth_cm", float("nan")))
-        depth_cm, depth_valid = fetch_vlm_depth_cm(vlm_client)
-        snap_for_bundle["depth_cm"] = depth_cm
-        snap_for_bundle["depth_valid"] = depth_valid
-        print(f"[{_ts()}] VLM depth at gaze: {depth_cm:.1f}cm (valid={depth_valid})")
-        return bundle_from_snapshot(
-            snap_for_bundle, robot_state["_t"], robot_state["q"],
-            robot_state["ee"], phase="captured",
-            target_label=target_label,
-            depth_source="vlm_depth_pro",
-            depth_cm_vergence=vergence_depth_cm,
-        )
-
-    return bundle_from_snapshot(last_snap, robot_state["_t"], robot_state["q"],
-                                robot_state["ee"], phase="captured",
-                                target_label=target_label,
-                                depth_source="vergence")
-
-
-def collect_moving_phase(link: RobotLink, target_label: str,
-                         duration_s: float) -> List[CaptureBundle]:
-    """Stream gaze + telemetry while the user is actively moving the
-    arm (i.e. between `m` and `c`). Used to log the user's reach path,
-    which downstream trajectory-based methods may consume. Plan §6.1
-    Track B step 3.
-    """
-    bundles: List[CaptureBundle] = []
-    poll_dt = 1.0 / MOVING_PHASE_SAMPLE_HZ
-    t_end = time.time() + duration_s
-    next_t = time.time()
-    while time.time() < t_end:
-        next_t += poll_dt
-        snap = gaze_snapshot(include_objects=False)
-        rstate = link.query_state()
-        if snap is None or rstate is None:
-            sleep_for = max(0.0, next_t - time.time())
-            time.sleep(sleep_for)
-            continue
-        bundles.append(bundle_from_snapshot(snap, rstate["_t"], rstate["q"],
-                                            rstate["ee"], phase="moving",
-                                            target_label=target_label))
-        sleep_for = max(0.0, next_t - time.time())
-        time.sleep(sleep_for)
-    return bundles
+    # Anchor depth: fetch from VLM Depth Pro at the current gaze and
+    # pin the row's depth_source to "vlm_depth_pro". The recorder no
+    # longer has access to vergence; depth_cm_vergence stays NaN.
+    snap_for_bundle = dict(last_snap)
+    depth_cm, depth_valid = fetch_vlm_depth_cm(vlm_client)
+    snap_for_bundle["depth_cm"] = depth_cm
+    snap_for_bundle["depth_valid"] = depth_valid
+    print(f"[{_ts()}] VLM depth at gaze: {depth_cm:.1f}cm (valid={depth_valid})")
+    return bundle_from_snapshot(
+        snap_for_bundle, robot_state["_t"], robot_state["q"],
+        robot_state["ee"], phase="captured",
+        target_label=target_label,
+        depth_source="vlm_depth_pro",
+    )
 
 
 # =============================================================================
@@ -615,13 +730,13 @@ class TelemetryThread(threading.Thread):
       a new transit leg, BEFORE sending the next ``m``. The label is
       written into the bundle's ``leg_label`` field so downstream
       analysis can group samples by which transit they belong to.
-    - ``pause()`` / ``resume()`` gate sampling around the ``c`` opcode
-      lock and the POST_CAPTURE_SETTLE_S window so the depth /
+    - ``pause()`` / ``resume()`` gate sampling around each ``c`` opcode
+      lock and the "Ready for anchor?" Enter gate so the depth /
       head-pose smoothers (Utils/gaze/gaze_system.py:419-560) converge
-      before we sample again.
-    - ``stop()`` joins cleanly; the main loop calls this before sending
-      the final waypoint's ``c`` (so the home transition is not
-      recorded) and on any error path.
+      between transit legs and so the operator can read the terminal
+      without polluting transit data.
+    - ``stop()`` joins cleanly; called from the run_session finally
+      block on session exit (clean or Ctrl+C).
 
     The thread fails-fast: TELEMETRY_MAX_CONSECUTIVE_FAILURES dead
     snapshot-or-query cycles in a row sets ``self.error_flag`` and
@@ -631,7 +746,7 @@ class TelemetryThread(threading.Thread):
 
     def __init__(self, link: "RobotLink", bundles: List[CaptureBundle],
                  bundles_lock: threading.Lock,
-                 sample_hz: float = MOVING_PHASE_SAMPLE_HZ) -> None:
+                 sample_hz: float = SAMPLE_HZ) -> None:
         super().__init__(name="harmony-telemetry", daemon=True)
         self._link = link
         self._bundles = bundles
@@ -720,10 +835,14 @@ class TelemetryThread(threading.Thread):
                 continue
 
             self.consecutive_failures = 0
+            # Transit rows carry no depth at recording time — the
+            # offline tools/fit_depth_interpolation.py post-fills
+            # depth_cm from the bracketing anchor depths and rewrites
+            # depth_source to its interpolation tag.
             bundle = bundle_from_snapshot(
                 snap, rstate["_t"], rstate["q"], rstate["ee"],
                 phase="transit", target_label="", leg_label=leg,
-                depth_source="vergence",
+                depth_source="pending_interpolation",
             )
             with self._bundles_lock:
                 self._bundles.append(bundle)
@@ -750,12 +869,11 @@ def prompt_user(message: str) -> str:
         return ""
 
 
-def announce_target(target_label: str, idx: int, total: int) -> None:
+def announce_waypoint(label: str, hint: str = "") -> None:
     print()
     print("=" * 70)
-    print(f"[{_ts()}] TARGET {idx}/{total}: {target_label}")
+    print(f"[{_ts()}] {label}{('  ' + hint) if hint else ''}")
     print(f"[{_ts()}] >>> LOOK AT THE END EFFECTOR <<<")
-    print(f"[{_ts()}] Press Enter when arm is positioned and you are fixating.")
     print("=" * 70)
 
 
@@ -843,6 +961,11 @@ def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
     Gaze_yaw_deg = stack_field(fit_rows, "gaze_yaw_deg")
     Gaze_pitch_deg = stack_field(fit_rows, "gaze_pitch_deg")
     Target_label = np.asarray([b.target_label for b in fit_rows], dtype="<U32")
+    # Per-fit-row leg label so tools/fit_depth_interpolation.py can
+    # identify each transit row's bracketing anchors. Captured rows
+    # leave this empty (TelemetryThread is the only producer of
+    # non-empty leg_label values).
+    Leg_label = np.asarray([b.leg_label for b in fit_rows], dtype="<U64")
 
     # REV01 (Plan §3.2 items 2, 3): per-row provenance + the parallel
     # vergence reading preserved at VLM anchors (NaN on transit). <U64
@@ -876,42 +999,27 @@ def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
     Depth_source_all = np.asarray([b.depth_source for b in bundles],
                                     dtype="<U64")
 
-    # REV01 (Plan §3.2 item 4): when the recorder is driven with
-    # GAZE_CALIBRATION_DEPTH_SOURCE="vlm_depth_pro", the NPZ is a
-    # hybrid — VLM Depth Pro at the 15 anchors, vergence at every
-    # transit tick — and meta["depth_source"] pins that.  The
-    # vergence-only path keeps the legacy "vergence" literal so a v2
-    # NPZ recorded without VLM stays a degenerate-but-valid hybrid
-    # (anchors and transit both vergence) without forcing the
-    # operator to think about a new string.
-    config_depth_source = str(getattr(config, "GAZE_CALIBRATION_DEPTH_SOURCE",
-                                       "vergence"))
-    if config_depth_source == "vlm_depth_pro":
-        depth_source = "hybrid_anchor_vlm_transit_vergence"
-    else:
-        depth_source = config_depth_source
-    vlm_service_host = (str(getattr(config, "VLM_SERVICE_HOST", ""))
-                        if config_depth_source == "vlm_depth_pro" else "")
+    # depth_source is always "vlm_depth_pro" in this build — anchors
+    # come from VLM Depth Pro and transit rows get bracketed-interp
+    # depths from tools/fit_depth_interpolation.py post-hoc. The
+    # runtime then dispatches to its per-query VLM Depth Pro path
+    # (Utils/gaze/calibration_mapping.py runtime_depth_pipeline).
+    vlm_service_host = str(getattr(config, "VLM_SERVICE_HOST", ""))
 
     meta = dict(
         version=2,
         side=ACTIVE_SIDE,
         recorder="harmony_free_arm_calibration.py",
-        plan_reference="Harmony_Gaze_Calibration_REV00_Plan.md §6.1 Track B",
-        cpp_branch="feature/research-interface-onboard/free-arm @ 01d91ea",
         wire_protocol="HARMONY-UNIT-4 tools/wire_protocol.md (m/c rows)",
         gaze_sample_width=float(getattr(config, "GAZE_SAMPLE_WIDTH", 1600.0)),
         gaze_sample_height=float(getattr(config, "GAZE_SAMPLE_HEIGHT", 1200.0)),
-        post_capture_settle_s=POST_CAPTURE_SETTLE_S,
         depth_valid_min_consecutive=DEPTH_VALID_MIN_CONSECUTIVE,
-        depth_source=depth_source,
+        depth_source="vlm_depth_pro",
         vlm_service_host=vlm_service_host,
-        # REV01 (Plan §3.2 item 6 / §3.3): the offline affine-fit script
-        # rewrites this placeholder to {"a", "b", "R2",
-        # "max_abs_residual_cm"} after solving the per-session
-        # D_vlm = a · D_vergence + b regression at the anchors. None
-        # here means "no fit yet" — the runtime falls back to raw
-        # vergence under that condition.
+        # Legacy field — preserved for back-compat with REV01 readers
+        # that probe ``affine_map``. The new flow does not fit a
+        # vergence-to-Depth-Pro affine; the depth source is
+        # vlm_depth_pro all the way through.
         affine_map=None,
         units=dict(X="mm", Q="rad", G="normalized_0_to_1",
                    D_cm="cm", Miss_mm="mm", IPD_mm="mm",
@@ -930,6 +1038,9 @@ def write_npz(bundles: List[CaptureBundle], out_path: str) -> None:
         Head_yaw_deg=Head_yaw_deg, Head_pitch_deg=Head_pitch_deg,
         Gaze_yaw_deg=Gaze_yaw_deg, Gaze_pitch_deg=Gaze_pitch_deg,
         Target_label=Target_label,
+        # Per-fit-row leg label for transit rows so the offline
+        # interpolation tool can find each row's bracketing anchors.
+        Leg_label=Leg_label,
         # REV01 (Plan §3.2 items 2, 3): per-row provenance and the
         # parallel vergence reading on anchor rows.
         Depth_source=Depth_source, D_cm_vergence=D_cm_vergence,
@@ -981,286 +1092,267 @@ def _send_auto_home(link: "RobotLink") -> None:
 
 
 def run_session(out_dir: str = ".") -> Optional[str]:
-    """Run the full free-arm calibration session. Returns the output
-    NPZ path on success, or None if the session was aborted.
+    """Run the interactive free-arm calibration session. Returns the
+    output NPZ path on success (≥1 anchor captured), or None if the
+    session ended with no anchors collected.
+
+    The session runs forever until Ctrl+C; each waypoint is operator-
+    paced via explicit Enter gates. On any exit path (clean Ctrl+C or
+    unexpected error), the finally block stops telemetry, locks the
+    arm if it is currently free, sends ``h;dur=4.0`` for auto-home,
+    closes the UDP socket, and writes the NPZ with whatever anchors
+    were collected.
 
     Bundle phases written into the NPZ:
 
-    - ``'captured'`` — one per accepted waypoint (the locked-in
-      reference sample used by the v2 mapping fit).
-    - ``'moving'`` — pre-capture 1-second window per waypoint (legacy
-      trajectory-history channel, retained for back-compat).
-    - ``'transit'`` — continuous ~20 Hz background telemetry emitted
-      by ``TelemetryThread`` while the arm is free between waypoints,
-      labelled with ``leg_label='transit_<from>_to_<to>'``. Used for
-      workspace-coverage analysis only; the v2 mapping fit ignores
-      this phase.
+    - ``'captured'`` — one per accepted waypoint anchor.
+    - ``'transit'`` — continuous ~20 Hz background samples emitted by
+      ``TelemetryThread`` while the arm is in master_free between
+      waypoints, labelled with
+      ``leg_label='transit_wp<N>_to_wp<N+1>'``. v2 fit consumes these
+      alongside the anchors (REV01 §3.2 #1).
 
-    The home-to-first-waypoint and final-waypoint-to-home transitions
-    are deliberately NOT recorded as transit: the telemetry thread
-    starts after the first waypoint's ``c`` ACK and stops before the
-    final waypoint's ``c`` is sent.
+    The home→WP1 leg is NOT recorded (telemetry stays inert until the
+    operator triggers the WP2 transit). The terminal auto-home is sent
+    from the finally block after telemetry has stopped, so it never
+    appears as transit.
     """
+    global _RELAY_CONSUMER
+
     print()
     print("=" * 70)
-    print("  HARMONY FREE-ARM GAZE CALIBRATION (Track B)")
+    print("  HARMONY INTERACTIVE FREE-ARM GAZE CALIBRATION")
     print("=" * 70)
     print(f"[{_ts()}] Active side: {ACTIVE_SIDE}")
     print(f"[{_ts()}] Robot endpoint: {ROBOT_IP}:{ROBOT_PORT}")
-    print(f"[{_ts()}] Gaze service:  {GAZE_HOST}:{GAZE_PORT}")
+    print(f"[{_ts()}] Frame relay:    {RELAY_HOST}:{RELAY_PORT}")
 
-    # Resolve depth-source preflight BEFORE binding the robot socket so
-    # a misconfigured VLM host does not leave the robot link orphaned.
-    # Fail-fast policy: the recorder refuses to start if vlm_depth_pro
-    # is requested but the service is unreachable or has depth disabled.
+    # Preflight (runs before any robot socket is bound, so a failure
+    # here cannot leave hardware in an unsafe state).
     depth_source = str(getattr(config, "GAZE_CALIBRATION_DEPTH_SOURCE",
-                                "vergence"))
-    vlm_client: Optional[VLMClient] = None
-    if depth_source == "vlm_depth_pro":
-        vlm_client = VLMClient(config)
-        verify_vlm_depth_available(vlm_client)
-        print(f"[{_ts()}] [recorder] depth source: vlm_depth_pro "
-              f"(host={vlm_client.host}, depth_enabled=True)")
-    elif depth_source == "vergence":
-        print(f"[{_ts()}] [recorder] depth source: vergence "
-              f"(gaze_runner vergence path)")
-    else:
+                                "vlm_depth_pro"))
+    if depth_source != "vlm_depth_pro":
         raise RuntimeError(
-            f"Unknown GAZE_CALIBRATION_DEPTH_SOURCE={depth_source!r}; "
-            f"must be 'vergence' or 'vlm_depth_pro'."
+            f"GAZE_CALIBRATION_DEPTH_SOURCE={depth_source!r} is not supported "
+            f"in this build. Set it to 'vlm_depth_pro' in config_local.py — "
+            f"the vergence pipeline (gaze_runner) is no longer consumed by "
+            f"the recorder; depth at anchors comes from VLM Depth Pro and "
+            f"transit-row depths are post-filled by "
+            f"tools/fit_depth_interpolation.py."
         )
+    vlm_client = VLMClient(config)
+    verify_vlm_depth_available(vlm_client)
+    print(f"[{_ts()}] [recorder] depth source: vlm_depth_pro "
+          f"(host={vlm_client.host}, depth_enabled=True)")
     print()
 
     link = RobotLink()
     print(f"[{_ts()}] Bound UDP socket {link.sock.getsockname()} -> {link.robot_addr}")
 
+    # Start the relay consumer BEFORE anything else — the recorder
+    # needs at least one bundle to compute gaze features. Failure here
+    # raises so the operator sees a precise reason without bothering
+    # with prompts.
+    _RELAY_CONSUMER = RelayBundleConsumer(RELAY_HOST, RELAY_PORT)
+    _RELAY_CONSUMER.start()
+    if not _RELAY_CONSUMER.wait_for_first_bundle(timeout_s=RELAY_HANDSHAKE_TIMEOUT_S + 1.0):
+        _RELAY_CONSUMER.stop()
+        _RELAY_CONSUMER = None
+        link.close()
+        raise RuntimeError(
+            f"No frame_relay bundle arrived at {RELAY_HOST}:{RELAY_PORT} "
+            f"within {RELAY_HANDSHAKE_TIMEOUT_S:.1f}s. Start the control "
+            f"panel (which embeds the relay) or `python -m Utils.frame_relay "
+            f"--bind 0.0.0.0 --port {RELAY_PORT}` first."
+        )
+    if _RELAY_CONSUMER.error_flag:
+        msg = _RELAY_CONSUMER.error_reason
+        _RELAY_CONSUMER.stop()
+        _RELAY_CONSUMER = None
+        link.close()
+        raise RuntimeError(f"Relay consumer error: {msg}")
+    print(f"[{_ts()}] Relay handshake landed; first bundle received.")
+
     bundles: List[CaptureBundle] = []
-    # Shared with the telemetry thread; ALL writes go through the lock.
-    # The lock is cheap (one append per ~50 ms tick) and keeps the
-    # NPZ writer's len(bundles) snapshot consistent.
     bundles_lock = threading.Lock()
     telemetry: Optional[TelemetryThread] = None
+    # Tracks whether the arm is currently in master_free. The finally
+    # block uses this to decide whether to send a safety `c` before
+    # auto-home so the home motion starts from a locked state.
+    arm_is_free = False
+    out_path: Optional[str] = None
+    last_label: Optional[str] = None
 
     def _check_telemetry_health() -> None:
-        """Re-raise telemetry's failure as a session-aborting error.
-        Called between waypoints (never inside a Tier-1 UDP round trip).
-        """
+        """Re-raise telemetry failure as a session-ending error so the
+        finally block saves whatever has been collected."""
         if telemetry is not None and telemetry.error_flag:
             raise RuntimeError(
                 f"Telemetry thread aborted: {telemetry.error_reason}"
             )
 
     try:
-        # Recenter head/gaze offsets relative to the user's neutral pose
-        # before any captures. Without this, head_yaw_deg etc. read in
-        # the world frame and the Pass-2 mapping inherits whatever offset
-        # the user was sitting at. Phase 1 doc §8 follow-up #1.
-        print(f"[{_ts()}] Ask the user to face their neutral position, then press Enter.")
-        prompt_user("Press Enter when ready to recenter the gaze tracker…")
-        if not gaze_recenter():
-            print(f"[{_ts()}] WARN: gaze_runner did not ACK recenter. "
-                  f"Head/gaze angles will be recorded in the absolute world frame.")
-        else:
-            print(f"[{_ts()}] Gaze recentered.")
-
-        # Workspace coverage protocol (Phase 1 doc §5 lock-in): mandatory
-        # 3-depth × 5-horizontal grid, then user-driven free additions.
-        operator_targets = list(MANDATORY_GRID)
-        print(f"[{_ts()}] Mandatory grid has {len(operator_targets)} points.")
-        print(f"[{_ts()}] After the grid, you'll be prompted for optional free additions.")
+        # Head-pose recenter is not available in vlm-only mode (the
+        # gaze_runner pipeline that owned the recenter RPC is not
+        # running). Pass-2 features remain off by default; the
+        # participant's seated posture at session start is the de
+        # facto neutral for Pass-1.
+        print(f"[{_ts()}] Head-pose recenter unavailable in vlm-only mode; "
+              f"Pass-1 features are camera-frame and do not require it.")
 
         telemetry = TelemetryThread(link, bundles, bundles_lock)
-        telemetry.start()
-        # The thread is alive but inert — it sits in the "inactive"
-        # branch of its loop until ``start_after_first_capture()`` is
-        # called after the first waypoint's ``c`` ACK below.
+        telemetry.start()  # alive but inert until the first resume()
 
-        idx = 0
-        total = len(operator_targets)
-        last_captured_label: Optional[str] = None
-        while idx < total:
-            target_label = operator_targets[idx]
-            announce_target(target_label, idx + 1, total)
-
-            # The leg label is set BEFORE sending `m`: any transit
-            # samples that land during the operator's reading time +
-            # arm motion to ``target_label`` carry the right name.
-            # Skipped only for idx==0, where the telemetry thread is
-            # not yet active.
-            if idx > 0 and last_captured_label is not None:
-                telemetry.set_leg(f"transit_{last_captured_label}_to_{target_label}")
-                telemetry.resume()
-
-            # 1) Free the arm.
-            if not free_arm(link):
-                print(f"[{_ts()}] ERR: `m` rejected — likely robot is still in MOVING. Retrying after 1s.")
-                time.sleep(1.0)
-                _check_telemetry_health()
-                continue
-
-            # 2) Wait for the operator to position the arm. The prompt
-            #    returns the line so the operator can type 's' to skip
-            #    a target they cannot reach with the active arm.
-            ans = prompt_user("Move the arm and fixate, then press Enter to capture (or 's' to skip)…")
-            if ans.lower() == "s":
-                print(f"[{_ts()}] Operator skipped {target_label}.")
-                idx += 1
-                _check_telemetry_health()
-                continue
-
-            # 3) Stream the arm motion as "moving" samples for ~1s prior
-            #    to capture — gives the trajectory-based consumers a
-            #    short pre-capture history without depending on the
-            #    operator's reaction time. Pause the transit sampler
-            #    while collect_moving_phase runs so we do not double-
-            #    log the same telemetry under two different phase tags.
-            telemetry.pause()
-            moving = collect_moving_phase(link, target_label, duration_s=1.0)
-
-            # 4) If this is the final waypoint, the telemetry thread
-            #    must be stopped BEFORE we send `c` — the post-capture
-            #    auto-home transition is explicitly excluded from the
-            #    transit log per the recorder spec.
-            is_final_waypoint = (idx == total - 1)
-            if is_final_waypoint:
-                telemetry.stop()
-                telemetry = None
-
-            # 5) Capture.
-            captured_state = capture_pose(link)
-            if captured_state is None:
-                print(f"[{_ts()}] ERR: `c` failed at {target_label}. Retrying this target.")
-                # If we just stopped the telemetry thread, re-create it so
-                # a retry of the final waypoint still has transit coverage
-                # on the way back in.
-                if is_final_waypoint:
-                    telemetry = TelemetryThread(link, bundles, bundles_lock)
-                    telemetry.start()
-                    telemetry.start_after_first_capture()
-                continue
-
-            # 6) Settle + sample. Telemetry stays paused.
-            bundle = settle_and_snapshot(target_label, captured_state,
-                                          vlm_client=vlm_client)
-            if bundle is None:
-                print(f"[{_ts()}] WARN: no gaze snapshot at {target_label}. Skipping.")
-                idx += 1  # advance anyway — operator will fill via free-additions phase if needed
-                _check_telemetry_health()
-                continue
-
+        # ──────────────────────────────────────────────────────────────
+        # WP1 — no transit recording on the home→WP1 leg.
+        # ──────────────────────────────────────────────────────────────
+        announce_waypoint("WP01", hint="(first waypoint — no transit on this leg)")
+        prompt_user("Press Enter to unlock the arm. "
+                    "Then move it to the first position while fixating the EE, "
+                    "and press Enter again to lock.")
+        if not free_arm(link):
+            raise RuntimeError("Initial `m` rejected — robot may be in MOVING state. Aborting.")
+        arm_is_free = True
+        prompt_user("Arm is free. Move to WP01 while fixating EE, "
+                    "then press Enter to lock.")
+        captured_state = capture_pose(link)
+        if captured_state is None:
+            raise RuntimeError("Initial `c` failed. Aborting.")
+        arm_is_free = False
+        prompt_user("Locked. When your eyes are fixated on the EE, "
+                    "press Enter to record the anchor.")
+        bundle = capture_anchor("wp01", captured_state, vlm_client=vlm_client)
+        if bundle is None:
+            print(f"[{_ts()}] WARN: no gaze snapshot at wp01 — anchor dropped.")
+        else:
             with bundles_lock:
-                bundles.extend(moving)
                 bundles.append(bundle)
-            print(f"[{_ts()}] Captured {target_label}: "
-                  f"q={np.round(bundle.q, 3).tolist()}, "
+            print(f"[{_ts()}] Captured wp01: "
                   f"depth={bundle.depth_cm:.1f}cm (valid={bundle.depth_valid}), "
                   f"head=({bundle.head_yaw_deg:+.1f},{bundle.head_pitch_deg:+.1f})")
+            last_label = "wp01"
 
-            # First successful capture: activate the telemetry thread so
-            # it begins sampling on the next iteration's "free" window.
-            if idx == 0 and telemetry is not None:
-                telemetry.start_after_first_capture()
-
-            last_captured_label = target_label
-            idx += 1
-            _check_telemetry_health()
-
-        # Free-additions phase.
-        print()
-        print("=" * 70)
-        captured_count = sum(1 for b in bundles if b.phase == "captured")
-        transit_count = sum(1 for b in bundles if b.phase == "transit")
-        print(f"[{_ts()}] Mandatory grid complete ({len(bundles)} bundles, "
-              f"{captured_count} captures, {transit_count} transit).")
-        print(f"[{_ts()}] Optional free-additions phase: add reach hotspots.")
-        print("=" * 70)
-
-        # Telemetry coverage continues across the free-additions phase.
-        # Restart the thread (the mandatory-grid loop stopped it before
-        # the final `c`) so free-add transit legs are also recorded.
-        telemetry = TelemetryThread(link, bundles, bundles_lock)
-        telemetry.start()
-        telemetry.start_after_first_capture()
-
-        free_idx = 0
-        prev_free_label = last_captured_label
+        # ──────────────────────────────────────────────────────────────
+        # WP2+ steady-state loop. Ctrl+C exits via the finally block,
+        # which saves whatever anchors and transit data have landed.
+        # ──────────────────────────────────────────────────────────────
+        wp_idx = 2
         while True:
-            free_idx += 1
-            telemetry.pause()
-            ans = prompt_user(f"Add free target #{free_idx}? Enter label (e.g. 'mug_handle'), or empty to finish: ")
-            if not ans:
-                break
-            target_label = f"free_{ans}"
-            announce_target(target_label, free_idx, free_idx)
+            label = f"wp{wp_idx:02d}"
+            announce_waypoint(label, hint="(Ctrl+C any time to finish and save)")
 
-            if prev_free_label is not None:
-                telemetry.set_leg(f"transit_free_{prev_free_label}_to_{target_label}")
+            from_label = last_label if last_label is not None else "start"
+            prompt_user(f"Press Enter to unlock the arm and begin "
+                        f"{from_label}→{label} transit recording.")
+            telemetry.set_leg(f"transit_{from_label}_to_{label}")
             telemetry.resume()
-
             if not free_arm(link):
-                print(f"[{_ts()}] ERR: `m` rejected. Skipping.")
+                telemetry.pause()
+                print(f"[{_ts()}] ERR: `m` rejected. Skipping {label}.")
+                wp_idx += 1
+                _check_telemetry_health()
                 continue
-            prompt_user("Move the arm and fixate, then press Enter to capture…")
+            arm_is_free = True
+
+            prompt_user(f"Arm free + transit recording. Move to {label} while "
+                        f"fixating EE, then press Enter to lock.")
             telemetry.pause()
-            moving = collect_moving_phase(link, target_label, duration_s=1.0)
             captured_state = capture_pose(link)
             if captured_state is None:
-                print(f"[{_ts()}] ERR: `c` failed at {target_label}. Skipping.")
+                print(f"[{_ts()}] ERR: `c` failed at {label}. Skipping.")
+                wp_idx += 1
+                _check_telemetry_health()
                 continue
-            bundle = settle_and_snapshot(target_label, captured_state,
-                                          vlm_client=vlm_client)
+            arm_is_free = False
+
+            prompt_user(f"{label} locked. When your eyes are fixated on the EE, "
+                        f"press Enter to record the anchor.")
+            bundle = capture_anchor(label, captured_state, vlm_client=vlm_client)
             if bundle is None:
-                print(f"[{_ts()}] WARN: no gaze snapshot at {target_label}. Skipping.")
-                continue
-            with bundles_lock:
-                bundles.extend(moving)
-                bundles.append(bundle)
-            print(f"[{_ts()}] Captured {target_label}.")
-            prev_free_label = target_label
+                print(f"[{_ts()}] WARN: no gaze snapshot at {label}; anchor "
+                      f"dropped (transit data preserved).")
+            else:
+                with bundles_lock:
+                    bundles.append(bundle)
+                print(f"[{_ts()}] Captured {label}: "
+                      f"depth={bundle.depth_cm:.1f}cm (valid={bundle.depth_valid}), "
+                      f"head=({bundle.head_yaw_deg:+.1f},{bundle.head_pitch_deg:+.1f})")
+                last_label = label
+
+            wp_idx += 1
             _check_telemetry_health()
 
-        # Stop the free-additions telemetry thread before the auto-home
-        # opcode goes out so the home transition is not recorded.
-        if telemetry is not None:
-            telemetry.stop()
-            telemetry = None
-
-        # Auto-home after the final accepted capture (no operator
-        # confirmation prompt — per locked recorder spec).
-        _send_auto_home(link)
-
-        # Write the NPZ.
-        if not bundles:
-            print(f"[{_ts()}] No bundles captured. Aborting (no file written).")
-            return None
-
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        out_name = f"poses_with_gaze_{stamp}_v2_freearm.npz"
-        out_path = os.path.join(out_dir, out_name)
-        write_npz(bundles, out_path)
-        captured_n = sum(1 for b in bundles if b.phase == "captured")
-        moving_n = sum(1 for b in bundles if b.phase == "moving")
-        transit_n = sum(1 for b in bundles if b.phase == "transit")
-        print(f"[{_ts()}] Wrote {out_path}")
-        print(f"[{_ts()}]   captured samples: {captured_n}")
-        print(f"[{_ts()}]   moving samples:   {moving_n}")
-        print(f"[{_ts()}]   transit samples:  {transit_n}")
-        return out_path
+    except KeyboardInterrupt:
+        print()
+        print(f"[{_ts()}] Ctrl+C received — finishing session.")
+    except Exception as e:
+        print()
+        print(f"[{_ts()}] ERROR: {type(e).__name__}: {e}")
+        print(f"[{_ts()}] Saving what has been collected so far.")
 
     finally:
-        # Always reap the telemetry thread before closing the socket so
-        # a stray query_state() does not fire after RobotLink.close().
+        # 1. Stop telemetry first so it cannot fire another query_state()
+        #    during the shutdown sequence.
         if telemetry is not None:
-            telemetry.stop()
-        link.close()
+            try:
+                telemetry.stop()
+            except Exception as e:
+                print(f"[{_ts()}] WARN: telemetry.stop() raised: {e}")
+
+        # 2. Stop the relay consumer so it stops adding to the bundle
+        #    queue and releases the TCP connection.
+        if _RELAY_CONSUMER is not None:
+            try:
+                _RELAY_CONSUMER.stop()
+            except Exception as e:
+                print(f"[{_ts()}] WARN: relay consumer stop raised: {e}")
+            _RELAY_CONSUMER = None
+
+        # 3. If the arm is currently in master_free, lock it before
+        #    sending h;dur= so the home motion transitions from a known
+        #    locked state. The resulting bundle is discarded — this is
+        #    a safety lock, not a calibration anchor.
+        if arm_is_free:
+            print(f"[{_ts()}] Locking arm before auto-home…")
+            try:
+                capture_pose(link)
+            except Exception as e:
+                print(f"[{_ts()}] WARN: safety `c` raised: {e}")
+            arm_is_free = False
+
+        # 4. Auto-home so the robot does not sit in an arbitrary pose
+        #    after the operator walks away.
+        try:
+            _send_auto_home(link)
+        except Exception as e:
+            print(f"[{_ts()}] WARN: auto-home failed: {e}")
+
+        # 5. Close the UDP socket.
+        try:
+            link.close()
+        except Exception:
+            pass
+
+        # 5. Write the NPZ if we have at least one captured anchor.
+        #    write_npz refuses to emit an empty captured block.
+        captured_n = sum(1 for b in bundles if b.phase == "captured")
+        transit_n = sum(1 for b in bundles if b.phase == "transit")
+        if captured_n == 0:
+            print(f"[{_ts()}] No anchors captured — no NPZ written.")
+        else:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            out_name = f"poses_with_gaze_{stamp}_v2_freearm.npz"
+            out_path = os.path.join(out_dir, out_name)
+            write_npz(bundles, out_path)
+            print(f"[{_ts()}] Wrote {out_path}")
+            print(f"[{_ts()}]   captured anchors: {captured_n}")
+            print(f"[{_ts()}]   transit samples:  {transit_n}")
+
+    return out_path
 
 
 def main() -> int:
-    try:
-        out = run_session(out_dir=".")
-    except KeyboardInterrupt:
-        print(f"\n[{_ts()}] KeyboardInterrupt — aborting session.")
-        return 1
+    out = run_session(out_dir=".")
     return 0 if out else 2
 
 

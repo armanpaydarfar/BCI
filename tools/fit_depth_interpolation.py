@@ -1,132 +1,260 @@
 #!/usr/bin/env python3
 """
-tools/fit_depth_interpolation.py — REV01 backup depth pipeline
-(Plan §3.3 backup path).
+tools/fit_depth_interpolation.py — Fill transit-row depths from the
+bracketing anchor depths in a vlm-only calibration NPZ.
 
-When ``tools/fit_vergence_affine.py`` rejects the per-session affine fit
-(R² below threshold or max-residual too large), this script offers a
-non-linear backup: build a KDTree over the 15 anchor EE positions and
-for every transit row, look up the nearest anchor's VLM Depth Pro value.
+Usage:
 
     python tools/fit_depth_interpolation.py poses_with_gaze_<stamp>_v2_freearm.npz \\
         [--out poses_with_gaze_<stamp>_v2_freearm_interp.npz]
 
-The script:
+The recorder emits anchor rows tagged ``Depth_source == "vlm_depth_pro"``
+(with the VLM Depth Pro reading at the gaze pixel) and transit rows
+tagged ``Depth_source == "pending_interpolation"`` (with ``D_cm = NaN``).
+This script:
 
-1. Loads the input NPZ.
-2. Identifies captured anchor rows (``D_cm_vergence`` finite) and
-   transit rows (``D_cm_vergence`` NaN) in the legacy fit block.
-3. Builds ``scipy.spatial.cKDTree`` over the anchor X (EE position).
-4. For every transit row, sets ``D_cm`` to the nearest anchor's
-   ``D_cm`` (the VLM Depth Pro reading at that anchor).
-5. Updates ``Depth_source`` and ``Depth_source_all`` on transit rows to
-   ``"vlm_interpolated_nearest_anchor"``.
-6. Sets ``meta["affine_map"] = None`` AND
-   ``meta["depth_source"] = "vergence"`` so the runtime's alignment-
-   invariant probe accepts the rewritten NPZ (the hybrid+None
-   combination raises ``RuntimeError`` at startup; tagging the meta
-   string as plain ``"vergence"`` keeps the file runtime-loadable per
-   Plan §1.3 design intent). Runtime then uses raw vergence — wrong-
-   but-safe; per-subject offset will be off by an unknown factor. The
-   proper fix is to re-record with better Depth Pro coverage.
+1. Loads the NPZ.
+2. Splits the fit-block rows by ``Depth_source`` into anchors vs transit.
+3. For each transit row, identifies the bracketing anchors from its
+   ``Leg_label`` (format ``"transit_<from_label>_to_<to_label>"``) and
+   linearly interpolates ``D_cm`` by the row's relative EE distance
+   between the two anchor EE positions:
 
-After this rewrite, an ``_interp.npz`` is distinguishable from a
-vergence-only recording only by per-row ``Depth_source`` tags
-(``"vlm_interpolated_nearest_anchor"`` on transit rows; the legacy
-vergence-only path leaves every row as ``"vergence"``). The meta
-``depth_source`` string is identical in both cases.
+       t = d_from / (d_from + d_to)
+       D_cm = (1 - t) * D_cm_from + t * D_cm_to
 
-Limitation (Plan §3.3): the runtime does NOT apply the per-row
-interpolation. Extending runtime would require a new EE-position feed
-which is out of scope for REV01. This script's value is offline analysis
-of how the Mahalanobis NN behaves with backup-pipeline data.
+   This is "bracketed" interpolation — sequential waypoints are
+   typically close together in space, and constraining the interp to
+   the two anchors that physically span the leg avoids pulling depth
+   from a far-away anchor that happens to be the global NN.
 
-Plan reference: Documents/SoftwareDocs/Harmony_Gaze_Calibration_REV01_Plan.md §3.3.
+4. Falls back to global KDTree NN over anchor EE positions when leg
+   info is missing (legacy NPZ) or when one of the bracketing anchors
+   has no anchor row (e.g., the recorder dropped that anchor capture).
+5. Rewrites transit rows with the interpolated ``D_cm`` and tags
+   ``Depth_source = "vlm_interpolated_bracketed"`` (or
+   ``"vlm_interpolated_nearest_anchor"`` for fallback rows).
+6. Pins ``meta["depth_source"] = "vlm_depth_pro"`` so the v2 runtime
+   dispatches to its per-query VLM Depth Pro path.
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import sys
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 from scipy.spatial import cKDTree
 
 
-def _select_anchors_and_transit(z: Any
-                                  ) -> Tuple[np.ndarray, np.ndarray]:
-    """Return (anchor_mask, transit_mask) over the fit-block rows.
+# Leg labels have the shape "transit_<from>_to_<to>" where <from> /
+# <to> can be anything but the literal "_to_" infix. Anchor at WP01 is
+# tagged Target_label="wp01"; the matching leg is
+# "transit_wp01_to_wp02". The "start" sentinel is used by the recorder
+# when the first transit leg begins before any anchor (should not
+# happen in WP1-skip mode, but tolerated for robustness).
+_LEG_PATTERN = re.compile(r"^transit_(?P<from>.+?)_to_(?P<to>.+)$")
 
-    Anchor rows have finite ``D_cm_vergence`` (the recorder's Step 2
-    writes that field only at VLM anchors). Transit rows have NaN.
-    Both masks are over the same fit-block length so callers can index
-    into ``D_cm`` / ``X`` directly.
+
+def _split_anchors_and_transit(
+    depth_source: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (anchor_mask, transit_mask) over the fit-block rows,
+    discriminating by the per-row ``Depth_source`` column. Anchors are
+    rows where Depth_source == "vlm_depth_pro"; transit rows are
+    everything else (typically "pending_interpolation").
     """
-    if "D_cm_vergence" not in z.files:
-        raise KeyError(
-            "Input NPZ has no D_cm_vergence column. Re-record with the "
-            "REV01 recorder (harmony_free_arm_calibration.py with "
-            "GAZE_CALIBRATION_DEPTH_SOURCE='vlm_depth_pro')."
-        )
-    d_cm_verg = np.asarray(z["D_cm_vergence"], dtype=float)
-    anchor_mask = np.isfinite(d_cm_verg)
+    ds = depth_source.astype(str)
+    anchor_mask = ds == "vlm_depth_pro"
     transit_mask = ~anchor_mask
     if not np.any(anchor_mask):
         raise RuntimeError(
-            "No valid anchor rows in the input NPZ — D_cm_vergence is "
-            "NaN on every row."
+            "No anchor rows in the input NPZ (no row with "
+            "Depth_source == 'vlm_depth_pro'). Re-record with "
+            "GAZE_CALIBRATION_DEPTH_SOURCE='vlm_depth_pro' before "
+            "running this tool."
         )
     if not np.any(transit_mask):
         raise RuntimeError(
-            "No transit rows in the input NPZ — nothing to interpolate."
+            "No transit rows in the input NPZ — nothing to interpolate. "
+            "(All rows are tagged 'vlm_depth_pro'; this only happens for "
+            "anchor-only NPZs.)"
         )
     return anchor_mask, transit_mask
 
 
-def _interpolate_transit_depths(X: np.ndarray, d_cm: np.ndarray,
-                                  anchor_mask: np.ndarray,
-                                  transit_mask: np.ndarray
-                                  ) -> np.ndarray:
-    """KDTree NN lookup from each transit EE position to the nearest
-    anchor's D_cm. Returns the rewritten D_cm array (copy)."""
-    anchor_X = X[anchor_mask]
-    anchor_d = d_cm[anchor_mask]
-    transit_X = X[transit_mask]
+def _parse_leg_label(leg_label: str) -> Optional[Tuple[str, str]]:
+    """Return (from_label, to_label) parsed from a transit leg label,
+    or None if the label is not in the expected shape.
+    """
+    if not leg_label:
+        return None
+    m = _LEG_PATTERN.match(leg_label)
+    if m is None:
+        return None
+    return m.group("from"), m.group("to")
+
+
+def _build_anchor_lookup(
+    target_label: np.ndarray, anchor_mask: np.ndarray
+) -> Dict[str, int]:
+    """Map ``Target_label`` → fit-block row index, restricted to anchor
+    rows. Used to look up the from/to anchors for each transit leg.
+    """
+    tl = target_label.astype(str)
+    lookup: Dict[str, int] = {}
+    for i in np.flatnonzero(anchor_mask):
+        label = tl[i]
+        if label and label not in lookup:
+            lookup[label] = int(i)
+    return lookup
+
+
+def _interpolate_transit_depths(
+    X: np.ndarray,
+    d_cm: np.ndarray,
+    target_label: np.ndarray,
+    leg_label: np.ndarray,
+    anchor_mask: np.ndarray,
+    transit_mask: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Fill transit-row depths and return (d_cm_out, per_row_method).
+
+    For each transit row:
+
+    - If the row's leg parses to (from_label, to_label) and BOTH anchor
+      labels exist in the anchor row set: linear interp by EE-distance
+      ratio between the two anchors.
+    - If only one of the brackets exists: use that anchor's depth
+      (constant across the leg).
+    - Otherwise: fall back to global KDTree NN over the anchor EE
+      positions.
+
+    ``per_row_method`` mirrors the shape of ``d_cm_out`` and carries the
+    tag ("bracketed" | "single_bracket" | "nearest_anchor") used to
+    drive Depth_source rewriting.
+    """
+    anchor_indices = np.flatnonzero(anchor_mask)
+    anchor_X = X[anchor_indices]
+    anchor_d = d_cm[anchor_indices]
+    label_to_anchor_idx = _build_anchor_lookup(target_label, anchor_mask)
+
+    # KDTree built once over anchor EE positions for the fallback path.
     tree = cKDTree(anchor_X)
-    _, nearest_idx = tree.query(transit_X, k=1)
+
     d_cm_out = d_cm.copy()
-    d_cm_out[transit_mask] = anchor_d[nearest_idx]
-    return d_cm_out
+    methods = np.full(len(d_cm), "", dtype="<U24")
+
+    transit_idx = np.flatnonzero(transit_mask)
+    leg_str = leg_label.astype(str)
+
+    for i in transit_idx:
+        leg = _parse_leg_label(leg_str[i])
+        x_i = X[i]
+        d_from: Optional[float] = None
+        d_to: Optional[float] = None
+        x_from: Optional[np.ndarray] = None
+        x_to: Optional[np.ndarray] = None
+        if leg is not None:
+            from_label, to_label = leg
+            if from_label in label_to_anchor_idx:
+                fi = label_to_anchor_idx[from_label]
+                d_from = float(d_cm[fi])
+                x_from = X[fi]
+            if to_label in label_to_anchor_idx:
+                ti = label_to_anchor_idx[to_label]
+                d_to = float(d_cm[ti])
+                x_to = X[ti]
+
+        if d_from is not None and d_to is not None:
+            assert x_from is not None and x_to is not None  # for mypy
+            d_a = float(np.linalg.norm(x_i - x_from))
+            d_b = float(np.linalg.norm(x_i - x_to))
+            denom = d_a + d_b
+            if denom <= 0.0 or not np.isfinite(denom):
+                d_cm_out[i] = 0.5 * (d_from + d_to)
+            else:
+                t = d_a / denom
+                d_cm_out[i] = (1.0 - t) * d_from + t * d_to
+            methods[i] = "bracketed"
+        elif d_from is not None:
+            d_cm_out[i] = d_from
+            methods[i] = "single_bracket"
+        elif d_to is not None:
+            d_cm_out[i] = d_to
+            methods[i] = "single_bracket"
+        else:
+            _, nearest = tree.query(x_i, k=1)
+            d_cm_out[i] = float(anchor_d[int(nearest)])
+            methods[i] = "nearest_anchor"
+
+    return d_cm_out, methods
+
+
+# Per-method Depth_source tag written into the rewritten NPZ.
+_METHOD_TO_TAG = {
+    "bracketed": "vlm_interpolated_bracketed",
+    "single_bracket": "vlm_interpolated_single_bracket",
+    "nearest_anchor": "vlm_interpolated_nearest_anchor",
+}
 
 
 def _rewrite_npz(in_path: str, out_path: str) -> None:
-    """Load, interpolate, rewrite. ``meta["affine_map"]`` is forced to
-    ``None`` and ``meta["depth_source"]`` to ``"vergence"`` so the
-    runtime accepts the rewritten NPZ via the legacy vergence path
-    (the hybrid+None combination raises at startup; see module
-    docstring)."""
     z = np.load(in_path, allow_pickle=True)
     try:
-        anchor_mask, transit_mask = _select_anchors_and_transit(z)
+        if "Depth_source" not in z.files:
+            raise KeyError(
+                "Input NPZ has no Depth_source column. Re-record with "
+                "the current harmony_free_arm_calibration.py — older "
+                "REV01 NPZs are not compatible with this tool."
+            )
+        depth_source_in = np.asarray(z["Depth_source"])
+        anchor_mask, transit_mask = _split_anchors_and_transit(depth_source_in)
+
         X = np.asarray(z["X"], dtype=float)
         d_cm = np.asarray(z["D_cm"], dtype=float)
-        d_cm_out = _interpolate_transit_depths(X, d_cm, anchor_mask,
-                                                  transit_mask)
+        target_label = np.asarray(z["Target_label"])
+        leg_label_key = "Leg_label" if "Leg_label" in z.files else None
+        if leg_label_key is None:
+            # Legacy NPZs without per-fit-row leg labels fall back to
+            # nearest-anchor exclusively (the bracket parser cannot run).
+            leg_label = np.full(len(X), "", dtype="<U64")
+        else:
+            leg_label = np.asarray(z[leg_label_key])
+
+        d_cm_out, methods = _interpolate_transit_depths(
+            X, d_cm, target_label, leg_label, anchor_mask, transit_mask
+        )
 
         fields: Dict[str, Any] = {k: z[k] for k in z.files if k != "meta"}
         fields["D_cm"] = d_cm_out
 
-        # Per-row provenance: transit rows tag the backup pipeline.
-        if "Depth_source" in fields:
-            ds = np.asarray(fields["Depth_source"]).astype("<U64").copy()
-            ds[transit_mask] = "vlm_interpolated_nearest_anchor"
-            fields["Depth_source"] = ds
+        # Per-row Depth_source: anchor rows keep "vlm_depth_pro";
+        # transit rows get the per-method interp tag.
+        ds = depth_source_in.astype("<U64").copy()
+        for i in np.flatnonzero(transit_mask):
+            tag = _METHOD_TO_TAG.get(methods[i], "vlm_interpolated_nearest_anchor")
+            ds[i] = tag
+        fields["Depth_source"] = ds
+
+        # Mirror the rewrite into the *_all block so downstream
+        # diagnostics that index by Phase_all keep agreeing with
+        # the fit block.
         if "Depth_source_all" in fields and "Phase_all" in fields:
+            ds_all = np.asarray(fields["Depth_source_all"]).astype("<U64").copy()
             phase_all = np.asarray(fields["Phase_all"]).astype(str)
-            ds_all = (np.asarray(fields["Depth_source_all"])
-                       .astype("<U64").copy())
-            ds_all[phase_all == "transit"] = "vlm_interpolated_nearest_anchor"
+            # The fit-block rows are exactly the captured + transit
+            # rows of the *_all block, in the same order. Build a
+            # mapping by walking phase_all and copying the per-row
+            # tag from the fit block.
+            fit_idx = 0
+            for j, ph in enumerate(phase_all):
+                if ph in ("captured", "transit"):
+                    if fit_idx < len(ds):
+                        ds_all[j] = ds[fit_idx]
+                    fit_idx += 1
             fields["Depth_source_all"] = ds_all
 
         meta_raw = z["meta"]
@@ -140,21 +268,37 @@ def _rewrite_npz(in_path: str, out_path: str) -> None:
                 f"refusing to rewrite."
             )
         meta = dict(meta)
+        # Pin depth_source so the v2 runtime dispatches to vlm_depth_pro
+        # (the runtime calls VLM per query at command time; the
+        # interpolated transit depths are only used by the calibration
+        # fit, not at runtime).
+        meta["depth_source"] = "vlm_depth_pro"
         meta["affine_map"] = None
-        # Tag as vergence so the runtime alignment-invariant probe
-        # accepts the file (hybrid + None affine_map raises at startup
-        # by design). Per-row Depth_source still records the backup
-        # provenance for offline analysis.
-        meta["depth_source"] = "vergence"
+        # Record interp-method counts so the operator can audit how
+        # many transit rows used each path.
+        counts: Dict[str, int] = {}
+        for i in np.flatnonzero(transit_mask):
+            counts[methods[i]] = counts.get(methods[i], 0) + 1
+        meta["transit_interp_method_counts"] = counts
         fields["meta"] = meta
 
         np.savez_compressed(out_path, **fields)
+
+        # Operator summary
+        n_transit = int(transit_mask.sum())
+        n_anchor = int(anchor_mask.sum())
+        print(f"  anchors:           {n_anchor}")
+        print(f"  transit rows:      {n_transit}")
+        for m_name in ("bracketed", "single_bracket", "nearest_anchor"):
+            print(f"    via {m_name:<18s} {counts.get(m_name, 0)}")
+        print(f"  wrote: {out_path}")
+        print(f"  meta['depth_source'] = 'vlm_depth_pro'")
     finally:
         z.close()
 
 
 def _derive_out_path(in_path: str) -> str:
-    """``foo.npz`` → ``foo_interp.npz`` (analogous to fit_vergence_affine.py)."""
+    """``foo.npz`` → ``foo_interp.npz``."""
     if in_path.lower().endswith(".npz"):
         return in_path[:-4] + "_interp.npz"
     return in_path + "_interp.npz"
@@ -162,10 +306,10 @@ def _derive_out_path(in_path: str) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="REV01 backup depth pipeline: NN interpolation over "
-                    "anchor EE positions (Plan §3.3)."
+        description="Fill transit-row depths from bracketing anchor depths "
+                    "(vlm-only calibration NPZ)."
     )
-    parser.add_argument("input", help="Path to the REV01 hybrid NPZ.")
+    parser.add_argument("input", help="Path to the vlm-only calibration NPZ.")
     parser.add_argument("--out", default=None,
                         help="Output NPZ path (default: <input>_interp.npz).")
     args = parser.parse_args(argv)
@@ -173,13 +317,6 @@ def main(argv: list[str] | None = None) -> int:
     out_path = (args.out if args.out is not None
                 else _derive_out_path(args.input))
     _rewrite_npz(args.input, out_path)
-
-    print(f"REV01 backup NN-over-EE depth interpolation:")
-    print(f"  wrote: {out_path}")
-    print(f"  meta['depth_source'] = 'vergence', meta['affine_map'] = None")
-    print(f"  runtime accepts as vergence-only NPZ; transit rows tagged via")
-    print(f"  per-row Depth_source for offline analysis.")
-    print(f"  (re-record for primary affine-fit path if quality is critical)")
     return 0
 
 

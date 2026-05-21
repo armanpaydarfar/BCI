@@ -6,6 +6,10 @@ The format is **lightweight** (this repo is not strictly semver-tagged). Add bul
 
 ## [Unreleased]
 
+### Behaviour
+
+- **Recorder + runtime: vlm-only operation via frame_relay.** `harmony_free_arm_calibration.py` no longer consumes from `gaze_runner.py`'s UDP snapshot. It dials `config.FRAME_RELAY_DIAL_HOST:FRAME_RELAY_PORT` as a TCP consumer (sharing the panel's embedded relay or a standalone `python -m Utils.frame_relay`), computes `(gaze_yaw_deg, gaze_pitch_deg)` locally from `gaze_px + camera_matrix` (camera-frame angles), and pulls anchor depth from VLM Depth Pro. Transit rows leave `D_cm = NaN` and are tagged `Depth_source = "pending_interpolation"`; the offline `tools/fit_depth_interpolation.py` post-fills them with a leg-aware bracketed linear interp (each transit row reads its `Leg_label`, finds the from/to anchors, blends by EE-distance ratio; falls back to global KDTree NN when bracketing anchors are unavailable). NPZ `meta["depth_source"]` is now `"vlm_depth_pro"` end-to-end. `harmony_online_control.py`'s `_fetch_v2_snapshot` mirrors the same frame_relay path so query-time features match calibration. `GAZE_CALIBRATION_DEPTH_SOURCE` is `"vlm_depth_pro"`-only in this build; the per-session affine fit and head-pose recenter are deferred and can be re-added when the gaze_system pipeline is reinstated. `tests/test_gaze_calibration_recorder.py`, `tests/test_gaze_depth_interpolation.py::TestFitDepthInterpolation`, and `tests/test_pose_library_loader_v1v2.py::TestHybridMetaRoundTrip` skip pending rewrite.
+
 ### Tooling
 
 - **`tools/deploy_robot_gaze.sh` single-command wrapper.** Invokes the C++ repo's `build_and_deploy.sh --push 192.168.2.1 --tool Gaze_Tracking` after checking the cross-repo `deploy.config` and the built `dist/01d91ea/Gaze_Tracking` exist. The underlying script (in `DockerProjects/ubuntu1804_container/HARMONY-UNIT-4/tools/`) now backs up the prior remote binary to `<name>.bak.<UTC-ISO-timestamp>` before rsync and verifies md5sum on both sides post-push; supports `DEPLOY_REMOTE_PASS` for sshpass-based auth against the lab Harmony robot. Rollback is one `mv` over SSH plus the standard `killall.sh && run.sh` re-init.
