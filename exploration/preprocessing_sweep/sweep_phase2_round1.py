@@ -23,9 +23,9 @@ right-arm MI:
   - Epochs kept / attempted, plus blink-removal diagnostics
 
 Results written to
-  /home/arman-admin/Documents/SoftwareDocs/clin_erd_phase2_round1.csv
+  /home/arman-admin/Documents/SoftwareDocs/projects/harmony-bci/clinical-erd/data/phase2-round1.csv
 and a markdown top-10 summary to
-  /home/arman-admin/Documents/SoftwareDocs/clin_erd_phase2_round1.md
+  /home/arman-admin/Documents/SoftwareDocs/projects/harmony-bci/clinical-erd/phase2-round1.md
 """
 
 import os
@@ -53,8 +53,8 @@ warnings.filterwarnings("ignore")
 SUBJECT   = "CLIN_SUBJ_003"
 SESSIONS  = ["S003ONLINE", "S004ONLINE", "S005ONLINE"]
 DATA_DIR  = "/home/arman-admin/Documents/CurrentStudy"
-OUT_CSV   = "/home/arman-admin/Documents/SoftwareDocs/clin_erd_phase2_round1.csv"
-OUT_MD    = "/home/arman-admin/Documents/SoftwareDocs/clin_erd_phase2_round1.md"
+OUT_CSV   = "/home/arman-admin/Documents/SoftwareDocs/projects/harmony-bci/clinical-erd/data/phase2-round1.csv"
+OUT_MD    = "/home/arman-admin/Documents/SoftwareDocs/projects/harmony-bci/clinical-erd/phase2-round1.md"
 
 FS           = 512
 NOTCH        = 60

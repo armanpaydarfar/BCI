@@ -50,8 +50,8 @@ warnings.filterwarnings("ignore")
 # ======================================================================
 
 DATA_DIR  = "/home/arman-admin/Documents/CurrentStudy"
-OUT_CSV   = "/home/arman-admin/Documents/SoftwareDocs/clin_erd_phase2_round2.csv"
-OUT_MD    = "/home/arman-admin/Documents/SoftwareDocs/clin_erd_phase2_round2.md"
+OUT_CSV   = "/home/arman-admin/Documents/SoftwareDocs/projects/harmony-bci/clinical-erd/data/phase2-round2.csv"
+OUT_MD    = "/home/arman-admin/Documents/SoftwareDocs/projects/harmony-bci/clinical-erd/phase2-round2.md"
 
 SESSION_MAP = {
     "CLIN_SUBJ_005": ["S004ONLINE", "S005ONLINE"],

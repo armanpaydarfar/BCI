@@ -159,7 +159,7 @@ def _sleep_inhibit(enable: bool) -> None:
 
     Windows-only — uses kernel32.SetThreadExecutionState with
     ES_CONTINUOUS | ES_SYSTEM_REQUIRED. Per
-    SoftwareDocs/GPU_Service_Host_Architecture_Plan.md §4.10 the GPU host
+    SoftwareDocs/projects/harmony-bci/gpu-service/architecture-plan.md §4.10 the GPU host
     must not sleep mid-session. POSIX is a no-op (Linux deployment uses
     systemd-inhibit / external power management).
     """

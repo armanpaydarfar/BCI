@@ -175,7 +175,7 @@ def parse_args():
     p.add_argument("--session-dir", default=None, help="Where to save depth PNGs etc.")
     p.add_argument("--verbose", action="store_true")
     # Frame source toggle for the GPU-host migration plan (see SoftwareDocs/
-    # GPU_Service_Host_Architecture_Plan.md §3.4). Default `local` preserves
+    # projects/harmony-bci/gpu-service/architecture-plan.md §3.4). Default `local` preserves
     # today's behaviour (open Neon directly via NeonLiveReader). `remote`
     # consumes envelopes from a Utils/frame_relay.py TCP server instead.
     p.add_argument("--frame-source", choices=["local", "remote"], default="local",

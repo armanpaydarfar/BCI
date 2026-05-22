@@ -4,7 +4,7 @@ scene_overlay_renderer.py — Linux-side scene + overlay renderer.
 Composites a Pupil Labs Neon scene frame with the JSON detection / gaze
 payload pushed by the Windows-hosted vlm_service.py, so the operator panel
 can paint at native frame rate without round-tripping pixels to Windows
-and back. See ``Documents/SoftwareDocs/GPU_Service_Render_Layer_Refactor.md``
+and back. See ``Documents/SoftwareDocs/projects/harmony-bci/gpu-service/render-layer-refactor-plan.md``
 §4 for design context.
 
 **Implementation choice (§4.1).** Option B — slim reimplementation, NOT an
@@ -30,7 +30,7 @@ production.
 
 Inputs are explicitly JSON-shaped dicts (see ``render``'s docstring),
 matching the wire payload defined in
-``Documents/SoftwareDocs/GPU_Service_Render_Layer_Refactor.md`` §3.
+``Documents/SoftwareDocs/projects/harmony-bci/gpu-service/render-layer-refactor-plan.md`` §3.
 """
 
 from __future__ import annotations

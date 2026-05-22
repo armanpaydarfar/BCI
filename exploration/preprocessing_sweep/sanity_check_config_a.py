@@ -8,7 +8,7 @@ Config A = spatial_filter='car', blink_removal='drop_fp',
 
 Runs on all 5 online sessions of CLIN_SUBJ_003 and writes a per-session report.
 Output:
-  /home/arman-admin/Documents/SoftwareDocs/clin_erd_config_a_sanity.md
+  /home/arman-admin/Documents/SoftwareDocs/projects/harmony-bci/clinical-erd/config-a-sanity.md
 """
 
 import os
@@ -20,7 +20,7 @@ from sweep_phase2_round2 import (
 
 SUBJECT  = "CLIN_SUBJ_003"
 SESSIONS = ["S001ONLINE", "S002ONLINE", "S003ONLINE", "S004ONLINE", "S005ONLINE"]
-OUT_MD   = "/home/arman-admin/Documents/SoftwareDocs/clin_erd_config_a_sanity.md"
+OUT_MD   = "/home/arman-admin/Documents/SoftwareDocs/projects/harmony-bci/clinical-erd/config-a-sanity.md"
 
 CONFIG_A = {
     "spatial_filter":    "car",

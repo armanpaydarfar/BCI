@@ -36,7 +36,7 @@ the rewritten NPZ via ``config.POSE_LIBRARY_PATH`` (set in
 ``config_local.py``) and dispatches on ``runtime_depth_pipeline``
 (``Utils/gaze/calibration_mapping.py``).
 
-Plan reference: Documents/SoftwareDocs/Harmony_Gaze_Calibration_REV01_Plan.md §3.3.
+Plan reference: Documents/SoftwareDocs/projects/harmony-bci/gaze-calibration/rev01-plan.md §3.3.
 """
 
 from __future__ import annotations

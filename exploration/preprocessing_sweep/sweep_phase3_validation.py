@@ -17,8 +17,8 @@ Subjects / sessions:
   CLIN_SUBJ_002..008, every online session (excluding CLIN_PILOT_001).
 
 Outputs:
-  /home/arman-admin/Documents/SoftwareDocs/clin_erd_phase3_validation.csv
-  /home/arman-admin/Documents/SoftwareDocs/clin_erd_phase3_validation.md
+  /home/arman-admin/Documents/SoftwareDocs/projects/harmony-bci/clinical-erd/data/phase3-validation.csv
+  /home/arman-admin/Documents/SoftwareDocs/projects/harmony-bci/clinical-erd/phase3-validation.md
 """
 
 import os
@@ -93,8 +93,8 @@ warnings.filterwarnings("ignore")
 # Run config
 # ======================================================================
 
-OUT_CSV = "/home/arman-admin/Documents/SoftwareDocs/clin_erd_phase3_validation.csv"
-OUT_MD  = "/home/arman-admin/Documents/SoftwareDocs/clin_erd_phase3_validation.md"
+OUT_CSV = "/home/arman-admin/Documents/SoftwareDocs/projects/harmony-bci/clinical-erd/data/phase3-validation.csv"
+OUT_MD  = "/home/arman-admin/Documents/SoftwareDocs/projects/harmony-bci/clinical-erd/phase3-validation.md"
 
 SUBJECTS = [f"CLIN_SUBJ_{i:03d}" for i in (2, 3, 4, 5, 6, 7, 8)]
 

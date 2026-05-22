@@ -126,7 +126,7 @@ class GazeConfig:
     discover_timeout_s: int = 10
 
     # Frame source toggle for the GPU-host migration plan (see SoftwareDocs/
-    # GPU_Service_Host_Architecture_Plan.md §3.4). Default `local` opens the
+    # projects/harmony-bci/gpu-service/architecture-plan.md §3.4). Default `local` opens the
     # Neon device directly. `remote` consumes envelopes from a TCP relay
     # (Utils/frame_relay.py) via Utils/remote_frame_reader.RemoteNeonDevice.
     # In remote mode gaze + IMU are subsampled to the relay rate (~10 Hz vs

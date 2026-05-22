@@ -30,7 +30,7 @@ import visualize_online_data as viz
 
 SUBJECT = "CLIN_SUBJ_003"
 SESSIONS = ["S003ONLINE", "S004ONLINE", "S005ONLINE"]
-OUTPUT_PATH = "/home/arman-admin/Documents/SoftwareDocs/clin_erd_phase1_calibration.md"
+OUTPUT_PATH = "/home/arman-admin/Documents/SoftwareDocs/projects/harmony-bci/clinical-erd/phase1-calibration.md"
 SCALAR_WINDOW = (1.0, 4.0)
 
 # For right-arm MI (marker 200), contralateral = LEFT hemisphere.

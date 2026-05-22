@@ -3,7 +3,7 @@
 perception_latency_probe.py — measure round-trip latency of the perception
 service stack (gaze + VLM + frame relay).
 
-Per SoftwareDocs/GPU_Service_Host_Architecture_Plan.md §4.11. Targets on
+Per SoftwareDocs/projects/harmony-bci/gpu-service/architecture-plan.md §4.11. Targets on
 LAN/Ethernet:
 
     - VLM   `status`         p99 < 5 ms

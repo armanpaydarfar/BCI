@@ -30,7 +30,7 @@ runtime behavior.
   config key (`local` opens Neon directly, `remote` consumes from
   `Utils/frame_relay.py`); default is `local` so single-machine workflows
   keep working without config edits. See
-  `Documents/SoftwareDocs/GPU_Service_Host_Architecture_Plan.md` for the
+  `Documents/SoftwareDocs/projects/harmony-bci/gpu-service/architecture-plan.md` for the
   full architecture, wire format, and deployment notes.
 
 ---
@@ -157,29 +157,38 @@ realtime but not in the critical path.
 
 ## Reference Literature and Documentation
 
-Two directories serve as the canonical locations for papers and
-implementation references related to this project. On Linux the paths
-are absolute as shown; on Windows replace `/home/arman-admin` with the
-appropriate Windows home prefix — the subdirectory structure is the
-same on both machines.
+Engineering documentation and reference papers for this project live in
+a single private git repo cloned at `/home/arman-admin/Documents/SoftwareDocs/`
+on the master Linux host (this machine), and at the same path on the
+Tiagobot Linux host and the Windows VLM host. On Windows replace
+`/home/arman-admin` with the appropriate Windows home prefix.
 
-### `/home/arman-admin/Documents/studies/`
-Contains academic papers providing context for methods implemented or
-planned in this repo. Papers here are reference material — read them
-for background and motivation, but do not assume the implementation
-follows them exactly. Divergences from the paper are intentional and
-documented in the relevant implementation reference.
+Start at `Documents/SoftwareDocs/INDEX.md` — the agent-readable catalog
+of every project and feature, with status and canonical entry point.
+The layout convention (project / feature / doc-type) is documented in
+`Documents/SoftwareDocs/CONVENTIONS.md`.
 
-### `/home/arman-admin/Documents/SoftwareDocs/`
-Contains implementation references, planning documents, and post-
-implementation technical records for features developed in this repo.
-These are the primary written records for features that may not have
-a separate planning document in the codebase. When working on a
-feature, check here first for an existing reference document before
-reading the code.
+### `Documents/SoftwareDocs/projects/<project>/<feature>/`
+Implementation references, planning documents, and post-implementation
+technical records for features developed in this repo. The
+`harmony-bci/` project covers this repo; sibling projects (`tiagobot/`,
+`impedance-monitor/`, future) live alongside it. When working on a
+feature, check here first for an existing reference doc before reading
+the code.
 
-When a feature is derived from a paper in `Documents/studies/`, note
-the reference in the commit message and relevant docstrings.
+### `Documents/SoftwareDocs/studies/`
+Academic papers providing context for methods implemented or planned
+in this repo. Papers are reference material — read them for background
+and motivation, but do not assume the implementation follows them
+exactly. Divergences from the paper are intentional and documented in
+the relevant project plan or reference doc.
+
+### `Documents/SoftwareDocs/vendor/`
+Third-party reference material (e.g. eegoSports manuals under
+`vendor/antneuro/`).
+
+When a feature is derived from a paper in `SoftwareDocs/studies/`,
+note the reference in the commit message and relevant docstrings.
 
 ---
 

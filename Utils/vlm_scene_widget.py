@@ -7,7 +7,7 @@ instead of receiving rendered overlay JPEGs from Windows, the widget
 pulls bundles from the local frame_relay, pulls JSON detection state
 from the Windows-hosted vlm_service.py over UDP 5589 subscribe, and
 composites the two locally via Utils.scene_overlay_renderer.
-SoftwareDocs/GPU_Service_Render_Layer_Refactor.md §4.3 / §4.4.
+SoftwareDocs/projects/harmony-bci/gpu-service/render-layer-refactor-plan.md §4.3 / §4.4.
 
 Threads owned by this widget:
 

@@ -210,7 +210,7 @@ NEON_COMPANION_HOST = ""
 #              server. Production topology: Linux runs the relay against
 #              the Neon device, Windows runs the perception services with
 #              --frame-source=remote.
-# Reference: SoftwareDocs/GPU_Service_Host_Architecture_Plan.md §3.4.
+# Reference: SoftwareDocs/projects/harmony-bci/gpu-service/architecture-plan.md §3.4.
 # Machine-local — override in config_local.py.
 PERCEPTION_FRAME_SOURCE = "local"
 
