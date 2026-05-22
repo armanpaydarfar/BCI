@@ -698,6 +698,37 @@ def main():
                 f"available={list(config.TIAGOBOT_TRAJECTORY)}"
             )
 
+        # === Phase 2.5: Abort MI trial on gaze failure ===
+        # Per brief Phase 2 + operator confirmation 2026-05-22: when
+        # the user IS looking at one of the 9 letters (the protocol
+        # guarantee), `_gaze_selected_letter` is None only on a real
+        # failure — zero confidence-passing samples (Neon disconnected,
+        # glasses off, etc.) or gaze landed implausibly far from any
+        # centroid (calibration drift). Both are abort-worthy on MI.
+        # Rest trials are untouched: the letter is never consumed, so a
+        # None letter has no effect on the trial outcome.
+        if mode == 0 and _gaze_selected_letter is None:
+            logger.log_event(
+                "MI trial aborted: gaze did not resolve to a letter "
+                "(no data or distance gate). Skipping baseline + "
+                "feedback for this trial; advancing to next."
+            )
+            display_multiple_messages_with_udp(
+                messages=["Trial aborted", "No gaze target"],
+                colors=[config.orange, config.white],
+                offsets=[-100, 100],
+                duration=float(config.TIME_STATIONARY),
+                udp_messages=None,
+                udp_socket=udp_socket_robot,
+                udp_ip=config.UDP_ROBOT["IP"],
+                udp_port=config.UDP_ROBOT["PORT"],
+                logger=logger,
+                eeg_state=eeg_state,
+            )
+            display_fixation_period(duration=3, eeg_state=eeg_state)
+            current_trial += 1
+            continue
+
         # === Phase 3: Mode-reveal render (cross + trial-prep shapes) ===
         # Byte-identical draw calls to the parent driver
         # (ExperimentDriver_Online_Tiagobot.py:~445-451) so the
@@ -791,19 +822,22 @@ def main():
                 send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["ROBOT_BEGIN"], logger=logger)
 
             elif prediction == 200 and _gaze_selected_letter is None:
-                # MI correct but gaze didn't resolve to a letter. Per
-                # plan §6.3 step 4 (user-confirmed 2026-05-19): skip
-                # the GO and log. No random fallback — failing visibly
-                # is the whole point of this branch. The trial still
-                # shows feedback to keep the cadence steady.
+                # Defensive: MI-correct but no letter. Normally
+                # unreachable — Phase 2.5 aborts MI trials with a None
+                # letter before baseline/show_feedback runs (so we
+                # never reach this elif). Kept as a safety net for
+                # future refactors that might bypass the abort, and to
+                # honor the brief's outcome matrix which preserves
+                # this defensive branch explicitly.
                 messages = ["Correct", "No gaze target"]
                 colors = [config.green, config.orange]
                 offsets = [-100, 100]
                 duration = config.TIME_STATIONARY
                 should_hold_and_classify = False
                 logger.log_event(
-                    "Prediction correct for MI but gaze did not resolve "
-                    "to a letter — skipping Tiagobot GO for this trial."
+                    "Defensive branch hit: MI-correct with no letter. "
+                    "Phase 2.5 abort should have prevented this — "
+                    "investigate if it fires."
                 )
 
             elif prediction is None:  # Ambiguous
