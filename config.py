@@ -288,6 +288,11 @@ TIAGOBOT_USE_GLOVE = True
 # starting too early means the actuator retracts mid-grip. Tune to match
 # the glove's actual close duration on this hardware.
 TIAGOBOT_GRIP_HOLD_DURATION = 5
+# Seconds the gaze driver holds the cross+shapes "mode reveal" frame on
+# screen between the Phase 2 gaze window and the Phase 4 show_feedback
+# call. Long enough for the user to register MI vs Rest from the cue
+# color; short enough that closed-loop pacing stays reasonable.
+TIAGOBOT_MODE_REVEAL_DURATION = 1.5
 
 # Tiagobot gaze calibration NPZ produced by tiago_gaze_calibration_exec.py.
 # Consumed by ExperimentDriver_Online_Tiagobot_Gaze.py to map averaged

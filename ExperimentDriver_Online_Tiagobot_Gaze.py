@@ -3,21 +3,21 @@ ExperimentDriver_Online_Tiagobot_Gaze.py
 
 Gaze-driven variant of ExperimentDriver_Online_Tiagobot.py — same trial
 loop, but per-trial letter selection comes from the user's gaze
-(classified against a calibration NPZ) instead of random.choice.
+classified against an on-screen 3x3 letter grid (head-fixed,
+eyes-only) instead of random.choice.
 
-Derived from ExperimentDriver_Online_Tiagobot.py @ b340e91 on
-feature/tiagobot-gaze-integration (2026-05-19). The parent driver MUST
-remain unchanged on this branch — it is the known-good fallback. If
-the parent receives a bug fix upstream (trial-loop ordering change,
-grip-hold tweak, etc.), port the same change here too. The two are
-expected to stay in sync except for the gaze-selection block in main().
+Pivoted 2026-05-22 from LSL-resolved physical-board gaze to the
+head-fixed on-screen path validated in tools/gaze_to_tiago_test.py.
+The physical-board / pylsl 'Gaze' inlet variant is gone — recoverable
+via `git revert` of commit feature/tiagobot-gaze-integration HEAD~1.
 
-Flow per MI-success trial (changes vs parent in CAPS):
-1. RUN A PER-TRIAL GAZE SELECTION WINDOW
-   (run_tiago_gaze_selection_window — collects (t, x_norm, y_norm,
-   conf) samples from the Pupil Labs Neon LSL stream).
-2. AVERAGE THE WINDOW AND CLASSIFY TO ONE OF A-I VIA
-   Utils.tiagobot_gaze.classify_gaze_to_letter.
+Flow per trial (changes vs parent in CAPS):
+1. RENDER THE 3x3 LETTER GRID + CENTRAL FIXATION CROSS while the
+   trial-start countdown ticks (user holds head pointed at cross).
+2. RUN A PER-TRIAL GAZE SELECTION WINDOW (head-fixed on-screen):
+   read GazeSystem snapshots for TIAGOBOT_GAZE_SELECTION_WINDOW
+   seconds, median (x, y) over confidence-passing samples, 2D centroid
+   1-NN classify via Utils.tiagobot_gaze.classify_gaze_to_letter.
 3. If classification fails (no centroid within max distance, or no
    valid samples) → log + skip the GO for this trial (no random
    fallback — fail visibly per plan §6.3 step 4).
@@ -32,7 +32,8 @@ The gaze layer is read-only with respect to Utils/tiagobot.py (Tier 1).
 All gaze logic lives in Utils/tiagobot_gaze.py (pure functions) and
 the inline run_tiago_gaze_selection_window helper below.
 
-Layout source of truth: Documents/SoftwareDocs/Tiagobot_Gaze_AI_Layout.md.
+Layout source of truth: Utils/tiagobot_gaze.grid_centroids_norm()
+(same layout the calibration UI in tiago_gaze_calibration_exec.py uses).
 Calibration produced by: tiago_gaze_calibration_exec.py.
 """
 
@@ -90,8 +91,13 @@ from Utils.tiagobot_gaze import (
     load_centroids as tiago_gaze_load_centroids,
     classify_gaze_to_letter as tiago_gaze_classify,
     average_gaze_over_window as tiago_gaze_average,
+    grid_centroids_norm as tiago_grid_centroids_norm,
     LETTERS as TIAGO_LETTERS,
 )
+
+# Pupil Labs Neon realtime API wrapper. Headless config (no display, no
+# CV, no tracker) — the driver only consumes gaze snapshots.
+from Utils.gaze.gaze_system import GazeConfig, GazeSystem
 
 import config
 
@@ -133,6 +139,7 @@ loggable_fields = [
     # Tiagobot-specific
     "TIAGOBOT_PORT", "TIAGOBOT_BAUD", "TIAGOBOT_TRAJECTORY",
     "TIAGOBOT_USE_GLOVE", "TIAGOBOT_GRIP_HOLD_DURATION",
+    "TIAGOBOT_MODE_REVEAL_DURATION",
     "SIMULATION_MODE",
     # Tiagobot gaze-specific
     "TIAGOBOT_GAZE_CALIBRATION_PATH",
@@ -307,19 +314,24 @@ if _missing_letters:
 
 
 # ============================================================
-# GAZE LSL STREAM (Pupil Labs Neon)
+# ON-SCREEN GAZE CONSTANTS
 # ============================================================
-# Resolved once at startup so the per-trial selection window only pulls
-# from an inlet — keeps the trial loop allocation-free.
-# Channel layout (matches harmony_calibration_exec.py:194-197):
-#   sample[0]  gaze_x (pixels, 0..GAZE_SAMPLE_WIDTH)
-#   sample[1]  gaze_y (pixels, 0..GAZE_SAMPLE_HEIGHT)
-#   sample[15] confidence
-TIAGO_NEON_X_INDEX = 0
-TIAGO_NEON_Y_INDEX = 1
-TIAGO_NEON_CONF_INDEX = 15
+# Scene-camera pixel scale (Neon constants — same shape used by the
+# calibration script and tools/gaze_to_tiago_test.py). Normalized
+# (gaze_px / sample_dim) gives the (x, y) the calibration centroids
+# live in.
 TIAGO_GAZE_SAMPLE_W = float(getattr(config, "GAZE_SAMPLE_WIDTH", 1600.0))
 TIAGO_GAZE_SAMPLE_H = float(getattr(config, "GAZE_SAMPLE_HEIGHT", 1200.0))
+
+# Cap the gaze-selection snapshot loop so EEG / pygame stay responsive
+# during the 4 s window. Matches tools/gaze_to_tiago_test.py.
+TIAGO_GAZE_SNAPSHOT_POLL_HZ = 60.0
+
+# Render layout for the 3x3 grid — must match the centroids the
+# calibration NPZ was captured against (same call as
+# tiago_gaze_calibration_exec.py uses, so on-screen letter positions
+# align with the calibrated scene-pixel centroids).
+TIAGO_GRID_RENDER_CENTROIDS = tiago_grid_centroids_norm()
 
 
 logger.log_event("finding training dataset . . .")
@@ -365,11 +377,16 @@ _RC.Prev_T_beta = Prev_T_beta
 _RC.counter_beta = counter_beta
 
 
+# GazeSystem handle — populated in main() once Neon is connected, read
+# back in _hardware_cleanup so the finally-block can stop it.
+_tiago_gaze_system = None
+
+
 def _hardware_cleanup():
-    """Best-effort release of the Tiagobot serial port and (if present)
-    the glove port. Runs on every exit path of main() — including
-    SystemExit from runtime_common when the operator closes the pygame
-    window mid-session."""
+    """Best-effort release of the Tiagobot serial port, the glove port
+    (if present), and the Neon GazeSystem. Runs on every exit path of
+    main() — including SystemExit from runtime_common when the operator
+    closes the pygame window mid-session."""
     try:
         tiago_close_port(tiago, logger)
     except Exception as e:
@@ -379,38 +396,122 @@ def _hardware_cleanup():
             arduino.close()
         except Exception as e:
             logger.log_event(f"Glove close error: {e}", level="error")
+    if _tiago_gaze_system is not None:
+        try:
+            _tiago_gaze_system.stop()
+        except Exception as e:
+            logger.log_event(f"GazeSystem stop error: {e}", level="error")
     try:
         pygame.quit()
     except Exception:
         pass
 
 
-def run_tiago_gaze_selection_window(gaze_inlet, eeg_state, duration_s):
-    """Accumulate gaze samples from the Neon LSL inlet for `duration_s`
-    seconds while keeping pygame + EEG state alive.
+def _tiago_draw_grid_with_cross(countdown_text=None):
+    """Render the 3x3 A-I grid + central fixation cross on `screen`.
 
-    Structurally analogous to
-    ExperimentDriver_Online_GazeTracking.py:404-543
-    (`run_gaze_selection_window`), but stripped to just sample
-    accumulation — the Tiagobot variant has no object-tracker, no dwell
-    contest, and no VLM bridge. Output is a flat list of
-    `(t, x_norm, y_norm, conf)` tuples for
-    `Utils.tiagobot_gaze.average_gaze_over_window`.
+    Mirrors tools/gaze_to_tiago_test.py:_draw_grid_with_cross — same
+    fonts, same colors, same per-letter normalized centroids. The
+    runtime layout must align byte-for-byte with the calibration UI
+    (tiago_gaze_calibration_exec._draw_grid) so the scene-pixel
+    centroids the NPZ stores still correspond to the rendered letter
+    positions at runtime.
 
-    LSL channel indices match the calibration script's contract:
-    sample[0]=x_px, sample[1]=y_px, sample[15]=conf. Pixels are
-    normalized against GAZE_SAMPLE_WIDTH / HEIGHT so the runtime values
-    are directly comparable to the calibration centroids.
+    `countdown_text` is an optional bottom-of-screen status line.
+    """
+    screen.fill(config.black)
+
+    font = pygame.font.SysFont(None, 96)
+    for ch in TIAGO_LETTERS:
+        cx_n, cy_n = TIAGO_GRID_RENDER_CENTROIDS[ch]
+        cx, cy = int(cx_n * screen_width), int(cy_n * screen_height)
+        surf = font.render(ch, True, (180, 180, 180))
+        rect = surf.get_rect(center=(cx, cy))
+        screen.blit(surf, rect)
+
+    # Central yellow-green cross — head-pose anchor. Matches the
+    # calibration script's cross (color + 18 px arm + 3 px stroke).
+    cx, cy = screen_width // 2, screen_height // 2
+    arm = 18
+    cross_color = (200, 200, 80)
+    pygame.draw.line(screen, cross_color, (cx - arm, cy), (cx + arm, cy), 3)
+    pygame.draw.line(screen, cross_color, (cx, cy - arm), (cx, cy + arm), 3)
+
+    if countdown_text:
+        font_cd = pygame.font.SysFont(None, 40)
+        surf = font_cd.render(countdown_text, True, (200, 200, 200))
+        rect = surf.get_rect(center=(screen_width // 2, screen_height - 40))
+        screen.blit(surf, rect)
+
+    pygame.display.flip()
+
+
+def _tiago_read_latest_valid_snapshot(gs, last_unix_t):
+    """Pull one fresh, worn, finite gaze sample from `gs`.
+
+    Returns `((t_unix, x_norm, y_norm, conf_or_worn, depth_cm), new_last_t)`
+    on success, `(None, new_last_t)` if the snapshot is stale, the
+    glasses are off, the gaze pixel is non-finite, or no snapshot is
+    available yet. `conf_or_worn` is `1.0` (treat-as-confidence for
+    Utils.tiagobot_gaze.average_gaze_over_window — the realtime API
+    does not expose per-sample confidence; we filter on the worn flag
+    instead, matching the calibration UI's contract). `depth_cm` is
+    NaN when vergence is invalid.
+
+    Identical dedupe/filter contract to
+    tools/gaze_to_tiago_test.py:_read_latest_valid.
+    """
+    snap = gs.get_snapshot(include_objects=False, include_frame=False)
+    if not snap or not snap.get("ok"):
+        return None, last_unix_t
+    t = snap.get("unix_t")
+    if t is None:
+        return None, last_unix_t
+    if last_unix_t is not None and t <= last_unix_t:
+        return None, last_unix_t
+    if not bool(snap.get("worn")):
+        return None, float(t)
+    px = snap.get("gaze_px_raw")
+    if px is None:
+        return None, float(t)
+    x_px, y_px = float(px[0]), float(px[1])
+    if not (np.isfinite(x_px) and np.isfinite(y_px)):
+        return None, float(t)
+    depth_cm = float("nan")
+    if bool(snap.get("depth_valid")):
+        d = snap.get("depth_cm")
+        if d is not None:
+            df = float(d)
+            if np.isfinite(df):
+                depth_cm = df
+    return (
+        float(t),
+        x_px / TIAGO_GAZE_SAMPLE_W,
+        y_px / TIAGO_GAZE_SAMPLE_H,
+        1.0,
+        depth_cm,
+    ), float(t)
+
+
+def run_tiago_gaze_selection_window(gs, eeg_state, duration_s):
+    """Accumulate Neon gaze snapshots for `duration_s` seconds while
+    rendering the 3x3 grid + cross and keeping EEG state alive.
+
+    Pivoted 2026-05-22 from the LSL 'Gaze' inlet to the head-fixed
+    on-screen path (`GazeSystem.get_snapshot()`). Pixel coords are
+    normalized against GAZE_SAMPLE_WIDTH/HEIGHT so the runtime values
+    are directly comparable to the calibration centroids. Output is a
+    flat list of `(t, x_norm, y_norm, worn_as_conf, depth_cm)` tuples
+    for `Utils.tiagobot_gaze.average_gaze_over_window`.
 
     Returns None if the operator quits the pygame window mid-window;
     otherwise the (possibly empty) sample list.
     """
     logger.log_event(f"Starting Tiagobot gaze selection window ({duration_s:.2f} s).")
-    screen.fill(config.black)
-    draw_fixation_cross(screen_width, screen_height)
-    pygame.display.flip()
 
     samples = []
+    last_t = None
+    poll_s = 1.0 / TIAGO_GAZE_SNAPSHOT_POLL_HZ
     start_t = time.monotonic()
     end_t = start_t + float(duration_s)
 
@@ -422,28 +523,18 @@ def run_tiago_gaze_selection_window(gaze_inlet, eeg_state, duration_s):
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 return None
 
-        # Drain the LSL inlet — keep all samples (not just latest) so
-        # the average / median over the window has the full picture.
-        while True:
-            sample, t_unix = gaze_inlet.pull_sample(timeout=0.0)
-            if not sample:
-                break
-            try:
-                x_px = float(sample[TIAGO_NEON_X_INDEX])
-                y_px = float(sample[TIAGO_NEON_Y_INDEX])
-                conf = float(sample[TIAGO_NEON_CONF_INDEX])
-            except (IndexError, TypeError, ValueError):
-                continue
-            if not (np.isfinite(x_px) and np.isfinite(y_px) and np.isfinite(conf)):
-                continue
-            samples.append((
-                float(t_unix),
-                x_px / TIAGO_GAZE_SAMPLE_W,
-                y_px / TIAGO_GAZE_SAMPLE_H,
-                conf,
-            ))
-        # Cooperative yield so we don't hog the GIL against eeg_state.update().
-        time.sleep(0.005)
+        s, last_t = _tiago_read_latest_valid_snapshot(gs, last_t)
+        if s is not None:
+            samples.append(s)
+
+        remaining = end_t - time.monotonic()
+        _tiago_draw_grid_with_cross(
+            countdown_text=(
+                f"Eyes on chosen letter — {remaining:0.1f}s   "
+                f"({len(samples)} samples)"
+            ),
+        )
+        time.sleep(poll_s)
 
     logger.log_event(
         f"Tiagobot gaze selection window done: {len(samples)} samples in "
@@ -469,18 +560,21 @@ def main():
     inlet = StreamInlet(streams[0])
     logger.log_event("✅ EEG stream detected and inlet established.")
 
-    logger.log_event("Resolving Pupil Labs Neon gaze stream via LSL...")
-    gaze_streams = resolve_stream('type', 'Gaze')
-    if not gaze_streams:
-        logger.log_event(
-            "❌ No LSL stream of type='Gaze' found — required for the "
-            "gaze-driven Tiagobot driver. Start Neon Companion + LSL "
-            "relay before launching this driver.",
-            level="error",
-        )
-        sys.exit(1)
-    gaze_inlet = StreamInlet(gaze_streams[0])
-    logger.log_event(f"✅ Gaze stream connected: {gaze_streams[0].name()}")
+    # Pupil Labs Neon via the realtime API (no LSL outlet on the phone).
+    # One GazeSystem instance per session — start here, stop in
+    # _hardware_cleanup. Headless flags: the driver only reads gaze
+    # snapshots, no scene CV / display / object tracker needed.
+    global _tiago_gaze_system
+    neon_host = str(getattr(config, "NEON_COMPANION_HOST", "") or "")
+    logger.log_event(
+        f"Starting GazeSystem (Neon Companion host={neon_host!r}, mDNS if empty)..."
+    )
+    _tiago_gaze_system = GazeSystem(GazeConfig(
+        enable_prints=False, enable_display=False, enable_cv=False,
+        use_tracker=False, neon_host=neon_host,
+    ))
+    _tiago_gaze_system.start()
+    logger.log_event("✅ GazeSystem started.")
 
     eeg_state = EEGStreamState(inlet=inlet, config=config, logger=logger)
     logger.log_event("EEGStreamState object created — ready to pull and process data.")
@@ -501,16 +595,17 @@ def main():
     while running and current_trial < len(trial_sequence):
         logger.log_event(f"--- Trial {current_trial+1}/{len(trial_sequence)} START ---")
 
-        # === Fixation cross + trial UI ===
-        screen.fill(config.black)
-        draw_fixation_cross(screen_width, screen_height)
-        draw_arrow_fill(0, screen_width, screen_height)
-        draw_ball_fill(0, screen_width, screen_height)
-        draw_time_balls(0, screen_width, screen_height)
-        pygame.display.flip()
-        logger.log_event("Initial screen rendered: fixation cross, bar, ball, and time indicators.")
+        # === Phase 1: render 3x3 grid + central fixation cross ===
+        # The user keeps their head pointed at the cross from now until
+        # the end of the gaze window — the head-fixed on-screen mode
+        # depends on a stable head pose between calibration and runtime.
+        _tiago_draw_grid_with_cross(countdown_text="SPACE to start trial")
 
-        # === Countdown + user input ===
+        # === Countdown + user input (Phase 1 timing) ===
+        # Same backdoor + SPACE handling as the parent driver, but the
+        # frame on screen is the grid+cross — no draw_time_balls here
+        # (those belong to the Phase 3 mode-reveal UI). Auto-countdown
+        # runs at the parent's 3 s constant when config.TIMING is on.
         backdoor_mode = None
         waiting_for_press = True
         countdown_start = None
@@ -537,8 +632,6 @@ def main():
                     logger.log_event("Countdown timer initiated.")
 
                 elapsed_time = pygame.time.get_ticks() - countdown_start
-                draw_time_balls(1, screen_width, screen_height)
-                pygame.display.flip()
 
                 if elapsed_time >= countdown_duration:
                     logger.log_event("Countdown expired — proceeding to trial.")
@@ -550,6 +643,9 @@ def main():
             break
 
         # === Trial mode selection ===
+        # Selected BEFORE Phase 2 so the gaze window still runs for
+        # both modes (uniform trial pacing), but the mode-reveal UI in
+        # Phase 3 can be primed with the right cue color.
         if backdoor_mode is not None:
             mode = backdoor_mode
             logger.log_event(f"Backdoor override activated: {'MI' if mode == 0 else 'REST'}")
@@ -557,46 +653,76 @@ def main():
             mode = trial_sequence[current_trial]
             logger.log_event(f"Trial mode selected from sequence: {'MI' if mode == 0 else 'REST'}")
 
-        # === Gaze selection window (MI trials only) ===
-        # Decide which letter the subject is looking at BEFORE the MI
-        # classification window starts. Gaze classification on REST
-        # trials is wasted effort (no GO will be sent regardless), so
-        # we skip the window entirely on those trials.
+        # === Phase 2: Gaze selection window (every trial) ===
+        # Runs on every trial so the user's behaviour is identical for
+        # MI and Rest — they always pick a letter, the driver only
+        # consumes it on MI-correct trials. Per brief 2026-05-22: a
+        # uniform Phase 2 keeps trial timing predictable and removes
+        # the "did this trial have a gaze window?" cue.
         _gaze_selected_letter = None
-        if mode == 0:
-            _gaze_samples = run_tiago_gaze_selection_window(
-                gaze_inlet=gaze_inlet,
-                eeg_state=eeg_state,
-                duration_s=float(getattr(config, "TIAGOBOT_GAZE_SELECTION_WINDOW", 4.0)),
+        _gaze_samples = run_tiago_gaze_selection_window(
+            gs=_tiago_gaze_system,
+            eeg_state=eeg_state,
+            duration_s=float(getattr(config, "TIAGOBOT_GAZE_SELECTION_WINDOW", 4.0)),
+        )
+        if _gaze_samples is None:
+            # Operator quit / ESC during the window.
+            running = False
+            logger.log_event("Experiment terminated during gaze selection window.")
+            break
+        _gaze_avg = tiago_gaze_average(
+            _gaze_samples,
+            conf_threshold=float(getattr(config, "TIAGOBOT_GAZE_CONFIDENCE_THRESHOLD", 0.7)),
+        )
+        if _gaze_avg is None:
+            logger.log_event(
+                "Gaze window produced no confidence-passing samples; "
+                "GO will be skipped on this trial."
             )
-            if _gaze_samples is None:
-                # Operator quit / ESC during the window.
-                running = False
-                logger.log_event("Experiment terminated during gaze selection window.")
-                break
-            _gaze_avg = tiago_gaze_average(
-                _gaze_samples,
-                conf_threshold=float(getattr(config, "TIAGOBOT_GAZE_CONFIDENCE_THRESHOLD", 0.7)),
+        else:
+            gx, gy, _gz = _gaze_avg
+            # 2D centroid 1-NN. Depth axis is disabled
+            # (gaze_depth_cm=None) — for head-fixed on-screen mode the
+            # (x, y) signal is well-separated and depth adds only noise.
+            _gaze_selected_letter = tiago_gaze_classify(
+                gx, gy, _tiago_centroids,
+                gaze_depth_cm=None,
+                available_letters=config.TIAGOBOT_TRAJECTORY,
+                max_dist_norm=float(getattr(config, "TIAGOBOT_GAZE_MAX_DIST_NORM", 0.2))
+                if getattr(config, "TIAGOBOT_GAZE_MAX_DIST_NORM", None) is not None
+                else None,
             )
-            if _gaze_avg is None:
-                logger.log_event(
-                    "Gaze window produced no confidence-passing samples; "
-                    "GO will be skipped on this trial."
-                )
-            else:
-                gx, gy = _gaze_avg
-                _gaze_selected_letter = tiago_gaze_classify(
-                    gx, gy, _tiago_centroids,
-                    available_letters=config.TIAGOBOT_TRAJECTORY,
-                    max_dist_norm=float(getattr(config, "TIAGOBOT_GAZE_MAX_DIST_NORM", 0.2))
-                    if getattr(config, "TIAGOBOT_GAZE_MAX_DIST_NORM", None) is not None
-                    else None,
-                )
-                logger.log_event(
-                    f"Gaze classification — avg_norm=({gx:.3f}, {gy:.3f}), "
-                    f"letter={_gaze_selected_letter!r}, "
-                    f"available={list(config.TIAGOBOT_TRAJECTORY)}"
-                )
+            logger.log_event(
+                f"Gaze classification — avg_norm=({gx:.3f}, {gy:.3f}), "
+                f"letter={_gaze_selected_letter!r}, "
+                f"available={list(config.TIAGOBOT_TRAJECTORY)}"
+            )
+
+        # === Phase 3: Mode-reveal render (cross + trial-prep shapes) ===
+        # Byte-identical draw calls to the parent driver
+        # (ExperimentDriver_Online_Tiagobot.py:~445-451) so the
+        # mode-reveal frame the user sees is unchanged by the gaze
+        # pivot. Held for a short window before show_feedback begins so
+        # the user has time to register MI vs Rest.
+        screen.fill(config.black)
+        draw_fixation_cross(screen_width, screen_height)
+        draw_arrow_fill(0, screen_width, screen_height)
+        draw_ball_fill(0, screen_width, screen_height)
+        draw_time_balls(0, screen_width, screen_height)
+        pygame.display.flip()
+        logger.log_event("Mode-reveal frame rendered: fixation cross, bar, ball, and time indicators.")
+
+        _reveal_end = time.time() + float(
+            getattr(config, "TIAGOBOT_MODE_REVEAL_DURATION", 1.5)
+        )
+        _reveal_clock = pygame.time.Clock()
+        while time.time() < _reveal_end:
+            eeg_state.update()
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    raise SystemExit
+            _reveal_clock.tick(60)
 
         # === Baseline ===
         try:
