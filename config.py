@@ -339,6 +339,22 @@ TIAGOBOT_GAZE_DEPTH_WEIGHT_CM_INV = 0.01
 # classifier (`classify_gaze_to_letter`), which still uses
 # `TIAGOBOT_GAZE_MAX_DIST_NORM`.
 TIAGOBOT_GAZE_MAX_MAHAL_DIST = None
+# Continuous-dwell letter selection. The Tiagobot gaze driver now
+# classifies every Neon snapshot in-loop and accumulates "continuous
+# dwell" on the current letter; switching letters, looking off-grid
+# (no centroid within TIAGOBOT_GAZE_MAX_DIST_NORM), or losing
+# tracking for longer than the stale gap resets the counter. Selection
+# fires when continuous dwell crosses TIAGOBOT_GAZE_DWELL_HIT_SEC.
+# TIAGOBOT_GAZE_SELECTION_TIMEOUT_SEC bounds how long we wait for a
+# hit before returning no-selection (Phase 2.5 aborts MI trials in
+# that case). TIAGOBOT_GAZE_CONFIRM_SELECTION_SEC is the duration of
+# the explicit "Selected: <letter>" screen that follows a successful
+# selection so the subject sees the chosen letter before Phase 3 /
+# baseline begins — most important on REST trials where the action
+# feedback never names the letter.
+TIAGOBOT_GAZE_DWELL_HIT_SEC = 2.0
+TIAGOBOT_GAZE_SELECTION_TIMEOUT_SEC = 12.0
+TIAGOBOT_GAZE_CONFIRM_SELECTION_SEC = 1.5
 
 # =============================================================================
 # Display colors (RGB)

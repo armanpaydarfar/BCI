@@ -86,11 +86,13 @@ from Utils.tiagobot import (
     TARGET_REACHED_MARKER, HOMED_MARKER,
 )
 
-# Tiagobot gaze helpers (pure functions; not Tier 1).
+# Tiagobot gaze helpers (pure functions; not Tier 1). The
+# continuous-dwell selection classifies every snapshot in-loop, so
+# `average_gaze_over_window` (the post-window median used by the
+# prior fixed-window flow) is no longer needed here.
 from Utils.tiagobot_gaze import (
     load_centroids as tiago_gaze_load_centroids,
     classify_gaze_to_letter as tiago_gaze_classify,
-    average_gaze_over_window as tiago_gaze_average,
     grid_centroids_norm as tiago_grid_centroids_norm,
     LETTERS as TIAGO_LETTERS,
 )
@@ -146,6 +148,9 @@ loggable_fields = [
     "TIAGOBOT_GAZE_SELECTION_WINDOW",
     "TIAGOBOT_GAZE_CONFIDENCE_THRESHOLD",
     "TIAGOBOT_GAZE_MAX_DIST_NORM",
+    "TIAGOBOT_GAZE_DWELL_HIT_SEC",
+    "TIAGOBOT_GAZE_SELECTION_TIMEOUT_SEC",
+    "TIAGOBOT_GAZE_CONFIRM_SELECTION_SEC",
     "GAZE_SAMPLE_WIDTH", "GAZE_SAMPLE_HEIGHT",
 ]
 config_log_subset = {
@@ -327,6 +332,24 @@ TIAGO_GAZE_SAMPLE_H = float(getattr(config, "GAZE_SAMPLE_HEIGHT", 1200.0))
 # during the 4 s window. Matches tools/gaze_to_tiago_test.py.
 TIAGO_GAZE_SNAPSHOT_POLL_HZ = 60.0
 
+# Continuous-dwell selection parameters. Resolved once at module load
+# and cached as module-level floats so the realtime loop doesn't pay
+# a getattr() per frame.
+TIAGO_GAZE_DWELL_HIT_SEC = float(getattr(config, "TIAGOBOT_GAZE_DWELL_HIT_SEC", 2.0))
+TIAGO_GAZE_TIMEOUT_SEC = float(getattr(config, "TIAGOBOT_GAZE_SELECTION_TIMEOUT_SEC", 12.0))
+TIAGO_GAZE_CONFIRM_SEC = float(getattr(config, "TIAGOBOT_GAZE_CONFIRM_SELECTION_SEC", 1.5))
+TIAGO_GAZE_CONF_THRESHOLD = float(getattr(config, "TIAGOBOT_GAZE_CONFIDENCE_THRESHOLD", 0.7))
+TIAGO_GAZE_MAX_DIST_NORM = (
+    float(config.TIAGOBOT_GAZE_MAX_DIST_NORM)
+    if getattr(config, "TIAGOBOT_GAZE_MAX_DIST_NORM", None) is not None
+    else None
+)
+# If no fresh, worn, finite snapshot arrives for this long, treat the
+# gaze as lost and reset the dwell counter — a brief tracker hiccup
+# (sub-frame) shouldn't reset, but a sustained dropout (glasses off,
+# blink longer than half a second) should.
+TIAGO_GAZE_STALE_GAP_SEC = 0.5
+
 # Render layout for the 3x3 grid — must match the centroids the
 # calibration NPZ was captured against (same call as
 # tiago_gaze_calibration_exec.py uses, so on-screen letter positions
@@ -493,54 +516,276 @@ def _tiago_read_latest_valid_snapshot(gs, last_unix_t):
     ), float(t)
 
 
-def run_tiago_gaze_selection_window(gs, eeg_state, duration_s):
-    """Accumulate Neon gaze snapshots for `duration_s` seconds while
-    rendering the 3x3 grid + cross and keeping EEG state alive.
+def _tiago_draw_progress_bar(progress, y, fill_color):
+    """Top-pinned countdown bar used by the selection screen. Same
+    proportions as Harmony's selection bar (55% screen width, 28 px
+    tall, white outline)."""
+    bar_w = int(screen_width * 0.55)
+    bar_x = (screen_width - bar_w) // 2
+    bar_h = 28
+    outer = pygame.Rect(bar_x, y, bar_w, bar_h)
+    inner = pygame.Rect(bar_x, y, int(bar_w * max(0.0, min(1.0, progress))), bar_h)
+    pygame.draw.rect(screen, (60, 60, 60), outer)
+    pygame.draw.rect(screen, fill_color, inner)
+    pygame.draw.rect(screen, config.white, outer, 2)
 
-    Pivoted 2026-05-22 from the LSL 'Gaze' inlet to the head-fixed
-    on-screen path (`GazeSystem.get_snapshot()`). Pixel coords are
-    normalized against GAZE_SAMPLE_WIDTH/HEIGHT so the runtime values
-    are directly comparable to the calibration centroids. Output is a
-    flat list of `(t, x_norm, y_norm, worn_as_conf, depth_cm)` tuples
-    for `Utils.tiagobot_gaze.average_gaze_over_window`.
 
-    Returns None if the operator quits the pygame window mid-window;
-    otherwise the (possibly empty) sample list.
+def _tiago_draw_centered_text(text, y, color, font_size):
+    font = pygame.font.SysFont(None, font_size)
+    surf = font.render(text, True, color)
+    rect = surf.get_rect(center=(screen_width // 2, y))
+    screen.blit(surf, rect)
+
+
+def _tiago_draw_letter_grid(highlight_letter, available_set):
+    """Render the 3x3 letter grid at the calibration-aligned nominal
+    centroids. `highlight_letter` (if not None) is drawn larger and in
+    config.green; letters not in `available_set` are dimmed so the
+    user can see at a glance which ones are eligible
+    (config.TIAGOBOT_TRAJECTORY).
+
+    Cell centers are unchanged from `_tiago_draw_grid_with_cross` — the
+    calibration NPZ centroids correspond to these positions, so visual
+    size and color have no effect on classification."""
+    for ch in TIAGO_LETTERS:
+        cx_n, cy_n = TIAGO_GRID_RENDER_CENTROIDS[ch]
+        cx, cy = int(cx_n * screen_width), int(cy_n * screen_height)
+        if ch == highlight_letter:
+            color = config.green
+            font_size = 132
+        elif ch in available_set:
+            color = (180, 180, 180)
+            font_size = 96
+        else:
+            color = (90, 90, 90)
+            font_size = 96
+        font = pygame.font.SysFont(None, font_size)
+        surf = font.render(ch, True, color)
+        rect = surf.get_rect(center=(cx, cy))
+        screen.blit(surf, rect)
+
+
+def _tiago_draw_fixation_cross():
+    """Yellow-green head-pose anchor cross. Same color (200, 200, 80) /
+    18 px arm / 3 px stroke as `_tiago_draw_grid_with_cross` so the
+    head-fixed protocol's visual anchor is preserved during the dwell
+    UI."""
+    cx, cy = screen_width // 2, screen_height // 2
+    arm = 18
+    pygame.draw.line(screen, (200, 200, 80), (cx - arm, cy), (cx + arm, cy), 3)
+    pygame.draw.line(screen, (200, 200, 80), (cx, cy - arm), (cx, cy + arm), 3)
+
+
+def _tiago_draw_selection_screen(progress, dwell_sec, current_letter,
+                                  available_set):
+    """Live continuous-dwell screen.
+
+      top:    progress bar + "Hold gaze: X.Xs / Y.Ys" label
+      center: 3x3 letter grid (current letter highlighted, off-trajectory
+              letters dimmed) + central yellow-green fixation cross
+      bottom: "Looking at: <letter>" or "Looking at: —"
     """
-    logger.log_event(f"Starting Tiagobot gaze selection window ({duration_s:.2f} s).")
+    screen.fill(config.black)
 
-    samples = []
-    last_t = None
-    poll_s = 1.0 / TIAGO_GAZE_SNAPSHOT_POLL_HZ
-    start_t = time.monotonic()
-    end_t = start_t + float(duration_s)
+    bar_y = 60
+    fill_color = config.green if current_letter is not None else (180, 180, 180)
+    _tiago_draw_progress_bar(progress, y=bar_y, fill_color=fill_color)
+    _tiago_draw_centered_text(
+        f"Hold gaze: {dwell_sec:.1f}s / {TIAGO_GAZE_DWELL_HIT_SEC:.1f}s",
+        y=bar_y + 50, color=config.white, font_size=32,
+    )
 
+    _tiago_draw_letter_grid(current_letter, available_set)
+    _tiago_draw_fixation_cross()
+
+    if current_letter is not None:
+        _tiago_draw_centered_text(
+            f"Looking at: {current_letter}",
+            y=screen_height - 100, color=config.green, font_size=64,
+        )
+    else:
+        _tiago_draw_centered_text(
+            "Looking at: —",
+            y=screen_height - 100, color=config.orange, font_size=64,
+        )
+
+    pygame.display.flip()
+
+
+def _tiago_draw_selection_confirmation(letter, available_set):
+    """Held screen shown after a successful selection. Same grid +
+    cross layout as the live selection screen so the head-fixed anchor
+    is unchanged; a "Selected:" header at the top and a large letter
+    glyph at the bottom make the choice unmistakable."""
+    screen.fill(config.black)
+    _tiago_draw_centered_text("Selected:", y=80, color=config.white, font_size=64)
+    _tiago_draw_letter_grid(highlight_letter=letter, available_set=available_set)
+    _tiago_draw_fixation_cross()
+    _tiago_draw_centered_text(
+        str(letter), y=screen_height - 100, color=config.green, font_size=140,
+    )
+    pygame.display.flip()
+
+
+def hold_tiago_selection_confirmation(letter, eeg_state, available_set):
+    """Hold the "Selected: <letter>" screen for TIAGO_GAZE_CONFIRM_SEC
+    so the subject sees what was chosen before Phase 3 (mode reveal)
+    begins. Returns False if the operator quits during the hold."""
+    end_t = time.monotonic() + TIAGO_GAZE_CONFIRM_SEC
     while time.monotonic() < end_t:
         eeg_state.update()
+        _tiago_draw_selection_confirmation(letter, available_set)
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return False
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                return False
+    return True
+
+
+def run_tiago_gaze_selection_window(gs, eeg_state, centroids, available_letters):
+    """Continuous-dwell letter selection.
+
+    Each loop iteration we pull one fresh Neon snapshot via
+    `_tiago_read_latest_valid_snapshot`, classify its
+    `(x_norm, y_norm)` against `centroids` restricted to
+    `available_letters` with the TIAGO_GAZE_MAX_DIST_NORM gate, and
+    update the continuous-dwell counter:
+
+    - sample on the same letter as the previous "current letter" →
+      accumulate dt onto the dwell counter
+    - sample on a different letter → restart the counter at dt
+    - sample off-grid (no centroid within the distance gate) → reset
+      to 0 and clear the current letter
+    - no fresh sample for more than TIAGO_GAZE_STALE_GAP_SEC →
+      reset to 0 (treats as tracking loss)
+
+    Exits the moment continuous dwell crosses TIAGO_GAZE_DWELL_HIT_SEC;
+    bails after TIAGO_GAZE_TIMEOUT_SEC with no hit. The depth axis is
+    disabled (`gaze_depth_cm=None`) to match the pre-pivot 2D mode
+    used downstream in main() — the head-fixed (x, y) signal is
+    well-separated and depth adds only noise here.
+
+    Returns None on operator quit; otherwise a dict with:
+      selected_letter (str or None on timeout),
+      continuous_dwell_sec (float),
+      samples (list[(t_unix, x_norm, y_norm, 1.0, depth_cm)]),
+      samples_used (int),
+      selection_attempt_success (bool).
+    """
+    logger.log_event(
+        f"Starting Tiagobot continuous-dwell selection — "
+        f"hit_sec={TIAGO_GAZE_DWELL_HIT_SEC:.2f}, "
+        f"timeout_sec={TIAGO_GAZE_TIMEOUT_SEC:.2f}, "
+        f"available={list(available_letters)}"
+    )
+
+    available_set = set(available_letters)
+    current_letter = None
+    continuous_dwell_sec = 0.0
+    samples_on_current = []
+    last_unix_t = None
+    last_good_sample_mono = None
+
+    poll_s = 1.0 / TIAGO_GAZE_SNAPSHOT_POLL_HZ
+    selection_start = time.monotonic()
+    last_loop_t = selection_start
+
+    while True:
+        eeg_state.update()
+
+        now = time.monotonic()
+        dt = max(0.0, now - last_loop_t)
+        last_loop_t = now
+        elapsed_total = now - selection_start
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return None
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 return None
 
-        s, last_t = _tiago_read_latest_valid_snapshot(gs, last_t)
+        # _tiago_read_latest_valid_snapshot returns the next fresh +
+        # worn + finite gaze pixel (or None if stale / glasses off /
+        # not yet available). It already filters bad samples for us.
+        s, last_unix_t = _tiago_read_latest_valid_snapshot(gs, last_unix_t)
+
         if s is not None:
-            samples.append(s)
+            t_unix, x_norm, y_norm, _conf, depth_cm = s
+            letter = tiago_gaze_classify(
+                x_norm, y_norm, centroids,
+                gaze_depth_cm=None,  # 2D mode — matches Phase 2 downstream
+                available_letters=available_letters,
+                max_dist_norm=TIAGO_GAZE_MAX_DIST_NORM,
+            )
+            last_good_sample_mono = now
 
-        remaining = end_t - time.monotonic()
-        _tiago_draw_grid_with_cross(
-            countdown_text=(
-                f"Eyes on chosen letter — {remaining:0.1f}s   "
-                f"({len(samples)} samples)"
-            ),
+            if letter is None:
+                # Off-grid (no centroid within the distance gate) →
+                # treat as "no letter", reset the dwell counter.
+                current_letter = None
+                continuous_dwell_sec = 0.0
+                samples_on_current = []
+            elif letter == current_letter:
+                continuous_dwell_sec += dt
+                samples_on_current.append(s)
+            else:
+                # Switched to a new letter — restart the counter so the
+                # subject has to hold the new target for the full
+                # TIAGO_GAZE_DWELL_HIT_SEC.
+                current_letter = letter
+                continuous_dwell_sec = dt
+                samples_on_current = [s]
+        else:
+            # No fresh sample this iteration. Hold the dwell counter
+            # for short gaps (sub-frame tracker hiccup, blink). Reset
+            # only if the gap exceeds TIAGO_GAZE_STALE_GAP_SEC.
+            if (last_good_sample_mono is not None
+                    and (now - last_good_sample_mono) > TIAGO_GAZE_STALE_GAP_SEC):
+                current_letter = None
+                continuous_dwell_sec = 0.0
+                samples_on_current = []
+                last_good_sample_mono = None
+
+        progress = (continuous_dwell_sec / TIAGO_GAZE_DWELL_HIT_SEC
+                    if TIAGO_GAZE_DWELL_HIT_SEC > 0 else 1.0)
+        _tiago_draw_selection_screen(
+            progress=progress,
+            dwell_sec=continuous_dwell_sec,
+            current_letter=current_letter,
+            available_set=available_set,
         )
-        time.sleep(poll_s)
 
-    logger.log_event(
-        f"Tiagobot gaze selection window done: {len(samples)} samples in "
-        f"{duration_s:.2f} s."
-    )
-    return samples
+        if (current_letter is not None
+                and continuous_dwell_sec >= TIAGO_GAZE_DWELL_HIT_SEC
+                and len(samples_on_current) > 0):
+            logger.log_event(
+                f"Tiagobot gaze hit — letter={current_letter}, "
+                f"continuous_dwell={continuous_dwell_sec:.3f}s, "
+                f"samples={len(samples_on_current)}"
+            )
+            return {
+                "selected_letter": current_letter,
+                "continuous_dwell_sec": continuous_dwell_sec,
+                "samples": samples_on_current,
+                "samples_used": len(samples_on_current),
+                "selection_attempt_success": True,
+            }
+
+        if elapsed_total >= TIAGO_GAZE_TIMEOUT_SEC:
+            logger.log_event(
+                f"Tiagobot gaze selection timed out after {elapsed_total:.1f}s "
+                f"with no {TIAGO_GAZE_DWELL_HIT_SEC:.1f}s continuous-dwell hit."
+            )
+            return {
+                "selected_letter": None,
+                "continuous_dwell_sec": 0.0,
+                "samples": [],
+                "samples_used": 0,
+                "selection_attempt_success": False,
+            }
+
+        time.sleep(poll_s)
 
 
 def main():
@@ -659,44 +904,52 @@ def main():
         # consumes it on MI-correct trials. Per brief 2026-05-22: a
         # uniform Phase 2 keeps trial timing predictable and removes
         # the "did this trial have a gaze window?" cue.
-        _gaze_selected_letter = None
-        _gaze_samples = run_tiago_gaze_selection_window(
+        #
+        # Continuous-dwell semantics (2026-05-23): the subject must
+        # hold their gaze on a single letter for
+        # TIAGOBOT_GAZE_DWELL_HIT_SEC; switching letters, looking
+        # off-grid, or losing tracking resets the counter. The window
+        # exits as soon as the threshold is crossed (responsive UX)
+        # or bails after TIAGOBOT_GAZE_SELECTION_TIMEOUT_SEC with no
+        # hit (Phase 2.5 then aborts the MI trial).
+        _gaze_result = run_tiago_gaze_selection_window(
             gs=_tiago_gaze_system,
             eeg_state=eeg_state,
-            duration_s=float(getattr(config, "TIAGOBOT_GAZE_SELECTION_WINDOW", 4.0)),
+            centroids=_tiago_centroids,
+            available_letters=list(config.TIAGOBOT_TRAJECTORY),
         )
-        if _gaze_samples is None:
+        if _gaze_result is None:
             # Operator quit / ESC during the window.
             running = False
             logger.log_event("Experiment terminated during gaze selection window.")
             break
-        _gaze_avg = tiago_gaze_average(
-            _gaze_samples,
-            conf_threshold=float(getattr(config, "TIAGOBOT_GAZE_CONFIDENCE_THRESHOLD", 0.7)),
+
+        _gaze_selected_letter = _gaze_result["selected_letter"]
+        logger.log_event(
+            f"Gaze selection — letter={_gaze_selected_letter!r}, "
+            f"continuous_dwell={_gaze_result['continuous_dwell_sec']:.3f}s, "
+            f"samples_used={_gaze_result['samples_used']}, "
+            f"success={_gaze_result['selection_attempt_success']}, "
+            f"available={list(config.TIAGOBOT_TRAJECTORY)}"
         )
-        if _gaze_avg is None:
-            logger.log_event(
-                "Gaze window produced no confidence-passing samples; "
-                "GO will be skipped on this trial."
+
+        # Hold "Selected: <letter>" so the subject sees the chosen
+        # letter before Phase 2.5 / Phase 3 / baseline. Skipped on
+        # timeout (no letter to confirm — Phase 2.5 will abort the MI
+        # trial; REST trials simply proceed without a selection).
+        if (_gaze_selected_letter is not None
+                and TIAGO_GAZE_CONFIRM_SEC > 0.0):
+            ok = hold_tiago_selection_confirmation(
+                letter=_gaze_selected_letter,
+                eeg_state=eeg_state,
+                available_set=set(config.TIAGOBOT_TRAJECTORY),
             )
-        else:
-            gx, gy, _gz = _gaze_avg
-            # 2D centroid 1-NN. Depth axis is disabled
-            # (gaze_depth_cm=None) — for head-fixed on-screen mode the
-            # (x, y) signal is well-separated and depth adds only noise.
-            _gaze_selected_letter = tiago_gaze_classify(
-                gx, gy, _tiago_centroids,
-                gaze_depth_cm=None,
-                available_letters=config.TIAGOBOT_TRAJECTORY,
-                max_dist_norm=float(getattr(config, "TIAGOBOT_GAZE_MAX_DIST_NORM", 0.2))
-                if getattr(config, "TIAGOBOT_GAZE_MAX_DIST_NORM", None) is not None
-                else None,
-            )
-            logger.log_event(
-                f"Gaze classification — avg_norm=({gx:.3f}, {gy:.3f}), "
-                f"letter={_gaze_selected_letter!r}, "
-                f"available={list(config.TIAGOBOT_TRAJECTORY)}"
-            )
+            if not ok:
+                running = False
+                logger.log_event(
+                    "Experiment terminated during selection confirmation."
+                )
+                break
 
         # === Phase 2.5: Abort MI trial on gaze failure ===
         # Per brief Phase 2 + operator confirmation 2026-05-22: when
