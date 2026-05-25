@@ -1117,17 +1117,23 @@ def main():
             current_trial += 1
             continue
 
-        # === Phase 3: Mode-reveal render (cross + trial-prep shapes) ===
-        # Byte-identical draw calls to the parent driver
-        # (ExperimentDriver_Online_Tiagobot.py:~445-451) so the
-        # mode-reveal frame the user sees is unchanged by the gaze
-        # pivot. Held for a short window before show_feedback begins so
-        # the user has time to register MI vs Rest.
+        # === Phase 3: pre-task indicator (cross + trial-prep shapes
+        # + WHITE timing orb above the cross) ===
+        # Matches the base driver convention
+        # (ExperimentDriver_Online.py line 305: `draw_time_balls(1,
+        # ...)` rendered each iteration of the 3 s countdown loop),
+        # which is also followed by ExperimentDriver_Online_Tiagobot
+        # parent (line 378). The white orb above the cross is the
+        # patient's "MI / Rest task starting in N seconds" cue;
+        # without it the show_feedback window opens with no warning.
+        # Held for `TIAGOBOT_MODE_REVEAL_DURATION` (3.0 s by default,
+        # matches base driver's hard-coded `countdown_duration = 3000`
+        # ms).
         screen.fill(config.black)
         draw_fixation_cross(screen_width, screen_height)
         draw_arrow_fill(0, screen_width, screen_height)
         draw_ball_fill(0, screen_width, screen_height)
-        draw_time_balls(0, screen_width, screen_height)
+        draw_time_balls(1, screen_width, screen_height)
         pygame.display.flip()
 
         _reveal_end = time.time() + float(

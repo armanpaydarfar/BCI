@@ -288,11 +288,13 @@ TIAGOBOT_USE_GLOVE = False
 # starting too early means the actuator retracts mid-grip. Tune to match
 # the glove's actual close duration on this hardware.
 TIAGOBOT_GRIP_HOLD_DURATION = 5
-# Seconds the gaze driver holds the cross+shapes "mode reveal" frame on
-# screen between the Phase 2 gaze window and the Phase 4 show_feedback
-# call. Long enough for the user to register MI vs Rest from the cue
-# color; short enough that closed-loop pacing stays reasonable.
-TIAGOBOT_MODE_REVEAL_DURATION = 1.5
+# Seconds the gaze driver holds the cross+shapes pre-task frame on
+# screen between the Phase 2 gaze window and the Phase 4
+# show_feedback call. Matches the base driver's `countdown_duration =
+# 3000` ms convention: a solid white timing orb above the cross
+# signals the MI/Rest task is about to begin in this many seconds.
+# (ExperimentDriver_Online.py line 305: `draw_time_balls(1, ...)`.)
+TIAGOBOT_MODE_REVEAL_DURATION = 3.0
 # Seconds of inter-trial anticipation fixation. The driver renders a
 # fixation cross plus a white orb that fills linearly over this
 # duration, with a "Look at the fixation cross" instruction below.
