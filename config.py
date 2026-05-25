@@ -293,6 +293,17 @@ TIAGOBOT_GRIP_HOLD_DURATION = 5
 # call. Long enough for the user to register MI vs Rest from the cue
 # color; short enough that closed-loop pacing stays reasonable.
 TIAGOBOT_MODE_REVEAL_DURATION = 1.5
+# Seconds of inter-trial anticipation fixation. The driver renders a
+# fixation cross plus a white orb that fills linearly over this
+# duration, with a "Look at the fixation cross" instruction below.
+# Acts as a visual countdown so the patient knows the gaze-grid
+# screen is about to appear.
+TIAGOBOT_ANTICIPATION_DURATION = 3.0
+# Seconds of Phase 1 trial-prep hold on the gaze-grid screen before
+# the continuous-dwell selection window opens. Gives the patient a
+# moment to register the grid and pick a target with their eyes
+# without imposing a visible countdown.
+TIAGOBOT_TRIAL_PREP_DURATION = 2.0
 
 # Tiagobot gaze calibration NPZ produced by tiago_gaze_calibration_exec.py.
 # Consumed by ExperimentDriver_Online_Tiagobot_Gaze.py to map averaged

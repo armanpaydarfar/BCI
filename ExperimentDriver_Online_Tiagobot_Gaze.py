@@ -109,7 +109,6 @@ from Utils.logging_manager import LoggerManager
 from Utils.runtime_common import (
     log_confusion_matrix_from_trial_summary,
     append_trial_probabilities_to_csv,
-    display_fixation_period,
     hold_messages_and_classify,
     show_feedback,
 )
@@ -142,6 +141,8 @@ loggable_fields = [
     "TIAGOBOT_PORT", "TIAGOBOT_BAUD", "TIAGOBOT_TRAJECTORY",
     "TIAGOBOT_USE_GLOVE", "TIAGOBOT_GRIP_HOLD_DURATION",
     "TIAGOBOT_MODE_REVEAL_DURATION",
+    "TIAGOBOT_ANTICIPATION_DURATION",
+    "TIAGOBOT_TRIAL_PREP_DURATION",
     "SIMULATION_MODE",
     # Tiagobot gaze-specific
     "TIAGOBOT_GAZE_CALIBRATION_PATH",
@@ -467,6 +468,89 @@ def _tiago_draw_grid_with_cross(countdown_text=None):
         screen.blit(surf, rect)
 
     pygame.display.flip()
+
+
+def _tiago_anticipation_fixation_period(duration, eeg_state, message):
+    """Inter-trial anticipation fixation: render the central cross plus
+    a *white-filled* orb above it that fills linearly from 0 → 1 over
+    `duration` seconds, with `message` rendered below the cross.
+
+    Acts as a visual countdown between trials so the patient knows the
+    gaze-grid screen is about to appear. The fill colour is white (not
+    the blue/red classification fills produced by `draw_ball_fill`
+    during `show_feedback`) so the orb is unambiguously an
+    anticipation timer rather than a classifier cue.
+
+    Replaces `display_fixation_period` for the trial-wrap and initial
+    fixation calls; runs the same EEG-state + QUIT-handling loop so
+    timing semantics are preserved.
+    """
+    # Ball geometry matches Utils.visualization.draw_ball_fill so the
+    # anticipation orb lives in the same screen position as the
+    # show_feedback ball — visual continuity for the patient.
+    ball_radius = 200
+    ball_offset = ball_radius * 2
+    if config.ARM_SIDE == "Left":
+        ball_x = screen_width // 2 + ball_offset
+    else:
+        ball_x = screen_width // 2 - ball_offset
+    ball_y = screen_height // 2
+
+    font = pygame.font.SysFont(None, 48)
+    start_time = time.time()
+    clock = pygame.time.Clock()
+
+    while time.time() - start_time < duration:
+        elapsed = time.time() - start_time
+        progress = min(1.0, max(0.0, elapsed / float(duration)))
+
+        screen.fill(config.black)
+        draw_fixation_cross(screen_width, screen_height)
+
+        # White orb outline
+        pygame.draw.circle(
+            screen, (255, 255, 255), (ball_x, ball_y), ball_radius, 2
+        )
+        # White fill rising from the bottom of the orb, masked to a
+        # circle so it stays inside the outline.
+        fill_height = int(progress * ball_radius * 2)
+        fill_surface = pygame.Surface(
+            (ball_radius * 2, ball_radius * 2), pygame.SRCALPHA
+        )
+        fill_rect = pygame.Rect(
+            0, ball_radius * 2 - fill_height, ball_radius * 2, fill_height
+        )
+        pygame.draw.rect(fill_surface, (255, 255, 255, 200), fill_rect)
+        mask_surface = pygame.Surface(
+            (ball_radius * 2, ball_radius * 2), pygame.SRCALPHA
+        )
+        pygame.draw.circle(
+            mask_surface,
+            (255, 255, 255, 255),
+            (ball_radius, ball_radius),
+            ball_radius,
+        )
+        fill_surface.blit(mask_surface, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+        screen.blit(
+            fill_surface, (ball_x - ball_radius, ball_y - ball_radius)
+        )
+
+        # Instruction text below the cross
+        msg_surf = font.render(message, True, (200, 200, 200))
+        msg_rect = msg_surf.get_rect(
+            center=(screen_width // 2, screen_height // 2 + 120)
+        )
+        screen.blit(msg_surf, msg_rect)
+
+        pygame.display.flip()
+
+        if eeg_state is not None:
+            eeg_state.update()
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                raise SystemExit
+        clock.tick(60)
 
 
 def _tiago_draw_message_screen(messages, colors, offsets):
@@ -874,28 +958,39 @@ def main():
     running = True
     clock = pygame.time.Clock()
 
-    display_fixation_period(duration=3, eeg_state=eeg_state)
-    logger.log_event("Initial fixation period complete. Beginning experimental loop.")
+    _tiago_anticipation_fixation_period(
+        duration=float(getattr(config, "TIAGOBOT_ANTICIPATION_DURATION", 3.0)),
+        eeg_state=eeg_state,
+        message="Look at the fixation cross",
+    )
+    logger.log_event("Initial anticipation fixation complete. Beginning experimental loop.")
 
     while running and current_trial < len(trial_sequence):
         logger.log_event(f"--- Trial {current_trial+1}/{len(trial_sequence)} START ---")
 
-        # === Phase 1: grid + cross + visible countdown ===
-        # The user keeps their head pointed at the cross from now until
-        # the end of the gaze window — head-fixed on-screen mode
-        # depends on a stable head pose between calibration and runtime.
-        # We re-render every iteration so the countdown ticks visibly
-        # ("Target selection in 3 s … 2 s … 1 s"). Backdoor RIGHT/DOWN
-        # and SPACE skip remain available silently for the operator;
-        # the on-screen prompt does not mention SPACE during a normal
-        # auto-paced session (the patient never uses it).
+        # === Phase 1: grid + cross prep hold ===
+        # Brief static hold on the gaze-grid screen — gives the patient
+        # a moment to register the letters and pick a target with their
+        # eyes before continuous-dwell begins. No on-screen countdown
+        # here: the inter-trial anticipation fixation (cross + filling
+        # white orb) already gave the timing cue. Backdoor RIGHT/DOWN
+        # and SPACE-skip remain available silently for the operator.
         backdoor_mode = None
         waiting_for_press = True
         countdown_start = pygame.time.get_ticks() if config.TIMING else None
-        countdown_duration = 3000  # ms
-        if config.TIMING:
-            logger.log_event("Phase 1 anticipation countdown initiated.")
+        prep_duration_s = float(getattr(config, "TIAGOBOT_TRIAL_PREP_DURATION", 2.0))
+        countdown_duration = int(prep_duration_s * 1000)
         phase1_clock = pygame.time.Clock()
+
+        # Single up-front render — no per-iter redraw needed because the
+        # frame is static. Operator-mode (TIMING=False) keeps the SPACE
+        # affordance visible; auto-paced mode shows the grid + cross
+        # only.
+        if config.TIMING:
+            _tiago_draw_grid_with_cross(countdown_text=None)
+            logger.log_event(f"Phase 1 trial-prep hold: {prep_duration_s:.1f} s")
+        else:
+            _tiago_draw_grid_with_cross(countdown_text="Press SPACE to start trial")
 
         while waiting_for_press:
             eeg_state.update()
@@ -914,18 +1009,9 @@ def main():
 
             if countdown_start is not None:
                 elapsed_ms = pygame.time.get_ticks() - countdown_start
-                remaining_ms = countdown_duration - elapsed_ms
-                remaining_label = max(0, int(np.ceil(remaining_ms / 1000.0)))
-                cd_text = f"Target selection in {remaining_label} s"
                 if elapsed_ms >= countdown_duration:
-                    logger.log_event("Phase 1 countdown expired — proceeding to gaze selection.")
                     waiting_for_press = False
-            else:
-                # Operator manual mode (config.TIMING=False): no auto
-                # advance, expose the SPACE affordance.
-                cd_text = "Press SPACE to start trial"
 
-            _tiago_draw_grid_with_cross(countdown_text=cd_text)
             phase1_clock.tick(60)
 
         if not running:
@@ -1023,7 +1109,11 @@ def main():
                 logger=logger,
                 eeg_state=eeg_state,
             )
-            display_fixation_period(duration=3, eeg_state=eeg_state)
+            _tiago_anticipation_fixation_period(
+                duration=float(getattr(config, "TIAGOBOT_ANTICIPATION_DURATION", 3.0)),
+                eeg_state=eeg_state,
+                message="Look at the fixation cross",
+            )
             current_trial += 1
             continue
 
@@ -1341,7 +1431,11 @@ def main():
             num_predictions=len(trial_probs)
         )
 
-        display_fixation_period(duration=3, eeg_state=eeg_state)
+        _tiago_anticipation_fixation_period(
+            duration=float(getattr(config, "TIAGOBOT_ANTICIPATION_DURATION", 3.0)),
+            eeg_state=eeg_state,
+            message="Look at the fixation cross",
+        )
         logger.log_event(f"Trial {current_trial+1} complete. Proceeding to next.")
 
         current_trial += 1
