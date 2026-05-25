@@ -469,19 +469,15 @@ def _tiago_draw_grid_with_cross(countdown_text=None):
     pygame.display.flip()
 
 
-def _tiago_hold_message_screen(messages, colors, offsets, duration, eeg_state):
-    """Render `messages` centred on `screen` and hold them for `duration`
-    seconds while keeping EEG state updated and pygame events drained.
-    Equivalent in structure to `display_fixation_period`, but renders a
-    custom multi-line message instead of the idle fixation UI.
+def _tiago_draw_message_screen(messages, colors, offsets):
+    """Render `messages` centred on `screen` and flip the display once.
 
-    Used so the user sees "Robot Move -> Home" while the actuator
-    retracts (mirroring the outbound "Robot Move -> {letter}" message).
-    Because the helper draws once and the subsequent
-    `wait_for_completion(HOMED, on_tick=_drive_tick)` only flips the
-    buffer without redrawing, the message persists across the entire
-    home phase — including the grip-hold delay that precedes the
-    actual HOME send.
+    No EEG pump, no event loop — pure one-shot render. Use this when
+    the caller needs the message to persist while ANOTHER blocking
+    call (e.g. `wait_for_completion(HOMED, on_tick=_drive_tick)`) pumps
+    the loop, since `_drive_tick` flips the buffer without redrawing
+    and pygame's software display keeps the last-blitted `screen`
+    contents on subsequent flips.
     """
     screen.fill(config.black)
     font = pygame.font.SysFont(None, 72)
@@ -493,6 +489,14 @@ def _tiago_hold_message_screen(messages, colors, offsets, duration, eeg_state):
         screen.blit(surf, rect)
     pygame.display.flip()
 
+
+def _tiago_hold_message_screen(messages, colors, offsets, duration, eeg_state):
+    """Render `messages` (via `_tiago_draw_message_screen`) and hold them
+    for `duration` seconds while pumping EEG state and pygame events.
+    Equivalent in structure to `display_fixation_period`, but renders a
+    custom multi-line message instead of the idle fixation UI.
+    """
+    _tiago_draw_message_screen(messages, colors, offsets)
     end_time = time.time() + float(duration)
     clock = pygame.time.Clock()
     while time.time() < end_time:
@@ -1244,6 +1248,13 @@ def main():
                     level="error",
                 )
 
+            # End-effector label: real glove writes if the Arduino port
+            # opened, otherwise the user is gripping/releasing with
+            # their own hand. The on-screen messages swap "Glove" ↔
+            # "Hand" accordingly so the patient sees an instruction
+            # that matches what's physically happening.
+            effector_label = "Glove" if arduino is not None else "Hand"
+
             # Grip the target. On early-stop we skip the grip entirely
             # so the operator's "bad MI" interruption doesn't grasp.
             if not robot_earlystop and arduino is not None:
@@ -1254,18 +1265,13 @@ def main():
             # before HOME starts retracting (otherwise the actuator pulls
             # back while the glove is still mid-close). Duration tunable
             # via config.TIAGOBOT_GRIP_HOLD_DURATION (default 4 s).
-            #
-            # Render "Robot Move -> Home" instead of idle fixation here;
-            # the message persists through the grip-hold AND through the
-            # subsequent wait_for_completion(HOMED) because _drive_tick
-            # only flips the buffer without redrawing. Mirrors the
-            # outbound "Robot Move -> {letter}" message in style so the
-            # user has continuous visual feedback that the robot is
-            # returning rather than a blank fixation gap.
+            # Show "{Glove|Hand} closing" so the patient knows to close
+            # their hand (gloveless mode) or sees what the glove is
+            # doing (glove enabled).
             if not robot_earlystop:
                 grip_hold = float(getattr(config, "TIAGOBOT_GRIP_HOLD_DURATION", 4))
                 _tiago_hold_message_screen(
-                    messages=["Correct", "Robot Move -> Home"],
+                    messages=["Correct", f"{effector_label} closing"],
                     colors=[config.green, config.green],
                     offsets=[-100, 100],
                     duration=grip_hold,
@@ -1282,6 +1288,17 @@ def main():
             )
             tiago_send_home(tiago, logger)
             logger.log_event("Sent HOME to Tiagobot — retracting.")
+
+            # Render "Robot Move -> Home" once. The message persists
+            # through the subsequent wait_for_completion(HOMED) because
+            # _drive_tick only flips the buffer; the screen still holds
+            # the contents we just drew. Style mirrors the outbound
+            # "Robot Move -> {letter}" message.
+            _tiago_draw_message_screen(
+                messages=["Correct", "Robot Move -> Home"],
+                colors=[config.green, config.green],
+                offsets=[-100, 100],
+            )
 
             # Wait for the retract to actually finish before opening
             # the glove (so the object goes back to the home position
@@ -1302,8 +1319,17 @@ def main():
                 arduino.write(config.ARDUINO_CMD_REST)
                 logger.log_event("Glove opening — releasing at home.")
 
-            display_fixation_period(duration=3, eeg_state=eeg_state)
-            logger.log_event("Robot reset fixation (3s) complete.")
+            # Post-home: show "{Glove|Hand} opening" instead of the
+            # idle fixation cross so the patient knows to release the
+            # object (gloveless) or sees the glove opening. Replaces
+            # the original `display_fixation_period(3)` call here.
+            _tiago_hold_message_screen(
+                messages=["Correct", f"{effector_label} opening"],
+                colors=[config.green, config.green],
+                offsets=[-100, 100],
+                duration=3,
+                eeg_state=eeg_state,
+            )
 
         logger.log_trial_summary(
             trial_number=current_trial + 1,
