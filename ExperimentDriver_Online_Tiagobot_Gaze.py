@@ -109,6 +109,7 @@ from Utils.logging_manager import LoggerManager
 from Utils.runtime_common import (
     log_confusion_matrix_from_trial_summary,
     append_trial_probabilities_to_csv,
+    display_fixation_period,
     hold_messages_and_classify,
     show_feedback,
 )
@@ -469,52 +470,6 @@ def _tiago_draw_grid_with_cross(countdown_text=None):
         screen.blit(surf, rect)
 
     pygame.display.flip()
-
-
-def _tiago_pre_task_hold(empty_duration, white_duration, eeg_state):
-    """Two-phase pre-task indicator hold.
-
-    Renders the trial-prep frame (cross + empty arrow + empty ball +
-    time-orb in `state`) and holds for the given durations:
-
-      Phase 3a (`empty_duration` s) — `draw_time_balls(0, ...)`
-        (empty outline above the cross). Lets the patient register
-        that the trial-prep UI is up before the countdown to the
-        task begins.
-
-      Phase 3b (`white_duration` s) — `draw_time_balls(1, ...)`
-        (solid white). Matches the base driver's "MI/Rest task
-        starting in N seconds" cue
-        (ExperimentDriver_Online.py:305).
-
-    The base driver collapses Phase 3a into a single frame before
-    the countdown loop overwrites it; we hold it explicitly here for
-    clearer pacing. EEG state + QUIT handling are pumped throughout.
-    """
-    def _render(time_balls_state):
-        screen.fill(config.black)
-        draw_fixation_cross(screen_width, screen_height)
-        draw_arrow_fill(0, screen_width, screen_height)
-        draw_ball_fill(0, screen_width, screen_height)
-        draw_time_balls(time_balls_state, screen_width, screen_height)
-        pygame.display.flip()
-
-    def _hold(duration):
-        end_t = time.time() + float(duration)
-        clock = pygame.time.Clock()
-        while time.time() < end_t:
-            if eeg_state is not None:
-                eeg_state.update()
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit()
-                    raise SystemExit
-            clock.tick(60)
-
-    _render(0)
-    _hold(empty_duration)
-    _render(1)
-    _hold(white_duration)
 
 
 def _tiago_anticipation_fixation_period(duration, eeg_state, message):
@@ -1164,21 +1119,42 @@ def main():
             current_trial += 1
             continue
 
-        # === Phase 3: two-phase pre-task indicator ===
-        # 3a: cross + empty shapes + EMPTY time-orb for
-        #     TIAGOBOT_EMPTY_HOLD_DURATION (2.0 s) — registration.
-        # 3b: same frame with WHITE time-orb for
-        #     TIAGOBOT_MODE_REVEAL_DURATION (3.0 s) — base-driver
-        #     "MI/Rest task starting in N seconds" cue.
-        _tiago_pre_task_hold(
-            empty_duration=float(
-                getattr(config, "TIAGOBOT_EMPTY_HOLD_DURATION", 2.0)
-            ),
-            white_duration=float(
-                getattr(config, "TIAGOBOT_MODE_REVEAL_DURATION", 3.0)
-            ),
+        # === Phase 3a: empty fixation period (matches base driver) ===
+        # `display_fixation_period` renders cross + empty arrow +
+        # empty ball + empty time-orb via `draw_class_fixation_idle`
+        # — same call the base driver uses at trial wrap
+        # (ExperimentDriver_Online.py:261/513). Holds for
+        # TIAGOBOT_EMPTY_HOLD_DURATION s with EEG pump.
+        display_fixation_period(
+            duration=float(getattr(config, "TIAGOBOT_EMPTY_HOLD_DURATION", 3.0)),
             eeg_state=eeg_state,
         )
+
+        # === Phase 3b: white time-orb countdown (base-driver cue) ===
+        # Cross + empty arrow + empty ball + WHITE time-orb. Inlined
+        # because we don't need the base driver's input handling here
+        # (mode was already captured at Phase 1). Mirrors
+        # ExperimentDriver_Online.py:268-311 — same draw calls,
+        # `draw_time_balls(1, ...)`, same `countdown_duration` (3 s)
+        # — minus the backdoor/SPACE event loop.
+        screen.fill(config.black)
+        draw_fixation_cross(screen_width, screen_height)
+        draw_arrow_fill(0, screen_width, screen_height)
+        draw_ball_fill(0, screen_width, screen_height)
+        draw_time_balls(1, screen_width, screen_height)
+        pygame.display.flip()
+
+        _white_end = time.time() + float(
+            getattr(config, "TIAGOBOT_MODE_REVEAL_DURATION", 3.0)
+        )
+        _white_clock = pygame.time.Clock()
+        while time.time() < _white_end:
+            eeg_state.update()
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    raise SystemExit
+            _white_clock.tick(60)
 
         # === Baseline ===
         try:

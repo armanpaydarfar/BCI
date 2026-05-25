@@ -288,24 +288,24 @@ TIAGOBOT_USE_GLOVE = False
 # starting too early means the actuator retracts mid-grip. Tune to match
 # the glove's actual close duration on this hardware.
 TIAGOBOT_GRIP_HOLD_DURATION = 5
-# Pre-task indicator hold durations (tiagobot drivers).
+# Pre-task indicator hold durations.
 #
-# Both tiagobot drivers render the trial-prep frame (cross + empty
-# arrow + empty ball + timing orb) before show_feedback opens. The
-# patient sees a two-phase progression:
+# Per-trial sequence before show_feedback opens (matches the base
+# driver convention — ExperimentDriver_Online.py uses
+# `display_fixation_period(duration=3)` at line 261/513 for the
+# empty period, then a hard-coded `countdown_duration = 3000` ms
+# white-orb countdown at line 280):
 #
-#   1. EMPTY_HOLD seconds — empty time-orb (state 0).
-#      Lets the patient register that the trial-prep UI is up
-#      before the actual countdown to the task begins.
-#   2. MODE_REVEAL seconds — solid white time-orb (state 1).
-#      Matches the base driver's `draw_time_balls(1, ...)` cue
-#      (ExperimentDriver_Online.py:305): "MI / Rest task starting
-#      in N seconds".
-#
-# The base driver collapses step 1 into a single 16 ms frame before
-# the countdown loop overwrites it; tiagobot drivers expose it as a
-# tunable hold for clearer per-trial pacing.
-TIAGOBOT_EMPTY_HOLD_DURATION = 2.0
+#   1. EMPTY hold (TIAGOBOT_EMPTY_HOLD_DURATION s) — cross + empty
+#      arrow + empty ball + empty time-orb. Read by the GAZE
+#      driver's Phase 3a via `display_fixation_period(...)`. The
+#      parent tiagobot inherits this from its existing trial-wrap
+#      `display_fixation_period(3)` and does NOT read this key.
+#   2. WHITE-orb hold (TIAGOBOT_MODE_REVEAL_DURATION s) — same
+#      shapes with `draw_time_balls(1, ...)`. Patient's "MI / Rest
+#      task starting in N seconds" cue. Read by both tiagobot
+#      drivers.
+TIAGOBOT_EMPTY_HOLD_DURATION = 3.0
 TIAGOBOT_MODE_REVEAL_DURATION = 3.0
 # Seconds of inter-trial anticipation fixation. The driver renders a
 # fixation cross plus a white orb that fills linearly over this
