@@ -349,10 +349,24 @@ def main():
         logger.log_event("Initial screen rendered: fixation cross, bar, ball, and time indicators.")
 
         # === Countdown + user input ===
+        # Two-phase pre-task indicator (matches the gaze-driver
+        # convention): hold empty time-orb for
+        # `TIAGOBOT_EMPTY_HOLD_DURATION` s, then switch the orb to
+        # solid white for `TIAGOBOT_MODE_REVEAL_DURATION` s — base
+        # driver's `draw_time_balls(1, ...)` "task starting in N s"
+        # cue (ExperimentDriver_Online.py:305). Backdoor RIGHT/DOWN
+        # and SPACE-skip stay live throughout both halves.
         backdoor_mode = None
         waiting_for_press = True
         countdown_start = None
-        countdown_duration = 3000  # ms
+        empty_hold_ms = int(
+            float(getattr(config, "TIAGOBOT_EMPTY_HOLD_DURATION", 2.0)) * 1000
+        )
+        white_hold_ms = int(
+            float(getattr(config, "TIAGOBOT_MODE_REVEAL_DURATION", 3.0)) * 1000
+        )
+        countdown_duration = empty_hold_ms + white_hold_ms
+        last_orb_state = 0  # initial render already drew state 0
 
         while waiting_for_press:
             eeg_state.update()
@@ -375,7 +389,13 @@ def main():
                     logger.log_event("Countdown timer initiated.")
 
                 elapsed_time = pygame.time.get_ticks() - countdown_start
-                draw_time_balls(1, screen_width, screen_height)
+                # Switch orb to WHITE at the empty/white boundary; only
+                # re-render on state change to avoid blitting every
+                # frame.
+                desired_orb_state = 1 if elapsed_time >= empty_hold_ms else 0
+                if desired_orb_state != last_orb_state:
+                    draw_time_balls(desired_orb_state, screen_width, screen_height)
+                    last_orb_state = desired_orb_state
                 pygame.display.flip()
 
                 if elapsed_time >= countdown_duration:
