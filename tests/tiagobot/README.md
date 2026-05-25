@@ -1,8 +1,8 @@
 # tests/tiagobot/
 
-Tiagobot-specific tests added by Phase 3 of the Tiagobot gaze
-integration project (`Documents/SoftwareDocs/Tiagobot_Gaze_Integration_Plan.md`
-and `Documents/SoftwareDocs/Tiagobot_Test_Suite_Plan.md`).
+Tiagobot-specific tests for the gaze integration. Canonical feature
+reference: `Documents/SoftwareDocs/projects/tiagobot/gaze-integration/reference.md`.
+Test-suite plan: `Documents/SoftwareDocs/projects/tiagobot/test-suite/plan.md`.
 
 ## Running
 
@@ -59,6 +59,6 @@ fixture-only update is allowed.
 
 ## Plan citations
 
-Per `Tiagobot_Test_Suite_Plan.md` §3, each test docstring cites the
-file:line for the bug class it guards. See the plan for the full list
-and verification protocol.
+Per `Documents/SoftwareDocs/projects/tiagobot/test-suite/plan.md` §3,
+each test docstring cites the file:line for the bug class it guards.
+See the plan for the full list and verification protocol.

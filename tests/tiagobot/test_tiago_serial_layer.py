@@ -2,7 +2,7 @@
 test_tiago_serial_layer.py
 
 Guards the Tier-1 serial helpers in `Utils/tiagobot.py`. Per
-`Tiagobot_Test_Suite_Plan.md` §3.5 (optional). These are the lowest-
+`Documents/SoftwareDocs/projects/tiagobot/test-suite/plan.md` §3.5 (optional). These are the lowest-
 level boundary between the BCI and the Tiagobot hardware; silent
 breakage here is the worst-case failure mode.
 

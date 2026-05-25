@@ -23,7 +23,8 @@ and is essential when the user sits at an angle to the board: two
 letters with similar scene-pixel positions can still be physically at
 quite different distances, which the 3D classifier can separate.
 
-Layout reference: `Documents/SoftwareDocs/Tiagobot_Gaze_AI_Layout.md`.
+Layout reference: `Documents/SoftwareDocs/projects/tiagobot/gaze-integration/reference.md`
+(canonical) and `.../ai-layout.md` (layout-decision rationale).
 """
 from __future__ import annotations
 
@@ -46,7 +47,7 @@ DEFAULT_DEPTH_WEIGHT_CM_INV: float = 0.01
 def grid_centroids_norm() -> Dict[str, Tuple[float, float]]:
     """Return the nominal A-I centroids in normalized [0, 1] coordinates,
     laid out alphabetical row-major per
-    `Documents/SoftwareDocs/Tiagobot_Gaze_AI_Layout.md`.
+    `Documents/SoftwareDocs/projects/tiagobot/gaze-integration/ai-layout.md`.
 
     Each letter is centred at one of (col, row) in {0.25, 0.5, 0.75}^2:
 

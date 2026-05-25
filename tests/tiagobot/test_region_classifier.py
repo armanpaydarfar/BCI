@@ -8,12 +8,12 @@ load-bearing piece of the rudimentary calibration — if it returns the
 wrong region, the Tiagobot moves to the wrong target without any visible
 failure mode.
 
-Per `Tiagobot_Test_Suite_Plan.md` §3.1.
+Per `Documents/SoftwareDocs/projects/tiagobot/test-suite/plan.md` §3.1.
 
 Citations (verified 2026-05-19):
   - `Utils/tiagobot_gaze.py:grid_centroids_norm` — nominal centroid set
   - `Utils/tiagobot_gaze.py:classify_gaze_to_letter` — function under test
-  - `Documents/SoftwareDocs/Tiagobot_Gaze_AI_Layout.md` — layout decision
+  - `Documents/SoftwareDocs/projects/tiagobot/gaze-integration/ai-layout.md` — layout decision
 """
 from __future__ import annotations
 

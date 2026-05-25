@@ -2,7 +2,7 @@
 test_calibration_roundtrip.py
 
 Guards calibration save / load drift in the Tiagobot gaze layer. Per
-`Tiagobot_Test_Suite_Plan.md` §3.2.
+`Documents/SoftwareDocs/projects/tiagobot/test-suite/plan.md` §3.2.
 
 The NPZ schema and load contract are defined by:
   - `tiago_gaze_calibration_exec.py:_save_calibration` (writer)

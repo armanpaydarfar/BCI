@@ -5,7 +5,7 @@ Guards silent wire-format drift between the Python host
 (`Utils/tiagobot.py:send_letter` / `send_home`) and the Arduino firmware
 at `tools/tiago_arduino/Final_code/Final_code.ino`.
 
-Per `Tiagobot_Test_Suite_Plan.md` §3.4.
+Per `Documents/SoftwareDocs/projects/tiagobot/test-suite/plan.md` §3.4.
 
 The wire format is documented in two places:
   - `Utils/tiagobot.py:7-19` module docstring.

@@ -4,7 +4,7 @@ test_tiago_driver_letter_dispatch.py
 Guards driver state-machine bugs in `ExperimentDriver_Online_Tiagobot.py`
 (the existing known-good driver) and
 `ExperimentDriver_Online_Tiagobot_Gaze.py` (the new gaze sibling).
-Per `Tiagobot_Test_Suite_Plan.md` §3.3.
+Per `Documents/SoftwareDocs/projects/tiagobot/test-suite/plan.md` §3.3.
 
 This is the Tiagobot analogue of `tests/test_errp_driver_state_machine.py`.
 Both drivers do pygame.display.set_mode + model.pkl load + LSL resolve at

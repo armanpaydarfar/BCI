@@ -322,17 +322,13 @@ TIAGOBOT_TRIAL_PREP_DURATION = 2.0
 # Tiagobot gaze calibration NPZ produced by tiago_gaze_calibration_exec.py.
 # Consumed by ExperimentDriver_Online_Tiagobot_Gaze.py to map averaged
 # gaze samples to one of the 9 A-I letters per
-# Documents/SoftwareDocs/Tiagobot_Gaze_AI_Layout.md. Empty string means
+# Documents/SoftwareDocs/projects/tiagobot/gaze-integration/reference.md.
+# Empty string means
 # "no calibration available" — the gaze driver fails at startup in that
 # case (fail-fast on Tier 2 paths per CLAUDE.md). Default empty so the
 # global config can ship platform-neutral; set the real path per machine
 # in config_local.py.
 TIAGOBOT_GAZE_CALIBRATION_PATH = ""
-# Per-trial gaze accumulation window (seconds) used by the gaze driver
-# to collect samples before classifying to a letter. Matches the
-# structure of GAZE_SELECTION_WINDOW used in the Harmony gaze driver,
-# but tuned independently for the rudimentary 9-letter classifier.
-TIAGOBOT_GAZE_SELECTION_WINDOW = 4.0
 # Minimum gaze confidence (Pupil Labs Neon) for a sample to count in
 # the per-trial average. Matches harmony_calibration_exec.py:43
 # (GAZE_CONFIDENCE_THRESHOLD = 0.7) for symmetry between calibration

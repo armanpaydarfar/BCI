@@ -14,10 +14,12 @@ via `git revert` of commit feature/tiagobot-gaze-integration HEAD~1.
 Flow per trial (changes vs parent in CAPS):
 1. RENDER THE 3x3 LETTER GRID + CENTRAL FIXATION CROSS while the
    trial-start countdown ticks (user holds head pointed at cross).
-2. RUN A PER-TRIAL GAZE SELECTION WINDOW (head-fixed on-screen):
-   read GazeSystem snapshots for TIAGOBOT_GAZE_SELECTION_WINDOW
-   seconds, median (x, y) over confidence-passing samples, 2D centroid
-   1-NN classify via Utils.tiagobot_gaze.classify_gaze_to_letter.
+2. RUN A PER-TRIAL CONTINUOUS-DWELL GAZE SELECTION (head-fixed
+   on-screen): classify each fresh GazeSystem snapshot via
+   Utils.tiagobot_gaze.classify_gaze_to_letter, accumulate dwell on
+   the current letter, commit when dwell crosses
+   TIAGOBOT_GAZE_DWELL_HIT_SEC, bail after
+   TIAGOBOT_GAZE_SELECTION_TIMEOUT_SEC.
 3. If classification fails (no centroid within max distance, or no
    valid samples) → log + skip the GO for this trial (no random
    fallback — fail visibly per plan §6.3 step 4).
@@ -148,7 +150,6 @@ loggable_fields = [
     "SIMULATION_MODE",
     # Tiagobot gaze-specific
     "TIAGOBOT_GAZE_CALIBRATION_PATH",
-    "TIAGOBOT_GAZE_SELECTION_WINDOW",
     "TIAGOBOT_GAZE_CONFIDENCE_THRESHOLD",
     "TIAGOBOT_GAZE_MAX_DIST_NORM",
     "TIAGOBOT_GAZE_DWELL_HIT_SEC",
@@ -917,12 +918,13 @@ def run_tiago_gaze_selection_window(gs, eeg_state, centroids, available_letters)
 def main():
     """Run the online MI/REST trial loop for the gaze-driven Tiagobot.
 
-    Per successful-MI trial: gaze samples are collected for
-    TIAGOBOT_GAZE_SELECTION_WINDOW seconds, averaged, and classified to
-    one of A-I; Tiagobot extends to that letter, the classification
-    window runs, then Tiagobot is sent HOME. Glove (if enabled) closes
-    on MI and opens on HOME. If gaze does not resolve, the GO is
-    skipped (logged) and the trial advances.
+    Per trial: continuous-dwell gaze selection commits a letter when
+    the subject holds gaze on it for TIAGOBOT_GAZE_DWELL_HIT_SEC; on
+    MI-correct trials Tiagobot extends to that letter, the
+    classification window runs, then Tiagobot is sent HOME. Glove
+    (if enabled) closes on MI and opens on HOME. If the dwell times
+    out without a hit on an MI trial, Phase 2.5 aborts the trial
+    (no GO) and advances the counter.
     """
     require_marker_stream(logger=logger)
 

@@ -4,7 +4,8 @@
 Tiagobot gaze calibration recorder.
 
 Displays a 3x3 on-screen grid of A-I targets (per
-`Documents/SoftwareDocs/Tiagobot_Gaze_AI_Layout.md`) and records the
+`Documents/SoftwareDocs/projects/tiagobot/gaze-integration/ai-layout.md`)
+and records the
 user's gaze samples while they fixate each letter in turn. Writes a
 calibration NPZ consumed at runtime by
 `ExperimentDriver_Online_Tiagobot_Gaze.py` via `Utils.tiagobot_gaze`.
@@ -391,7 +392,7 @@ def _save_calibration(
         version=1,
         capture_date=datetime.datetime.now().isoformat(timespec="seconds"),
         subject=subject,
-        layout_doc="Documents/SoftwareDocs/Tiagobot_Gaze_AI_Layout.md",
+        layout_doc="Documents/SoftwareDocs/projects/tiagobot/gaze-integration/ai-layout.md",
         gaze_source="pupil_labs_realtime_api",
         samples_per_target=int(samples_per_target),
         gaze_sample_width=GAZE_SAMPLE_W,
