@@ -472,29 +472,29 @@ def _tiago_draw_grid_with_cross(countdown_text=None):
 
 def _tiago_anticipation_fixation_period(duration, eeg_state, message):
     """Inter-trial anticipation fixation: render the central cross plus
-    a *white-filled* orb above it that fills linearly from 0 → 1 over
-    `duration` seconds, with `message` rendered below the cross.
+    a *white-filled* small orb above it that fills linearly from 0 → 1
+    over `duration` seconds, with `message` rendered below the cross.
 
-    Acts as a visual countdown between trials so the patient knows the
-    gaze-grid screen is about to appear. The fill colour is white (not
-    the blue/red classification fills produced by `draw_ball_fill`
-    during `show_feedback`) so the orb is unambiguously an
-    anticipation timer rather than a classifier cue.
+    The orb's position matches Utils.visualization.draw_time_balls's
+    "single" mode geometry (above the cross), since the timing orb in
+    that position is already the patient's familiar cue for "something
+    is about to switch". draw_time_balls itself only supports four
+    discrete states (empty / white / red / blue), so we render a
+    smooth fill manually at the same position rather than toggle a
+    state mid-period — closer to the "fill up" cue the protocol
+    needs. Fill colour stays white (matches state 1 of the existing
+    timing orb) so the visual language is consistent.
 
     Replaces `display_fixation_period` for the trial-wrap and initial
     fixation calls; runs the same EEG-state + QUIT-handling loop so
     timing semantics are preserved.
     """
-    # Ball geometry matches Utils.visualization.draw_ball_fill so the
-    # anticipation orb lives in the same screen position as the
-    # show_feedback ball — visual continuity for the patient.
-    ball_radius = 200
-    ball_offset = ball_radius * 2
-    if config.ARM_SIDE == "Left":
-        ball_x = screen_width // 2 + ball_offset
-    else:
-        ball_x = screen_width // 2 - ball_offset
-    ball_y = screen_height // 2
+    # Geometry matches Utils.visualization.draw_time_balls "single"
+    # mode — small orb centred horizontally and offset upward above
+    # the fixation cross.
+    ball_radius = 60
+    ball_x = screen_width // 2
+    ball_y = screen_height // 2 - ball_radius * 4
 
     font = pygame.font.SysFont(None, 48)
     start_time = time.time()
