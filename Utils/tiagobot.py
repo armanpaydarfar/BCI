@@ -372,6 +372,16 @@ def wait_for_completion(ser, marker, timeout=DEFAULT_MOTION_TIMEOUT_S,
         return True
 
     deadline = time.monotonic() + timeout
+    # The Arduino sketch emits a per-tick position line on every step of
+    # the actuator move ("Linear Analog Reading: NNN || Angle Reading: NN").
+    # We need to drain those from the serial buffer so it doesn't back up,
+    # but the per-tick log lines flood the experiment log (~50 lines per
+    # move × 2 moves per trial × 20 trials = ~2000 noise lines per
+    # session) and obscure the real events. Track the latest tick line
+    # silently and emit ONE summary line ("final position — ...") on
+    # marker hit so the log shows where the actuator stopped without the
+    # intermediate spam.
+    last_tick_line = None
     while time.monotonic() < deadline:
         try:
             line = ser.readline().decode("utf-8", errors="replace").strip()
@@ -388,9 +398,16 @@ def wait_for_completion(ser, marker, timeout=DEFAULT_MOTION_TIMEOUT_S,
                 pass
         if not line:
             continue
-        if logger is not None:
+        is_position_tick = (
+            "Linear Analog Reading" in line and "Angle Reading" in line
+        )
+        if is_position_tick:
+            last_tick_line = line
+        elif logger is not None:
             logger.log_event(f"Tiagobot: {line}")
         if marker in line:
+            if logger is not None and last_tick_line is not None:
+                logger.log_event(f"Tiagobot: final position — {last_tick_line}")
             return True
 
     if logger is not None:

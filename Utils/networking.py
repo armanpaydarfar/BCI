@@ -126,9 +126,25 @@ _generic_sock = None
 # Reset back to False on any successful bind so future re-attempts log
 # their first failure again.
 _ROBOT_BIND_FAILED_LOGGED = False
+
+# Gate the Harmony UDP control-socket bind. On Tiagobot-only rigs the
+# Harmony bind address (`config.UDP_CONTROL_BIND["IP"]`, typically
+# 192.168.2.2) is not assigned to any local interface, so the bind
+# fails with EADDRNOTAVAIL on every send attempt and floods the log.
+# Setting `BIND_ROBOT_CONTROL_SOCKET = False` in config_local.py on
+# those rigs makes import-time + late-bind silently skip; Harmony rigs
+# keep the default True. Tiagobot drivers never send to UDP_ROBOT
+# anyway (their actuator is serial), so skipping the socket has zero
+# functional impact for them.
+_BIND_ROBOT_CONTROL_SOCKET = bool(
+    getattr(_config, "BIND_ROBOT_CONTROL_SOCKET", True)
+)
+
 # Bind robot control socket at import-time (best effort)
 try:
-    if not SIMULATION_MODE:
+    if SIMULATION_MODE or not _BIND_ROBOT_CONTROL_SOCKET:
+        _ROBOT_SOCK = None
+    else:
         _ROBOT_SOCK = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             _ROBOT_SOCK.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -136,8 +152,6 @@ try:
             pass
         _ROBOT_SOCK.bind((_BIND_IP, _BIND_PORT))
         _ROBOT_SOCK.setblocking(False)
-    else:
-        _ROBOT_SOCK = None
 except Exception as e:
     print(f"[ERROR] Could not bind control socket to {_BIND_IP}:{_BIND_PORT}: {e}")
     _ROBOT_SOCK = None
@@ -252,6 +266,13 @@ def _ensure_control_socket(logger=None):
 
     if SIMULATION_MODE:
         # Absolutely do not touch/bind robot sockets in sim mode.
+        return None
+
+    if not _BIND_ROBOT_CONTROL_SOCKET:
+        # Tiagobot-only rig: Harmony control IP isn't on a local
+        # interface, retrying the bind is guaranteed to fail. Skip
+        # silently — Tiagobot drivers never send to UDP_ROBOT so the
+        # missing socket has no functional impact.
         return None
 
     if _ROBOT_SOCK is not None:

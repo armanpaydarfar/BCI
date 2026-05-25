@@ -386,6 +386,15 @@ UDP_CONTROL_BIND = {
     "PORT": 8080
 }
 
+# When True (default), Utils/networking.py binds a UDP socket to
+# UDP_CONTROL_BIND at module import for sending Harmony robot opcodes.
+# On Tiagobot-only rigs the Harmony bind address is not assigned to a
+# local interface — the bind fails with EADDRNOTAVAIL on every send and
+# floods the log. Override to False in config_local.py on those rigs;
+# Tiagobot drivers never send to UDP_ROBOT (the actuator speaks serial)
+# so the missing socket has no functional impact.
+BIND_ROBOT_CONTROL_SOCKET = True
+
 TRIGGERS = {
     "MI_BEGIN": "200",
     "MI_END": "220",

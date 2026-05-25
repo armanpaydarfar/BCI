@@ -469,6 +469,42 @@ def _tiago_draw_grid_with_cross(countdown_text=None):
     pygame.display.flip()
 
 
+def _tiago_hold_message_screen(messages, colors, offsets, duration, eeg_state):
+    """Render `messages` centred on `screen` and hold them for `duration`
+    seconds while keeping EEG state updated and pygame events drained.
+    Equivalent in structure to `display_fixation_period`, but renders a
+    custom multi-line message instead of the idle fixation UI.
+
+    Used so the user sees "Robot Move -> Home" while the actuator
+    retracts (mirroring the outbound "Robot Move -> {letter}" message).
+    Because the helper draws once and the subsequent
+    `wait_for_completion(HOMED, on_tick=_drive_tick)` only flips the
+    buffer without redrawing, the message persists across the entire
+    home phase — including the grip-hold delay that precedes the
+    actual HOME send.
+    """
+    screen.fill(config.black)
+    font = pygame.font.SysFont(None, 72)
+    for i, text in enumerate(messages):
+        surf = font.render(text, True, colors[i])
+        rect = surf.get_rect(
+            center=(screen_width // 2, screen_height // 2 + offsets[i])
+        )
+        screen.blit(surf, rect)
+    pygame.display.flip()
+
+    end_time = time.time() + float(duration)
+    clock = pygame.time.Clock()
+    while time.time() < end_time:
+        if eeg_state is not None:
+            eeg_state.update()
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                raise SystemExit
+        clock.tick(60)
+
+
 def _tiago_read_latest_valid_snapshot(gs, last_unix_t):
     """Pull one fresh, worn, finite gaze sample from `gs`.
 
@@ -840,21 +876,22 @@ def main():
     while running and current_trial < len(trial_sequence):
         logger.log_event(f"--- Trial {current_trial+1}/{len(trial_sequence)} START ---")
 
-        # === Phase 1: render 3x3 grid + central fixation cross ===
+        # === Phase 1: grid + cross + visible countdown ===
         # The user keeps their head pointed at the cross from now until
-        # the end of the gaze window — the head-fixed on-screen mode
+        # the end of the gaze window — head-fixed on-screen mode
         # depends on a stable head pose between calibration and runtime.
-        _tiago_draw_grid_with_cross(countdown_text="SPACE to start trial")
-
-        # === Countdown + user input (Phase 1 timing) ===
-        # Same backdoor + SPACE handling as the parent driver, but the
-        # frame on screen is the grid+cross — no draw_time_balls here
-        # (those belong to the Phase 3 mode-reveal UI). Auto-countdown
-        # runs at the parent's 3 s constant when config.TIMING is on.
+        # We re-render every iteration so the countdown ticks visibly
+        # ("Target selection in 3 s … 2 s … 1 s"). Backdoor RIGHT/DOWN
+        # and SPACE skip remain available silently for the operator;
+        # the on-screen prompt does not mention SPACE during a normal
+        # auto-paced session (the patient never uses it).
         backdoor_mode = None
         waiting_for_press = True
-        countdown_start = None
+        countdown_start = pygame.time.get_ticks() if config.TIMING else None
         countdown_duration = 3000  # ms
+        if config.TIMING:
+            logger.log_event("Phase 1 anticipation countdown initiated.")
+        phase1_clock = pygame.time.Clock()
 
         while waiting_for_press:
             eeg_state.update()
@@ -871,17 +908,21 @@ def main():
                         logger.log_event("Space bar pressed — proceeding without override.")
                     waiting_for_press = False
 
-            if config.TIMING:
-                if countdown_start is None:
-                    countdown_start = pygame.time.get_ticks()
-                    logger.log_event("Countdown timer initiated.")
-
-                elapsed_time = pygame.time.get_ticks() - countdown_start
-
-                if elapsed_time >= countdown_duration:
-                    logger.log_event("Countdown expired — proceeding to trial.")
-                    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_SPACE))
+            if countdown_start is not None:
+                elapsed_ms = pygame.time.get_ticks() - countdown_start
+                remaining_ms = countdown_duration - elapsed_ms
+                remaining_label = max(0, int(np.ceil(remaining_ms / 1000.0)))
+                cd_text = f"Target selection in {remaining_label} s"
+                if elapsed_ms >= countdown_duration:
+                    logger.log_event("Phase 1 countdown expired — proceeding to gaze selection.")
                     waiting_for_press = False
+            else:
+                # Operator manual mode (config.TIMING=False): no auto
+                # advance, expose the SPACE affordance.
+                cd_text = "Press SPACE to start trial"
+
+            _tiago_draw_grid_with_cross(countdown_text=cd_text)
+            phase1_clock.tick(60)
 
         if not running:
             logger.log_event("Experiment terminated early via quit event.")
@@ -994,7 +1035,6 @@ def main():
         draw_ball_fill(0, screen_width, screen_height)
         draw_time_balls(0, screen_width, screen_height)
         pygame.display.flip()
-        logger.log_event("Mode-reveal frame rendered: fixation cross, bar, ball, and time indicators.")
 
         _reveal_end = time.time() + float(
             getattr(config, "TIAGOBOT_MODE_REVEAL_DURATION", 1.5)
@@ -1042,8 +1082,6 @@ def main():
             logger=logger,
             phase="MI" if mode == 0 else "REST"
         )
-
-        logger.log_event(f"Stored decoder output for trial {current_trial+1}: {len(trial_probs)} timepoints.")
 
         predictions_list.append(prediction)
         ground_truth_list.append(200 if mode == 0 else 100)
@@ -1216,9 +1254,23 @@ def main():
             # before HOME starts retracting (otherwise the actuator pulls
             # back while the glove is still mid-close). Duration tunable
             # via config.TIAGOBOT_GRIP_HOLD_DURATION (default 4 s).
+            #
+            # Render "Robot Move -> Home" instead of idle fixation here;
+            # the message persists through the grip-hold AND through the
+            # subsequent wait_for_completion(HOMED) because _drive_tick
+            # only flips the buffer without redrawing. Mirrors the
+            # outbound "Robot Move -> {letter}" message in style so the
+            # user has continuous visual feedback that the robot is
+            # returning rather than a blank fixation gap.
             if not robot_earlystop:
                 grip_hold = float(getattr(config, "TIAGOBOT_GRIP_HOLD_DURATION", 4))
-                display_fixation_period(duration=grip_hold, eeg_state=eeg_state)
+                _tiago_hold_message_screen(
+                    messages=["Correct", "Robot Move -> Home"],
+                    colors=[config.green, config.green],
+                    offsets=[-100, 100],
+                    duration=grip_hold,
+                    eeg_state=eeg_state,
+                )
 
             # Send HOME — Tiagobot retracts with the gripped object.
             send_udp_message(
