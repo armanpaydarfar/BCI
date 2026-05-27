@@ -241,6 +241,11 @@ class TestAwaitAckBlocking:
         return True. Exercises the post-7b20b1c base-token matching path
         (file:355, 383-387)."""
         monkeypatch.setattr(net, "SIMULATION_MODE", False)
+        # _ensure_control_socket() short-circuits to None when
+        # _BIND_ROBOT_CONTROL_SOCKET is False (the Tiagobot-rig setting
+        # in config_local.py). Force True here so the patched
+        # _ROBOT_SOCK below is actually used.
+        monkeypatch.setattr(net, "_BIND_ROBOT_CONTROL_SOCKET", True)
         # Bind a control socket that the helper will recv from.
         ctrl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         ctrl.bind(("127.0.0.1", 0))
