@@ -58,6 +58,18 @@ HIGHCUT = 13           # Hz, mu-band high cutoff
 session = "S002ONLINE"
 PROMPT_FOR_FILE_SELECTION = True
 
+# When set to a filesystem path (via --xdf CLI flag), load_and_preprocess_session
+# bypasses the directory scan + operator prompt and uses only this XDF. Useful
+# when a session dir holds multiple recordings and you want to analyze one in
+# isolation (e.g. TEST vs TESTold side-by-side).
+SINGLE_XDF_OVERRIDE: str = ""
+
+# When set to a directory (via --save-dir CLI flag), every matplotlib figure
+# created during the run is saved as PNG into that directory and plt.show()
+# is skipped at the end. Lets the script run unattended and write output to
+# (e.g.) ~/Pictures/BCI_TopoMaps/.
+SAVE_FIG_DIR: str = ""
+
 # ---- Multi-session mode ----
 MULTI_SESSION_MODE = False
 SESSION_LIST = ["S001ONLINE", "S002ONLINE", "S003ONLINE", "S004ONLINE", "S005ONLINE"]
@@ -593,16 +605,37 @@ def load_and_preprocess_session(subject, session, prompt_selection=True):
       (Optional) Auto-drop dominant bad channels and re-epoch
       (Optional) CSD on epochs (after rejection)
     """
-    xdf_dir = os.path.join(
+    # Allow per-machine data root via env var (BCI_DATA_DIR). Falls
+    # back to the historical hardcoded path on the original author's
+    # machine. Lets this script work on every clone of the repo without
+    # importing config.py (the script's standalone contract).
+    _data_root = os.environ.get(
+        "BCI_DATA_DIR",
         "/home/arman-admin/Documents/CurrentStudy",
+    )
+    xdf_dir = os.path.join(
+        _data_root,
         f"sub-{subject}", f"ses-{session}", "eeg/"
     )
 
     if not os.path.exists(xdf_dir):
         raise FileNotFoundError(f"❌ EEG directory not found: {xdf_dir}")
 
-    xdf_files = [os.path.join(xdf_dir, f)
-                 for f in os.listdir(xdf_dir) if f.endswith(".xdf")]
+    # Single-file override: when SINGLE_XDF_OVERRIDE is set (by --xdf
+    # CLI flag below), skip directory discovery + the operator prompt
+    # entirely and treat that one file as the only input. Lets the
+    # script run against one specific XDF in a directory that contains
+    # multiple recordings without having to symlink-shuffle.
+    if SINGLE_XDF_OVERRIDE:
+        if not os.path.isfile(SINGLE_XDF_OVERRIDE):
+            raise FileNotFoundError(
+                f"❌ --xdf override not found: {SINGLE_XDF_OVERRIDE}"
+            )
+        print(f"📂 [{session}] Single-XDF override: {SINGLE_XDF_OVERRIDE}")
+        xdf_files = [SINGLE_XDF_OVERRIDE]
+    else:
+        xdf_files = [os.path.join(xdf_dir, f)
+                     for f in os.listdir(xdf_dir) if f.endswith(".xdf")]
     if not xdf_files:
         raise FileNotFoundError(f"❌ No XDF files found in: {xdf_dir}")
 
@@ -1652,7 +1685,30 @@ def main():
             ga_timecourses = compute_grand_avg_focal_timecourses(grand_avg_tfr, grand_focal)
             plot_grand_avg_focal_timecourses(ga_timecourses, grand_focal)
 
-    plt.show()
+    # When --save-dir is set, save every open matplotlib figure as a
+    # PNG and skip the interactive plt.show(). Lets the script run
+    # unattended and produce a directory of artifacts. Filename uses
+    # the figure's suptitle (or "fig_N") so figures are recognisable.
+    if SAVE_FIG_DIR:
+        os.makedirs(SAVE_FIG_DIR, exist_ok=True)
+        for fignum in plt.get_fignums():
+            fig = plt.figure(fignum)
+            # Best-effort title extraction — figures created via
+            # plt.subplots() with a suptitle expose it on fig._suptitle.
+            title = ""
+            if getattr(fig, "_suptitle", None) is not None:
+                title = fig._suptitle.get_text()
+            if not title and fig.axes:
+                title = fig.axes[0].get_title()
+            slug = "".join(
+                c if c.isalnum() or c in "-_" else "_" for c in title
+            ).strip("_") or f"fig_{fignum}"
+            out_path = os.path.join(SAVE_FIG_DIR, f"{fignum:02d}_{slug}.png")
+            fig.savefig(out_path, dpi=120, bbox_inches="tight")
+            print(f"💾 saved {out_path}")
+        plt.close("all")
+    else:
+        plt.show()
 
 
 def _parse_cli_overrides():
@@ -1672,6 +1728,18 @@ def _parse_cli_overrides():
                    help="override EPOCH_REJECT_MODE")
     p.add_argument("--max-abs-uv", type=float, default=None, help="override EPOCH_MAX_ABS_UV")
     p.add_argument("--p2p-uv", type=float, default=None, help="override EPOCH_P2P_UV")
+    p.add_argument(
+        "--xdf", type=str, default=None,
+        help="Path to a specific XDF file. Bypasses the per-session directory "
+             "scan + operator prompt — use this when a session dir contains "
+             "multiple recordings and you want only one (e.g. TEST vs TESTold).",
+    )
+    p.add_argument(
+        "--save-dir", type=str, default=None,
+        help="Directory to save every matplotlib figure as PNG (skips the "
+             "interactive plt.show() at the end). Lets the script run "
+             "unattended; figure filenames are derived from suptitles.",
+    )
     return p.parse_args()
 
 
@@ -1685,4 +1753,15 @@ if __name__ == "__main__":
     if _args.reject_mode is not None: EPOCH_REJECT_MODE = _args.reject_mode
     if _args.max_abs_uv is not None: EPOCH_MAX_ABS_UV = float(_args.max_abs_uv)
     if _args.p2p_uv is not None:     EPOCH_P2P_UV = float(_args.p2p_uv)
+    if _args.xdf is not None:
+        SINGLE_XDF_OVERRIDE = _args.xdf
+        # Don't prompt operator when an explicit XDF is given.
+        PROMPT_FOR_FILE_SELECTION = False
+    if _args.save_dir is not None:
+        SAVE_FIG_DIR = _args.save_dir
+        # Force a non-interactive matplotlib backend so the script can
+        # run over SSH or headless. Must happen BEFORE main() creates
+        # any figure.
+        import matplotlib
+        matplotlib.use("Agg")
     main()
