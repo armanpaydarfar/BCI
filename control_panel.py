@@ -2382,7 +2382,20 @@ class ControlPanel(QMainWindow):
         self._append_log("Panel", f"[{self._ts()}] Opened STMsetup.py\n")
 
     def on_open_mne_viewer(self):
-        self._spawn_external('mne-lsl viewer')
+        # cv2 (opencv-python) ships its own bundled Qt5 platform plugins
+        # and sets QT_QPA_PLATFORM_PLUGIN_PATH to point at them at import
+        # time (site-packages/cv2/config-3.py). Those plugins are ABI-
+        # incompatible with the env's PyQt5 / pyqtgraph, so any Qt app
+        # launched while that env var is set crashes with
+        # "Could not load the Qt platform plugin xcb ... even though it
+        # was found". We can't swap to opencv-python-headless because
+        # neon_viewer.py and Utils/gaze/gaze_ui.py use cv2.imshow.
+        # Stripping the var here is the surgical fix — other
+        # _spawn_external callers (UDPRobot, training scripts) don't
+        # use Qt and don't need it.
+        self._spawn_external(
+            'env -u QT_QPA_PLATFORM_PLUGIN_PATH -u QT_PLUGIN_PATH mne-lsl viewer'
+        )
         self._append_log("Panel", f"[{self._ts()}] Opened mne-lsl viewer\n")
 
     def on_open_impedance_monitor(self):
