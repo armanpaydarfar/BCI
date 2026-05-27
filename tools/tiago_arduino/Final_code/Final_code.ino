@@ -45,8 +45,17 @@ int comma1, comma2;
 
 void setup() {
 
-  // Servo Motor pin
+  // Servo: write s_center to the library's internal `ticks` BEFORE
+  // calling attach(). The Servo library starts PWM on attach using
+  // whatever ticks were last written (constructor default is
+  // DEFAULT_PULSE_WIDTH = 1500 us = 90 deg). By writing s_center
+  // first, the very first PWM pulse goes to s_center and the servo
+  // moves directly there from wherever it was — no detour through
+  // the library default. If the servo was already at s_center
+  // (typical after a clean session end), there's no visible motion.
+  servo1.write(s_center);
   servo1.attach(2);
+  currentAngle = s_center;
 
   // Linear Actuator pins
   pinMode(RPWM, OUTPUT); // Extend
@@ -59,20 +68,38 @@ void setup() {
   Serial.println(" ");
   Serial.println("Begin");
 
-  // Boot is now handshake-only: print a banner and wait for commands.
-  // The Python side (Utils/tiagobot.open_port) treats this banner as
-  // proof the device is alive. The 15-30 s actuator calibration sweep
-  // moved into runCalibration(), triggered explicitly by the 't'
-  // command from the operator (panel "Test" button) or driver.
+  // Linear actuator: only retract to home if not already there.
+  // After a clean session (last command was 'h' HOME), the actuator
+  // is already at minAnalogReading and this is a no-op (zero motion,
+  // boot completes in milliseconds). If USB was unplugged mid-stroke
+  // or the actuator drifted, this retracts to home. settleThreshold
+  // = 15 matches moveToLimit(-1)'s tolerance — anywhere within that
+  // band counts as "at home" and skips the motion.
+  sensorVal = analogRead(sensorPin);
+  if (sensorVal - minAnalogReading > 15) {
+    Serial.println("Linear actuator off-home; parking...");
+    while (sensorVal > minAnalogReading) {
+      driveActuator(-1, Speed);
+      displayOutput();
+      sensorVal = analogRead(sensorPin);
+    }
+    driveActuator(0, Speed);
+    Serial.println("Linear actuator parked at home.");
+  } else {
+    Serial.println("Linear actuator already at home; skipping park.");
+  }
+
+  // Handshake-only banner: print and wait for commands. The Python
+  // side (Utils/tiagobot.open_port) sends '?' immediately after open
+  // and expects "OK" — that's what proves the device is alive. The
+  // 15-30 s full actuator calibration sweep (servo + linear extend/
+  // retract) moved into the 't' command handler in loop(), triggered
+  // explicitly by the panel's "Test" button.
   //
-  // Rationale: prior behaviour auto-calibrated on every USB enumerate
-  // and on every panel/driver port-open. The visible sweep slowed down
-  // every session start. With handshake-only boot, the actuator stays
-  // idle at whatever position it was last in until the operator
-  // explicitly calibrates. Motion commands (letters, 'h') still work
-  // pre-calibration using the hardcoded s_center / s_l/r_max defaults
-  // — accuracy may be lower than post-calibration but the actuator
-  // won't refuse to move.
+  // Motion commands (letters, 'h') work pre-calibration using the
+  // hardcoded s_center / s_l/r_max / min/maxAnalogReading defaults
+  // at the top of this file — accuracy may be lower than post-
+  // calibration but the actuator won't refuse to move.
   Serial.println("Tiagobot ready. Send '?' to ping, 't' to calibrate, "
                  "'analog,angle,delay' to GO, 'h' to HOME.");
 }
