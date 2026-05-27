@@ -345,13 +345,27 @@ def open_port(port, baud, logger, yield_callback=None):
                 return ser
 
     # Warm-reopen path (or cold-boot fallback): explicit ?->OK probe.
-    try:
-        ser.write(HANDSHAKE_REQUEST)
-    except Exception as e:
-        ser.close()
-        raise serial.SerialException(
-            f"Tiagobot: write to {port} failed during handshake: {e}"
-        ) from e
+    #
+    # Bootloader-trap handling: when Python's quick_probe runs in the
+    # 500 ms after open, the Arduino may still be in the Mega 2560's
+    # STK500v2 bootloader (which polls for ~8 s before jumping to the
+    # user sketch). cold_boot=False is then incorrectly latched, we
+    # send `?`, but the bootloader consumes/discards the byte instead
+    # of forwarding it to the user sketch. When the bootloader finally
+    # hands off and setup() starts printing, the user sketch never
+    # received `?`. The lost-byte recovery: in the wait loop below,
+    # treat BOOT_READY_MARKER as a re-send trigger. When we see it,
+    # loop() is now running and a freshly-sent `?` will be processed.
+    def _send_q():
+        try:
+            ser.write(HANDSHAKE_REQUEST)
+        except Exception as e:
+            ser.close()
+            raise serial.SerialException(
+                f"Tiagobot: write to {port} failed during handshake: {e}"
+            ) from e
+
+    _send_q()
 
     deadline = time.monotonic() + HANDSHAKE_TIMEOUT_S
     while time.monotonic() < deadline:
@@ -372,6 +386,19 @@ def open_port(port, baud, logger, yield_callback=None):
             if logger is not None:
                 logger.log_event("Tiagobot: handshake OK; device alive.")
             return ser
+        if BOOT_READY_MARKER in line:
+            # The Arduino just exited setup() and is now in loop().
+            # Our earlier `?` was almost certainly consumed by the
+            # bootloader; re-send now so loop() can answer it. Also
+            # extend the deadline since the bootloader chewed up the
+            # original handshake budget.
+            if logger is not None:
+                logger.log_event(
+                    "Tiagobot: boot banner observed; re-sending handshake "
+                    "(bootloader likely ate the first `?`)."
+                )
+            _send_q()
+            deadline = max(deadline, time.monotonic() + HANDSHAKE_TIMEOUT_S)
 
     ser.close()
     raise TimeoutError(
