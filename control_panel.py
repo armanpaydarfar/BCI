@@ -90,6 +90,7 @@ except Exception:
     _HCFG = None
 
 MARKER_PY = os.path.join(ROOT, "UTIL_marker_stream.py")
+NEON_LSL_BRIDGE_PY = os.path.join(ROOT, "tools", "neon_lsl_bridge.py")
 DRIVER_ONLINE_PY = os.path.join(ROOT, "ExperimentDriver_Online.py")
 DRIVER_ONLINE_GAZE_PY = os.path.join(ROOT, "ExperimentDriver_Online_GazeTracking.py")
 DRIVER_ONLINE_GLOVE_PY = os.path.join(ROOT, "ExperimentDriver_Online_Glove.py")
@@ -753,6 +754,14 @@ class ControlPanel(QMainWindow):
         self.marker = Proc("Marker Stream", f'python -u "{MARKER_PY}"', ROOT)
         self.driver = Proc("Experiment Driver", None, ROOT)
         self.fes    = Proc("FES Listener", f'python -u "{FES_PY}"', ROOT)
+        # Neon Gaze LSL bridge — republishes Pupil Labs Neon realtime
+        # API gaze samples as an LSL outlet so LabRecorder captures them
+        # alongside EEG into a single XDF (see tools/neon_lsl_bridge.py
+        # docstring for the rationale — Companion app's on-device LSL
+        # toggle does NOT publish an externally-discoverable stream).
+        self.neon_bridge = Proc(
+            "Neon Gaze LSL", f'python -u "{NEON_LSL_BRIDGE_PY}"', ROOT,
+        )
 
         # ---- Gaze procs (NEW) ----
         self.gaze_runner = Proc("Gaze Runner", None, ROOT)
@@ -828,6 +837,7 @@ class ControlPanel(QMainWindow):
         self._set_led(self.lbl_fes, "stopped")
         self._set_led(self.lbl_driver, "stopped")
         self._set_led(self.lbl_eego, "stopped")
+        self._set_led(self.lbl_neon_bridge, "stopped")
         self._set_led(self.lbl_labrec, "stopped")
         self._set_led(self.lbl_gaze_service, "stopped")
         self._set_led(self.lbl_compute_led, "stopped")
@@ -1017,6 +1027,25 @@ class ControlPanel(QMainWindow):
         grid.addWidget(self.btn_marker_start, row, 2)
         grid.addWidget(self.btn_marker_stop, row, 3)
         grid.addWidget(self.btn_marker_refresh, row, 4)
+        row += 1
+
+        # ===== Neon Gaze LSL Bridge =====
+        # Republishes Pupil Labs Neon realtime-API gaze samples as an
+        # LSL outlet so LabRecorder captures them into the EEG XDF.
+        # Same Start/Stop/Refresh pattern as Marker Stream.
+        self.lbl_neon_bridge = QLabel("●")
+        self._set_led(self.lbl_neon_bridge, "stopped")
+        grid.addWidget(QLabel("<b>Neon Gaze LSL</b>"), row, 0)
+        grid.addWidget(self.lbl_neon_bridge, row, 1)
+        self.btn_neon_bridge_start = QPushButton("Start")
+        self.btn_neon_bridge_stop  = QPushButton("Stop")
+        self.btn_neon_bridge_refresh = QPushButton("Refresh")
+        self.btn_neon_bridge_start.clicked.connect(self.on_neon_bridge_start)
+        self.btn_neon_bridge_stop.clicked.connect(self.on_neon_bridge_stop)
+        self.btn_neon_bridge_refresh.clicked.connect(self.on_neon_bridge_refresh)
+        grid.addWidget(self.btn_neon_bridge_start, row, 2)
+        grid.addWidget(self.btn_neon_bridge_stop, row, 3)
+        grid.addWidget(self.btn_neon_bridge_refresh, row, 4)
         row += 1
 
         # ===== FES =====
@@ -2420,6 +2449,19 @@ class ControlPanel(QMainWindow):
         time.sleep(0.1)
         self.on_marker_start()
         self._append_log("Marker", f"[{self._ts()}] Refreshed marker stream\n")
+
+    # ----- Neon Gaze LSL Bridge -----
+    def on_neon_bridge_start(self):
+        self._start_proc(self.neon_bridge, self.lbl_neon_bridge, "NeonGaze")
+    def on_neon_bridge_stop(self):
+        self._stop_proc(self.neon_bridge, self.lbl_neon_bridge, "NeonGaze")
+    def on_neon_bridge_refresh(self):
+        self.on_neon_bridge_stop()
+        time.sleep(0.1)
+        self.on_neon_bridge_start()
+        self._append_log(
+            "NeonGaze", f"[{self._ts()}] Refreshed Neon LSL bridge\n"
+        )
 
     # ----- FES -----
     def on_fes_start(self):
