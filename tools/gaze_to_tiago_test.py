@@ -240,6 +240,18 @@ def main() -> int:
              "the test window MUST match the calibration window. Run "
              "calibration with --windowed too if you use this here.",
     )
+    parser.add_argument(
+        "--display", type=int, default=0,
+        help="Display index to open the test window on (0=primary, "
+             "1=secondary, etc.). MUST match the --display used at "
+             "calibration time — centroids are tied to physical letter "
+             "positions on whichever screen the calibration ran on. "
+             "Default: 0.",
+    )
+    parser.add_argument(
+        "--list-displays", action="store_true",
+        help="Print available pygame display indices and sizes, then exit.",
+    )
     args = parser.parse_args()
 
     logger = _Logger()
@@ -300,13 +312,39 @@ def main() -> int:
     # ---- UI ----
     # Fullscreen by default so the letters land in the same scene-camera
     # pixels they did during calibration. --windowed only for off-Neon
-    # development. Mirrors tiago_gaze_calibration_exec.py:407-410.
+    # development. --display N picks a specific physical monitor (e.g.,
+    # an external display plugged into a laptop). Mirrors the calibration
+    # script's flag — MUST match the value used at calibration time.
     pygame.init()
+    n_disp = pygame.display.get_num_displays()
+    if args.list_displays:
+        print(f"Available pygame displays: {n_disp}")
+        try:
+            sizes = pygame.display.get_desktop_sizes()
+        except AttributeError:
+            sizes = [None] * n_disp
+        for i, sz in enumerate(sizes):
+            print(f"  display {i}: size={sz}")
+        pygame.quit()
+        return 0
+    if args.display < 0 or args.display >= n_disp:
+        print(
+            f"ERROR: --display {args.display} out of range; "
+            f"{n_disp} display(s) available. Re-run with --list-displays.",
+            file=sys.stderr,
+        )
+        pygame.quit()
+        return 1
     if args.windowed:
-        screen = pygame.display.set_mode((1280, 800))
+        screen = pygame.display.set_mode((1280, 800), display=args.display)
     else:
-        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN, display=args.display)
     pygame.display.set_caption("Gaze -> Tiagobot test (no EEG)")
+    print(
+        f"[TEST] Opened on display {args.display} of {n_disp}; "
+        f"surface size={screen.get_size()}",
+        flush=True,
+    )
 
     win_s = float(getattr(config, "TIAGOBOT_GAZE_SELECTION_WINDOW", 4.0))
     conf_thr = float(getattr(config, "TIAGOBOT_GAZE_CONFIDENCE_THRESHOLD", 0.7))

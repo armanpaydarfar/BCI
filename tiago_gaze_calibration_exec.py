@@ -459,17 +459,59 @@ def main() -> int:
         help="Use a 1280x800 windowed mode instead of fullscreen "
              "(handy for local validation without a head-mounted Neon).",
     )
+    parser.add_argument(
+        "--display", type=int, default=0,
+        help="Display index to open the calibration window on "
+             "(0=primary, 1=secondary, etc.). Use this when an external "
+             "monitor is plugged in and you want calibration to run on "
+             "it instead of the laptop screen. Run with --list-displays "
+             "to see the available indices. Default: 0.",
+    )
+    parser.add_argument(
+        "--list-displays", action="store_true",
+        help="Print the available pygame display indices and their sizes, "
+             "then exit. Use this to find the right --display N.",
+    )
     args = parser.parse_args()
 
     out_path = _resolve_output_path(args.subject, args.out)
 
-    # Pygame setup.
+    # Pygame setup. `display=N` targets a specific physical monitor on
+    # pygame 2.x — needed when an external monitor is plugged into a
+    # laptop and the calibration should open there. Required for both
+    # fullscreen and windowed modes because the calibration centroids
+    # are tied to the physical letter positions in the Neon scene
+    # camera, which depends on which screen the letters render on.
     pygame.init()
+    n_disp = pygame.display.get_num_displays()
+    if args.list_displays:
+        print(f"Available pygame displays: {n_disp}")
+        try:
+            sizes = pygame.display.get_desktop_sizes()
+        except AttributeError:
+            sizes = [None] * n_disp  # pygame < 2.1
+        for i, sz in enumerate(sizes):
+            print(f"  display {i}: size={sz}")
+        pygame.quit()
+        return 0
+    if args.display < 0 or args.display >= n_disp:
+        print(
+            f"ERROR: --display {args.display} out of range; "
+            f"{n_disp} display(s) available. Re-run with --list-displays.",
+            file=sys.stderr,
+        )
+        pygame.quit()
+        return 1
     if args.windowed:
-        screen = pygame.display.set_mode((1280, 800))
+        screen = pygame.display.set_mode((1280, 800), display=args.display)
     else:
-        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN, display=args.display)
     pygame.display.set_caption("Tiagobot Gaze Calibration")
+    print(
+        f"[CAL] Opened on display {args.display} of {n_disp}; "
+        f"surface size={screen.get_size()}",
+        flush=True,
+    )
 
     centroids_norm = grid_centroids_norm()
 
