@@ -282,7 +282,7 @@ TIAGOBOT_TRAJECTORY = ["A", "B", "C", "D", "E", "F", "G", "H", "I"]
 # Optional glove integration in the Tiagobot driver. When True, the driver
 # also opens config.ARDUINO_PORT and writes ARDUINO_CMD_MI / ARDUINO_CMD_REST
 # on each MI / HOME phase, exactly like ExperimentDriver_Online_Glove.py.
-TIAGOBOT_USE_GLOVE = False
+TIAGOBOT_USE_GLOVE = True
 # Seconds the driver waits after writing ARDUINO_CMD_MI (close glove) and
 # before sending HOME. The glove's mechanical close takes time and HOME
 # starting too early means the actuator retracts mid-grip. Tune to match
