@@ -114,19 +114,29 @@ CALIBRATION_TIMEOUT_S = 60.0
 BOOT_READY_MARKER = "Tiagobot ready."
 
 # Handshake / ping. open_port writes this and waits for HANDSHAKE_REPLY
-# on the WARM-reopen path (Arduino already past boot, silent). Kept
-# short so warm reopens feel instant.
+# on the WARM-reopen path (Arduino already past boot, silent), or as a
+# fallback after the cold-boot drain finishes/times-out. Returns as soon
+# as the OK arrives, so warm reopens still feel instant — the ceiling
+# only matters when the Arduino is mid-bootloader.
+#
+# 10 s ceiling accommodates the Mega 2560's STK500v2 bootloader delay
+# (~1-2 s before the sketch's setup() runs) plus the rare case where
+# the panel's first port open races against the bootloader and the `?`
+# byte sits in the UART buffer until loop() starts.
 HANDSHAKE_REQUEST = b"?\n"
 HANDSHAKE_REPLY = "OK"
-HANDSHAKE_TIMEOUT_S = 3.0
+HANDSHAKE_TIMEOUT_S = 10.0
 
 # Cold-boot path: on USB plug-in (or any DTR-reset), the sketch's
-# setup() prints chatter while parking the actuator at home position
-# (~5-10 s of motion before loop() starts processing commands).
-# open_port detects this chatter and waits up to BOOT_DRAIN_TIMEOUT_S
-# for the BOOT_READY_MARKER instead of sending an early `?` that
-# would block in the Arduino's UART buffer past HANDSHAKE_TIMEOUT_S.
-BOOT_DRAIN_TIMEOUT_S = 15.0
+# setup() prints chatter while parking the actuator at home position.
+# The wait is adaptive: as long as the Arduino is producing output,
+# we keep listening (resets the deadline on every fresh line). Only
+# falls through to the `?` handshake after BOOT_SILENT_TIMEOUT_S of
+# silence without seeing BOOT_READY_MARKER, OR after the absolute
+# ceiling BOOT_DRAIN_TIMEOUT_S. The ceiling covers worst-case
+# retract from a fully-extended actuator (~20-30 s) plus headroom.
+BOOT_DRAIN_TIMEOUT_S = 60.0
+BOOT_SILENT_TIMEOUT_S = 5.0
 
 # Explicit calibration trigger sent by `calibrate()`.
 CALIBRATE_REQUEST = b"t\n"
@@ -287,8 +297,32 @@ def open_port(port, baud, logger, yield_callback=None):
             logger.log_event(
                 "Tiagobot: cold-boot chatter detected; waiting for boot banner..."
             )
-        boot_deadline = time.monotonic() + BOOT_DRAIN_TIMEOUT_S
-        while time.monotonic() < boot_deadline:
+        # Adaptive wait: reset last_chatter on every fresh line. As
+        # long as the Arduino keeps printing (e.g., displayOutput()
+        # during a long retract from a fully-extended actuator), we
+        # keep listening. Only give up after BOOT_SILENT_TIMEOUT_S of
+        # silence without seeing the marker, OR after the absolute
+        # BOOT_DRAIN_TIMEOUT_S ceiling.
+        boot_start = time.monotonic()
+        last_chatter = boot_start
+        while True:
+            now = time.monotonic()
+            if now - boot_start > BOOT_DRAIN_TIMEOUT_S:
+                if logger is not None:
+                    logger.log_event(
+                        f"Tiagobot: BOOT_READY_MARKER not seen in "
+                        f"{BOOT_DRAIN_TIMEOUT_S:.0f}s ceiling; falling "
+                        f"back to ? handshake."
+                    )
+                break
+            if now - last_chatter > BOOT_SILENT_TIMEOUT_S:
+                if logger is not None:
+                    logger.log_event(
+                        f"Tiagobot: silent for {BOOT_SILENT_TIMEOUT_S:.0f}s "
+                        f"without BOOT_READY_MARKER; falling back to ? "
+                        f"handshake."
+                    )
+                break
             try:
                 line = ser.readline().decode("utf-8", errors="replace").strip()
             except Exception:
@@ -300,6 +334,7 @@ def open_port(port, baud, logger, yield_callback=None):
                     pass
             if not line:
                 continue
+            last_chatter = now
             if logger is not None:
                 logger.log_event(f"Tiagobot[boot]: {line}")
             if BOOT_READY_MARKER in line:
@@ -308,16 +343,6 @@ def open_port(port, baud, logger, yield_callback=None):
                         "Tiagobot: boot complete; device alive (banner seen)."
                     )
                 return ser
-        # Banner didn't arrive — fall through to the explicit `?`
-        # handshake. Maybe the boot motion took longer than expected,
-        # or the firmware is older and just printing different
-        # chatter. The handshake below either succeeds (proves life)
-        # or fails (real problem, surface it).
-        if logger is not None:
-            logger.log_event(
-                f"Tiagobot: BOOT_READY_MARKER not seen in "
-                f"{BOOT_DRAIN_TIMEOUT_S:.0f}s; falling back to ? handshake."
-            )
 
     # Warm-reopen path (or cold-boot fallback): explicit ?->OK probe.
     try:
