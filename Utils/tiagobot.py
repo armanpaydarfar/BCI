@@ -101,12 +101,26 @@ GLOVE_USB_VID = 0x2341  # Arduino SA
 GLOVE_USB_PID = 0x0043  # Uno R3
 
 # Banner printed by the sketch after calibrateServo() + calibrateLinAct().
-# We wait for it on port open so the first letter is not sent into a
-# mid-calibration Arduino. Servo sweep alone takes ~10 s; the linear
-# actuator extend+retract adds another 10-30 s depending on stroke length
-# and friction. 60 s leaves comfortable headroom.
+# Latched by `calibrate()` (the explicit operator-triggered calibration
+# command). Servo sweep alone takes ~10 s; the linear actuator
+# extend+retract adds another 10-30 s depending on stroke length and
+# friction. 60 s leaves comfortable headroom.
 CALIBRATION_READY_MARKER = "Calibration complete."
 CALIBRATION_TIMEOUT_S = 60.0
+
+# Banner printed by the sketch on boot (after the Serial.begin and
+# before the main loop). Latched by `open_port` as proof the device is
+# alive. Substring match — the actual line includes a usage hint.
+BOOT_READY_MARKER = "Tiagobot ready."
+
+# Handshake / ping. open_port writes this and waits for HANDSHAKE_REPLY.
+# Kept short so the round-trip is well under HANDSHAKE_TIMEOUT_S.
+HANDSHAKE_REQUEST = b"?\n"
+HANDSHAKE_REPLY = "OK"
+HANDSHAKE_TIMEOUT_S = 3.0
+
+# Explicit calibration trigger sent by `calibrate()`.
+CALIBRATE_REQUEST = b"t\n"
 
 
 # =========================================================
@@ -186,23 +200,28 @@ def find_glove_port(logger=None):
 
 
 def open_port(port, baud, logger, yield_callback=None):
-    """Open the Tiagobot Arduino serial port and wait for the sketch's
-    `Calibration complete.` banner.
+    """Open the Tiagobot Arduino serial port and verify the device is
+    alive via the lightweight `?`->`OK` handshake.
+
+    This is a FAST operation (sub-second on a responsive Arduino). It
+    does NOT trigger the actuator calibration sweep — that lives in
+    `calibrate()` and is now an explicit, operator-triggered step
+    (panel "Test" button, or driver if you decide to call it).
 
     Returns the serial.Serial handle, or None if `port` is empty or
     SIMULATION_MODE is set (the driver still runs in either case; the
     send_* helpers no-op when given None).
 
     `yield_callback` is an optional zero-arg callable invoked once per
-    serial read iteration during the calibration wait. Use it from a Qt
-    main thread to pump events
-    (e.g. ``yield_callback=QApplication.processEvents``) so the GUI stays
-    responsive across the 15-60 s calibration sweep. The experiment
-    driver passes None — it's already blocked at startup and doesn't
-    need to yield.
+    serial read iteration during the handshake wait — same Qt-event-
+    pump pattern as `calibrate()`. Largely vestigial here since the
+    handshake completes well within HANDSHAKE_TIMEOUT_S, but kept for
+    signature symmetry.
 
-    Raises serial.SerialException on real open failures (port specified
-    but unavailable) — caller decides whether to abort.
+    Raises serial.SerialException on real open failures, or TimeoutError
+    if the handshake never returns within HANDSHAKE_TIMEOUT_S (device
+    plugged in but sketch is wedged / not flashed with the new
+    handshake-aware firmware).
     """
     if SIMULATION_MODE:
         if logger is not None:
@@ -218,10 +237,11 @@ def open_port(port, baud, logger, yield_callback=None):
 
     # Disable HUPCL on this tty so closing the port doesn't drop DTR.
     # Without this, every close-then-reopen across the session triggers
-    # an Arduino auto-reset (DTR low->high edge on next open) and re-runs
-    # the sketch's ~20-30 s calibration sweep. With HUPCL cleared, DTR
-    # stays high between processes; only the very first open after a
-    # fresh USB plug-in actually triggers a calibration.
+    # an Arduino auto-reset (DTR low->high edge on next open). With the
+    # post-2026-05-27 handshake-only boot the reset only costs ~100 ms
+    # of banner-print (no actuator sweep), but we still want to avoid
+    # spurious sketch restarts — they reset the BOOT_READY_MARKER state
+    # and chew through the serial buffer needlessly.
     try:
         subprocess.run(["stty", "-F", port, "-hupcl"],
                        check=False, timeout=2)
@@ -229,17 +249,37 @@ def open_port(port, baud, logger, yield_callback=None):
         if logger is not None:
             logger.log_event(f"Tiagobot: could not clear HUPCL on {port}: {e}")
 
-    ser = serial.Serial(port, baud, timeout=0.5)
+    ser = serial.Serial(port, baud, timeout=0.2)
 
-    # Fast-path detection: if the Arduino is already past calibration
-    # (typical when we've previously opened the port with HUPCL=0), the
-    # main loop is silent. Probe for ~2 s — calibration's tight
-    # moveToLimit loop prints continuously, so any output within this
-    # window means we caught a fresh boot. Silence means the sketch is
-    # already in the main loop and ready for commands.
-    quiet_deadline = time.monotonic() + 2.0
-    saw_boot_output = False
-    while time.monotonic() < quiet_deadline:
+    # Drain any stale buffer chatter from a prior session / boot banner.
+    # Short 200 ms window — long enough to absorb the boot banner on
+    # fresh USB enumerate, short enough to feel instant on warm reopen.
+    drain_deadline = time.monotonic() + 0.2
+    while time.monotonic() < drain_deadline:
+        if not ser.in_waiting:
+            time.sleep(0.01)
+            continue
+        try:
+            stale = ser.readline().decode("utf-8", errors="replace").strip()
+            if stale and logger is not None:
+                logger.log_event(f"Tiagobot[drain]: {stale}")
+        except Exception:
+            break
+
+    # Handshake: ?\n -> "OK". Confirms the sketch is up + responsive.
+    # Times out fast so a plugged-in-but-unflashed Arduino (or pre-
+    # 2026-05-27 firmware that doesn't know `?`) is detected
+    # immediately.
+    try:
+        ser.write(HANDSHAKE_REQUEST)
+    except Exception as e:
+        ser.close()
+        raise serial.SerialException(
+            f"Tiagobot: write to {port} failed during handshake: {e}"
+        ) from e
+
+    deadline = time.monotonic() + HANDSHAKE_TIMEOUT_S
+    while time.monotonic() < deadline:
         try:
             line = ser.readline().decode("utf-8", errors="replace").strip()
         except Exception:
@@ -249,26 +289,57 @@ def open_port(port, baud, logger, yield_callback=None):
                 yield_callback()
             except Exception:
                 pass
-        if line:
-            saw_boot_output = True
-            if logger is not None:
-                logger.log_event(f"Tiagobot[boot]: {line}")
-            if CALIBRATION_READY_MARKER in line:
-                if logger is not None:
-                    logger.log_event("Tiagobot: calibration complete.")
-                return ser
-            # Caught calibration output — switch to the long wait below.
-            break
-
-    if not saw_boot_output:
+        if not line:
+            continue
         if logger is not None:
-            logger.log_event(
-                "Tiagobot: no boot output within 2 s — assuming already "
-                "initialized (skipping calibration wait)."
-            )
-        return ser
+            logger.log_event(f"Tiagobot[hs]: {line}")
+        if HANDSHAKE_REPLY in line:
+            if logger is not None:
+                logger.log_event("Tiagobot: handshake OK; device alive.")
+            return ser
 
-    # Slow path: calibration is running. Wait for the banner.
+    ser.close()
+    raise TimeoutError(
+        f"Tiagobot did not reply '{HANDSHAKE_REPLY}' to handshake within "
+        f"{HANDSHAKE_TIMEOUT_S:.1f}s on {port}. Is the sketch flashed "
+        f"with handshake support (post-2026-05-27 firmware)?"
+    )
+
+
+def calibrate(ser, logger, yield_callback=None):
+    """Send the explicit calibration command and wait for the
+    `Calibration complete.` banner. Triggers the ~15-30 s actuator
+    sweep on the Arduino (calibrateServo + calibrateLinAct).
+
+    Called explicitly by the panel "Test" button at the start of a
+    session. The driver does NOT call this — operator decides when to
+    calibrate. Motion commands work without prior calibration using
+    the sketch's hardcoded servo / linear-actuator defaults; accuracy
+    may be lower, but the device won't refuse to move.
+
+    Returns True on success, False if `ser` is None (SIMULATION_MODE).
+    Raises TimeoutError if the banner doesn't arrive within
+    CALIBRATION_TIMEOUT_S.
+
+    `yield_callback` pumps Qt events from a long-running GUI thread,
+    same pattern as the old open_port. Pass
+    `QApplication.processEvents` from the panel.
+    """
+    if ser is None:
+        if logger is not None:
+            logger.log_event("Tiagobot[cal]: SIMULATION_MODE — skipping.")
+        return False
+
+    if logger is not None:
+        logger.log_event("Tiagobot[cal]: sending calibrate (sweep starts now)...")
+
+    try:
+        ser.write(CALIBRATE_REQUEST)
+    except Exception as e:
+        raise serial.SerialException(
+            f"Tiagobot: write of calibrate command failed: {e}"
+        ) from e
+
     deadline = time.monotonic() + CALIBRATION_TIMEOUT_S
     while time.monotonic() < deadline:
         try:
@@ -285,16 +356,15 @@ def open_port(port, baud, logger, yield_callback=None):
         if not line:
             continue
         if logger is not None:
-            logger.log_event(f"Tiagobot[boot]: {line}")
+            logger.log_event(f"Tiagobot[cal]: {line}")
         if CALIBRATION_READY_MARKER in line:
             if logger is not None:
                 logger.log_event("Tiagobot: calibration complete.")
-            return ser
+            return True
 
-    ser.close()
     raise TimeoutError(
         f"Tiagobot did not emit '{CALIBRATION_READY_MARKER}' within "
-        f"{CALIBRATION_TIMEOUT_S:.0f}s on {port}"
+        f"{CALIBRATION_TIMEOUT_S:.0f}s after calibrate request"
     )
 
 

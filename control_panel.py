@@ -3446,7 +3446,12 @@ class ControlPanel(QMainWindow):
         self._set_led(self.lbl_tiago, "starting")
         QApplication.processEvents()
         try:
-            from Utils.tiagobot import open_port as _tiago_open
+            from Utils.tiagobot import (
+                open_port as _tiago_open,
+                calibrate as _tiago_calibrate,
+            )
+            # Phase 1: fast handshake — proves the device is alive,
+            # sub-second.
             ser = _tiago_open(
                 port,
                 baud,
@@ -3459,7 +3464,16 @@ class ControlPanel(QMainWindow):
                 return
             self.tiago_ser = ser
             self.tiago_port_name = port
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot connected and calibrated on {port} @ {baud}\n")
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot handshake OK on {port} @ {baud}; starting calibration sweep...\n")
+            # Phase 2: explicit calibration. The 15-30 s actuator
+            # sweep. Operator opted in by clicking the "Test" button,
+            # so the visible sweep is expected here.
+            _tiago_calibrate(
+                ser,
+                self._tiago_panel_logger(),
+                yield_callback=QApplication.processEvents,
+            )
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot calibration complete.\n")
             self._set_led(self.lbl_tiago, "running")
             self._set_cmds_for_mode_and_driver()
         except Exception as e:
@@ -3630,11 +3644,37 @@ class ControlPanel(QMainWindow):
                 return
         # The panel and the experiment driver can't share the Tiagobot
         # serial port — release ours before the driver tries to claim it.
-        # No-op if the panel never opened the port.
+        # No-op if the panel never opened the port. Releasing for the
+        # driver does NOT gray the Tiagobot LED — the LED tracks "device
+        # was last verified alive", not "panel currently owns the port".
+        # Operator-triggered Disconnect remains the only path back to
+        # gray. This is the 2026-05-27 LED-semantics change: an operator
+        # who calibrated the device shouldn't see the indicator regress
+        # to "stopped" just because the driver took over the port.
         if self.tiago_ser is not None:
-            self._append_log("Panel", f"[{self._ts()}] Releasing Tiagobot port for the experiment driver.\n")
-            self.on_tiago_disconnect()
+            self._append_log("Panel", f"[{self._ts()}] Releasing Tiagobot port for the experiment driver (LED stays green).\n")
+            self._release_tiago_for_driver()
         self._start_proc(self.driver, self.lbl_driver, "Driver")
+
+    def _release_tiago_for_driver(self):
+        """Close the cached Tiagobot serial handle (the driver needs
+        exclusive access) but leave the LED in its current state.
+        Internal-only counterpart to on_tiago_disconnect (which is the
+        operator-triggered Disconnect button and explicitly sets the
+        LED to 'stopped'). Keeps the on_tiago_disconnect semantics
+        unchanged for the explicit-disconnect path."""
+        if self.tiago_ser is None:
+            return
+        try:
+            from Utils.tiagobot import close_port as _tiago_close
+            _tiago_close(self.tiago_ser, self._tiago_panel_logger())
+        except Exception as e:
+            self._append_log("Panel", f"[{self._ts()}] Tiagobot release error: {e}\n")
+        finally:
+            self.tiago_ser = None
+            # NOTE: LED intentionally NOT changed. The driver now owns
+            # the port; the LED still reflects "panel verified alive".
+            self._tiago_set_controls_busy(False)
 
     def on_driver_stop(self):
         self._stop_proc(self.driver, self.lbl_driver, "Driver")

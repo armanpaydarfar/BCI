@@ -47,7 +47,7 @@ void setup() {
 
   // Servo Motor pin
   servo1.attach(2);
- 
+
   // Linear Actuator pins
   pinMode(RPWM, OUTPUT); // Extend
   pinMode(LPWM, OUTPUT); // Retract
@@ -59,20 +59,22 @@ void setup() {
   Serial.println(" ");
   Serial.println("Begin");
 
-  
-
-  // CALIBRATING SERVO
-  Serial.println("Initializing rotational motor...");
-  calibrateServo();
-  
-
-  // CALIBRATING LINEAR ACTUATOR
-  Serial.println("Initializing linear motor...");
-  calibrateLinAct();
-
-
-  // Calibration Complete
-  Serial.println("Calibration complete. Waiting for next command. Enter: 'analog_value,angle,delay'.");
+  // Boot is now handshake-only: print a banner and wait for commands.
+  // The Python side (Utils/tiagobot.open_port) treats this banner as
+  // proof the device is alive. The 15-30 s actuator calibration sweep
+  // moved into runCalibration(), triggered explicitly by the 't'
+  // command from the operator (panel "Test" button) or driver.
+  //
+  // Rationale: prior behaviour auto-calibrated on every USB enumerate
+  // and on every panel/driver port-open. The visible sweep slowed down
+  // every session start. With handshake-only boot, the actuator stays
+  // idle at whatever position it was last in until the operator
+  // explicitly calibrates. Motion commands (letters, 'h') still work
+  // pre-calibration using the hardcoded s_center / s_l/r_max defaults
+  // — accuracy may be lower than post-calibration but the actuator
+  // won't refuse to move.
+  Serial.println("Tiagobot ready. Send '?' to ping, 't' to calibrate, "
+                 "'analog,angle,delay' to GO, 'h' to HOME.");
 }
 
 
@@ -83,6 +85,31 @@ void loop() {
     // Parsing input values, splitting them into analog (linear) and angle
     String input = Serial.readStringUntil('\n');
     input.trim();
+
+    // Handshake / ping. Python's open_port sends this immediately
+    // after opening the serial port to confirm the device is alive
+    // without triggering the slow actuator calibration sweep. Reply
+    // is intentionally short so the round-trip is sub-second.
+    if (input == "?") {
+      Serial.println("OK");
+      continue;
+    }
+
+    // Explicit calibration command. Operator triggers this via the
+    // panel's Test button when they want to (re)home the actuator
+    // and verify the full motion range. Same banner text the prior
+    // setup()-driven calibration printed, so the Python wait logic
+    // in Utils/tiagobot.calibrate() can latch onto the existing
+    // CALIBRATION_READY_MARKER.
+    if (input == "t") {
+      Serial.println("Initializing rotational motor...");
+      calibrateServo();
+      Serial.println("Initializing linear motor...");
+      calibrateLinAct();
+      Serial.println("Calibration complete. Waiting for next command. "
+                     "Enter: 'analog_value,angle,delay'.");
+      continue;
+    }
 
     // Discrete HOME command: retract actuator + center servo, with the
     // two motions running simultaneously, mirroring the GO loop's
