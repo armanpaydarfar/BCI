@@ -777,7 +777,16 @@ class ControlPanel(QMainWindow):
         self.eego_term: Optional[QProcess] = None
 
         # Logs
-        self._log_buffers: Dict[str, str] = {"Marker": "", "FES": "", "Driver": "", "Gaze": "", "VLM": "", "Relay": "", "Robot": "", "Panel": ""}
+        # "Tiagobot" + "NeonGaze" are the 2026-05-27 splits: previously
+        # all tiagobot-port-handling messages and bridge-process events
+        # landed in the catch-all "Panel" tab, which made it hard to
+        # follow either independently. _append_log auto-routes based on
+        # the title argument; existing callers updated accordingly.
+        self._log_buffers: Dict[str, str] = {
+            "Marker": "", "FES": "", "Driver": "", "Gaze": "",
+            "VLM": "", "Relay": "", "Robot": "",
+            "Tiagobot": "", "NeonGaze": "", "Panel": "",
+        }
         self._current_log_target = "Panel"
         # Subject-tied VLM log file. Captures only the "VLM" buffer
         # (vlm_service stdout when local + every panel-side UDP TX/RX
@@ -1375,7 +1384,10 @@ class ControlPanel(QMainWindow):
         pick_row = QHBoxLayout()
         self.log_title = QLabel("Logs:")
         self.log_selector = QComboBox()
-        self.log_selector.addItems(["Marker", "FES", "Driver", "Gaze", "VLM", "Relay", "Robot", "Panel"])
+        self.log_selector.addItems([
+            "Marker", "FES", "Driver", "Gaze", "VLM",
+            "Relay", "Robot", "Tiagobot", "NeonGaze", "Panel",
+        ])
         self.log_selector.setCurrentText(self._current_log_target)
         self.log_selector.currentTextChanged.connect(self._on_log_target_changed)
         pick_row.addWidget(self.log_title); pick_row.addStretch(1)
@@ -3382,7 +3394,7 @@ class ControlPanel(QMainWindow):
         self.tiago_port_name = self.cmb_tiago_port.currentData() or ""
         self.cmb_tiago_port.blockSignals(False)
 
-        self._append_log("Panel", f"[{self._ts()}] Tiagobot ports refreshed. Selected: {self.tiago_port_name or 'None'}\n")
+        self._append_log("Tiagobot", f"[{self._ts()}] Tiagobot ports refreshed. Selected: {self.tiago_port_name or 'None'}\n")
         self._set_cmds_for_mode_and_driver()
 
     def on_tiago_port_changed(self, index: int):
@@ -3392,7 +3404,7 @@ class ControlPanel(QMainWindow):
         if self.tiago_ser is not None:
             self.on_tiago_disconnect()
         self.tiago_port_name = device or ""
-        self._append_log("Panel", f"[{self._ts()}] Tiagobot port set to: {self.tiago_port_name}\n")
+        self._append_log("Tiagobot", f"[{self._ts()}] Tiagobot port set to: {self.tiago_port_name}\n")
         self._set_led(self.lbl_tiago, "stopped")
         self._set_cmds_for_mode_and_driver()
 
@@ -3409,7 +3421,7 @@ class ControlPanel(QMainWindow):
 
         class _PanelLogger:
             def log_event(self, msg, level="info"):
-                panel._append_log("Panel", f"[{panel._ts()}] tiago: {msg}\n")
+                panel._append_log("Tiagobot", f"[{panel._ts()}] {msg}\n")
 
         return _PanelLogger()
 
@@ -3423,19 +3435,19 @@ class ControlPanel(QMainWindow):
         Qt events via the yield_callback so the GUI stays responsive."""
         if self.tiago_ser is not None:
             # Already connected — make this idempotent rather than failing.
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot already connected on {self.tiago_port_name}\n")
+            self._append_log("Tiagobot", f"[{self._ts()}] Tiagobot already connected on {self.tiago_port_name}\n")
             return
 
         port = self.tiago_port_name or self.cmb_tiago_port.currentData()
         if not port:
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot test: no port selected\n")
+            self._append_log("Tiagobot", f"[{self._ts()}] Tiagobot test: no port selected\n")
             self._set_led(self.lbl_tiago, "error")
             QMessageBox.information(self, "Tiagobot test", "No serial port selected.")
             return
 
         baud = self._tiago_baud_int()
         if baud is None:
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot test: invalid baudrate {self.tiago_baudrate!r}\n")
+            self._append_log("Tiagobot", f"[{self._ts()}] Tiagobot test: invalid baudrate {self.tiago_baudrate!r}\n")
             self._set_led(self.lbl_tiago, "error")
             QMessageBox.warning(self, "Tiagobot test", "Invalid TIAGOBOT_BAUD.")
             return
@@ -3464,7 +3476,7 @@ class ControlPanel(QMainWindow):
                 return
             self.tiago_ser = ser
             self.tiago_port_name = port
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot handshake OK on {port} @ {baud}; starting calibration sweep...\n")
+            self._append_log("Tiagobot", f"[{self._ts()}] Tiagobot handshake OK on {port} @ {baud}; starting calibration sweep...\n")
             # Phase 2: explicit calibration. The 15-30 s actuator
             # sweep. Operator opted in by clicking the "Test" button,
             # so the visible sweep is expected here.
@@ -3473,11 +3485,11 @@ class ControlPanel(QMainWindow):
                 self._tiago_panel_logger(),
                 yield_callback=QApplication.processEvents,
             )
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot calibration complete.\n")
+            self._append_log("Tiagobot", f"[{self._ts()}] Tiagobot calibration complete.\n")
             self._set_led(self.lbl_tiago, "running")
             self._set_cmds_for_mode_and_driver()
         except Exception as e:
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot test ERROR: {e}\n")
+            self._append_log("Tiagobot", f"[{self._ts()}] Tiagobot test ERROR: {e}\n")
             self._set_led(self.lbl_tiago, "error")
             QMessageBox.warning(self, "Tiagobot test", f"Error opening {port}:\n{e}")
         finally:
@@ -3501,7 +3513,7 @@ class ControlPanel(QMainWindow):
         opening triggers a 20-30 s calibration sweep, which is not what
         the operator wants when clicking a Send button)."""
         if self.tiago_ser is None:
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot send {action!r}: not connected — click Test first.\n")
+            self._append_log("Tiagobot", f"[{self._ts()}] Tiagobot send {action!r}: not connected — click Test first.\n")
             self._set_led(self.lbl_tiago, "error")
             QMessageBox.information(
                 self, "Tiagobot",
@@ -3520,10 +3532,10 @@ class ControlPanel(QMainWindow):
                 _tiago_send_home(self.tiago_ser, logger)
             else:
                 _tiago_send_letter(self.tiago_ser, action, logger)
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot: sent {action!r}\n")
+            self._append_log("Tiagobot", f"[{self._ts()}] Tiagobot: sent {action!r}\n")
             self._set_led(self.lbl_tiago, "running")
         except Exception as e:
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot send ERROR: {e}\n")
+            self._append_log("Tiagobot", f"[{self._ts()}] Tiagobot send ERROR: {e}\n")
             self._set_led(self.lbl_tiago, "error")
             # On a serial error, assume the cached handle is stale.
             self.tiago_ser = None
@@ -3548,12 +3560,12 @@ class ControlPanel(QMainWindow):
             from Utils.tiagobot import close_port as _tiago_close
             _tiago_close(self.tiago_ser, self._tiago_panel_logger())
         except Exception as e:
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot disconnect error: {e}\n")
+            self._append_log("Tiagobot", f"[{self._ts()}] Tiagobot disconnect error: {e}\n")
         finally:
             self.tiago_ser = None
             self._set_led(self.lbl_tiago, "stopped")
             self._tiago_set_controls_busy(False)
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot disconnected.\n")
+            self._append_log("Tiagobot", f"[{self._ts()}] Tiagobot disconnected.\n")
 
     def on_save_tiago_to_config(self):
         port = (self.tiago_port_name or self.cmb_tiago_port.currentData() or "").strip()
@@ -3575,7 +3587,7 @@ class ControlPanel(QMainWindow):
         except Exception as e:
             self._append_log("Panel", f"[{self._ts()}] Failed to write TIAGOBOT_USE_GLOVE: {e}\n")
             return
-        self._append_log("Panel", f"[{self._ts()}] TIAGOBOT_USE_GLOVE set to {self.tiago_use_glove}\n")
+        self._append_log("Tiagobot", f"[{self._ts()}] TIAGOBOT_USE_GLOVE set to {self.tiago_use_glove}\n")
         self._set_cmds_for_mode_and_driver()
 
     # ----- Harmony calibration / online control -----
@@ -3652,7 +3664,7 @@ class ControlPanel(QMainWindow):
         # who calibrated the device shouldn't see the indicator regress
         # to "stopped" just because the driver took over the port.
         if self.tiago_ser is not None:
-            self._append_log("Panel", f"[{self._ts()}] Releasing Tiagobot port for the experiment driver (LED stays green).\n")
+            self._append_log("Tiagobot", f"[{self._ts()}] Releasing Tiagobot port for the experiment driver (LED stays green).\n")
             self._release_tiago_for_driver()
         self._start_proc(self.driver, self.lbl_driver, "Driver")
 
@@ -3669,7 +3681,7 @@ class ControlPanel(QMainWindow):
             from Utils.tiagobot import close_port as _tiago_close
             _tiago_close(self.tiago_ser, self._tiago_panel_logger())
         except Exception as e:
-            self._append_log("Panel", f"[{self._ts()}] Tiagobot release error: {e}\n")
+            self._append_log("Tiagobot", f"[{self._ts()}] Tiagobot release error: {e}\n")
         finally:
             self.tiago_ser = None
             # NOTE: LED intentionally NOT changed. The driver now owns
