@@ -11,8 +11,7 @@ import os
 # config_local.py is created (see config_local.example.py).
 WORKING_DIR = ""
 DATA_DIR = ""
-TRAINING_SUBJECT = "PILOT007"
-
+TRAINING_SUBJECT = "CLIN_SUBJ_007"
 # =============================================================================
 # EEG acquisition and channels
 # =============================================================================
@@ -35,7 +34,7 @@ TOTAL_TRIALS = 20
 MAX_REPEATS = 3
 
 TIME_MI = 5          # Motor imagery / rest cue duration (s)
-TIME_ROB = 7         # Robot movement window (s)
+TIME_ROB = 8         # Robot movement window (s)
 TIME_STATIONARY = 2  # Stationary feedback after failed/no movement (s)
 TIME_MASTER_MOVE = 5 # Bimanual: time to position master arm (s)
 TIMING = True        # If True, drivers use automatic countdown paths where implemented
@@ -55,7 +54,7 @@ EARLYSTOP_MODE = "correct_only"       # "correct_only" or "either"
 # =============================================================================
 # Runtime decoder — online classification and thresholds
 # =============================================================================
-DECODER_BACKEND = "xgb_cov"   # "mdm" | "xgb_cov" | "xgb_cov_erd"
+DECODER_BACKEND = "mdm"   # "mdm" | "xgb_cov" | "xgb_cov_erd"
 CLASSIFY_WINDOW = 1000        # EEG window length for classification (ms)
 BASELINE_DURATION = 1         # seconds
 THRESHOLD_MI = 0.6
@@ -63,7 +62,7 @@ THRESHOLD_REST = 0.6
 RELAXATION_RATIO = 0.0
 MIN_PREDICTIONS = 16
 STEP_SIZE = 1/16
-INTEGRATOR_ALPHA = 0.97
+INTEGRATOR_ALPHA = 0.95
 SELECT_MOTOR_CHANNELS = 1
 SELECT_ERRP_CHANNELS = 0
 SURFACE_LAPLACIAN_TOGGLE = 1
@@ -199,7 +198,7 @@ FRAME_RELAY_PORT = 5591
 # FPS for sharper fixation timing; at 30 Hz both consumers together push
 # ~72 Mbit/s which UT IoT will not carry. The relay can never exceed the
 # Neon producer (~30 Hz), so values above 30 are silently capped.
-FRAME_RELAY_HZ = 15.0
+FRAME_RELAY_HZ = 15
 # When True (default) the control panel hosts the frame relay in-process,
 # so launching the panel is sufficient on the Neon machine. Set to False
 # when an out-of-process relay is being run separately (e.g. for testing
@@ -376,6 +375,15 @@ TIAGOBOT_GAZE_MAX_MAHAL_DIST = None
 TIAGOBOT_GAZE_DWELL_HIT_SEC = 2.0
 TIAGOBOT_GAZE_SELECTION_TIMEOUT_SEC = 12.0
 TIAGOBOT_GAZE_CONFIRM_SELECTION_SEC = 1.5
+# Letters to exclude from the random per-trial gaze target draw. The
+# gaze driver builds its target pool from TIAGOBOT_TRAJECTORY ∩
+# calibrated letters and then removes any letter in this list. Use
+# when a letter is physically reachable and calibrated but too hard
+# for the patient to acquire reliably (corner letters, occluded
+# positions, etc.) and you want to bias the session away from it.
+# Empty list = no exclusions. Editable from the control panel
+# Runtime config tab.
+TIAGOBOT_GAZE_TARGET_EXCLUDE = []
 
 # =============================================================================
 # Display colors (RGB)

@@ -473,7 +473,7 @@ def _tiago_draw_grid_with_cross(countdown_text=None):
     pygame.display.flip()
 
 
-def _tiago_anticipation_fixation_period(duration, eeg_state, message):
+def _tiago_anticipation_fixation_period(duration, eeg_state, message, target_letter=None):
     """Inter-trial anticipation fixation: render the central cross plus
     a *white-filled* small orb above it that fills linearly from 0 → 1
     over `duration` seconds, with `message` rendered below the cross.
@@ -488,6 +488,14 @@ def _tiago_anticipation_fixation_period(duration, eeg_state, message):
     needs. Fill colour stays white (matches state 1 of the existing
     timing orb) so the visual language is consistent.
 
+    If `target_letter` is provided, it is rendered in a large font
+    further below the instruction text — the prescribed gaze target
+    for the next trial, so the patient can mentally pre-plan which
+    letter to look at when the Phase 2 selection grid appears. The
+    patient should still keep their eyes on the cross during the
+    anticipation period; the target is a planning cue, not a gaze
+    target during this period.
+
     Replaces `display_fixation_period` for the trial-wrap and initial
     fixation calls; runs the same EEG-state + QUIT-handling loop so
     timing semantics are preserved.
@@ -500,6 +508,7 @@ def _tiago_anticipation_fixation_period(duration, eeg_state, message):
     ball_y = screen_height // 2 - ball_radius * 4
 
     font = pygame.font.SysFont(None, 48)
+    target_font = pygame.font.SysFont(None, 240) if target_letter is not None else None
     start_time = time.time()
     clock = pygame.time.Clock()
 
@@ -544,6 +553,16 @@ def _tiago_anticipation_fixation_period(duration, eeg_state, message):
             center=(screen_width // 2, screen_height // 2 + 120)
         )
         screen.blit(msg_surf, msg_rect)
+
+        # Prescribed gaze target for the next trial. Large + green so
+        # it's unmistakable; placed well below the instruction so it
+        # doesn't compete with the "Look at the fixation cross" cue.
+        if target_letter is not None:
+            tgt_surf = target_font.render(target_letter, True, config.green)
+            tgt_rect = tgt_surf.get_rect(
+                center=(screen_width // 2, screen_height // 2 + 280)
+            )
+            screen.blit(tgt_surf, tgt_rect)
 
         pygame.display.flip()
 
@@ -864,15 +883,22 @@ def run_tiago_gaze_selection_window(gs, eeg_state, centroids, available_letters)
                 continuous_dwell_sec = dt
                 samples_on_current = [s]
         else:
-            # No fresh sample this iteration. Hold the dwell counter
-            # for short gaps (sub-frame tracker hiccup, blink). Reset
-            # only if the gap exceeds TIAGO_GAZE_STALE_GAP_SEC.
+            # No fresh sample this iteration. Reset only if the gap
+            # exceeds TIAGO_GAZE_STALE_GAP_SEC (sustained dropout —
+            # glasses off, long blink). For short gaps with a held
+            # letter, advance the dwell counter by wall-clock dt so
+            # the progress bar tracks real time even when Neon's
+            # effective publish rate is slower than our 60 Hz poll;
+            # otherwise stale-poll iterations drop their dt and the
+            # bar lags visibly behind actual elapsed dwell.
             if (last_good_sample_mono is not None
                     and (now - last_good_sample_mono) > TIAGO_GAZE_STALE_GAP_SEC):
                 current_letter = None
                 continuous_dwell_sec = 0.0
                 samples_on_current = []
                 last_good_sample_mono = None
+            elif current_letter is not None:
+                continuous_dwell_sec += dt
 
         progress = (continuous_dwell_sec / TIAGO_GAZE_DWELL_HIT_SEC
                     if TIAGO_GAZE_DWELL_HIT_SEC > 0 else 1.0)
@@ -956,6 +982,45 @@ def main():
     mode_labels = ["MI" if t == 0 else "REST" for t in trial_sequence]
     logger.log_event(f"Trial Sequence generated: {trial_sequence}")
     logger.log_event(f"Trial Sequence (labeled): {mode_labels}")
+
+    # Per-trial prescribed gaze target — shown during the anticipation
+    # fixation so the patient can pre-plan which letter to look at. The
+    # pool is the configured trajectory intersected with the calibrated
+    # letters, minus any letter listed in TIAGOBOT_GAZE_TARGET_EXCLUDE
+    # (operator-controlled from the control panel — used to drop letters
+    # that are reachable+calibrated but too hard for the patient to
+    # acquire reliably). The gaze classifier itself is unchanged: the
+    # patient is free to select any letter; both target and actual
+    # selection are logged so offline analysis can measure target-match
+    # rate.
+    _target_exclude = {
+        str(ch).upper()
+        for ch in (getattr(config, "TIAGOBOT_GAZE_TARGET_EXCLUDE", []) or [])
+    }
+    _target_pool = [
+        ch for ch in config.TIAGOBOT_TRAJECTORY
+        if ch in _tiago_centroids and ch not in _target_exclude
+    ]
+    if not _target_pool:
+        logger.log_event(
+            "❌ Empty per-trial target pool: TIAGOBOT_TRAJECTORY ∩ "
+            "calibration ∖ TIAGOBOT_GAZE_TARGET_EXCLUDE is empty. "
+            "Check that the calibration covers the trajectory letters "
+            "and that TIAGOBOT_GAZE_TARGET_EXCLUDE does not remove "
+            "every remaining letter.",
+            level="error",
+        )
+        sys.exit(1)
+    if _target_exclude:
+        logger.log_event(
+            f"Target exclude list active — excluded={sorted(_target_exclude)}, "
+            f"remaining pool={_target_pool}"
+        )
+    target_letter_sequence = [
+        str(np.random.choice(_target_pool)) for _ in range(len(trial_sequence))
+    ]
+    logger.log_event(f"Target letter sequence: {target_letter_sequence}")
+
     current_trial = 0
 
     all_results = []
@@ -966,6 +1031,7 @@ def main():
         duration=float(getattr(config, "TIAGOBOT_ANTICIPATION_DURATION", 3.0)),
         eeg_state=eeg_state,
         message="Look at the fixation cross",
+        target_letter=target_letter_sequence[0],
     )
     logger.log_event("Initial anticipation fixation complete. Beginning experimental loop.")
 
@@ -1060,8 +1126,11 @@ def main():
             break
 
         _gaze_selected_letter = _gaze_result["selected_letter"]
+        _trial_target = target_letter_sequence[current_trial]
+        _target_match = (_gaze_selected_letter == _trial_target)
         logger.log_event(
             f"Gaze selection — letter={_gaze_selected_letter!r}, "
+            f"target={_trial_target!r}, match={_target_match}, "
             f"continuous_dwell={_gaze_result['continuous_dwell_sec']:.3f}s, "
             f"samples_used={_gaze_result['samples_used']}, "
             f"success={_gaze_result['selection_attempt_success']}, "
@@ -1113,10 +1182,15 @@ def main():
                 logger=logger,
                 eeg_state=eeg_state,
             )
+            _next_target = (
+                target_letter_sequence[current_trial + 1]
+                if current_trial + 1 < len(target_letter_sequence) else None
+            )
             _tiago_anticipation_fixation_period(
                 duration=float(getattr(config, "TIAGOBOT_ANTICIPATION_DURATION", 3.0)),
                 eeg_state=eeg_state,
                 message="Look at the fixation cross",
+                target_letter=_next_target,
             )
             current_trial += 1
             continue
@@ -1447,10 +1521,15 @@ def main():
             num_predictions=len(trial_probs)
         )
 
+        _next_target = (
+            target_letter_sequence[current_trial + 1]
+            if current_trial + 1 < len(target_letter_sequence) else None
+        )
         _tiago_anticipation_fixation_period(
             duration=float(getattr(config, "TIAGOBOT_ANTICIPATION_DURATION", 3.0)),
             eeg_state=eeg_state,
             message="Look at the fixation cross",
+            target_letter=_next_target,
         )
         logger.log_event(f"Trial {current_trial+1} complete. Proceeding to next.")
 

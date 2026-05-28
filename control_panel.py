@@ -37,7 +37,7 @@ IMPORTANT:
 - NO --telemetry flag is passed (that caused argparse errors).
 """
 
-import os, sys, shlex, time, re, tempfile, socket, subprocess, json, threading, glob
+import os, sys, shlex, time, re, tempfile, socket, subprocess, json, threading, glob, ast
 import serial
 import serial.tools.list_ports
 
@@ -1958,6 +1958,11 @@ class ControlPanel(QMainWindow):
         self.rc_arduino_baud = QSpinBox()
         self.rc_arduino_baud.setRange(300, 1_000_000)
         self.rc_arduino_baud.setSingleStep(100)
+        # Tiagobot gaze target exclude — comma-separated letters to drop
+        # from the random per-trial target draw in the gaze driver. Free
+        # text rather than 9 checkboxes to stay compact in this form.
+        self.rc_tiago_target_exclude = QLineEdit()
+        self.rc_tiago_target_exclude.setPlaceholderText("e.g. I, F  (blank = no exclusions)")
         form.addRow("DECODER_BACKEND", self.rc_decoder)
         form.addRow("EARLYSTOP_MODE", self.rc_earlystop)
         form.addRow("CLASS_VISUAL_STYLE", self.rc_visual)
@@ -1988,6 +1993,7 @@ class ControlPanel(QMainWindow):
         form.addRow("FRAME_RELAY_HZ", self.rc_relay_hz)
         form.addRow(self.rc_vlm_depth)
         form.addRow("ARDUINO_BAUD", self.rc_arduino_baud)
+        form.addRow("TIAGOBOT_GAZE_TARGET_EXCLUDE", self.rc_tiago_target_exclude)
         scroll.setWidget(inner)
         outer.addWidget(scroll, 1)
         btn_row = QHBoxLayout()
@@ -2040,6 +2046,20 @@ class ControlPanel(QMainWindow):
         self.rc_relay_hz.setValue(_read_float_key("FRAME_RELAY_HZ", 15.0))
         self.rc_vlm_depth.setChecked(_read_bool_key("VLM_ENABLE_DEPTH", True))
         self.rc_arduino_baud.setValue(_read_int_key("ARDUINO_BAUD", 9600))
+        # TIAGOBOT_GAZE_TARGET_EXCLUDE is a Python list literal in config.py.
+        # Parse with ast.literal_eval so we tolerate any whitespace / quoting
+        # variant the user might have hand-edited, and fall back to [] on
+        # anything unparseable rather than crashing the panel.
+        _, _m_excl = _find_assignment("TIAGOBOT_GAZE_TARGET_EXCLUDE")
+        _excl_list = []
+        if _m_excl is not None:
+            try:
+                _parsed = ast.literal_eval(_m_excl.group(2).strip())
+                if isinstance(_parsed, (list, tuple)):
+                    _excl_list = [str(x).strip().upper() for x in _parsed if str(x).strip()]
+            except (ValueError, SyntaxError):
+                _excl_list = []
+        self.rc_tiago_target_exclude.setText(", ".join(_excl_list))
         self._append_log("Panel", f"[{self._ts()}] Runtime config widgets reloaded from config.py / config_local.py\n")
 
     def on_runtime_apply_config(self):
@@ -2077,6 +2097,22 @@ class ControlPanel(QMainWindow):
             _write_assign_rhs("FRAME_RELAY_HZ", _fmtf(self.rc_relay_hz.value()))
             _write_assign_rhs("VLM_ENABLE_DEPTH", "True" if self.rc_vlm_depth.isChecked() else "False")
             _write_assign_rhs("ARDUINO_BAUD", str(self.rc_arduino_baud.value()))
+            # TIAGOBOT_GAZE_TARGET_EXCLUDE: parse CSV from the widget,
+            # uppercase + dedupe (preserving entry order so the diff in
+            # config.py is stable across re-saves), serialize as a
+            # Python list literal.
+            _raw_excl = self.rc_tiago_target_exclude.text()
+            _excl_items = []
+            _seen = set()
+            for tok in _raw_excl.split(","):
+                t = tok.strip().upper()
+                if t and t not in _seen:
+                    _seen.add(t)
+                    _excl_items.append(t)
+            _write_assign_rhs(
+                "TIAGOBOT_GAZE_TARGET_EXCLUDE",
+                "[" + ", ".join(f'"{ch}"' for ch in _excl_items) + "]",
+            )
         except Exception as e:
             QMessageBox.warning(self, "Runtime config", f"Failed to update config files:\n{e}")
             self._append_log("Panel", f"[{self._ts()}] Runtime config apply FAILED: {e}\n")
