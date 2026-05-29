@@ -85,6 +85,14 @@ mne.set_log_level("ERROR")
 
 SCALAR_WIN = (1.0, 4.0)
 TRIAL_WIN = (-1.0, 4.0)
+# Pre-cue baseline window for the per-class EDS variant. Sits entirely
+# before the cue (t=0) so the cue itself doesn't bleed into the
+# baseline covariance. (-1.0, 0.0) s with TRIAL_WIN = (-1.0, 4.0)
+# guarantees no overlap with SCALAR_WIN = (1.0, 4.0). Verified that
+# the trial-start markers in the chronological pairing block at
+# `Analyze_eds_topoplot_CLIN.py:_load_raw_from_xdf_path:151-166` mark
+# the cue onset, so t<0 is the rest-state pre-trial period.
+BASELINE_WIN = (-1.0, 0.0)
 BETA_LO, BETA_HI = 13.0, 30.0
 
 # 15-channel motor subset per config.py:26 (= harmony_stable:config.py:14)
@@ -286,6 +294,103 @@ def _config_a_epochs(
     data = epochs_band.get_data()
     ch_names = list(epochs_band.ch_names)
     return data, labels, dropped, ch_names
+
+
+def _config_a_epochs_two_windows(
+    raw, events, event_dict, band: tuple[float, float],
+    *,
+    blink_removal: str = "drop_fp",
+    spatial_filter: str = "car",
+    post_win: tuple[float, float] = SCALAR_WIN,
+    baseline_win: tuple[float, float] = BASELINE_WIN,
+):
+    """Like `_config_a_epochs` but returns BOTH the post-cue window and
+    a pre-cue baseline window from the same preprocessed epochs.
+
+    Used by the per-class EDS variant (`--per-class-eds`) so each
+    class can be compared against its own pre-cue covariance state
+    rather than against the other class. The preprocessing pipeline
+    is identical to `_config_a_epochs` (notch, BB, blink removal,
+    auto-drop loop on mu-filtered TRIAL_WIN epochs, spatial filter,
+    band filter); only the final crop changes — instead of one crop
+    to SCALAR_WIN, two crops are applied to copies.
+
+    Returns (post_data, baseline_data, labels, dropped, ch_names)
+    where post_data and baseline_data have shapes (N, C, T_post) and
+    (N, C, T_base) respectively, sharing the same N trials and C
+    channels.
+    """
+    raw_bb = raw.copy()
+    raw_1hz = raw.copy()
+    raw_bb.notch_filter(NOTCH, method="iir", verbose=False)
+    raw_bb.filter(l_freq=BB_LO, h_freq=BB_HI, method="iir", verbose=False)
+    raw_bb, _ = apply_blink_removal(raw_bb, raw_1hz, blink_removal)
+
+    dropped = []
+    iters = 0
+    t0, t1 = TRIAL_WIN
+    while True:
+        iters += 1
+        raw_mu = raw_bb.copy()
+        raw_mu.filter(
+            l_freq=MU_LO, h_freq=MU_HI, method="iir", verbose=False,
+        )
+        epoch_kw = dict(
+            event_id=event_dict,
+            tmin=t0, tmax=t1,
+            baseline=None, detrend=1, preload=True, verbose=False,
+        )
+        epochs_mu = mne.Epochs(
+            raw_mu, events, reject=None, flat=None, **epoch_kw,
+        )
+        epochs_bb = mne.Epochs(
+            raw_bb, events, reject=None, flat=None, **epoch_kw,
+        )
+        mu_data = epochs_mu.get_data()
+        mask = np.max(np.abs(mu_data), axis=(1, 2)) <= REJECT_MAX_ABS_UV
+        good_ix = np.where(mask)[0].tolist()
+        bad_ix = np.where(~mask)[0]
+        n_att = int(len(events))
+        n_kept = int(len(good_ix))
+        drop_frac = 1.0 - n_kept / n_att if n_att else 1.0
+        if drop_frac < AUTO_DROP_REJECT_FRAC:
+            break
+        if len(dropped) >= AUTO_DROP_MAX_CHANNELS:
+            break
+        if iters > AUTO_DROP_MAX_ITERS:
+            break
+        bad_ch, _ = _pick_dominant_bad_channel_max_abs(
+            mu_data, list(epochs_mu.ch_names), bad_ix,
+            AUTO_DROP_DOMINANCE_FRAC,
+        )
+        if bad_ch is None or bad_ch not in raw_bb.ch_names:
+            break
+        raw_bb = raw_bb.copy().drop_channels([bad_ch])
+        dropped.append(bad_ch)
+
+    if not good_ix:
+        return None, None, None, dropped, []
+
+    epochs_bb = apply_spatial_filter(epochs_bb, spatial_filter)
+    epochs_band = epochs_bb.copy().filter(
+        l_freq=band[0], h_freq=band[1], method="iir", verbose=False,
+    )
+    epochs_band = epochs_band[good_ix]
+
+    # Two crops — one for post-cue window, one for pre-cue baseline.
+    # Use .copy() to keep the un-cropped reference around for the
+    # second crop.
+    epochs_post = epochs_band.copy().crop(
+        tmin=post_win[0], tmax=post_win[1],
+    )
+    epochs_base = epochs_band.copy().crop(
+        tmin=baseline_win[0], tmax=baseline_win[1],
+    )
+    labels = epochs_post.events[:, 2].astype(int)
+    post_data = epochs_post.get_data()
+    base_data = epochs_base.get_data()
+    ch_names = list(epochs_post.ch_names)
+    return post_data, base_data, labels, dropped, ch_names
 
 
 # ----------------------------------------------------------------------
@@ -566,6 +671,95 @@ def per_session_eds(
         return None, motor_kept, len(cov_mi) + len(cov_rest)
     eds = eds_from_class_covs(cov_mi, cov_rest, len(motor_kept))
     return eds, motor_kept, len(cov_mi) + len(cov_rest)
+
+
+def per_session_eds_per_class(
+    subject: str, session: str, band: tuple[float, float],
+    motor_channels: list[str], band_label: str,
+    *,
+    blink_removal: str = "drop_fp",
+    spatial_filter: str = "car",
+) -> tuple[
+    np.ndarray | None, np.ndarray | None, list[str], int, int
+]:
+    """Per-class EDS for one CLIN session.
+
+    For each class k ∈ {MI, Rest}, compute EDS between the post-cue
+    prototype (Karcher mean of (1, 4) s covariances of class-k trials)
+    and the pre-cue baseline prototype (same trials, (-1, 0) s
+    covariances). The result is one EDS vector per class indicating
+    which electrodes carry the class-specific task-evoked change
+    relative to that class's own pre-cue state.
+
+    This decouples the EDS measurement from cross-class contamination
+    — e.g. eye-closed alpha during Rest (CLIN_SUBJ_007 stated
+    strategy) inflates the standard MI-vs-Rest EDS at posterior
+    channels even though that signal is not motor-imagery-related.
+    The per-class formulation isolates each class's signature against
+    its own baseline.
+
+    Returns (eds_mi, eds_rest, motor_kept, n_mi, n_rest).
+    """
+    try:
+        raw, events, event_dict = load_raw_cached(subject, session)
+    except Exception as e:
+        print(
+            f"  [{subject}/{session}/{band_label}/per-class] FAILED load: "
+            f"{type(e).__name__}: {e}"
+        )
+        return None, None, [], 0, 0
+
+    try:
+        post_data, base_data, labels, dropped, ch_names = (
+            _config_a_epochs_two_windows(
+                raw, events, event_dict, band,
+                blink_removal=blink_removal,
+                spatial_filter=spatial_filter,
+            )
+        )
+    except Exception as e:
+        print(
+            f"  [{subject}/{session}/{band_label}/per-class] FAILED preproc: "
+            f"{type(e).__name__}: {e}"
+        )
+        return None, None, [], 0, 0
+
+    if post_data is None or len(post_data) == 0:
+        return None, None, [], 0, 0
+
+    post_motor, motor_kept = _restrict_to_motor(
+        post_data, ch_names, motor_channels,
+    )
+    base_motor, _ = _restrict_to_motor(
+        base_data, ch_names, motor_channels,
+    )
+    if len(motor_kept) < 2:
+        return None, None, motor_kept, 0, 0
+
+    use_lw = (subject == "CLIN_SUBJ_002")
+    shr = 0.1 if use_lw else 0.02
+    post_covs = trial_covs(
+        post_motor, use_ledoitwolf=use_lw, shrinkage_param=shr,
+    )
+    base_covs = trial_covs(
+        base_motor, use_ledoitwolf=use_lw, shrinkage_param=shr,
+    )
+    mi_mask = labels == 200
+    rest_mask = labels == 100
+    n_mi = int(mi_mask.sum())
+    n_rest = int(rest_mask.sum())
+
+    eds_mi = None
+    if n_mi >= 5:
+        eds_mi = eds_from_class_covs(
+            post_covs[mi_mask], base_covs[mi_mask], len(motor_kept),
+        )
+    eds_rest = None
+    if n_rest >= 5:
+        eds_rest = eds_from_class_covs(
+            post_covs[rest_mask], base_covs[rest_mask], len(motor_kept),
+        )
+    return eds_mi, eds_rest, motor_kept, n_mi, n_rest
 
 
 # ----------------------------------------------------------------------
@@ -1088,6 +1282,231 @@ def run_for_band(
     )
 
 
+def run_for_band_per_class(
+    band_label: str, band: tuple[float, float],
+    cohort_subjects: list[str], out_dir: Path,
+    include_clin002: bool,
+    *,
+    channel_set: str = "motor15",
+    blink_removal: str = "drop_fp",
+    spatial_filter: str = "car",
+    variant_tag: str = "",
+):
+    """Per-class EDS variant: compute EDS_MI and EDS_Rest as the
+    backward-elimination distance between each class's post-cue
+    prototype and its OWN pre-cue baseline prototype.
+
+    This decouples each class from the other so the cohort
+    discriminative pattern can be attributed to a single class's
+    task-evoked covariance change rather than a class-vs-class
+    contrast that may be dominated by the noisier class.
+
+    Outputs per band (in `out_dir`):
+        cohort_eds_mi_per_class_{band}{variant}.png
+        cohort_eds_rest_per_class_{band}{variant}.png
+        per_subject_eds_mi_per_class_{band}{variant}_grid.png
+        per_subject_eds_rest_per_class_{band}{variant}_grid.png
+        eds_per_class_per_subject_session_{band}{variant}.csv
+        eds_per_class_cohort_summary_{band}{variant}.csv
+
+    Last-two-session averaging + uncorrected/Bonferroni Wilcoxon vs 0
+    follow the existing run_for_band conventions.
+    """
+    if channel_set == "full22":
+        motor_channels = FULL22_CHANNELS
+    else:
+        motor_channels = MOTOR_CHANNEL_NAMES
+
+    per_subj_eds_mi: dict[str, tuple[np.ndarray, list[str]]] = {}
+    per_subj_eds_rest: dict[str, tuple[np.ndarray, list[str]]] = {}
+    rows: list[dict] = []
+
+    for subject in cohort_subjects:
+        if subject == "CLIN_SUBJ_002" and not include_clin002:
+            continue
+        sessions = enumerate_online_sessions_for_subject(subject)
+        print(
+            f"\n=== {subject} ({band_label}/per-class, "
+            f"{len(sessions)} sessions) ==="
+        )
+        session_mi: list[tuple[str, np.ndarray, list[str]]] = []
+        session_rest: list[tuple[str, np.ndarray, list[str]]] = []
+        for sess in sessions:
+            t_s = time.time()
+            eds_mi, eds_rest, channels, n_mi, n_rest = (
+                per_session_eds_per_class(
+                    subject, sess, band, motor_channels, band_label,
+                    blink_removal=blink_removal,
+                    spatial_filter=spatial_filter,
+                )
+            )
+            dt = time.time() - t_s
+            if not channels:
+                print(
+                    f"  {sess}: SKIP (no channels), n_mi={n_mi} "
+                    f"n_rest={n_rest} ({dt:.1f}s)"
+                )
+                continue
+            tag_mi = "ok" if eds_mi is not None else "—"
+            tag_rest = "ok" if eds_rest is not None else "—"
+            print(
+                f"  {sess}: {len(channels)} ch  MI={tag_mi}(n={n_mi})  "
+                f"REST={tag_rest}(n={n_rest})  ({dt:.1f}s)"
+            )
+            if eds_mi is not None:
+                session_mi.append((sess, eds_mi, channels))
+                for ch, v in zip(channels, eds_mi):
+                    rows.append({
+                        "subject": subject, "session": sess,
+                        "band": band_label, "class": "mi",
+                        "channel": ch, "eds": float(v),
+                        "n_trials": n_mi,
+                    })
+            if eds_rest is not None:
+                session_rest.append((sess, eds_rest, channels))
+                for ch, v in zip(channels, eds_rest):
+                    rows.append({
+                        "subject": subject, "session": sess,
+                        "band": band_label, "class": "rest",
+                        "channel": ch, "eds": float(v),
+                        "n_trials": n_rest,
+                    })
+
+        # Average last two sessions for each class
+        for store, sess_list in (
+            (per_subj_eds_mi, session_mi),
+            (per_subj_eds_rest, session_rest),
+        ):
+            last_two = sess_list[-2:]
+            if not last_two:
+                continue
+            common = list(last_two[0][2])
+            for _, _, ch_list in last_two[1:]:
+                common = [c for c in common if c in ch_list]
+            if not common:
+                continue
+            vecs = []
+            for _, eds_vec, ch_list in last_two:
+                idx = [ch_list.index(c) for c in common]
+                vecs.append(eds_vec[idx])
+            store[subject] = (np.mean(np.stack(vecs, 0), axis=0), common)
+
+    if not per_subj_eds_mi and not per_subj_eds_rest:
+        print(f"  ! per-class EDS empty for {band_label}; skip plots")
+        return
+
+    # Cohort grand mean + Wilcoxon per class
+    def _zscore(v):
+        sd = v.std(ddof=1)
+        return np.zeros_like(v) if sd == 0 else (v - v.mean()) / sd
+
+    cohort_summary_rows: list[dict] = []
+    for class_label, per_subj in (
+        ("mi", per_subj_eds_mi),
+        ("rest", per_subj_eds_rest),
+    ):
+        if not per_subj:
+            print(f"  ! no {class_label} subjects with EDS; skip")
+            continue
+        # Cohort channel intersection
+        cohort_common = list(next(iter(per_subj.values()))[1])
+        for _, ch_list in per_subj.values():
+            cohort_common = [c for c in cohort_common if c in ch_list]
+        if not cohort_common:
+            print(f"  ! {class_label} cohort channel intersection empty")
+            continue
+        aligned: list[np.ndarray] = []
+        for subj, (vec, ch_list) in sorted(per_subj.items()):
+            idx = [ch_list.index(c) for c in cohort_common]
+            aligned.append(vec[idx])
+        stack = np.stack(aligned, axis=0)
+        cohort_mean = stack.mean(axis=0)
+        cohort_std = stack.std(axis=0, ddof=1)
+        z_cohort = _zscore(cohort_mean)
+
+        # Wilcoxon vs 0 per channel
+        _, p_zero = _wilcoxon_per_channel(stack)
+        n_ch_cohort = len(cohort_common)
+        alpha_bonf = 0.05 / n_ch_cohort
+        sig_uncorr = np.array(
+            [np.isfinite(p) and p < 0.05 for p in p_zero], dtype=bool,
+        )
+        sig_bonf = np.array(
+            [np.isfinite(p) and p < alpha_bonf for p in p_zero], dtype=bool,
+        )
+
+        # Per-channel summary rows
+        for i, ch in enumerate(cohort_common):
+            cohort_summary_rows.append({
+                "band": band_label, "class": class_label, "channel": ch,
+                "cohort_eds_mean_raw": float(cohort_mean[i]),
+                "cohort_eds_std_raw": float(cohort_std[i]),
+                "cohort_z_score": float(z_cohort[i]),
+                "wilcoxon_vs0_p":
+                    float(p_zero[i]) if np.isfinite(p_zero[i]) else np.nan,
+                "wilcoxon_vs0_sig_uncorr": bool(sig_uncorr[i]),
+                "wilcoxon_vs0_sig_bonf": bool(sig_bonf[i]),
+                "n_subjects": int(stack.shape[0]),
+                "bonf_alpha_cohort": float(alpha_bonf),
+            })
+
+        # Cohort topomap
+        n_subj = stack.shape[0]
+        title = (
+            f"CLIN cohort EDS — class={class_label.upper()} vs pre-cue baseline "
+            f"— {band_label}"
+            + (
+                f"\n[channel-set={channel_set}, blink={blink_removal}, "
+                f"spatial={spatial_filter}]"
+                if variant_tag else ""
+            )
+            + f"\n(n={n_subj} subj, last 2 sessions; o = Wilcoxon vs 0 "
+            f"p<0.05 uncorrected; {int(sig_bonf.sum())}/{n_ch_cohort} pass "
+            f"Bonf α'={alpha_bonf:.4f})"
+        )
+        _plot_topomap_panel(
+            z_cohort, cohort_common, title,
+            str(
+                out_dir
+                / f"cohort_eds_{class_label}_per_class_{band_label}{variant_tag}.png"
+            ),
+            mask=sig_uncorr,
+        )
+
+        # Per-subject grid
+        _plot_per_subject_grid(
+            per_subj,
+            (f"Per-subject EDS — class={class_label.upper()} vs pre-cue "
+             f"baseline — {band_label}"
+             + (
+                 f"  [channel-set={channel_set}, blink={blink_removal}, "
+                 f"spatial={spatial_filter}]"
+                 if variant_tag else ""
+             )),
+            str(
+                out_dir
+                / f"per_subject_eds_{class_label}_per_class_{band_label}{variant_tag}_grid.png"
+            ),
+        )
+
+    # CSV (long form: per (subj, sess, class, channel))
+    pd.DataFrame(rows).to_csv(
+        out_dir
+        / f"eds_per_class_per_subject_session_{band_label}{variant_tag}.csv",
+        index=False,
+    )
+    pd.DataFrame(cohort_summary_rows).to_csv(
+        out_dir
+        / f"eds_per_class_cohort_summary_{band_label}{variant_tag}.csv",
+        index=False,
+    )
+    print(
+        f"\n  wrote per-class CSVs for {band_label}: "
+        f"per_subj_session ({len(rows)} rows), "
+        f"cohort_summary ({len(cohort_summary_rows)} rows)"
+    )
+
+
 _DEFAULT_CHANNEL_SET = "motor15"
 _DEFAULT_BLINK = "drop_fp"
 _DEFAULT_SPATIAL = "car"
@@ -1165,6 +1584,17 @@ def main():
         help=("Comma-separated subject filter for smoke tests, e.g. "
               "`CLIN_SUBJ_005`. Empty = full cohort."),
     )
+    parser.add_argument(
+        "--per-class-eds", action="store_true",
+        help=("Compute the per-class EDS variant: for each class "
+              "(MI, REST) compute EDS between the post-cue prototype "
+              "and the SAME class's pre-cue baseline prototype. "
+              "Decouples each class's task-evoked signature from the "
+              "other class's variability (useful when one class — "
+              "e.g. eyes-closed Rest — is contaminated by class-"
+              "specific artifact). Produces separate cohort + "
+              "per-subject grid plots for MI and REST."),
+    )
     args = parser.parse_args()
     subject_filter = {
         s.strip() for s in args.subjects.split(",") if s.strip()
@@ -1211,16 +1641,26 @@ def main():
         )
 
     for band_label, band in bands:
-        run_for_band(
-            band_label, band, cohort, out_dir,
-            include_clin002=args.include_clin002,
-            from_csv=args.from_csv,
-            channel_set=args.channel_set,
-            blink_removal=args.blink_removal,
-            spatial_filter=args.spatial_filter,
-            no_diff_plot=args.no_diff_plot,
-            variant_tag=variant_tag,
-        )
+        if args.per_class_eds:
+            run_for_band_per_class(
+                band_label, band, cohort, out_dir,
+                include_clin002=args.include_clin002,
+                channel_set=args.channel_set,
+                blink_removal=args.blink_removal,
+                spatial_filter=args.spatial_filter,
+                variant_tag=variant_tag,
+            )
+        else:
+            run_for_band(
+                band_label, band, cohort, out_dir,
+                include_clin002=args.include_clin002,
+                from_csv=args.from_csv,
+                channel_set=args.channel_set,
+                blink_removal=args.blink_removal,
+                spatial_filter=args.spatial_filter,
+                no_diff_plot=args.no_diff_plot,
+                variant_tag=variant_tag,
+            )
 
     print(f"\nDone. Outputs at: {out_dir}")
 
