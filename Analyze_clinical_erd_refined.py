@@ -98,8 +98,20 @@ def _most_focal_electrode_motor(tfr_trials, marker="200"):
 
 
 def _timecourse_at_channel(tfr_trials, ch_name, marker):
-    """Same convention as generate_plots_config_a.py:339-364: trial-mean
-    + SEM in logratio space, converted to % at the end.
+    """Trial-mean + SEM ERD%, computed by per-trial logratio→pct then
+    trial-averaging.
+
+    Order of operations matters: averaging logratio across trials first
+    and converting once at the end (the original
+    `generate_plots_config_a.py:339-364` convention) introduces a
+    Jensen's-inequality negative bias in the baseline window —
+    mean_t(log10(P/P_bl)) ≤ log10(1) = 0. The result is a baseline
+    that sits at ~-15% rather than 0%. Per-trial conversion produces
+    `mean_t(P/P_bl - 1)·100`, which has baseline-window mean = 0 by
+    construction (since per-trial mean of P/P_bl across the baseline
+    window is exactly 1 — that's what `apply_baseline(mode="logratio")`
+    enforces). Mathematically equivalent to using `mode="percent"` in
+    `apply_baseline`.
 
     Returns (times, mean_pct, low_pct, up_pct, n_trials) or None.
     """
@@ -110,26 +122,31 @@ def _timecourse_at_channel(tfr_trials, ch_name, marker):
         return None
     ch_idx = tfr.ch_names.index(ch_name)
     fmask = (tfr.freqs >= MU_LO) & (tfr.freqs <= MU_HI)
-    per_trial = tfr.data[:, ch_idx][:, fmask, :].mean(axis=1)
-    n = per_trial.shape[0]
+    per_trial_log = tfr.data[:, ch_idx][:, fmask, :].mean(axis=1)
+    n = per_trial_log.shape[0]
     if n < 1:
         return None
-    mean_log = per_trial.mean(axis=0)
+    per_trial_pct = _logratio_to_pct(per_trial_log)
+    mean_pct = per_trial_pct.mean(axis=0)
     if n > 1:
-        sem_log = per_trial.std(axis=0, ddof=1) / np.sqrt(n)
+        sem_pct = per_trial_pct.std(axis=0, ddof=1) / np.sqrt(n)
     else:
-        sem_log = np.zeros_like(mean_log)
+        sem_pct = np.zeros_like(mean_pct)
     return (
-        tfr.times, _logratio_to_pct(mean_log),
-        _logratio_to_pct(mean_log - sem_log),
-        _logratio_to_pct(mean_log + sem_log),
+        tfr.times, mean_pct,
+        mean_pct - sem_pct, mean_pct + sem_pct,
         n,
     )
 
 
 def _cluster_timecourse(tfr_trials, cluster_channels, marker="200"):
     """Cluster-averaged ERD%(t) ± SEM per `rev01-erd-refinement-plan.md`
-    §7.1. Trial-averaging in logratio space then converted to %.
+    §7.1, with per-trial logratio→pct conversion before trial-averaging.
+
+    See docstring of `_timecourse_at_channel` for why the order of
+    operations was changed from the original `generate_plots_config_a`
+    convention — avoids a Jensen-inequality negative bias in the
+    baseline window.
 
     Returns (times, mean_pct, low_pct, up_pct, n_trials, surviving_channels)
     or None.
@@ -142,20 +159,22 @@ def _cluster_timecourse(tfr_trials, cluster_channels, marker="200"):
         return None
     ch_idxs = [tfr.ch_names.index(c) for c in present]
     fmask = (tfr.freqs >= MU_LO) & (tfr.freqs <= MU_HI)
-    # tfr.data: (trials, channels, freqs, times)
-    per_trial = tfr.data[:, ch_idxs][:, :, fmask].mean(axis=(1, 2))
-    n = per_trial.shape[0]
+    # tfr.data: (trials, channels, freqs, times). Average over cluster
+    # channels and mu freqs in logratio space (linear in log power), then
+    # convert to per-trial ERD% before trial-averaging.
+    per_trial_log = tfr.data[:, ch_idxs][:, :, fmask].mean(axis=(1, 2))
+    n = per_trial_log.shape[0]
     if n < 1:
         return None
-    mean_log = per_trial.mean(axis=0)
+    per_trial_pct = _logratio_to_pct(per_trial_log)
+    mean_pct = per_trial_pct.mean(axis=0)
     if n > 1:
-        sem_log = per_trial.std(axis=0, ddof=1) / np.sqrt(n)
+        sem_pct = per_trial_pct.std(axis=0, ddof=1) / np.sqrt(n)
     else:
-        sem_log = np.zeros_like(mean_log)
+        sem_pct = np.zeros_like(mean_pct)
     return (
-        tfr.times, _logratio_to_pct(mean_log),
-        _logratio_to_pct(mean_log - sem_log),
-        _logratio_to_pct(mean_log + sem_log),
+        tfr.times, mean_pct,
+        mean_pct - sem_pct, mean_pct + sem_pct,
         n, present,
     )
 
