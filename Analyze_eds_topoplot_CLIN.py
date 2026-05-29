@@ -93,6 +93,19 @@ MOTOR_CHANNEL_NAMES = [
     "P7",  "P3",  "Pz", "P4", "P8", "POz",
 ]
 
+# Full 22-channel montage per `rev01-eds-analysis-plan.md` §6.2 (the
+# Kumar 2024 montage minus the Fp channels — drop_fp is still applied,
+# so the actual EDS runs on the subset of this list that survives the
+# blink-removal stage). Adds frontal F-row and FC5/FC6 on top of the
+# motor15 set.
+FULL22_CHANNELS = [
+    "F7", "F3", "Fz", "F4", "F8",
+    "FC5", "FC1", "FC2", "FC6",
+    "C3", "Cz", "C4",
+    "CP5", "CP1", "CP2", "CP6",
+    "P7", "P3", "Pz", "P4", "P8", "POz",
+]
+
 # Shared expert pool — the 6 OG_Right CLASS+LAB files identical across
 # CLIN_SUBJ_003..008/training_data/ per rev01-paper-angle.md §1.1.
 EXPERT_OG_RIGHT_BASENAMES = [
@@ -177,16 +190,22 @@ def _load_raw_from_xdf_path(xdf_path: str):
 
 def _config_a_epochs(
     raw, events, event_dict, band: tuple[float, float],
+    *,
+    blink_removal: str = "drop_fp",
+    spatial_filter: str = "car",
 ):
     """Apply Config A preprocessing and return time-domain epochs at
     `band` cropped to SCALAR_WIN = (1, 4) s.
 
     Pipeline (matches `generate_plots_config_a.py:88-161`):
       1. Notch + 4-40 Hz broadband (IIR Butterworth).
-      2. drop_fp blink removal.
+      2. Blink removal: `drop_fp` (Config A default; drops Fp1/Fp2/Fpz)
+         or `fp_regression` (regress Fp channels out of others while
+         keeping them; `sweep_phase2_round2.py:225-226`).
       3. Auto-drop loop on mu-filtered epochs at 50 µV (sweep_phase3
          knobs).
-      4. CAR spatial filter.
+      4. Spatial filter: `car` (Config A default), `csd`, or `hjorth`
+         per `sweep_phase2_round2.py:253-261`.
       5. Bandpass to `band` (mu or beta).
       6. Epoch on TRIAL_WIN, keep `good_ix` only, crop to SCALAR_WIN.
 
@@ -197,7 +216,7 @@ def _config_a_epochs(
     raw_1hz = raw.copy()
     raw_bb.notch_filter(NOTCH, method="iir", verbose=False)
     raw_bb.filter(l_freq=BB_LO, h_freq=BB_HI, method="iir", verbose=False)
-    raw_bb, _ = apply_blink_removal(raw_bb, raw_1hz, "drop_fp")
+    raw_bb, _ = apply_blink_removal(raw_bb, raw_1hz, blink_removal)
 
     # Auto-drop loop on mu-filtered copy. Same logic as
     # generate_plots_config_a.py:103-131.
@@ -246,8 +265,9 @@ def _config_a_epochs(
     if not good_ix:
         return None, None, dropped, []
 
-    # CAR spatial filter (matches generate_plots_config_a.py:136)
-    epochs_bb = apply_spatial_filter(epochs_bb, "car")
+    # Spatial filter (Config A default = "car"; can be overridden via
+    # --spatial-filter to test CSD or Hjorth).
+    epochs_bb = apply_spatial_filter(epochs_bb, spatial_filter)
 
     # Filter into the requested band on the spatial-filtered epochs by
     # reconstructing a Raw at this stage is heavy; instead, apply the
@@ -389,6 +409,9 @@ def _restrict_to_motor(
 
 def expert_eds_shared(
     band: tuple[float, float], motor_channels: list[str], band_label: str,
+    *,
+    blink_removal: str = "drop_fp",
+    spatial_filter: str = "car",
 ) -> tuple[np.ndarray | None, list[str], int]:
     """Compute EDS once on the shared 6-file OG_Right expert pool.
 
@@ -417,6 +440,8 @@ def expert_eds_shared(
         try:
             data, labels, dropped, ch_names = _config_a_epochs(
                 raw, events, event_dict, band,
+                blink_removal=blink_removal,
+                spatial_filter=spatial_filter,
             )
         except Exception as e:
             print(
@@ -487,6 +512,9 @@ def expert_eds_shared(
 def per_session_eds(
     subject: str, session: str, band: tuple[float, float],
     motor_channels: list[str], band_label: str,
+    *,
+    blink_removal: str = "drop_fp",
+    spatial_filter: str = "car",
 ) -> tuple[np.ndarray | None, list[str], int]:
     """EDS for one CLIN session.
 
@@ -506,6 +534,8 @@ def per_session_eds(
     try:
         data, labels, dropped, ch_names = _config_a_epochs(
             raw, events, event_dict, band,
+            blink_removal=blink_removal,
+            spatial_filter=spatial_filter,
         )
     except Exception as e:
         print(
@@ -691,16 +721,33 @@ def run_for_band(
     cohort_subjects: list[str], out_dir: Path,
     include_clin002: bool,
     from_csv: bool = False,
+    *,
+    channel_set: str = "motor15",
+    blink_removal: str = "drop_fp",
+    spatial_filter: str = "car",
+    no_diff_plot: bool = False,
+    variant_tag: str = "",
 ):
     """Build EDS, plot all four topomaps, and dump the CSV for one band.
 
     `from_csv=True` skips Karcher-mean computation and reloads
-    `eds_per_subject_session_{band}.csv` from a prior run. Used in
-    pass-2 to add significance tests and Mi6 cosmetics without rerunning
-    the ~22 min preprocessing pass. Note: requires the prior run to have
-    written a non-degenerate CSV for the requested band.
+    `eds_per_subject_session_{band}{variant_tag}.csv` from a prior run.
+    Note: requires the prior run to have written a non-degenerate CSV
+    for the requested band + variant.
+
+    `channel_set` selects the EDS channel pool: "motor15" (the deployed
+    decoder subset, default) or "full22" (Kumar 2024 montage minus
+    Fp's). `blink_removal` and `spatial_filter` are passed through to
+    Config-A preprocessing. `no_diff_plot` skips the
+    cohort_minus_expert topomap (the diff plot is harder to interpret;
+    the separate expert + cohort plots cover the same content).
+    `variant_tag` is appended to every output filename so non-default
+    runs don't overwrite the default pass-1 outputs.
     """
-    motor_channels = MOTOR_CHANNEL_NAMES
+    if channel_set == "full22":
+        motor_channels = FULL22_CHANNELS
+    else:
+        motor_channels = MOTOR_CHANNEL_NAMES
 
     # 1. Expert EDS
     if from_csv:
@@ -713,6 +760,8 @@ def run_for_band(
         print(f"\n=== Expert pool ({band_label}) ===")
     expert_eds, expert_channels, expert_n = expert_eds_shared(
         band, motor_channels, band_label,
+        blink_removal=blink_removal,
+        spatial_filter=spatial_filter,
     )
     if expert_eds is None:
         print(f"  ! expert EDS failed for {band_label}; skipping band")
@@ -723,7 +772,9 @@ def run_for_band(
     rows = []
 
     if from_csv:
-        csv_path = out_dir / f"eds_per_subject_session_{band_label}.csv"
+        csv_path = (
+            out_dir / f"eds_per_subject_session_{band_label}{variant_tag}.csv"
+        )
         if not csv_path.exists():
             print(
                 f"  --from-csv requested but missing {csv_path}; "
@@ -779,6 +830,8 @@ def run_for_band(
                 t_s = time.time()
                 eds_vec, channels, n_trials = per_session_eds(
                     subject, sess, band, motor_channels, band_label,
+                    blink_removal=blink_removal,
+                    spatial_filter=spatial_filter,
                 )
                 dt = time.time() - t_s
                 if eds_vec is None or not channels:
@@ -913,7 +966,8 @@ def run_for_band(
             "n_channels": int(len(cohort_common)),
         })
     pd.DataFrame(consistency_rows).to_csv(
-        out_dir / f"eds_cohort_consistency_{band_label}.csv", index=False,
+        out_dir / f"eds_cohort_consistency_{band_label}{variant_tag}.csv",
+        index=False,
     )
 
     # 4. z-score across electrodes
@@ -930,42 +984,60 @@ def run_for_band(
     z_diff = z_cohort_a - z_expert_a
 
     # 5. Plot — significance marks (Bonferroni-adjusted) drawn via mask.
+    variant_in_title = (
+        f"  [channel-set={channel_set}, blink={blink_removal}, "
+        f"spatial={spatial_filter}]" if variant_tag else ""
+    )
     _plot_topomap_panel(
         z_expert, expert_channels,
-        f"Expert EDS (shared OG_Right pool, n_trials={expert_n}) — {band_label}",
-        str(out_dir / f"expert_eds_topoplot_{band_label}.png"),
+        (f"Expert EDS (shared OG_Right pool, n_trials={expert_n}) — "
+         f"{band_label}{variant_in_title}"),
+        str(out_dir / f"expert_eds_topoplot_{band_label}{variant_tag}.png"),
     )
     _plot_topomap_panel(
         z_cohort, cohort_common,
-        (f"CLIN cohort EDS grand average — {band_label}\n"
+        (f"CLIN cohort EDS grand average — {band_label}{variant_in_title}\n"
          f"(n={n_subj_used} subj, last 2 sessions; o = Wilcoxon vs 0 p<0.05 "
          f"uncorrected; {int(sig_zero_mask_bonf.sum())}/{n_ch_cohort} "
          f"pass Bonf α'={alpha_bonf_cohort:.4f}; min two-sided "
          f"Wilcoxon p at n={n_subj_used} is {2**-(n_subj_used-1):.4f})"),
-        str(out_dir / f"cohort_eds_topoplot_{band_label}.png"),
+        str(out_dir / f"cohort_eds_topoplot_{band_label}{variant_tag}.png"),
         mask=sig_zero_mask,
     )
-    _plot_topomap_panel(
-        z_diff, common_for_diff,
-        (f"Cohort − Expert EDS — {band_label}\n"
-         f"(o = paired Wilcoxon p<0.05 uncorrected; "
-         f"{int(sig_diff_mask_bonf.sum())}/{n_ch_diff} pass Bonf "
-         f"α'={alpha_bonf_diff:.4f})"),
-        str(out_dir / f"cohort_minus_expert_eds_topoplot_{band_label}.png"),
-        cmap="RdBu_r",
-        mask=sig_diff_mask,
-    )
+    if not no_diff_plot:
+        _plot_topomap_panel(
+            z_diff, common_for_diff,
+            (f"Cohort − Expert EDS — {band_label}{variant_in_title}\n"
+             f"(o = paired Wilcoxon p<0.05 uncorrected; "
+             f"{int(sig_diff_mask_bonf.sum())}/{n_ch_diff} pass Bonf "
+             f"α'={alpha_bonf_diff:.4f})"),
+            str(
+                out_dir
+                / f"cohort_minus_expert_eds_topoplot_{band_label}{variant_tag}.png"
+            ),
+            cmap="RdBu_r",
+            mask=sig_diff_mask,
+        )
     _plot_per_subject_grid(
         per_subj_eds,
-        f"Per-subject EDS (last 2 ONLINE sessions averaged) — {band_label}",
-        str(out_dir / f"per_subject_eds_topoplot_{band_label}_grid.png"),
+        (f"Per-subject EDS (last 2 ONLINE sessions averaged) — "
+         f"{band_label}{variant_in_title}"),
+        str(
+            out_dir
+            / f"per_subject_eds_topoplot_{band_label}{variant_tag}_grid.png"
+        ),
     )
 
     # 6. CSV (long form: original rows + significance + raw-units summary)
     df = pd.DataFrame(rows)
-    df.to_csv(out_dir / f"eds_per_subject_session_{band_label}.csv", index=False)
-    print(f"\n  wrote: eds_per_subject_session_{band_label}.csv "
-          f"({len(df)} rows)")
+    df.to_csv(
+        out_dir / f"eds_per_subject_session_{band_label}{variant_tag}.csv",
+        index=False,
+    )
+    print(
+        f"\n  wrote: eds_per_subject_session_{band_label}{variant_tag}.csv "
+        f"({len(df)} rows)"
+    )
 
     # Cohort summary CSV (M1 raw-units + C4 significance):
     cohort_summary_rows = []
@@ -1003,16 +1075,40 @@ def run_for_band(
             "bonf_alpha_diff": float(alpha_bonf_diff),
         })
     pd.DataFrame(cohort_summary_rows).to_csv(
-        out_dir / f"eds_cohort_summary_{band_label}.csv", index=False,
+        out_dir / f"eds_cohort_summary_{band_label}{variant_tag}.csv",
+        index=False,
     )
     print(
-        f"  wrote: eds_cohort_summary_{band_label}.csv "
+        f"  wrote: eds_cohort_summary_{band_label}{variant_tag}.csv "
         f"({n_ch_cohort} channels; "
         f"uncorr: {sig_zero_mask.sum()} pass vs 0, "
         f"{sig_diff_mask.sum()} pass vs expert; "
         f"Bonf: {sig_zero_mask_bonf.sum()} vs 0, "
         f"{sig_diff_mask_bonf.sum()} vs expert)"
     )
+
+
+_DEFAULT_CHANNEL_SET = "motor15"
+_DEFAULT_BLINK = "drop_fp"
+_DEFAULT_SPATIAL = "car"
+
+
+def _build_variant_tag(channel_set: str, blink: str, spatial: str) -> str:
+    """Return a filename suffix encoding any non-default variant choices.
+
+    Default values (motor15, drop_fp, car) yield an empty string so
+    re-running with defaults overwrites the existing pass-1 outputs.
+    Any non-default selection yields a tag like `_full22_fpreg_csd`
+    so different variants coexist in the same output dir.
+    """
+    parts: list[str] = []
+    if channel_set != _DEFAULT_CHANNEL_SET:
+        parts.append(channel_set)
+    if blink != _DEFAULT_BLINK:
+        parts.append("fpreg" if blink == "fp_regression" else blink)
+    if spatial != _DEFAULT_SPATIAL:
+        parts.append(spatial)
+    return ("_" + "_".join(parts)) if parts else ""
 
 
 def main():
@@ -1028,10 +1124,51 @@ def main():
     parser.add_argument(
         "--from-csv", action="store_true",
         help=("Reload per-session EDS values from "
-              "eds_per_subject_session_<band>.csv (skips the ~22 min "
-              "preprocessing pass; expert EDS is still recomputed)."),
+              "eds_per_subject_session_<band><variant>.csv (skips the "
+              "~22 min preprocessing pass; expert EDS is still "
+              "recomputed)."),
+    )
+    parser.add_argument(
+        "--channel-set", choices=("motor15", "full22"),
+        default=_DEFAULT_CHANNEL_SET,
+        help=("EDS channel pool. `motor15` = deployed-decoder subset "
+              "(default). `full22` = Kumar 2024 montage minus Fp "
+              "channels (frontal F-row + FC5/FC6 added on top of "
+              "motor15). Output filenames are tagged with the variant "
+              "so motor15 + full22 results coexist."),
+    )
+    parser.add_argument(
+        "--blink-removal", choices=("drop_fp", "fp_regression"),
+        default=_DEFAULT_BLINK,
+        help=("Blink-removal method passed to "
+              "`sweep_phase2_round2.apply_blink_removal`. `drop_fp` "
+              "(default) drops Fp1/Fp2/Fpz; `fp_regression` regresses "
+              "them out of the other channels while keeping them in "
+              "the data."),
+    )
+    parser.add_argument(
+        "--spatial-filter", choices=("car", "csd", "hjorth"),
+        default=_DEFAULT_SPATIAL,
+        help=("Spatial filter passed to "
+              "`sweep_phase2_round2.apply_spatial_filter`. `car` is "
+              "Config A default; `csd` is MNE current-source-density; "
+              "`hjorth` is k=4 nearest-neighbour Laplacian."),
+    )
+    parser.add_argument(
+        "--no-diff-plot", action="store_true",
+        help=("Skip the cohort_minus_expert topomap (harder to "
+              "interpret; the separate expert + cohort plots cover "
+              "the same content)."),
+    )
+    parser.add_argument(
+        "--subjects", default="",
+        help=("Comma-separated subject filter for smoke tests, e.g. "
+              "`CLIN_SUBJ_005`. Empty = full cohort."),
     )
     args = parser.parse_args()
+    subject_filter = {
+        s.strip() for s in args.subjects.split(",") if s.strip()
+    }
 
     out_dir = clin_pictures_root() / "eds"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1039,16 +1176,50 @@ def main():
     cohort = list(CLIN_PRIMARY_SUBJECTS)
     if args.include_clin002:
         cohort = ["CLIN_SUBJ_002"] + cohort
+    if subject_filter:
+        cohort = [s for s in cohort if s in subject_filter]
+        if not cohort:
+            print(
+                f"  ! --subjects filter {sorted(subject_filter)} "
+                "matches no cohort member; nothing to do."
+            )
+            return
 
     bands = [("mu", (MU_LO, MU_HI))]
     if args.include_beta:
         bands.append(("beta", (BETA_LO, BETA_HI)))
+
+    variant_tag = _build_variant_tag(
+        args.channel_set, args.blink_removal, args.spatial_filter,
+    )
+    # Safety: a subject filter on its own would otherwise overwrite the
+    # full-cohort PNG/CSV with sub-cohort outputs (cohort PNG becomes
+    # n=1, Wilcoxon NaN, etc.). Tag every --subjects run so smoke tests
+    # land in dedicated filenames.
+    if subject_filter:
+        subjects_tag = "_subj-" + "-".join(
+            s.replace("CLIN_SUBJ_", "") for s in sorted(subject_filter)
+        )
+        variant_tag = variant_tag + subjects_tag
+    if variant_tag:
+        print(
+            f"[variant] channel_set={args.channel_set} "
+            f"blink_removal={args.blink_removal} "
+            f"spatial_filter={args.spatial_filter}"
+            + (f" subjects={sorted(subject_filter)}" if subject_filter else "")
+            + f" → filename tag = '{variant_tag}'"
+        )
 
     for band_label, band in bands:
         run_for_band(
             band_label, band, cohort, out_dir,
             include_clin002=args.include_clin002,
             from_csv=args.from_csv,
+            channel_set=args.channel_set,
+            blink_removal=args.blink_removal,
+            spatial_filter=args.spatial_filter,
+            no_diff_plot=args.no_diff_plot,
+            variant_tag=variant_tag,
         )
 
     print(f"\nDone. Outputs at: {out_dir}")

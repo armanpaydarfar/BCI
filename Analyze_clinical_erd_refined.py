@@ -8,14 +8,19 @@ Implements `rev01-erd-refinement-plan.md`:
      ERD%, with auto-dropped cluster channels removed and the surviving
      subset reported in the legend.
 
-Per-subject 3-panel figure: Contralateral, Bilateral, Motor-focal.
-Cohort 2-panel figure: Contralateral and Bilateral, one line per
-session_idx colour-coded by viridis.
+Per-subject 6-panel figure: 3 rows (Contralateral, Bilateral, Motor-focal)
+x 2 cols (MI, Rest). Same y-axis per row so MI and Rest are directly
+comparable on the same scale. Focal channel is picked from MI only and
+the same channel is rendered for Rest (paired comparison at one
+electrode).
+
+Cohort 4-panel figure: 2 rows (Contralateral, Bilateral) x 2 cols
+(MI, Rest), one line per session_idx colour-coded by viridis.
 
 Outputs to `~/Pictures/clin_analysis_pass1/erd_refined/`:
-    <SUBJ>_3panel_contra_bilat_focal.png        (per subject)
-    cohort_2panel_contra_bilat.png              (cohort summary)
-    erd_refined_data.csv                        (cluster traces per (subj, sess))
+    <SUBJ>_6panel_mi_rest.png    (per subject)
+    cohort_4panel_mi_rest.png    (cohort summary)
+    erd_refined_data.csv         (cluster traces per (subj, sess, marker))
 
 Analysis-only. No Tier 1 / Tier 2 writes.
 """
@@ -54,6 +59,10 @@ from sweep_phase2_round2 import MU_HI, MU_LO, SCALAR_WIN  # noqa: E402
 import mne  # noqa: E402
 
 mne.set_log_level("ERROR")
+
+
+MI_MARKER = "200"
+REST_MARKER = "100"
 
 
 # ----------------------------------------------------------------------
@@ -152,71 +161,98 @@ def _cluster_timecourse(tfr_trials, cluster_channels, marker="200"):
 
 
 # ----------------------------------------------------------------------
-# Per-subject 3-panel figure
+# Per-subject 6-panel figure (3 metric rows × 2 class cols)
 # ----------------------------------------------------------------------
 
 def _extract_session_traces(tfr_trials, dropped_channels):
     """Return a small dict of (session-level) traces needed for the
-    3-panel figure. Doing this once-per-session avoids holding all
-    tfr_trials in RAM across sessions (each tfr_trials is ~1 GB for a
-    100-trial, 22-channel session at the default mu+beta TFR grid).
+    6-panel figure (3 metrics × {MI, REST}). Doing this once-per-session
+    avoids holding all tfr_trials in RAM across sessions (each
+    tfr_trials is ~1 GB for a 100-trial, 22-channel session at the
+    default mu+beta TFR grid).
+
+    The motor-focal channel is selected from MI only (existing
+    convention in `rev01-erd-refinement-plan.md` §3.2). The same
+    channel is used to render the focal Rest trace, so the
+    motor-focal row is a paired single-channel comparison.
     """
-    contra_res = _cluster_timecourse(
-        tfr_trials, CONTRA_MOTOR_CLUSTER, "200",
+    contra_mi = _cluster_timecourse(
+        tfr_trials, CONTRA_MOTOR_CLUSTER, MI_MARKER,
     )
-    bilat_res = _cluster_timecourse(
-        tfr_trials, BILATERAL_MOTOR_CLUSTER, "200",
+    contra_rest = _cluster_timecourse(
+        tfr_trials, CONTRA_MOTOR_CLUSTER, REST_MARKER,
     )
-    focal_pick = _most_focal_electrode_motor(tfr_trials, "200")
-    focal_res = (
-        _timecourse_at_channel(tfr_trials, focal_pick, "200")
+    bilat_mi = _cluster_timecourse(
+        tfr_trials, BILATERAL_MOTOR_CLUSTER, MI_MARKER,
+    )
+    bilat_rest = _cluster_timecourse(
+        tfr_trials, BILATERAL_MOTOR_CLUSTER, REST_MARKER,
+    )
+    focal_pick = _most_focal_electrode_motor(tfr_trials, MI_MARKER)
+    focal_mi = (
+        _timecourse_at_channel(tfr_trials, focal_pick, MI_MARKER)
+        if focal_pick is not None else None
+    )
+    focal_rest = (
+        _timecourse_at_channel(tfr_trials, focal_pick, REST_MARKER)
         if focal_pick is not None else None
     )
     return {
-        "contra": contra_res,
-        "bilat":  bilat_res,
-        "focal_pick": focal_pick,
-        "focal_trace": focal_res,
+        "contra_mi":   contra_mi,
+        "contra_rest": contra_rest,
+        "bilat_mi":    bilat_mi,
+        "bilat_rest":  bilat_rest,
+        "focal_pick":  focal_pick,
+        "focal_mi":    focal_mi,
+        "focal_rest":  focal_rest,
         "dropped_channels": list(dropped_channels),
     }
 
 
-def _plot_subject_3panel(subject, session_traces, out_path):
-    """Plot 3 panels: contralateral cluster, bilateral cluster, motor
-    focal. One line per session.
+def _plot_subject_6panel(subject, session_traces, out_path):
+    """Plot 3 rows (Contra, Bilat, Motor-focal) × 2 cols (MI, REST).
 
-    `session_traces` is a list of (sess, traces_dict) where traces_dict
-    is the output of `_extract_session_traces`.
+    Y-axis is shared within each row so MI and REST are on the same
+    scale for direct visual comparison. X-axis is shared across all
+    panels.
     """
     if not session_traces:
         return
-    fig, axes = plt.subplots(3, 1, figsize=(11, 11), sharex=True)
-    # Mi3 fix: use viridis for session_idx (ordinal, light-early →
-    # dark-late) consistent with the cohort 2-panel plot. Pass 1 used
-    # tab10 here and viridis on the cohort plot — inconsistent palette
-    # for the same x-axis variable.
+    fig, axes = plt.subplots(
+        3, 2, figsize=(14, 11), sharex=True, sharey="row",
+    )
     cmap = plt.get_cmap("viridis")
     n_sess = max(1, len(session_traces))
+    # (row, class) -> (title, key_in_traces, cluster_for_legend, panel_kind)
     panel_specs = [
-        (axes[0], "Contralateral ERD%", "contra", CONTRA_MOTOR_CLUSTER),
-        (axes[1], "Bilateral ERD%",     "bilat",  BILATERAL_MOTOR_CLUSTER),
-        (axes[2], "Motor-focal ERD%",   "focal",  None),
+        (0, "mi",   "Contralateral ERD% — MI",
+         "contra_mi",   CONTRA_MOTOR_CLUSTER,    "cluster"),
+        (0, "rest", "Contralateral ERD% — REST",
+         "contra_rest", CONTRA_MOTOR_CLUSTER,    "cluster"),
+        (1, "mi",   "Bilateral ERD% — MI",
+         "bilat_mi",    BILATERAL_MOTOR_CLUSTER, "cluster"),
+        (1, "rest", "Bilateral ERD% — REST",
+         "bilat_rest",  BILATERAL_MOTOR_CLUSTER, "cluster"),
+        (2, "mi",   "Motor-focal ERD% — MI",
+         "focal_mi",    None,                    "focal"),
+        (2, "rest", "Motor-focal ERD% — REST",
+         "focal_rest",  None,                    "focal"),
     ]
+    col_of_class = {"mi": 0, "rest": 1}
 
     drew = False
     for i, (sess, traces) in enumerate(session_traces):
         color = cmap(i / max(1, n_sess - 1))
-        for ax, title, key, cluster in panel_specs:
-            if key == "focal":
-                res = traces.get("focal_trace")
-                if res is None:
-                    continue
+        for row, cls, title, key, cluster, kind in panel_specs:
+            ax = axes[row][col_of_class[cls]]
+            res = traces.get(key)
+            if res is None:
+                ax.set_title(title)
+                continue
+            if kind == "focal":
                 times, mean_pct, low_pct, up_pct, n_trials = res
                 label = f"{sess} ({traces['focal_pick']}, n={n_trials})"
             else:
-                res = traces.get(key)
-                if res is None:
-                    continue
                 times, mean_pct, low_pct, up_pct, n_trials, present = res
                 missing = [c for c in cluster if c not in present]
                 tag = ", ".join(present)
@@ -229,19 +265,26 @@ def _plot_subject_3panel(subject, session_traces, out_path):
             ax.axhline(0, color="k", lw=0.6)
             ax.axvline(0, color="k", ls="--", lw=0.7)
             ax.axvline(1.0, color="k", ls=":", lw=0.7)
-            ax.set_ylabel("ERD %")
             ax.grid(True, alpha=0.25)
             drew = True
+        # y-label on the left column only (sharey="row" mirrors the
+        # tick labels)
+        axes[row][0].set_ylabel("ERD %")
 
     if not drew:
         plt.close(fig)
         return
 
-    axes[-1].set_xlabel("Time (s)")
-    for ax in axes:
-        ax.legend(loc="best", fontsize=7)
+    for ax in axes[-1]:
+        ax.set_xlabel("Time (s)")
+    # Legends only on the left column to keep the figure readable
+    # (legends are identical between MI and REST columns: same sessions,
+    # same colours; only the per-trial counts differ).
+    for row in range(3):
+        axes[row][0].legend(loc="best", fontsize=7)
+        axes[row][1].legend(loc="best", fontsize=7)
     fig.suptitle(
-        f"MU ERD across sessions — {subject} | Config A\n"
+        f"MU ERD across sessions — {subject} | Config A | MI vs REST\n"
         f"Contra cluster: {CONTRA_MOTOR_CLUSTER} | "
         f"Bilateral cluster: {BILATERAL_MOTOR_CLUSTER} | "
         f"Motor-focal pool: {MOTOR_FOCAL_POOL}",
@@ -253,23 +296,30 @@ def _plot_subject_3panel(subject, session_traces, out_path):
 
 
 # ----------------------------------------------------------------------
-# Cohort 2-panel figure
+# Cohort 4-panel figure (2 cluster rows × 2 class cols)
 # ----------------------------------------------------------------------
 
-def _plot_cohort_2panel(cohort_traces, out_path):
-    """Plot two panels (Contralateral, Bilateral). Within each panel,
-    one line per session_idx (1..N), colour-coded via viridis (light
-    early → dark late), with cohort mean across subjects per session.
+def _plot_cohort_4panel(cohort_traces, out_path):
+    """Plot 2 rows (Contralateral, Bilateral) × 2 cols (MI, REST).
 
-    cohort_traces: dict keyed by ("contra" | "bilat") containing list
-    of (subject, session_label, times, mean_pct).
+    Within each panel, one line per session_idx (1..N) colour-coded
+    via viridis (light early → dark late), showing the cohort grand
+    mean across subjects per session.
+
+    cohort_traces: dict keyed by ("contra_mi" | "contra_rest" |
+    "bilat_mi" | "bilat_rest") containing list of
+    (subject, session_label, times, mean_pct).
     """
-    fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
+    fig, axes = plt.subplots(
+        2, 2, figsize=(14, 8), sharex=True, sharey="row",
+    )
     panels = [
-        (axes[0], "Contralateral ERD% — cohort mean by session_idx", "contra"),
-        (axes[1], "Bilateral ERD% — cohort mean by session_idx",     "bilat"),
+        (0, 0, "Contralateral ERD% — MI",   "contra_mi"),
+        (0, 1, "Contralateral ERD% — REST", "contra_rest"),
+        (1, 0, "Bilateral ERD% — MI",       "bilat_mi"),
+        (1, 1, "Bilateral ERD% — REST",     "bilat_rest"),
     ]
-    # Determine all session indices present
+    # Determine all session indices present (across all four panels)
     all_idxs = sorted({
         session_idx_from_label(sess)
         for traces in cohort_traces.values()
@@ -284,23 +334,19 @@ def _plot_cohort_2panel(cohort_traces, out_path):
         for i, idx in enumerate(all_idxs)
     }
 
-    for ax, title, key in panels:
+    for row, col, title, key in panels:
+        ax = axes[row][col]
         traces = cohort_traces.get(key, [])
-        # Group by session_idx
         per_idx: dict[int, list[tuple[np.ndarray, np.ndarray]]] = {}
         for subj, sess, times, mean_pct in traces:
             idx = session_idx_from_label(sess)
             per_idx.setdefault(idx, []).append((times, mean_pct))
 
-        # All subjects share the same TFR window so times are aligned —
-        # assert by simple length matching.
         for idx in sorted(per_idx.keys()):
             entries = per_idx[idx]
             if not entries:
                 continue
-            # Use the first entry's times as canonical
             t = entries[0][0]
-            # Truncate any entry whose length differs (defensive)
             stack = np.stack(
                 [e[1][:len(t)] for e in entries if len(e[1]) >= len(t)],
                 axis=0,
@@ -317,12 +363,15 @@ def _plot_cohort_2panel(cohort_traces, out_path):
         ax.axhline(0, color="k", lw=0.6)
         ax.axvline(0, color="k", ls="--", lw=0.7)
         ax.axvline(1.0, color="k", ls=":", lw=0.7)
-        ax.set_ylabel("ERD %")
         ax.grid(True, alpha=0.25)
         ax.legend(loc="best", fontsize=8)
-    axes[-1].set_xlabel("Time (s)")
+        if col == 0:
+            ax.set_ylabel("ERD %")
+        if row == 1:
+            ax.set_xlabel("Time (s)")
     fig.suptitle(
-        "CLIN cohort — MU ERD% by session index (cohort grand mean per session)",
+        "CLIN cohort — MU ERD% by session index | MI vs REST "
+        "(cohort grand mean per session)",
         fontsize=11,
     )
     fig.tight_layout()
@@ -335,16 +384,17 @@ def _plot_cohort_2panel(cohort_traces, out_path):
 # ----------------------------------------------------------------------
 
 def _redraw_from_csv(out_dir: Path):
-    """Regenerate the per-subject 3-panels and cohort 2-panel from
-    erd_refined_data.csv. Used in pass-2 to apply Mi3 (palette fix)
-    without re-running the ~25 min Config-A TFR pass.
+    """Regenerate the per-subject 6-panel and cohort 4-panel from
+    erd_refined_data.csv. Used to replot without re-running the
+    ~25 min Config-A TFR pass.
 
-    Limitation: the per-trace focal-electrode panel cannot be
-    reconstructed from the CSV (the CSV only stores contra + bilat
-    cluster traces). The 3-panel here is therefore reduced to a
-    2-panel for the --from-csv path; the focal-electrode panel from
-    pass-1 remains in the saved PNG output (overwritten only if a
-    full run is executed).
+    Limitation: the focal-electrode rows cannot be reconstructed from
+    the CSV (the CSV stores contra + bilat cluster traces only). The
+    focal row in the redraw will be empty; rerun without --from-csv
+    to refresh it.
+
+    Backwards compat: if the CSV lacks a `marker` column it is from
+    an older (MI-only) run; treat every row as MI and skip Rest.
     """
     csv_path = out_dir / "erd_refined_data.csv"
     if not csv_path.exists():
@@ -352,38 +402,60 @@ def _redraw_from_csv(out_dir: Path):
             f"{csv_path} not found; re-run without --from-csv first."
         )
     df = pd.read_csv(csv_path)
-    cohort_traces = {"contra": [], "bilat": []}
+    has_marker = "marker" in df.columns
+    if not has_marker:
+        print(
+            "  [warn] CSV has no `marker` column (old schema); "
+            "treating all rows as MI. Rerun without --from-csv to "
+            "produce Rest panels."
+        )
+        df["marker"] = "mi"
+    cohort_traces = {
+        "contra_mi": [], "contra_rest": [],
+        "bilat_mi":  [], "bilat_rest":  [],
+    }
+    cluster_to_key = {"contra": "contra", "bilat": "bilat"}
     for subject in sorted(df["subject"].unique()):
         sub = df[df.subject == subject]
         sessions_in_csv = list(sub["session"].drop_duplicates())
         session_traces: list[tuple[str, dict]] = []
         for sess in sessions_in_csv:
             s = sub[sub.session == sess].sort_values("t")
-            traces = {"focal_pick": None, "focal_trace": None,
-                      "dropped_channels": []}
-            for key in ("contra", "bilat"):
-                k = s[s.cluster == key]
-                if k.empty:
-                    traces[key] = None
-                    continue
-                times = k["t"].to_numpy(dtype=float)
-                mean_pct = k["mean_pct"].to_numpy(dtype=float)
-                low_pct = k["low_pct"].to_numpy(dtype=float)
-                up_pct = k["up_pct"].to_numpy(dtype=float)
-                n_trials = int(k["n_trials"].iloc[0])
-                present_str = k["channels_used"].iloc[0]
-                present = present_str.split(",") if isinstance(
-                    present_str, str,
-                ) and present_str else []
-                traces[key] = (times, mean_pct, low_pct, up_pct, n_trials, present)
-                cohort_traces[key].append((subject, sess, times, mean_pct))
+            traces = {
+                "focal_pick": None,
+                "focal_mi":   None, "focal_rest": None,
+                "contra_mi":  None, "contra_rest": None,
+                "bilat_mi":   None, "bilat_rest":  None,
+                "dropped_channels": [],
+            }
+            for cluster in ("contra", "bilat"):
+                for marker in ("mi", "rest"):
+                    k = s[(s.cluster == cluster) & (s.marker == marker)]
+                    if k.empty:
+                        continue
+                    times = k["t"].to_numpy(dtype=float)
+                    mean_pct = k["mean_pct"].to_numpy(dtype=float)
+                    low_pct = k["low_pct"].to_numpy(dtype=float)
+                    up_pct = k["up_pct"].to_numpy(dtype=float)
+                    n_trials = int(k["n_trials"].iloc[0])
+                    present_str = k["channels_used"].iloc[0]
+                    present = present_str.split(",") if isinstance(
+                        present_str, str,
+                    ) and present_str else []
+                    key = f"{cluster_to_key[cluster]}_{marker}"
+                    traces[key] = (
+                        times, mean_pct, low_pct, up_pct, n_trials, present,
+                    )
+                    cohort_traces[key].append(
+                        (subject, sess, times, mean_pct),
+                    )
             session_traces.append((sess, traces))
         if session_traces:
-            sub_path = out_dir / f"{subject}_3panel_contra_bilat_focal.png"
-            _plot_subject_3panel(subject, session_traces, str(sub_path))
+            sub_path = out_dir / f"{subject}_6panel_mi_rest.png"
+            _plot_subject_6panel(subject, session_traces, str(sub_path))
             print(f"  wrote: {sub_path.name}")
-    _plot_cohort_2panel(
-        cohort_traces, str(out_dir / "cohort_2panel_contra_bilat.png"),
+    _plot_cohort_4panel(
+        cohort_traces, str(out_dir / "cohort_4panel_mi_rest.png"),
     )
     print(f"Done (re-plot from CSV). Outputs at: {out_dir}")
 
@@ -392,11 +464,31 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--from-csv", action="store_true",
-        help=("Skip the Config-A TFR pass; redraw per-subject 3-panel "
-              "(contra+bilat only, no focal) and cohort 2-panel from "
-              "erd_refined_data.csv. Used for pass-2 Mi3 palette fix."),
+        help=("Skip the Config-A TFR pass; redraw per-subject 6-panel "
+              "(contra+bilat only, no focal) and cohort 4-panel from "
+              "erd_refined_data.csv."),
+    )
+    parser.add_argument(
+        "--subjects", default="",
+        help=("Comma-separated subject filter for smoke tests, e.g. "
+              "`CLIN_SUBJ_005,CLIN_SUBJ_007`. Empty = full cohort. "
+              "Skips the per-subject cohort accumulation for subjects "
+              "outside the filter so this only meaningfully reduces "
+              "runtime when one or two subjects are specified."),
     )
     args = parser.parse_args()
+    subject_filter: set[str] = {
+        s.strip() for s in args.subjects.split(",") if s.strip()
+    }
+    # Safety: a subject filter on its own would otherwise overwrite the
+    # full-cohort PNG/CSV with sub-cohort outputs. Tag every --subjects
+    # run so smoke tests land in dedicated filenames.
+    variant_tag = ""
+    if subject_filter:
+        variant_tag = "_subj-" + "-".join(
+            s.replace("CLIN_SUBJ_", "") for s in sorted(subject_filter)
+        )
+        print(f"[variant] subjects={sorted(subject_filter)} → tag '{variant_tag}'")
 
     out_dir = clin_pictures_root() / "erd_refined"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -405,10 +497,23 @@ def main():
         _redraw_from_csv(out_dir)
         return
 
-    cohort_traces = {"contra": [], "bilat": []}
+    cohort_traces = {
+        "contra_mi": [], "contra_rest": [],
+        "bilat_mi":  [], "bilat_rest":  [],
+    }
     csv_rows = []
 
+    # Map (cluster_label, marker_label) -> (key_in_traces_dict, cluster_list)
+    cluster_specs = [
+        ("contra", "mi",   "contra_mi",   CONTRA_MOTOR_CLUSTER),
+        ("contra", "rest", "contra_rest", CONTRA_MOTOR_CLUSTER),
+        ("bilat",  "mi",   "bilat_mi",    BILATERAL_MOTOR_CLUSTER),
+        ("bilat",  "rest", "bilat_rest",  BILATERAL_MOTOR_CLUSTER),
+    ]
+
     for subject in enumerate_clin_subjects():
+        if subject_filter and subject not in subject_filter:
+            continue
         sessions = enumerate_online_sessions_for_subject(subject)
         print(f"\n=== {subject} ({len(sessions)} sessions) ===")
         # Hold only the small extracted traces per session (not the
@@ -430,15 +535,12 @@ def main():
             session_traces.append((sess, traces))
 
             # Cluster-mean traces for the cohort figure + CSV
-            for label_key, cluster in [
-                ("contra", CONTRA_MOTOR_CLUSTER),
-                ("bilat",  BILATERAL_MOTOR_CLUSTER),
-            ]:
-                res = traces[label_key]
+            for cluster_label, marker_label, key, cluster_chs in cluster_specs:
+                res = traces[key]
                 if res is None:
                     continue
                 times, mean_pct, low_pct, up_pct, n_trials, present = res
-                cohort_traces[label_key].append(
+                cohort_traces[key].append(
                     (subject, sess, times, mean_pct)
                 )
                 for t_idx, t_val in enumerate(times):
@@ -446,7 +548,8 @@ def main():
                         "subject": subject,
                         "session": sess,
                         "session_idx": session_idx_from_label(sess),
-                        "cluster": label_key,
+                        "cluster": cluster_label,
+                        "marker": marker_label,
                         "channels_used": ",".join(present),
                         "t": float(t_val),
                         "mean_pct": float(mean_pct[t_idx]),
@@ -464,19 +567,22 @@ def main():
             gc.collect()
 
         if session_traces:
-            sub_path = out_dir / f"{subject}_3panel_contra_bilat_focal.png"
-            _plot_subject_3panel(subject, session_traces, str(sub_path))
+            sub_path = (
+                out_dir / f"{subject}_6panel_mi_rest{variant_tag}.png"
+            )
+            _plot_subject_6panel(subject, session_traces, str(sub_path))
             print(f"  wrote: {sub_path.name}")
         del session_traces
         gc.collect()
 
     # Cohort figure
-    _plot_cohort_2panel(
-        cohort_traces, str(out_dir / "cohort_2panel_contra_bilat.png"),
+    _plot_cohort_4panel(
+        cohort_traces,
+        str(out_dir / f"cohort_4panel_mi_rest{variant_tag}.png"),
     )
 
     df = pd.DataFrame(csv_rows)
-    df.to_csv(out_dir / "erd_refined_data.csv", index=False)
+    df.to_csv(out_dir / f"erd_refined_data{variant_tag}.csv", index=False)
     print(f"\nDone. Outputs at: {out_dir}")
 
 
