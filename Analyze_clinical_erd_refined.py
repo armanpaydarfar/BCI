@@ -122,11 +122,17 @@ def _timecourse_at_channel(tfr_trials, ch_name, marker):
         return None
     ch_idx = tfr.ch_names.index(ch_name)
     fmask = (tfr.freqs >= MU_LO) & (tfr.freqs <= MU_HI)
-    per_trial_log = tfr.data[:, ch_idx][:, fmask, :].mean(axis=1)
-    n = per_trial_log.shape[0]
+    # Convert to ERD% FIRST (per-trial, per-freq), then average over freqs
+    # and trials. Averaging in pct space avoids the residual Jensen bias
+    # that arises when the freq-collapse `.mean(axis=1)` is done in log
+    # space.
+    data_pct = _logratio_to_pct(
+        tfr.data[:, ch_idx][:, fmask, :],
+    )
+    n = data_pct.shape[0]
     if n < 1:
         return None
-    per_trial_pct = _logratio_to_pct(per_trial_log)
+    per_trial_pct = data_pct.mean(axis=1)  # average over mu freqs
     mean_pct = per_trial_pct.mean(axis=0)
     if n > 1:
         sem_pct = per_trial_pct.std(axis=0, ddof=1) / np.sqrt(n)
@@ -159,14 +165,18 @@ def _cluster_timecourse(tfr_trials, cluster_channels, marker="200"):
         return None
     ch_idxs = [tfr.ch_names.index(c) for c in present]
     fmask = (tfr.freqs >= MU_LO) & (tfr.freqs <= MU_HI)
-    # tfr.data: (trials, channels, freqs, times). Average over cluster
-    # channels and mu freqs in logratio space (linear in log power), then
-    # convert to per-trial ERD% before trial-averaging.
-    per_trial_log = tfr.data[:, ch_idxs][:, :, fmask].mean(axis=(1, 2))
-    n = per_trial_log.shape[0]
+    # tfr.data: (trials, channels, freqs, times). Convert to ERD% FIRST
+    # (Pfurtscheller's per-channel per-freq definition), then average
+    # over cluster channels, mu freqs, and trials. Averaging in pct
+    # space is Jensen-free; averaging in logratio space introduces a
+    # residual negative bias that survives the per-trial→pct fix.
+    data_pct = _logratio_to_pct(
+        tfr.data[:, ch_idxs][:, :, fmask],
+    )
+    n = data_pct.shape[0]
     if n < 1:
         return None
-    per_trial_pct = _logratio_to_pct(per_trial_log)
+    per_trial_pct = data_pct.mean(axis=(1, 2))  # over cluster ch + mu freqs
     mean_pct = per_trial_pct.mean(axis=0)
     if n > 1:
         sem_pct = per_trial_pct.std(axis=0, ddof=1) / np.sqrt(n)
