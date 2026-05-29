@@ -47,7 +47,7 @@ for _p in (str(_REPO_ROOT), str(_SWEEP_DIR)):
 
 from exploration.clinical_analysis._helpers import (  # noqa: E402
     BILATERAL_MOTOR_CLUSTER, CONTRA_MOTOR_CLUSTER, MOTOR_FOCAL_POOL,
-    clin_pictures_root, config_a_pipeline, enumerate_clin_subjects,
+    clin_pictures_root, enumerate_clin_subjects,
     enumerate_online_sessions_for_subject, resolve_motor_cluster,
     session_idx_from_label,
 )
@@ -56,7 +56,34 @@ from exploration.clinical_analysis._helpers import (  # noqa: E402
 # sweep). MU_LO, MU_HI come from sweep_phase2_round2.py:66.
 from sweep_phase2_round2 import MU_HI, MU_LO, SCALAR_WIN  # noqa: E402
 
+# Override Config A's spectral baseline to be contiguous to the cue
+# (-1, 0) s. The helper's CONFIG_A uses (-1.5, -0.25) — chosen by the
+# sweep to leave a quarter-second gap before the cue — but the
+# downstream `tfr.crop(tmin=-1, tmax=4)` at
+# `generate_plots_config_a.py:151` then hides the (-1.5, -1) portion
+# from the displayed window. That asymmetry leaves the visible
+# baseline offset by whatever average the hidden window held. Setting
+# the baseline equal to the visible pre-cue window puts the baseline
+# at 0 on the plot by construction.
+CONFIG_A_DISPLAY_BASELINE = {
+    "spatial_filter":    "car",
+    "blink_removal":     "drop_fp",
+    "baseline_mode":     "logratio",
+    "spectral_baseline": (-1.0, 0.0),
+}
+
 import mne  # noqa: E402
+
+
+def config_a_pipeline(subject, session):
+    """Run Config A preprocess + TFR with a display-matched baseline.
+
+    Local override of `_helpers.config_a_pipeline` — same Config A
+    (CAR, drop_fp, logratio) but with `spectral_baseline=(-1, 0)` so
+    the baseline window matches the visible pre-cue display window.
+    """
+    from generate_plots_config_a import preprocess_and_tfr
+    return preprocess_and_tfr(subject, session, CONFIG_A_DISPLAY_BASELINE)
 
 mne.set_log_level("ERROR")
 
@@ -98,22 +125,24 @@ def _most_focal_electrode_motor(tfr_trials, marker="200"):
 
 
 def _timecourse_at_channel(tfr_trials, ch_name, marker):
-    """Trial-mean + SEM ERD%, computed by per-trial logratio→pct then
-    trial-averaging.
+    """Per-trial logratio→pct conversion, then median across trials.
 
-    Order of operations matters: averaging logratio across trials first
-    and converting once at the end (the original
-    `generate_plots_config_a.py:339-364` convention) introduces a
-    Jensen's-inequality negative bias in the baseline window —
-    mean_t(log10(P/P_bl)) ≤ log10(1) = 0. The result is a baseline
-    that sits at ~-15% rather than 0%. Per-trial conversion produces
-    `mean_t(P/P_bl - 1)·100`, which has baseline-window mean = 0 by
-    construction (since per-trial mean of P/P_bl across the baseline
-    window is exactly 1 — that's what `apply_baseline(mode="logratio")`
-    enforces). Mathematically equivalent to using `mode="percent"` in
-    `apply_baseline`.
+    Median is preferred over mean here because the per-trial
+    arithmetic mean of P/P_bl is outlier-sensitive in clinical data —
+    a single trial with high ERS power can flip the cohort post-cue
+    average positive even when most trials show MI desync. Median
+    isolates the typical-trial response and is consistent with the
+    pass-2 ERD switch to medians for the longitudinal LMEs
+    (`Analyze_clinical_neuromodulation_longitudinal.py` cohort
+    response = per-session median). Baseline stays at 0 by
+    construction because every trial's pct over the baseline window
+    averages to 0 (the apply_baseline guarantee) and median of zeros
+    is zero.
 
     Returns (times, mean_pct, low_pct, up_pct, n_trials) or None.
+    `low_pct` and `up_pct` are now the 25th and 75th percentile
+    (IQR) bands instead of mean ± SEM — IQR is the matching
+    measure of spread for a median.
     """
     if marker not in tfr_trials:
         return None
@@ -122,10 +151,6 @@ def _timecourse_at_channel(tfr_trials, ch_name, marker):
         return None
     ch_idx = tfr.ch_names.index(ch_name)
     fmask = (tfr.freqs >= MU_LO) & (tfr.freqs <= MU_HI)
-    # Convert to ERD% FIRST (per-trial, per-freq), then average over freqs
-    # and trials. Averaging in pct space avoids the residual Jensen bias
-    # that arises when the freq-collapse `.mean(axis=1)` is done in log
-    # space.
     data_pct = _logratio_to_pct(
         tfr.data[:, ch_idx][:, fmask, :],
     )
@@ -133,26 +158,19 @@ def _timecourse_at_channel(tfr_trials, ch_name, marker):
     if n < 1:
         return None
     per_trial_pct = data_pct.mean(axis=1)  # average over mu freqs
-    mean_pct = per_trial_pct.mean(axis=0)
+    mean_pct = np.median(per_trial_pct, axis=0)
     if n > 1:
-        sem_pct = per_trial_pct.std(axis=0, ddof=1) / np.sqrt(n)
+        low_pct = np.percentile(per_trial_pct, 25, axis=0)
+        up_pct = np.percentile(per_trial_pct, 75, axis=0)
     else:
-        sem_pct = np.zeros_like(mean_pct)
-    return (
-        tfr.times, mean_pct,
-        mean_pct - sem_pct, mean_pct + sem_pct,
-        n,
-    )
+        low_pct = mean_pct.copy()
+        up_pct = mean_pct.copy()
+    return (tfr.times, mean_pct, low_pct, up_pct, n)
 
 
 def _cluster_timecourse(tfr_trials, cluster_channels, marker="200"):
-    """Cluster-averaged ERD%(t) ± SEM per `rev01-erd-refinement-plan.md`
-    §7.1, with per-trial logratio→pct conversion before trial-averaging.
-
-    See docstring of `_timecourse_at_channel` for why the order of
-    operations was changed from the original `generate_plots_config_a`
-    convention — avoids a Jensen-inequality negative bias in the
-    baseline window.
+    """Cluster-averaged ERD%(t), median ± IQR across trials. See
+    `_timecourse_at_channel` docstring for the median rationale.
 
     Returns (times, mean_pct, low_pct, up_pct, n_trials, surviving_channels)
     or None.
@@ -165,11 +183,6 @@ def _cluster_timecourse(tfr_trials, cluster_channels, marker="200"):
         return None
     ch_idxs = [tfr.ch_names.index(c) for c in present]
     fmask = (tfr.freqs >= MU_LO) & (tfr.freqs <= MU_HI)
-    # tfr.data: (trials, channels, freqs, times). Convert to ERD% FIRST
-    # (Pfurtscheller's per-channel per-freq definition), then average
-    # over cluster channels, mu freqs, and trials. Averaging in pct
-    # space is Jensen-free; averaging in logratio space introduces a
-    # residual negative bias that survives the per-trial→pct fix.
     data_pct = _logratio_to_pct(
         tfr.data[:, ch_idxs][:, :, fmask],
     )
@@ -177,14 +190,16 @@ def _cluster_timecourse(tfr_trials, cluster_channels, marker="200"):
     if n < 1:
         return None
     per_trial_pct = data_pct.mean(axis=(1, 2))  # over cluster ch + mu freqs
-    mean_pct = per_trial_pct.mean(axis=0)
+    mean_pct = np.median(per_trial_pct, axis=0)
     if n > 1:
-        sem_pct = per_trial_pct.std(axis=0, ddof=1) / np.sqrt(n)
+        low_pct = np.percentile(per_trial_pct, 25, axis=0)
+        up_pct = np.percentile(per_trial_pct, 75, axis=0)
     else:
-        sem_pct = np.zeros_like(mean_pct)
+        low_pct = mean_pct.copy()
+        up_pct = mean_pct.copy()
     return (
         tfr.times, mean_pct,
-        mean_pct - sem_pct, mean_pct + sem_pct,
+        low_pct, up_pct,
         n, present,
     )
 
