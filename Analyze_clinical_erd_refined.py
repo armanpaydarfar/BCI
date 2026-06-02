@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """Refined ERD line plots for the CLIN_* cohort (Pass 1).
 
-Implements `rev01-erd-refinement-plan.md`:
-  1. Motor-cluster-restricted focal-electrode pick (replaces the
-     unconstrained argmin in `generate_plots_config_a.py:322-332`).
-  2. Two combined-channel metrics: Contralateral ERD% and Bilateral
-     ERD%, with auto-dropped cluster channels removed and the surviving
-     subset reported in the legend.
+Three cluster-averaged ERD% metrics — Contralateral, Bilateral, and
+Ipsilateral — with auto-dropped cluster channels removed and the
+surviving subset reported in the legend.
 
-Per-subject 6-panel figure: 3 rows (Contralateral, Bilateral, Motor-focal)
-x 2 cols (MI, Rest). Same y-axis per row so MI and Rest are directly
-comparable on the same scale. Focal channel is picked from MI only and
-the same channel is rendered for Rest (paired comparison at one
-electrode).
+Per-subject 6-panel figure: 3 rows (Contralateral, Bilateral,
+Ipsilateral) x 2 cols (MI, Rest). Same y-axis per row so MI and Rest
+are directly comparable on the same scale.
 
-Cohort 4-panel figure: 2 rows (Contralateral, Bilateral) x 2 cols
-(MI, Rest), one line per session_idx colour-coded by viridis.
+Cohort 6-panel figure: 3 rows (Contralateral, Bilateral, Ipsilateral)
+x 2 cols (MI, Rest), one line per session_idx colour-coded by viridis.
 
-Outputs to `~/Pictures/clin_analysis_pass1/erd_refined/`:
+Every figure carries a one-line preprocessing caption (spatial filter,
+blink handling, mu band, baseline window) so the scheme behind the
+plot is always visible.
+
+Outputs to `~/Pictures/clin_analysis/erd_refined/`:
     <SUBJ>_6panel_mi_rest.png    (per subject)
-    cohort_4panel_mi_rest.png    (cohort summary)
+    cohort_6panel_mi_rest.png    (cohort summary)
     erd_refined_data.csv         (cluster traces per (subj, sess, marker))
 
 Analysis-only. No Tier 1 / Tier 2 writes.
@@ -46,15 +45,15 @@ for _p in (str(_REPO_ROOT), str(_SWEEP_DIR)):
         sys.path.insert(0, _p)
 
 from exploration.clinical_analysis._helpers import (  # noqa: E402
-    BILATERAL_MOTOR_CLUSTER, CONTRA_MOTOR_CLUSTER, MOTOR_FOCAL_POOL,
+    BILATERAL_MOTOR_CLUSTER, CONTRA_MOTOR_CLUSTER, IPSI_MOTOR_CLUSTER,
     clin_pictures_root, enumerate_clin_subjects,
     enumerate_online_sessions_for_subject, resolve_motor_cluster,
     session_idx_from_label,
 )
 
-# Constants used for the focal/cluster selection (same as the validated
+# Mu-band edges for the cluster ERD% average (same as the validated
 # sweep). MU_LO, MU_HI come from sweep_phase2_round2.py:66.
-from sweep_phase2_round2 import MU_HI, MU_LO, SCALAR_WIN  # noqa: E402
+from sweep_phase2_round2 import MU_HI, MU_LO  # noqa: E402
 
 # Override Config A's spectral baseline to be contiguous to the cue
 # (-1, 0) s. The helper's CONFIG_A uses (-1.5, -0.25) — chosen by the
@@ -70,6 +69,17 @@ CONFIG_A_DISPLAY_BASELINE = {
     "blink_removal":     "drop_fp",
     "baseline_mode":     "logratio",
     "spectral_baseline": (-1.0, 0.0),
+    # Per-session channel qualification: railing electrodes (e.g.
+    # CLIN_SUBJ_004 S002 P7/FC2, S005 FC5/T8) drive the wide median±SE
+    # bands. Detect via broadband MAD-z > 3.5 and spherical-spline
+    # interpolate before spatial filtering. reject_window restricts the
+    # 50µV epoch reject to the displayed (-1, 4) s window. Scoped to this
+    # ERD config only — neuromod (_helpers.CONFIG_A) and the topomap
+    # (generate_plots_config_a.CONFIG_A) configs leave these keys unset
+    # and so are unaffected.
+    "channel_qualify":   True,
+    "channel_qualify_z": 3.5,
+    "reject_window":     (-1.0, 4.0),
 }
 
 import mne  # noqa: E402
@@ -91,9 +101,34 @@ mne.set_log_level("ERROR")
 MI_MARKER = "200"
 REST_MARKER = "100"
 
+# Description of the shaded band drawn around each median trace.
+_BAND_LABEL = "shaded = median ± SE (std/√n across trials)"
+
+
+def _preproc_caption():
+    """One-line preprocessing caption rendered on every figure. Read
+    from the live CONFIG at call time so it reflects the runtime
+    `--spatial-filter` override.
+    """
+    cfg = CONFIG_A_DISPLAY_BASELINE
+    caption = (
+        f"Preproc: {cfg['spatial_filter'].upper()} spatial filter | "
+        f"blink={cfg['blink_removal']} | "
+        f"μ {MU_LO:g}–{MU_HI:g} Hz | "
+        f"baseline {cfg['spectral_baseline']} s"
+    )
+    if cfg.get("channel_qualify"):
+        rw = cfg.get("reject_window")
+        rw_txt = f" | reject {rw[0]:g}..{rw[1]:g}s" if rw else ""
+        caption += (
+            f" | chan-qualify: MAD-z>{cfg['channel_qualify_z']:g} (interp)"
+            f"{rw_txt}"
+        )
+    return caption
+
 
 # ----------------------------------------------------------------------
-# Cluster trace + focal-electrode (motor-constrained) helpers
+# Cluster trace helpers
 # ----------------------------------------------------------------------
 
 def _logratio_to_pct(x):
@@ -101,76 +136,17 @@ def _logratio_to_pct(x):
     return 100.0 * (10.0 ** x - 1.0)
 
 
-def _most_focal_electrode_motor(tfr_trials, marker="200"):
-    """Motor-restricted analog of
-    generate_plots_config_a.py:322-332 (`_most_focal_electrode`).
-
-    The motor focal pool is restricted to
-    `_helpers.MOTOR_FOCAL_POOL` ∩ surviving channels per
-    `rev01-erd-refinement-plan.md` §3.1.
-    """
-    if marker not in tfr_trials:
-        return None
-    tfr = tfr_trials[marker]
-    motor_present = [c for c in MOTOR_FOCAL_POOL if c in tfr.ch_names]
-    if not motor_present:
-        return None
-    ch_idxs = [tfr.ch_names.index(c) for c in motor_present]
-    fmask = (tfr.freqs >= MU_LO) & (tfr.freqs <= MU_HI)
-    tmask = (tfr.times >= SCALAR_WIN[0]) & (tfr.times <= SCALAR_WIN[1])
-    per_ch = tfr.data[:, ch_idxs][:, :, fmask, :][:, :, :, tmask].mean(
-        axis=(0, 2, 3),
-    )
-    return motor_present[int(np.argmin(per_ch))]
-
-
-def _timecourse_at_channel(tfr_trials, ch_name, marker):
-    """Per-trial logratio→pct conversion, then median across trials.
-
-    Median is preferred over mean here because the per-trial
-    arithmetic mean of P/P_bl is outlier-sensitive in clinical data —
-    a single trial with high ERS power can flip the cohort post-cue
-    average positive even when most trials show MI desync. Median
-    isolates the typical-trial response and is consistent with the
-    pass-2 ERD switch to medians for the longitudinal LMEs
-    (`Analyze_clinical_neuromodulation_longitudinal.py` cohort
-    response = per-session median). Baseline stays at 0 by
-    construction because every trial's pct over the baseline window
-    averages to 0 (the apply_baseline guarantee) and median of zeros
-    is zero.
-
-    Returns (times, mean_pct, low_pct, up_pct, n_trials) or None.
-    `low_pct` and `up_pct` are now the 25th and 75th percentile
-    (IQR) bands instead of mean ± SEM — IQR is the matching
-    measure of spread for a median.
-    """
-    if marker not in tfr_trials:
-        return None
-    tfr = tfr_trials[marker]
-    if ch_name not in tfr.ch_names:
-        return None
-    ch_idx = tfr.ch_names.index(ch_name)
-    fmask = (tfr.freqs >= MU_LO) & (tfr.freqs <= MU_HI)
-    data_pct = _logratio_to_pct(
-        tfr.data[:, ch_idx][:, fmask, :],
-    )
-    n = data_pct.shape[0]
-    if n < 1:
-        return None
-    per_trial_pct = data_pct.mean(axis=1)  # average over mu freqs
-    mean_pct = np.median(per_trial_pct, axis=0)
-    if n > 1:
-        low_pct = np.percentile(per_trial_pct, 25, axis=0)
-        up_pct = np.percentile(per_trial_pct, 75, axis=0)
-    else:
-        low_pct = mean_pct.copy()
-        up_pct = mean_pct.copy()
-    return (tfr.times, mean_pct, low_pct, up_pct, n)
-
-
 def _cluster_timecourse(tfr_trials, cluster_channels, marker="200"):
-    """Cluster-averaged ERD%(t), median ± IQR across trials. See
-    `_timecourse_at_channel` docstring for the median rationale.
+    """Cluster-averaged ERD%(t), median ± SE across trials.
+
+    Median (not mean) across trials: the per-trial arithmetic mean of
+    P/P_bl is outlier-sensitive in clinical data — one high-ERS trial
+    can flip the post-cue average positive even when most trials show
+    desync. Median isolates the typical-trial response. The shaded band
+    is the standard error of the per-trial distribution (sample
+    std / sqrt(n)), centred on the median. Baseline sits at 0 by
+    construction (each trial's pct over the baseline window averages to
+    0 per the apply_baseline guarantee, and the median of zeros is 0).
 
     Returns (times, mean_pct, low_pct, up_pct, n_trials, surviving_channels)
     or None.
@@ -192,8 +168,9 @@ def _cluster_timecourse(tfr_trials, cluster_channels, marker="200"):
     per_trial_pct = data_pct.mean(axis=(1, 2))  # over cluster ch + mu freqs
     mean_pct = np.median(per_trial_pct, axis=0)
     if n > 1:
-        low_pct = np.percentile(per_trial_pct, 25, axis=0)
-        up_pct = np.percentile(per_trial_pct, 75, axis=0)
+        sem = np.std(per_trial_pct, axis=0, ddof=1) / np.sqrt(n)
+        low_pct = mean_pct - sem
+        up_pct = mean_pct + sem
     else:
         low_pct = mean_pct.copy()
         up_pct = mean_pct.copy()
@@ -210,15 +187,10 @@ def _cluster_timecourse(tfr_trials, cluster_channels, marker="200"):
 
 def _extract_session_traces(tfr_trials, dropped_channels):
     """Return a small dict of (session-level) traces needed for the
-    6-panel figure (3 metrics × {MI, REST}). Doing this once-per-session
-    avoids holding all tfr_trials in RAM across sessions (each
-    tfr_trials is ~1 GB for a 100-trial, 22-channel session at the
-    default mu+beta TFR grid).
-
-    The motor-focal channel is selected from MI only (existing
-    convention in `rev01-erd-refinement-plan.md` §3.2). The same
-    channel is used to render the focal Rest trace, so the
-    motor-focal row is a paired single-channel comparison.
+    6-panel figure (3 cluster metrics × {MI, REST}). Doing this
+    once-per-session avoids holding all tfr_trials in RAM across
+    sessions (each tfr_trials is ~1 GB for a 100-trial, 22-channel
+    session at the default mu+beta TFR grid).
     """
     contra_mi = _cluster_timecourse(
         tfr_trials, CONTRA_MOTOR_CLUSTER, MI_MARKER,
@@ -232,29 +204,25 @@ def _extract_session_traces(tfr_trials, dropped_channels):
     bilat_rest = _cluster_timecourse(
         tfr_trials, BILATERAL_MOTOR_CLUSTER, REST_MARKER,
     )
-    focal_pick = _most_focal_electrode_motor(tfr_trials, MI_MARKER)
-    focal_mi = (
-        _timecourse_at_channel(tfr_trials, focal_pick, MI_MARKER)
-        if focal_pick is not None else None
+    ipsi_mi = _cluster_timecourse(
+        tfr_trials, IPSI_MOTOR_CLUSTER, MI_MARKER,
     )
-    focal_rest = (
-        _timecourse_at_channel(tfr_trials, focal_pick, REST_MARKER)
-        if focal_pick is not None else None
+    ipsi_rest = _cluster_timecourse(
+        tfr_trials, IPSI_MOTOR_CLUSTER, REST_MARKER,
     )
     return {
         "contra_mi":   contra_mi,
         "contra_rest": contra_rest,
         "bilat_mi":    bilat_mi,
         "bilat_rest":  bilat_rest,
-        "focal_pick":  focal_pick,
-        "focal_mi":    focal_mi,
-        "focal_rest":  focal_rest,
+        "ipsi_mi":     ipsi_mi,
+        "ipsi_rest":   ipsi_rest,
         "dropped_channels": list(dropped_channels),
     }
 
 
 def _plot_subject_6panel(subject, session_traces, out_path):
-    """Plot 3 rows (Contra, Bilat, Motor-focal) × 2 cols (MI, REST).
+    """Plot 3 rows (Contra, Bilat, Ipsi) × 2 cols (MI, REST).
 
     Y-axis is shared within each row so MI and REST are on the same
     scale for direct visual comparison. X-axis is shared across all
@@ -267,42 +235,38 @@ def _plot_subject_6panel(subject, session_traces, out_path):
     )
     cmap = plt.get_cmap("viridis")
     n_sess = max(1, len(session_traces))
-    # (row, class) -> (title, key_in_traces, cluster_for_legend, panel_kind)
+    # (row, class) -> (title, key_in_traces, cluster_for_legend)
     panel_specs = [
         (0, "mi",   "Contralateral ERD% — MI",
-         "contra_mi",   CONTRA_MOTOR_CLUSTER,    "cluster"),
+         "contra_mi",   CONTRA_MOTOR_CLUSTER),
         (0, "rest", "Contralateral ERD% — REST",
-         "contra_rest", CONTRA_MOTOR_CLUSTER,    "cluster"),
+         "contra_rest", CONTRA_MOTOR_CLUSTER),
         (1, "mi",   "Bilateral ERD% — MI",
-         "bilat_mi",    BILATERAL_MOTOR_CLUSTER, "cluster"),
+         "bilat_mi",    BILATERAL_MOTOR_CLUSTER),
         (1, "rest", "Bilateral ERD% — REST",
-         "bilat_rest",  BILATERAL_MOTOR_CLUSTER, "cluster"),
-        (2, "mi",   "Motor-focal ERD% — MI",
-         "focal_mi",    None,                    "focal"),
-        (2, "rest", "Motor-focal ERD% — REST",
-         "focal_rest",  None,                    "focal"),
+         "bilat_rest",  BILATERAL_MOTOR_CLUSTER),
+        (2, "mi",   "Ipsilateral ERD% — MI",
+         "ipsi_mi",     IPSI_MOTOR_CLUSTER),
+        (2, "rest", "Ipsilateral ERD% — REST",
+         "ipsi_rest",   IPSI_MOTOR_CLUSTER),
     ]
     col_of_class = {"mi": 0, "rest": 1}
 
     drew = False
     for i, (sess, traces) in enumerate(session_traces):
         color = cmap(i / max(1, n_sess - 1))
-        for row, cls, title, key, cluster, kind in panel_specs:
+        for row, cls, title, key, cluster in panel_specs:
             ax = axes[row][col_of_class[cls]]
             res = traces.get(key)
             if res is None:
                 ax.set_title(title)
                 continue
-            if kind == "focal":
-                times, mean_pct, low_pct, up_pct, n_trials = res
-                label = f"{sess} ({traces['focal_pick']}, n={n_trials})"
-            else:
-                times, mean_pct, low_pct, up_pct, n_trials, present = res
-                missing = [c for c in cluster if c not in present]
-                tag = ", ".join(present)
-                if missing:
-                    tag += f"  [missing: {','.join(missing)}]"
-                label = f"{sess} (n={n_trials}; {tag})"
+            times, mean_pct, low_pct, up_pct, n_trials, present = res
+            missing = [c for c in cluster if c not in present]
+            tag = ", ".join(present)
+            if missing:
+                tag += f"  [missing: {','.join(missing)}]"
+            label = f"{sess} (n={n_trials}; {tag})"
             ax.plot(times, mean_pct, color=color, label=label, linewidth=1.4)
             ax.fill_between(times, low_pct, up_pct, color=color, alpha=0.15)
             ax.set_title(title)
@@ -328,10 +292,11 @@ def _plot_subject_6panel(subject, session_traces, out_path):
         axes[row][0].legend(loc="best", fontsize=7)
         axes[row][1].legend(loc="best", fontsize=7)
     fig.suptitle(
-        f"MU ERD across sessions — {subject} | Config A | MI vs REST\n"
-        f"Contra cluster: {CONTRA_MOTOR_CLUSTER} | "
-        f"Bilateral cluster: {BILATERAL_MOTOR_CLUSTER} | "
-        f"Motor-focal pool: {MOTOR_FOCAL_POOL}",
+        f"MU ERD across sessions — {subject} | MI vs REST\n"
+        f"Contra: {CONTRA_MOTOR_CLUSTER} | "
+        f"Bilateral: {BILATERAL_MOTOR_CLUSTER} | "
+        f"Ipsi: {IPSI_MOTOR_CLUSTER}\n"
+        f"{_preproc_caption()} | {_BAND_LABEL}",
         fontsize=10,
     )
     fig.tight_layout()
@@ -343,25 +308,28 @@ def _plot_subject_6panel(subject, session_traces, out_path):
 # Cohort 4-panel figure (2 cluster rows × 2 class cols)
 # ----------------------------------------------------------------------
 
-def _plot_cohort_4panel(cohort_traces, out_path):
-    """Plot 2 rows (Contralateral, Bilateral) × 2 cols (MI, REST).
+def _plot_cohort_6panel(cohort_traces, out_path):
+    """Plot 3 rows (Contralateral, Bilateral, Ipsilateral) × 2 cols
+    (MI, REST).
 
     Within each panel, one line per session_idx (1..N) colour-coded
     via viridis (light early → dark late), showing the cohort grand
     mean across subjects per session.
 
     cohort_traces: dict keyed by ("contra_mi" | "contra_rest" |
-    "bilat_mi" | "bilat_rest") containing list of
-    (subject, session_label, times, mean_pct).
+    "bilat_mi" | "bilat_rest" | "ipsi_mi" | "ipsi_rest") containing
+    list of (subject, session_label, times, mean_pct).
     """
     fig, axes = plt.subplots(
-        2, 2, figsize=(14, 8), sharex=True, sharey="row",
+        3, 2, figsize=(14, 11), sharex=True, sharey="row",
     )
     panels = [
         (0, 0, "Contralateral ERD% — MI",   "contra_mi"),
         (0, 1, "Contralateral ERD% — REST", "contra_rest"),
         (1, 0, "Bilateral ERD% — MI",       "bilat_mi"),
         (1, 1, "Bilateral ERD% — REST",     "bilat_rest"),
+        (2, 0, "Ipsilateral ERD% — MI",     "ipsi_mi"),
+        (2, 1, "Ipsilateral ERD% — REST",   "ipsi_rest"),
     ]
     # Determine all session indices present (across all four panels)
     all_idxs = sorted({
@@ -411,11 +379,12 @@ def _plot_cohort_4panel(cohort_traces, out_path):
         ax.legend(loc="best", fontsize=8)
         if col == 0:
             ax.set_ylabel("ERD %")
-        if row == 1:
+        if row == 2:
             ax.set_xlabel("Time (s)")
     fig.suptitle(
         "CLIN cohort — MU ERD% by session index | MI vs REST "
-        "(cohort grand mean per session)",
+        "(cohort grand mean per session)\n"
+        f"{_preproc_caption()}",
         fontsize=11,
     )
     fig.tight_layout()
@@ -428,14 +397,9 @@ def _plot_cohort_4panel(cohort_traces, out_path):
 # ----------------------------------------------------------------------
 
 def _redraw_from_csv(out_dir: Path):
-    """Regenerate the per-subject 6-panel and cohort 4-panel from
+    """Regenerate the per-subject 6-panel and cohort 6-panel from
     erd_refined_data.csv. Used to replot without re-running the
     ~25 min Config-A TFR pass.
-
-    Limitation: the focal-electrode rows cannot be reconstructed from
-    the CSV (the CSV stores contra + bilat cluster traces only). The
-    focal row in the redraw will be empty; rerun without --from-csv
-    to refresh it.
 
     Backwards compat: if the CSV lacks a `marker` column it is from
     an older (MI-only) run; treat every row as MI and skip Rest.
@@ -457,8 +421,9 @@ def _redraw_from_csv(out_dir: Path):
     cohort_traces = {
         "contra_mi": [], "contra_rest": [],
         "bilat_mi":  [], "bilat_rest":  [],
+        "ipsi_mi":   [], "ipsi_rest":   [],
     }
-    cluster_to_key = {"contra": "contra", "bilat": "bilat"}
+    cluster_to_key = {"contra": "contra", "bilat": "bilat", "ipsi": "ipsi"}
     for subject in sorted(df["subject"].unique()):
         sub = df[df.subject == subject]
         sessions_in_csv = list(sub["session"].drop_duplicates())
@@ -466,13 +431,12 @@ def _redraw_from_csv(out_dir: Path):
         for sess in sessions_in_csv:
             s = sub[sub.session == sess].sort_values("t")
             traces = {
-                "focal_pick": None,
-                "focal_mi":   None, "focal_rest": None,
                 "contra_mi":  None, "contra_rest": None,
                 "bilat_mi":   None, "bilat_rest":  None,
+                "ipsi_mi":    None, "ipsi_rest":   None,
                 "dropped_channels": [],
             }
-            for cluster in ("contra", "bilat"):
+            for cluster in ("contra", "bilat", "ipsi"):
                 for marker in ("mi", "rest"):
                     k = s[(s.cluster == cluster) & (s.marker == marker)]
                     if k.empty:
@@ -498,8 +462,8 @@ def _redraw_from_csv(out_dir: Path):
             sub_path = out_dir / f"{subject}_6panel_mi_rest.png"
             _plot_subject_6panel(subject, session_traces, str(sub_path))
             print(f"  wrote: {sub_path.name}")
-    _plot_cohort_4panel(
-        cohort_traces, str(out_dir / "cohort_4panel_mi_rest.png"),
+    _plot_cohort_6panel(
+        cohort_traces, str(out_dir / "cohort_6panel_mi_rest.png"),
     )
     print(f"Done (re-plot from CSV). Outputs at: {out_dir}")
 
@@ -509,7 +473,7 @@ def main():
     parser.add_argument(
         "--from-csv", action="store_true",
         help=("Skip the Config-A TFR pass; redraw per-subject 6-panel "
-              "(contra+bilat only, no focal) and cohort 4-panel from "
+              "and cohort 6-panel (contra/bilat/ipsi) from "
               "erd_refined_data.csv."),
     )
     parser.add_argument(
@@ -520,16 +484,26 @@ def main():
               "outside the filter so this only meaningfully reduces "
               "runtime when one or two subjects are specified."),
     )
+    parser.add_argument(
+        "--spatial-filter", choices=("car", "csd", "hjorth"), default="car",
+        help=("Spatial filter for the Config-A preprocessing pass. "
+              "Output filenames are tagged with the filter name so "
+              "car/csd/hjorth variants coexist in erd_refined/ for "
+              "side-by-side review."),
+    )
     args = parser.parse_args()
+    # Apply the spatial-filter override to the shared local CONFIG; the
+    # figure caption reads this at plot time so it always matches.
+    CONFIG_A_DISPLAY_BASELINE["spatial_filter"] = args.spatial_filter
     subject_filter: set[str] = {
         s.strip() for s in args.subjects.split(",") if s.strip()
     }
-    # Safety: a subject filter on its own would otherwise overwrite the
-    # full-cohort PNG/CSV with sub-cohort outputs. Tag every --subjects
-    # run so smoke tests land in dedicated filenames.
-    variant_tag = ""
+    # Tag outputs by spatial filter (always) so the three variants
+    # coexist, plus by subject when a --subjects filter is set so
+    # smoke tests don't overwrite the full-cohort files.
+    variant_tag = f"_{args.spatial_filter}"
     if subject_filter:
-        variant_tag = "_subj-" + "-".join(
+        variant_tag += "_subj-" + "-".join(
             s.replace("CLIN_SUBJ_", "") for s in sorted(subject_filter)
         )
         print(f"[variant] subjects={sorted(subject_filter)} → tag '{variant_tag}'")
@@ -544,6 +518,7 @@ def main():
     cohort_traces = {
         "contra_mi": [], "contra_rest": [],
         "bilat_mi":  [], "bilat_rest":  [],
+        "ipsi_mi":   [], "ipsi_rest":   [],
     }
     csv_rows = []
 
@@ -553,6 +528,8 @@ def main():
         ("contra", "rest", "contra_rest", CONTRA_MOTOR_CLUSTER),
         ("bilat",  "mi",   "bilat_mi",    BILATERAL_MOTOR_CLUSTER),
         ("bilat",  "rest", "bilat_rest",  BILATERAL_MOTOR_CLUSTER),
+        ("ipsi",   "mi",   "ipsi_mi",     IPSI_MOTOR_CLUSTER),
+        ("ipsi",   "rest", "ipsi_rest",   IPSI_MOTOR_CLUSTER),
     ]
 
     for subject in enumerate_clin_subjects():
@@ -604,6 +581,7 @@ def main():
             print(
                 f"  {sess}: n_kept={out['n_kept']}/{out['n_attempted']} "
                 f"dropped={out['dropped_channels'] or '—'} "
+                f"interp={out.get('interpolated_channels') or '—'} "
                 f"({time.time()-t0:.1f}s)"
             )
             # Release heavy TFR objects immediately
@@ -620,9 +598,9 @@ def main():
         gc.collect()
 
     # Cohort figure
-    _plot_cohort_4panel(
+    _plot_cohort_6panel(
         cohort_traces,
-        str(out_dir / f"cohort_4panel_mi_rest{variant_tag}.png"),
+        str(out_dir / f"cohort_6panel_mi_rest{variant_tag}.png"),
     )
 
     df = pd.DataFrame(csv_rows)

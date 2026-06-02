@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Publication plot generator — Config A (CAR + drop_fp + logratio + (-1.5, -0.25)).
+Publication plot generator — Config A (CAR + drop_fp + logratio + (-1, 0)).
 
 Plot style mirrors visualize_online_data.py:
   - cmap = "viridis" (visualize_online_data.py:1173)
@@ -15,13 +15,10 @@ Plot style mirrors visualize_online_data.py:
 NO MI-minus-Rest figures (per user request).
 
 Outputs:
-  ~/Pictures/clin_erd_plots/
-    per_session_topomaps/<SUBJ>_<SESSION>_{rest,mi}.png
-    per_subject_topomaps/<SUBJ>_{rest,mi}.png       (session-avg AverageTFR)
-    grand_average_topomap/grand_avg_{rest,mi}.png   (subject+session grand avg)
-    per_subject_timecourses/<SUBJ>_timecourse.png   (2 panels, rest + mi,
-        one line per session at that session's most-focal MI electrode;
-        legend = "<session> (<electrode>)")
+  ~/Pictures/clin_analysis/erd_topomaps/
+    per_session/<SUBJ>_<SESSION>_{rest,mi}.png
+    per_subject/<SUBJ>_{rest,mi}.png       (session-avg AverageTFR)
+    grand_average/grand_avg_{rest,mi}.png   (subject+session grand avg)
 """
 
 import os
@@ -38,7 +35,7 @@ import mne
 from sweep_phase2_round2 import (
     apply_blink_removal, apply_spatial_filter,
     ZONES,
-    NOTCH, BB_LO, BB_HI, MU_LO, MU_HI, PAD_TFR, TRIAL_WIN, SCALAR_WIN,
+    NOTCH, BB_LO, BB_HI, MU_LO, MU_HI, PAD_TFR, TRIAL_WIN,
     REJECT_MAX_ABS_UV, FREQS, N_CYCLES, ICA_HP_HZ,
 )
 from sweep_phase3_validation import (
@@ -60,19 +57,21 @@ CONFIG_A = {
     "spatial_filter":    "car",
     "blink_removal":     "drop_fp",
     "baseline_mode":     "logratio",
-    "spectral_baseline": (-1.5, -0.25),
+    # Baseline matched to the ERD timecourse window (-1, 0) s so the
+    # topomaps and `Analyze_clinical_erd_refined.py` reference the same
+    # contiguous pre-cue period (2026-06-01).
+    "spectral_baseline": (-1.0, 0.0),
 }
 
 SUBJECTS = [f"CLIN_SUBJ_{i:03d}" for i in (2, 3, 4, 5, 6, 7, 8)]
-OUT_ROOT = os.path.expanduser("~/Pictures/clin_erd_plots")
+OUT_ROOT = os.path.expanduser("~/Pictures/clin_analysis/erd_topomaps")
 APPEND_MODE = False  # flip to True to skip plots that already exist
 
-DIR_PER_SESS   = os.path.join(OUT_ROOT, "per_session_topomaps")
-DIR_PER_SUBJ   = os.path.join(OUT_ROOT, "per_subject_topomaps")
-DIR_GRAND      = os.path.join(OUT_ROOT, "grand_average_topomap")
-DIR_TIMECOURSE = os.path.join(OUT_ROOT, "per_subject_timecourses")
+DIR_PER_SESS   = os.path.join(OUT_ROOT, "per_session")
+DIR_PER_SUBJ   = os.path.join(OUT_ROOT, "per_subject")
+DIR_GRAND      = os.path.join(OUT_ROOT, "grand_average")
 
-for d in (DIR_PER_SESS, DIR_PER_SUBJ, DIR_GRAND, DIR_TIMECOURSE):
+for d in (DIR_PER_SESS, DIR_PER_SUBJ, DIR_GRAND):
     os.makedirs(d, exist_ok=True)
 
 # Topomap layout — match visualize_online_data.py:1153-1156
@@ -99,9 +98,35 @@ def preprocess_and_tfr(subject, session, config):
 
     raw_bb, _ = apply_blink_removal(raw_bb, raw_1hz, config["blink_removal"])
 
+    # Per-session channel qualification: detect railing electrodes on the
+    # broadband signal and spherical-spline interpolate them BEFORE spatial
+    # filtering, so a single bad channel can't contaminate the CAR/CSD/Hjorth
+    # reference. Gated off by default (channel_qualify=False) so neuromod and
+    # topomap callers, which don't set the key, are byte-for-byte unchanged.
+    # The 50µV epoch reject is unreliable here (e.g. CLIN_SUBJ_004 S002 has a
+    # 227µV P7 channel that rejects 0 epochs), hence detect+interpolate rather
+    # than relying on amplitude rejection. Threshold of 3.5 cleanly separates
+    # good channels (MAD-z < 3) from railing ones (MAD-z ≥ 6); see
+    # exploration/clinical_analysis/explore_subj004_channel_noise.py.
+    interpolated_channels = []
+    if config.get("channel_qualify", False):
+        qz = config.get("channel_qualify_z", 3.5)
+        data = raw_bb.get_data()  # native µV, channels already montaged
+        rms = data.std(axis=1)
+        med = np.median(rms)
+        mad = np.median(np.abs(rms - med))
+        if mad > 0:
+            z = (rms - med) / (1.4826 * mad)
+            bad = [raw_bb.ch_names[i] for i in np.where(np.abs(z) > qz)[0]]
+            if bad:
+                raw_bb.info["bads"] = bad
+                raw_bb.interpolate_bads(reset_bads=True, verbose=False)
+                interpolated_channels = bad
+
     dropped = []
     iters = 0
     t0, t1 = TRIAL_WIN
+    reject_window = config.get("reject_window", None)
     while True:
         iters += 1
         raw_mu = raw_bb.copy()
@@ -114,7 +139,19 @@ def preprocess_and_tfr(subject, session, config):
         epochs_mu = mne.Epochs(raw_mu, events, reject=None, flat=None, **epoch_kw)
         epochs_bb = mne.Epochs(raw_bb, events, reject=None, flat=None, **epoch_kw)
         mu_data = epochs_mu.get_data()
-        mask = np.max(np.abs(mu_data), axis=(1, 2)) <= REJECT_MAX_ABS_UV
+        # Optionally restrict the 50µV amplitude check to a display-relevant
+        # time window so pre/post padding artefacts don't reject otherwise
+        # usable epochs. reject_window=None preserves the original full-epoch
+        # check for callers that don't set the key.
+        if reject_window is not None:
+            tmask = (
+                (epochs_mu.times >= reject_window[0])
+                & (epochs_mu.times <= reject_window[1])
+            )
+            mu_amp = mu_data[:, :, tmask]
+        else:
+            mu_amp = mu_data
+        mask = np.max(np.abs(mu_amp), axis=(1, 2)) <= REJECT_MAX_ABS_UV
         good_ix = np.where(mask)[0].tolist()
         bad_ix = np.where(~mask)[0]
         n_att = int(len(events)); n_kept = int(len(good_ix))
@@ -156,6 +193,7 @@ def preprocess_and_tfr(subject, session, config):
         "tfr_avg":    tfr_avg,
         "tfr_trials": tfr_trials,
         "dropped_channels": dropped,
+        "interpolated_channels": interpolated_channels,
         "n_kept":     n_kept,
         "n_attempted": n_att,
     }
@@ -316,107 +354,6 @@ def plot_grand_topo(all_subject_tfrs, out_dir):
 
 
 # ======================================================================
-# Per-subject timecourse (viz multi-session-overlay style)
-# ======================================================================
-
-def _most_focal_electrode(tfr_trials, marker="200"):
-    """Channel with strongest mu-band ERD over the (1, 4)s scalar window,
-    averaged over trials. Negative logratio = stronger ERD."""
-    if marker not in tfr_trials:
-        return None
-    tfr = tfr_trials[marker]
-    freqs = tfr.freqs; times = tfr.times
-    fmask = (freqs >= MU_LO) & (freqs <= MU_HI)
-    tmask = (times >= SCALAR_WIN[0]) & (times <= SCALAR_WIN[1])
-    per_ch = tfr.data[:, :, fmask, :][:, :, :, tmask].mean(axis=(0, 2, 3))
-    return tfr.ch_names[int(np.argmin(per_ch))]
-
-
-def _logratio_to_pct(x):
-    return 100.0 * (10.0 ** x - 1.0)
-
-
-def _timecourse_at_channel(tfr_trials, ch_name, marker):
-    """Trial-mean and SEM at `ch_name` for the marker, in % space.
-
-    Trial-averaging is done in logratio (stable), then converted.
-    Mirrors compute_focal_timecourses in visualize_online_data.py:1058-1100,
-    but for a single channel."""
-    if marker not in tfr_trials:
-        return None
-    tfr = tfr_trials[marker]
-    if ch_name not in tfr.ch_names:
-        return None
-    ch_idx = tfr.ch_names.index(ch_name)
-    freqs = tfr.freqs; times = tfr.times
-    fmask = (freqs >= MU_LO) & (freqs <= MU_HI)
-    per_trial = tfr.data[:, ch_idx][:, fmask, :].mean(axis=1)  # (trials, time)
-    if per_trial.shape[0] < 1:
-        return None
-    mean_log = per_trial.mean(axis=0)
-    if per_trial.shape[0] > 1:
-        sem_log = per_trial.std(axis=0, ddof=1) / np.sqrt(per_trial.shape[0])
-    else:
-        sem_log = np.zeros_like(mean_log)
-    mean_pct = _logratio_to_pct(mean_log)
-    low_pct = _logratio_to_pct(mean_log - sem_log)
-    up_pct  = _logratio_to_pct(mean_log + sem_log)
-    return times, mean_pct, low_pct, up_pct
-
-
-def plot_subject_timecourse(subject, sessions_and_trials, out_dir):
-    """Two-panel (Rest, MI) figure. Each session is one line; the focal
-    electrode is selected from MI mu-band peak ERD on that session and is
-    used for BOTH panels. Mirrors plot_multisession_overlay_timecourses_cached
-    in visualize_online_data.py:524-578."""
-    if not sessions_and_trials:
-        return
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
-    ax_rest, ax_mi = axes
-    cmap = plt.get_cmap("tab10")
-
-    any_drawn = False
-    for i, (sess, tfr_trials) in enumerate(sessions_and_trials):
-        focal_ch = _most_focal_electrode(tfr_trials, marker="200")
-        if focal_ch is None:
-            continue
-        line_label = f"{sess} ({focal_ch})"
-        color = cmap(i % 10)
-
-        for marker, ax in (("100", ax_rest), ("200", ax_mi)):
-            res = _timecourse_at_channel(tfr_trials, focal_ch, marker=marker)
-            if res is None:
-                continue
-            times, mean_pct, low_pct, up_pct = res
-            ax.plot(times, mean_pct, color=color, label=line_label, linewidth=1.5)
-            ax.fill_between(times, low_pct, up_pct, color=color, alpha=0.15)
-            any_drawn = True
-
-    if not any_drawn:
-        plt.close(fig); return
-
-    for ax, t in zip(axes, ["REST", "MI"]):
-        ax.axhline(0, color="k", linewidth=0.6)
-        ax.axvline(0, color="k", linestyle="--", linewidth=0.7)
-        ax.axvline(1.0, color="k", linestyle=":", linewidth=0.7)
-        ax.set_xlabel("Time (s)")
-        ax.set_title(t)
-        ax.grid(True, alpha=0.25)
-    ax_rest.set_ylabel("ERD %")
-    fig.suptitle(
-        f"Focal MU ERD Across Sessions | {subject} | Config A", fontsize=12
-    )
-    ax_mi.legend(loc="best", fontsize=8)
-    fig.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, f"{subject}_timecourse.png"),
-        dpi=120, bbox_inches="tight",
-    )
-    plt.close(fig)
-
-
-# ======================================================================
 # Main
 # ======================================================================
 
@@ -432,7 +369,6 @@ def main():
         sessions = enumerate_online_sessions(subj)
         print(f"\n=== {subj} ({len(sessions)} sessions) ===")
         subj_tfr_avgs = []
-        subj_sess_trials = []
 
         for sess in sessions:
             idx += 1
@@ -445,7 +381,6 @@ def main():
 
             plot_session_topos(subj, sess, out["tfr_avg"], DIR_PER_SESS)
             subj_tfr_avgs.append(out["tfr_avg"])
-            subj_sess_trials.append((sess, out["tfr_trials"]))
 
             print(
                 f"  [{idx}/{total_sessions}] {sess}: "
@@ -457,10 +392,8 @@ def main():
 
         if subj_tfr_avgs:
             plot_subject_topo(subj, subj_tfr_avgs, DIR_PER_SUBJ)
-            plot_subject_timecourse(subj, subj_sess_trials, DIR_TIMECOURSE)
             all_subject_tfrs[subj] = subj_tfr_avgs
 
-        del subj_sess_trials
         gc.collect()
 
     if all_subject_tfrs:
