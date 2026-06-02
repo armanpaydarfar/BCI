@@ -189,10 +189,12 @@ def _reject_artifact_trials(tfr_trials, reject_z=TRIAL_REJECT_Z,
     cap catches those. A few-hundred-percent mu ERD% is physiologically
     impossible, so the cap removes only artifact.
 
-    Guard (rubric §4 G2): if dropping would remove > max_frac of a marker's
-    trials, the session is fundamentally bad, not salvageable by trimming —
-    keep it raw and let the scorer's gates surface it (do not clean into a
-    corner).
+    Guard (rubric §4 G2): cleaning is capped at `max_frac` of a marker's
+    trials. If more than that qualify, only the `max_frac` WORST offenders
+    (highest post-cue peak |ERD%|) are dropped and the rest are kept — so a
+    pervasively-noisy session is trimmed of its worst artifacts rather than
+    left raw, but never cleaned past the cap into a corner. `over_gate` flags a
+    session that hit the cap.
 
     Mutates `tfr_trials`. Returns a per-marker report:
     {marker: {"n_before", "n_dropped", "kept", "over_gate"}}.
@@ -237,11 +239,26 @@ def _reject_artifact_trials(tfr_trials, reject_z=TRIAL_REJECT_Z,
         n_drop = int(drop.sum())
         if n_drop == 0:
             continue
-        if n_drop / n_before > max_frac:
+        max_drop = int(np.floor(max_frac * n_before))
+        if n_drop > max_drop:
+            # More artifacts qualify than the cap allows. Rather than leave the
+            # session raw, drop only the `max_drop` WORST offenders (highest
+            # post-cue peak |ERD%|) and keep the rest. The kept remainder still
+            # contains the sub-threshold qualifiers, so the session reads as
+            # "less bad", not falsely pristine; over_gate flags that cleaning
+            # was capped (the session needed maximal trimming — interpret with
+            # care). Removing the high tail biases the kept median slightly
+            # optimistic, an accepted trade for not discarding a whole session.
             info["over_gate"] = True
-            info["kept"] = False  # left un-rejected; gate G2 will flag it
-            continue
-        tfr_trials[marker] = tfr[np.where(~drop)[0]]
+            worst = np.argsort(scalar)[::-1][:max_drop]
+            keep_mask = np.ones(n_before, dtype=bool)
+            keep_mask[worst] = False
+            n_drop = max_drop
+        else:
+            keep_mask = ~drop
+        if n_drop == 0:
+            continue  # cap floored to 0 (tiny n); nothing to drop
+        tfr_trials[marker] = tfr[np.where(keep_mask)[0]]
         info["n_dropped"] = n_drop
     return report
 
@@ -837,7 +854,7 @@ def main():
                     })
             rej = " ".join(
                 f"{m}:-{r['n_dropped']}"
-                + ("(>gate,kept-raw)" if r["over_gate"] else "")
+                + ("(capped)" if r["over_gate"] else "")
                 for m, r in reject_report.items()
             ) or "—"
             print(
