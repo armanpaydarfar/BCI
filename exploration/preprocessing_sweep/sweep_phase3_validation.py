@@ -23,13 +23,19 @@ Outputs:
 
 import os
 import csv
+import tempfile
 import time
 import warnings
 import atexit
 import signal
 import sys
 import gc
-import resource
+
+# resource is POSIX-only; crash diagnostics degrade to a no-op on Windows.
+if sys.platform != "win32":
+    import resource
+else:
+    resource = None
 
 import numpy as np
 import mne
@@ -39,11 +45,13 @@ import mne
 # Crash diagnostics
 # ======================================================================
 
-HEARTBEAT_PATH = "/tmp/sweep_phase3_heartbeat.txt"
+HEARTBEAT_PATH = os.path.join(tempfile.gettempdir(), "sweep_phase3_heartbeat.txt")
 
 
 def _rss_gb():
-    """Return peak RSS in GB (Linux reports ru_maxrss in kB)."""
+    """Return peak RSS in GB (Linux reports ru_maxrss in kB). 0 on Windows."""
+    if resource is None:
+        return 0.0
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 * 1024.0)
 
 
@@ -70,7 +78,14 @@ def _on_signal(signum, frame):
 
 
 atexit.register(_on_exit)
-for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1):
+# SIGHUP / SIGUSR1 exist on POSIX only; reference by name to avoid
+# AttributeError at import time on Windows.
+_diag_signals = [signal.SIGTERM, signal.SIGINT]
+for _name in ("SIGHUP", "SIGUSR1"):
+    _sig = getattr(signal, _name, None)
+    if _sig is not None:
+        _diag_signals.append(_sig)
+for _sig in _diag_signals:
     try:
         signal.signal(_sig, _on_signal)
     except Exception:
