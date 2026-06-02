@@ -190,6 +190,3 @@ def session_idx_from_label(session_label: str) -> int:
     """
     m = re.search(r"S(\d+)", session_label)
     return int(m.group(1)) if m else 999
-
-
-DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"

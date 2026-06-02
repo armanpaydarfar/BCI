@@ -40,6 +40,7 @@ import mne
 
 from Utils.stream_utils import load_xdf, get_channel_names_from_xdf
 from Utils.preprocessing import concatenate_streams
+from config import DATA_DIR
 
 # Silence MNE chatter for the sweep (we still print our own per-config line)
 mne.set_log_level("ERROR")
@@ -52,7 +53,6 @@ warnings.filterwarnings("ignore")
 
 SUBJECT   = "CLIN_SUBJ_003"
 SESSIONS  = ["S003ONLINE", "S004ONLINE", "S005ONLINE"]
-DATA_DIR  = "/home/arman-admin/Documents/CurrentStudy"
 OUT_CSV   = "/home/arman-admin/Documents/SoftwareDocs/clin_erd_phase2_round1.csv"
 OUT_MD    = "/home/arman-admin/Documents/SoftwareDocs/clin_erd_phase2_round1.md"
 
