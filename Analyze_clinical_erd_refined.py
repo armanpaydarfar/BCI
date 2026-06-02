@@ -69,17 +69,6 @@ CONFIG_A_DISPLAY_BASELINE = {
     "blink_removal":     "drop_fp",
     "baseline_mode":     "logratio",
     "spectral_baseline": (-1.0, 0.0),
-    # Per-session channel qualification: railing electrodes (e.g.
-    # CLIN_SUBJ_004 S002 P7/FC2, S005 FC5/T8) drive the wide median±SE
-    # bands. Detect via broadband MAD-z > 3.5 and spherical-spline
-    # interpolate before spatial filtering. reject_window restricts the
-    # 50µV epoch reject to the displayed (-1, 4) s window. Scoped to this
-    # ERD config only — neuromod (_helpers.CONFIG_A) and the topomap
-    # (generate_plots_config_a.CONFIG_A) configs leave these keys unset
-    # and so are unaffected.
-    "channel_qualify":   True,
-    "channel_qualify_z": 3.5,
-    "reject_window":     (-1.0, 4.0),
 }
 
 import mne  # noqa: E402
@@ -111,20 +100,12 @@ def _preproc_caption():
     `--spatial-filter` override.
     """
     cfg = CONFIG_A_DISPLAY_BASELINE
-    caption = (
+    return (
         f"Preproc: {cfg['spatial_filter'].upper()} spatial filter | "
         f"blink={cfg['blink_removal']} | "
         f"μ {MU_LO:g}–{MU_HI:g} Hz | "
         f"baseline {cfg['spectral_baseline']} s"
     )
-    if cfg.get("channel_qualify"):
-        rw = cfg.get("reject_window")
-        rw_txt = f" | reject {rw[0]:g}..{rw[1]:g}s" if rw else ""
-        caption += (
-            f" | chan-qualify: MAD-z>{cfg['channel_qualify_z']:g} (interp)"
-            f"{rw_txt}"
-        )
-    return caption
 
 
 # ----------------------------------------------------------------------
@@ -581,7 +562,6 @@ def main():
             print(
                 f"  {sess}: n_kept={out['n_kept']}/{out['n_attempted']} "
                 f"dropped={out['dropped_channels'] or '—'} "
-                f"interp={out.get('interpolated_channels') or '—'} "
                 f"({time.time()-t0:.1f}s)"
             )
             # Release heavy TFR objects immediately

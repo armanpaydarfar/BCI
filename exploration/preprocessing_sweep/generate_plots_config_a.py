@@ -98,35 +98,9 @@ def preprocess_and_tfr(subject, session, config):
 
     raw_bb, _ = apply_blink_removal(raw_bb, raw_1hz, config["blink_removal"])
 
-    # Per-session channel qualification: detect railing electrodes on the
-    # broadband signal and spherical-spline interpolate them BEFORE spatial
-    # filtering, so a single bad channel can't contaminate the CAR/CSD/Hjorth
-    # reference. Gated off by default (channel_qualify=False) so neuromod and
-    # topomap callers, which don't set the key, are byte-for-byte unchanged.
-    # The 50µV epoch reject is unreliable here (e.g. CLIN_SUBJ_004 S002 has a
-    # 227µV P7 channel that rejects 0 epochs), hence detect+interpolate rather
-    # than relying on amplitude rejection. Threshold of 3.5 cleanly separates
-    # good channels (MAD-z < 3) from railing ones (MAD-z ≥ 6); see
-    # exploration/clinical_analysis/explore_subj004_channel_noise.py.
-    interpolated_channels = []
-    if config.get("channel_qualify", False):
-        qz = config.get("channel_qualify_z", 3.5)
-        data = raw_bb.get_data()  # native µV, channels already montaged
-        rms = data.std(axis=1)
-        med = np.median(rms)
-        mad = np.median(np.abs(rms - med))
-        if mad > 0:
-            z = (rms - med) / (1.4826 * mad)
-            bad = [raw_bb.ch_names[i] for i in np.where(np.abs(z) > qz)[0]]
-            if bad:
-                raw_bb.info["bads"] = bad
-                raw_bb.interpolate_bads(reset_bads=True, verbose=False)
-                interpolated_channels = bad
-
     dropped = []
     iters = 0
     t0, t1 = TRIAL_WIN
-    reject_window = config.get("reject_window", None)
     while True:
         iters += 1
         raw_mu = raw_bb.copy()
@@ -139,19 +113,7 @@ def preprocess_and_tfr(subject, session, config):
         epochs_mu = mne.Epochs(raw_mu, events, reject=None, flat=None, **epoch_kw)
         epochs_bb = mne.Epochs(raw_bb, events, reject=None, flat=None, **epoch_kw)
         mu_data = epochs_mu.get_data()
-        # Optionally restrict the 50µV amplitude check to a display-relevant
-        # time window so pre/post padding artefacts don't reject otherwise
-        # usable epochs. reject_window=None preserves the original full-epoch
-        # check for callers that don't set the key.
-        if reject_window is not None:
-            tmask = (
-                (epochs_mu.times >= reject_window[0])
-                & (epochs_mu.times <= reject_window[1])
-            )
-            mu_amp = mu_data[:, :, tmask]
-        else:
-            mu_amp = mu_data
-        mask = np.max(np.abs(mu_amp), axis=(1, 2)) <= REJECT_MAX_ABS_UV
+        mask = np.max(np.abs(mu_data), axis=(1, 2)) <= REJECT_MAX_ABS_UV
         good_ix = np.where(mask)[0].tolist()
         bad_ix = np.where(~mask)[0]
         n_att = int(len(events)); n_kept = int(len(good_ix))
@@ -193,7 +155,6 @@ def preprocess_and_tfr(subject, session, config):
         "tfr_avg":    tfr_avg,
         "tfr_trials": tfr_trials,
         "dropped_channels": dropped,
-        "interpolated_channels": interpolated_channels,
         "n_kept":     n_kept,
         "n_attempted": n_att,
     }
