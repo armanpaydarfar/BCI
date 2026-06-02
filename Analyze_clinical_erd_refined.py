@@ -91,9 +91,11 @@ CONFIG_A_DISPLAY_BASELINE = {
 TRIAL_REJECT_Z = 5.0
 
 # A session marker is left un-rejected (raw, surfaced for review) rather than
-# cleaned past this fraction — mirrors rubric gate G2. Dropping >25% via z>5
-# would mean the session is fundamentally bad, not salvageable by trimming.
-TRIAL_REJECT_MAX_FRAC = 0.25
+# cleaned past this fraction — mirrors rubric gate G2. Set to 0.50 (per Arman):
+# dropping up to half a run's trials is still a minority and acceptable when the
+# rest are clean; only beyond half is the session "fundamentally bad". Must stay
+# in sync with the scorer's G2 threshold (evaluate_erd_quality.G2_OVERREJECT_FRAC).
+TRIAL_REJECT_MAX_FRAC = 0.50
 
 # Absolute artifact cap: a trial whose post-cue peak |ERD%| exceeds this is
 # dropped regardless of its robust-z. The relative z-rule catches outliers in a

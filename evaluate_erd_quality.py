@@ -109,6 +109,13 @@ G1_OUTLIER_FRAC = 0.05
 REST_BAND_LO = 50.0
 REST_BAND_HI = 250.0
 
+# Gate G2 over-rejection threshold: fail a session if > this fraction of its
+# trials were dropped across the full chain (µV + channel + trial-z + abs-cap).
+# 0.50 (per Arman): dropping up to half a run is an acceptable minority when the
+# survivors are clean; only beyond half is the session cleaned-into-a-corner.
+# Must match Analyze_clinical_erd_refined.TRIAL_REJECT_MAX_FRAC.
+G2_OVERREJECT_FRAC = 0.50
+
 
 # ----------------------------------------------------------------------
 # Sub-score ramp helpers (imported by figure-annotation code later)
@@ -472,7 +479,7 @@ def score_npz(path: str | Path) -> list[dict]:
         drop_frac = 1.0 - sess.n_after_reject / sess.n_attempted
     else:
         drop_frac = float("nan")
-    g2_failed = (not np.isnan(drop_frac)) and drop_frac > 0.25
+    g2_failed = (not np.isnan(drop_frac)) and drop_frac > G2_OVERREJECT_FRAC
 
     # Lateralization is a subject/session-level quantity shared by all rows:
     # contra MI scalar minus ipsi MI scalar over each cluster's own SCALAR.
@@ -600,7 +607,9 @@ def _score_cluster(sess: _Session, cluster: str, lat_class: str,
     # G2: session-level over-rejection.
     if g2_failed:
         gates.append("G2")
-        reasons.append(f"G2 over-rejection: drop_frac={drop_frac:.2f} > 0.25")
+        reasons.append(
+            f"G2 over-rejection: drop_frac={drop_frac:.2f} > {G2_OVERREJECT_FRAC:g}"
+        )
 
     # G4: lost cluster (fewer than 2 surviving channels).
     if len(channels) < 2:
