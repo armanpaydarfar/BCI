@@ -95,6 +95,14 @@ TRIAL_REJECT_Z = 5.0
 # would mean the session is fundamentally bad, not salvageable by trimming.
 TRIAL_REJECT_MAX_FRAC = 0.25
 
+# Absolute artifact cap: a trial whose post-cue peak |ERD%| exceeds this is
+# dropped regardless of its robust-z. The relative z-rule catches outliers in a
+# clean session but misses catastrophic trials in a *pervasively* noisy one
+# (CLIN_SUBJ_007/008 REST: residual 500–2900% trials whose z<5 because the MAD
+# is inflated by the surrounding noise). A mu-band ERD% of several hundred
+# percent is physiologically impossible, so this cap is pure-artifact removal.
+TRIAL_REJECT_ABS_PCT = 600.0
+
 import mne  # noqa: E402
 
 
@@ -124,8 +132,8 @@ def _preproc_caption():
     `--spatial-filter` override.
     """
     cfg = CONFIG_A_DISPLAY_BASELINE
-    reject = (f"trial-z>{TRIAL_REJECT_Z:g}" if TRIAL_REJECT_Z > 0
-              else "off")
+    reject = (f"trial-z>{TRIAL_REJECT_Z:g}|cap{TRIAL_REJECT_ABS_PCT:g}%"
+              if TRIAL_REJECT_Z > 0 else "off")
     return (
         f"Preproc: {cfg['spatial_filter'].upper()} spatial filter | "
         f"blink={cfg['blink_removal']} | "
@@ -146,7 +154,8 @@ def _logratio_to_pct(x):
 
 
 def _reject_artifact_trials(tfr_trials, reject_z=TRIAL_REJECT_Z,
-                            max_frac=TRIAL_REJECT_MAX_FRAC):
+                            max_frac=TRIAL_REJECT_MAX_FRAC,
+                            abs_cap=TRIAL_REJECT_ABS_PCT):
     """Drop baseline-normalization artifact trials per marker, in place.
 
     The 50µV epoch reject upstream catches amplitude artifacts but misses
@@ -170,6 +179,13 @@ def _reject_artifact_trials(tfr_trials, reject_z=TRIAL_REJECT_Z,
     A single per-trial scalar is used (not max-over-time z), which targets
     the few blow-up trials without the ~40% over-rejection a per-timepoint
     z-rule produces.
+
+    A trial is also dropped if its scalar exceeds `abs_cap` (absolute peak
+    |ERD%|), independent of z. The relative z-rule misses catastrophic trials
+    in a *pervasively* noisy marker (CLIN_SUBJ_007/008 REST), where the MAD is
+    inflated by surrounding noise so a 1000%+ trial reads as z<5; the absolute
+    cap catches those. A few-hundred-percent mu ERD% is physiologically
+    impossible, so the cap removes only artifact.
 
     Guard (rubric §4 G2): if dropping would remove > max_frac of a marker's
     trials, the session is fundamentally bad, not salvageable by trimming —
@@ -204,12 +220,18 @@ def _reject_artifact_trials(tfr_trials, reject_z=TRIAL_REJECT_Z,
         # is not rejected.
         tmask = tfr.times >= 0.0
         scalar = np.max(np.abs(pct[:, tmask]), axis=1)  # peak |ERD%| / trial
+        # Absolute cap is independent of the spread, so it still fires when the
+        # MAD is degenerate (one huge trial among many identical ones gives
+        # MAD=0, which would otherwise skip rejection and keep the outlier).
+        abs_drop = scalar > abs_cap
         med = np.median(scalar)
         mad = np.median(np.abs(scalar - med))
-        if mad <= 0:
-            continue  # degenerate spread; nothing to separate
-        z = (scalar - med) / (1.4826 * mad)
-        drop = np.abs(z) > reject_z
+        if mad > 0:
+            z = (scalar - med) / (1.4826 * mad)
+            z_drop = np.abs(z) > reject_z
+        else:
+            z_drop = np.zeros_like(scalar, dtype=bool)
+        drop = z_drop | abs_drop
         n_drop = int(drop.sum())
         if n_drop == 0:
             continue
