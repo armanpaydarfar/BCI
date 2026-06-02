@@ -6,9 +6,9 @@ For each (subject, session), compute the per-trial mu-band ERD% over
 the Contralateral cluster (primary), Ipsilateral cluster (added
 2026-06-01 as a within-subject lateralisation reference), and
 Bilateral cluster (secondary) at SCALAR_WIN = (1, 4) s, using Config A
-preprocessing. Spatial filter is Hjorth (k=4 nearest-neighbour
-Laplacian) — promoted to canonical 2026-06-01 via
-`_helpers.CONFIG_A`.
+preprocessing. Spatial filter is CAR — re-locked as cohort canonical
+2026-06-02 after a full car/hjorth/csd sweep (briefly Hjorth on
+2026-06-01); the active filter is whatever `_helpers.CONFIG_A` says.
 
 Pass 2 (2026-05-28): LMEs now fit per-session response (median primary,
 mean sensitivity), not per-trial, per `rev01-longitudinal-analysis-plan.md`
