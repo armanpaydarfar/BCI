@@ -55,6 +55,15 @@ from exploration.clinical_analysis._helpers import (  # noqa: E402
 # sweep). MU_LO, MU_HI come from sweep_phase2_round2.py:66.
 from sweep_phase2_round2 import MU_HI, MU_LO  # noqa: E402
 
+# Quality-score primitives, imported so the per-panel legend tags are computed
+# with the exact same functions/thresholds evaluate_erd_quality uses — the
+# figure and the scorer can never disagree (single source of truth). The
+# scorer's docstring designates these dimension helpers for annotation reuse.
+from evaluate_erd_quality import (  # noqa: E402
+    G1_OUTLIER_FRAC, G1_OUTLIER_PCT, _d1_mi_strength, _d2_sustained,
+    _d4_rest_specificity, _d8_band_to_signal, _postcue_mask, _scalar_mask,
+)
+
 # Override Config A's spectral baseline to be contiguous to the cue
 # (-1, 0) s. The helper's CONFIG_A uses (-1.5, -0.25) — chosen by the
 # sweep to leave a quarter-second gap before the cue — but the
@@ -69,7 +78,22 @@ CONFIG_A_DISPLAY_BASELINE = {
     "blink_removal":     "drop_fp",
     "baseline_mode":     "logratio",
     "spectral_baseline": (-1.0, 0.0),
+    # ERD-only window override: cover the full 5 s MI task. preprocess_and_tfr
+    # defaults to the shared TRIAL_WIN (-1, 4) when this key is absent, so the
+    # topomap pass is unaffected. Set on the CLI via --window-end.
+    "trial_win":         (-1.0, 5.0),
 }
+
+# Robust-z threshold for per-trial artifact rejection (Phase 4). A trial whose
+# post-cue peak |logratio| over the bilateral montage is > this many MADs from
+# the session median is dropped. Artifacts sit at z=15–789, normal trials z<5,
+# so 5.0 cleanly separates them. Set on the CLI via --reject-z (<=0 disables).
+TRIAL_REJECT_Z = 5.0
+
+# A session marker is left un-rejected (raw, surfaced for review) rather than
+# cleaned past this fraction — mirrors rubric gate G2. Dropping >25% via z>5
+# would mean the session is fundamentally bad, not salvageable by trimming.
+TRIAL_REJECT_MAX_FRAC = 0.25
 
 import mne  # noqa: E402
 
@@ -100,11 +124,15 @@ def _preproc_caption():
     `--spatial-filter` override.
     """
     cfg = CONFIG_A_DISPLAY_BASELINE
+    reject = (f"trial-z>{TRIAL_REJECT_Z:g}" if TRIAL_REJECT_Z > 0
+              else "off")
     return (
         f"Preproc: {cfg['spatial_filter'].upper()} spatial filter | "
         f"blink={cfg['blink_removal']} | "
         f"μ {MU_LO:g}–{MU_HI:g} Hz | "
-        f"baseline {cfg['spectral_baseline']} s"
+        f"baseline {cfg['spectral_baseline']} s | "
+        f"window {cfg['trial_win']} s | "
+        f"trial-reject {reject}"
     )
 
 
@@ -117,7 +145,85 @@ def _logratio_to_pct(x):
     return 100.0 * (10.0 ** x - 1.0)
 
 
-def _cluster_timecourse(tfr_trials, cluster_channels, marker="200"):
+def _reject_artifact_trials(tfr_trials, reject_z=TRIAL_REJECT_Z,
+                            max_frac=TRIAL_REJECT_MAX_FRAC):
+    """Drop baseline-normalization artifact trials per marker, in place.
+
+    The 50µV epoch reject upstream catches amplitude artifacts but misses
+    trials whose tiny pre-cue baseline makes the logratio explode (one
+    CLIN_SUBJ_004 trial reached 20,649% ERD%). For each marker we form a
+    per-trial scalar = post-cue peak |ERD%| over the bilateral motor montage,
+    take a robust z (median/MAD across the session's trials), and drop trials
+    with |z| > reject_z. The drop is applied to the marker's EpochsTFR, so it
+    is consistent across the contra/bilat/ipsi clusters that index into the
+    same trials.
+
+    The scalar is built in PERCENT space (convert each channel to ERD% then
+    average over the montage and mu band), matching the validated diagnostic
+    `explore_subj004_trial_variance._per_trial_pct` and the scorer substrate.
+    Averaging in logratio space first would geometrically dilute a focal
+    single-channel blow-up (one channel at x≈2.3 with seven near 0 averages
+    to ≈0.29) and hide the very trial we are trying to catch; in % space the
+    arithmetic mean preserves it (the blow-up trial sits at z≈100s). MAD is a
+    median statistic, so the single outlier does not corrupt the spread.
+
+    A single per-trial scalar is used (not max-over-time z), which targets
+    the few blow-up trials without the ~40% over-rejection a per-timepoint
+    z-rule produces.
+
+    Guard (rubric §4 G2): if dropping would remove > max_frac of a marker's
+    trials, the session is fundamentally bad, not salvageable by trimming —
+    keep it raw and let the scorer's gates surface it (do not clean into a
+    corner).
+
+    Mutates `tfr_trials`. Returns a per-marker report:
+    {marker: {"n_before", "n_dropped", "kept", "over_gate"}}.
+    """
+    report = {}
+    for marker, tfr in list(tfr_trials.items()):
+        n_before = int(tfr.data.shape[0])
+        info = {"n_before": n_before, "n_dropped": 0,
+                "kept": True, "over_gate": False}
+        report[marker] = info
+        if reject_z <= 0 or n_before < 4:
+            continue  # disabled, or too few trials for a robust MAD
+        present = [c for c in BILATERAL_MOTOR_CLUSTER if c in tfr.ch_names]
+        if not present:
+            continue
+        ch_idxs = [tfr.ch_names.index(c) for c in present]
+        fmask = (tfr.freqs >= MU_LO) & (tfr.freqs <= MU_HI)
+        # Per-trial cluster-mean ERD% trace (% first, then mean over montage
+        # channels + mu freqs) — same substrate as the scorer/diagnostic.
+        pct = _logratio_to_pct(
+            tfr.data[:, ch_idxs][:, :, fmask],
+        ).mean(axis=(1, 2))
+        # Full post-cue window [0, t_end] — onset-region (0–1 s) blow-ups are
+        # real artifacts (one subj3 trial peaked 2213% there) and must be
+        # caught here, matching the scorer's gate G1 window. The robust z only
+        # flags statistical outliers, so a bounded physiological onset desync
+        # is not rejected.
+        tmask = tfr.times >= 0.0
+        scalar = np.max(np.abs(pct[:, tmask]), axis=1)  # peak |ERD%| / trial
+        med = np.median(scalar)
+        mad = np.median(np.abs(scalar - med))
+        if mad <= 0:
+            continue  # degenerate spread; nothing to separate
+        z = (scalar - med) / (1.4826 * mad)
+        drop = np.abs(z) > reject_z
+        n_drop = int(drop.sum())
+        if n_drop == 0:
+            continue
+        if n_drop / n_before > max_frac:
+            info["over_gate"] = True
+            info["kept"] = False  # left un-rejected; gate G2 will flag it
+            continue
+        tfr_trials[marker] = tfr[np.where(~drop)[0]]
+        info["n_dropped"] = n_drop
+    return report
+
+
+def _cluster_timecourse(tfr_trials, cluster_channels, marker="200",
+                        return_per_trial=False):
     """Cluster-averaged ERD%(t), median ± SE across trials.
 
     Median (not mean) across trials: the per-trial arithmetic mean of
@@ -130,7 +236,10 @@ def _cluster_timecourse(tfr_trials, cluster_channels, marker="200"):
     0 per the apply_baseline guarantee, and the median of zeros is 0).
 
     Returns (times, mean_pct, low_pct, up_pct, n_trials, surviving_channels)
-    or None.
+    or None. When `return_per_trial=True`, appends the per-trial cluster-mean
+    ERD% matrix `per_trial_pct[n_trials, n_time]` as a 7th element — the same
+    array the median/SE are derived from, exposed so the quality scorer can
+    consume the full trial distribution (it is otherwise discarded here).
     """
     if marker not in tfr_trials:
         return None
@@ -155,6 +264,12 @@ def _cluster_timecourse(tfr_trials, cluster_channels, marker="200"):
     else:
         low_pct = mean_pct.copy()
         up_pct = mean_pct.copy()
+    if return_per_trial:
+        return (
+            tfr.times, mean_pct,
+            low_pct, up_pct,
+            n, present, per_trial_pct,
+        )
     return (
         tfr.times, mean_pct,
         low_pct, up_pct,
@@ -172,34 +287,118 @@ def _extract_session_traces(tfr_trials, dropped_channels):
     once-per-session avoids holding all tfr_trials in RAM across
     sessions (each tfr_trials is ~1 GB for a 100-trial, 22-channel
     session at the default mu+beta TFR grid).
+
+    The returned dict carries the 6-tuple traces (used by plotting and the
+    CSV) under their `<cluster>_<marker>` keys, plus a `per_trial` sub-dict
+    holding the per-trial cluster-mean ERD% matrix for each key — the
+    substrate the quality scorer consumes (written to the npz side-car).
+    Per-trial arrays are kilobytes (n_trials × n_time), so stashing them
+    does not change peak RSS, which is dominated by the ~1 GB tfr_trials.
     """
-    contra_mi = _cluster_timecourse(
-        tfr_trials, CONTRA_MOTOR_CLUSTER, MI_MARKER,
-    )
-    contra_rest = _cluster_timecourse(
-        tfr_trials, CONTRA_MOTOR_CLUSTER, REST_MARKER,
-    )
-    bilat_mi = _cluster_timecourse(
-        tfr_trials, BILATERAL_MOTOR_CLUSTER, MI_MARKER,
-    )
-    bilat_rest = _cluster_timecourse(
-        tfr_trials, BILATERAL_MOTOR_CLUSTER, REST_MARKER,
-    )
-    ipsi_mi = _cluster_timecourse(
-        tfr_trials, IPSI_MOTOR_CLUSTER, MI_MARKER,
-    )
-    ipsi_rest = _cluster_timecourse(
-        tfr_trials, IPSI_MOTOR_CLUSTER, REST_MARKER,
-    )
-    return {
-        "contra_mi":   contra_mi,
-        "contra_rest": contra_rest,
-        "bilat_mi":    bilat_mi,
-        "bilat_rest":  bilat_rest,
-        "ipsi_mi":     ipsi_mi,
-        "ipsi_rest":   ipsi_rest,
-        "dropped_channels": list(dropped_channels),
+    cluster_specs = [
+        ("contra_mi",   CONTRA_MOTOR_CLUSTER,    MI_MARKER),
+        ("contra_rest", CONTRA_MOTOR_CLUSTER,    REST_MARKER),
+        ("bilat_mi",    BILATERAL_MOTOR_CLUSTER, MI_MARKER),
+        ("bilat_rest",  BILATERAL_MOTOR_CLUSTER, REST_MARKER),
+        ("ipsi_mi",     IPSI_MOTOR_CLUSTER,      MI_MARKER),
+        ("ipsi_rest",   IPSI_MOTOR_CLUSTER,      REST_MARKER),
+    ]
+    traces: dict = {"dropped_channels": list(dropped_channels)}
+    per_trial: dict = {}
+    for key, cluster, marker in cluster_specs:
+        res = _cluster_timecourse(
+            tfr_trials, cluster, marker, return_per_trial=True,
+        )
+        if res is None:
+            traces[key] = None
+            continue
+        times, mean_pct, low_pct, up_pct, n, present, ptp = res
+        # 6-tuple kept for plotting/CSV; per-trial array kept separately.
+        traces[key] = (times, mean_pct, low_pct, up_pct, n, present)
+        per_trial[key] = {
+            "per_trial_pct": ptp,           # (n_trials, n_time) ERD%
+            "times": times,
+            "channels_used": present,
+        }
+    traces["per_trial"] = per_trial
+    return traces
+
+
+# ----------------------------------------------------------------------
+# Per-trial side-car (consumed by evaluate_erd_quality.py)
+# ----------------------------------------------------------------------
+
+def _write_per_trial_npz(out_path, subject, session, traces, out_meta):
+    """Write one compressed npz holding the per-trial ERD% distribution for
+    every (cluster, marker) of one session, plus session-level rejection
+    metadata. This is the substrate the quality scorer reads — it never
+    re-runs the TFR pass.
+
+    Schema (all flat keys so the scorer needs no pickle):
+      keys                       : comma-joined list of present cluster_marker keys
+      <key>__ptp                 : float32 (n_trials, n_time) per-trial ERD%
+      <key>__times               : float64 (n_time,) time axis (s)
+      <key>__channels            : comma-joined surviving channel names
+      subject, session           : str (0-d)
+      n_attempted, n_kept        : int  (session-level, after µV + channel drop)
+      n_after_reject             : int  (after trial-z rejection; == n_kept until
+                                          Phase 4 rejection lands)
+      dropped_channels           : comma-joined auto-dropped channel names
+    Per-marker rejection counts are added by the Phase 4 rejection step.
+    """
+    per_trial = traces.get("per_trial", {})
+    present_keys = [k for k, v in per_trial.items() if v is not None]
+    payload: dict = {
+        "keys": np.array(",".join(present_keys)),
+        "subject": np.array(str(subject)),
+        "session": np.array(str(session)),
+        "n_attempted": np.array(int(out_meta.get("n_attempted", 0))),
+        "n_kept": np.array(int(out_meta.get("n_kept", 0))),
+        "n_after_reject": np.array(int(out_meta.get("n_after_reject",
+                                                    out_meta.get("n_kept", 0)))),
+        "dropped_channels": np.array(",".join(out_meta.get("dropped_channels", []))),
     }
+    for key in present_keys:
+        entry = per_trial[key]
+        payload[f"{key}__ptp"] = np.asarray(
+            entry["per_trial_pct"], dtype=np.float32,
+        )
+        payload[f"{key}__times"] = np.asarray(entry["times"], dtype=np.float64)
+        payload[f"{key}__channels"] = np.array(
+            ",".join(entry["channels_used"]),
+        )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out_path, **payload)
+
+
+def _panel_score_tag(cls, times, median, ptp):
+    """Compact per-session quality tag appended to a panel's legend entry.
+
+    Computed with the same functions/thresholds `evaluate_erd_quality` uses, so
+    what the figure shows and what the scorer records cannot drift. MI panels
+    report D1 (strength), sustained fraction, band-to-signal ratio, and a `G1!`
+    marker when a retained trial exceeds the outlier threshold; REST panels
+    report D4 (specificity) and an `ES!` eyes-closed marker. `median` is the
+    plotted median trace; `ptp` is the per-trial ERD% matrix (or None).
+    """
+    smask = _scalar_mask(times)
+    if cls == "mi":
+        d1 = _d1_mi_strength(median, smask)
+        d2 = _d2_sustained(median, smask)
+        bs, flag = "", ""
+        if ptp is not None and ptp.shape[0] > 0:
+            _d8, ratio = _d8_band_to_signal(ptp, median, smask)
+            if not np.isnan(ratio):
+                bs = f" b/s={ratio:.1f}"
+            pmask = _postcue_mask(times)
+            if pmask.any():
+                trial_peaks = np.max(np.abs(ptp[:, pmask]), axis=1)
+                n_out = int((trial_peaks > G1_OUTLIER_PCT).sum())
+                if n_out / ptp.shape[0] > G1_OUTLIER_FRAC:
+                    flag = f"  G1!({n_out}/{ptp.shape[0]}>{G1_OUTLIER_PCT:.0f}%)"
+        return f" | D1={d1:.2f} sus={d2:.2f}{bs}{flag}"
+    d4, eyes = _d4_rest_specificity(median, smask)
+    return f" | D4={d4:.2f}{'  ES!' if eyes else ''}"
 
 
 def _plot_subject_6panel(subject, session_traces, out_path):
@@ -247,7 +446,10 @@ def _plot_subject_6panel(subject, session_traces, out_path):
             tag = ", ".join(present)
             if missing:
                 tag += f"  [missing: {','.join(missing)}]"
-            label = f"{sess} (n={n_trials}; {tag})"
+            ptp = traces.get("per_trial", {}).get(key)
+            ptp_arr = ptp["per_trial_pct"] if ptp else None
+            score_tag = _panel_score_tag(cls, times, mean_pct, ptp_arr)
+            label = f"{sess} (n={n_trials}; {tag}){score_tag}"
             ax.plot(times, mean_pct, color=color, label=label, linewidth=1.4)
             ax.fill_between(times, low_pct, up_pct, color=color, alpha=0.15)
             ax.set_title(title)
@@ -266,9 +468,9 @@ def _plot_subject_6panel(subject, session_traces, out_path):
 
     for ax in axes[-1]:
         ax.set_xlabel("Time (s)")
-    # Legends only on the left column to keep the figure readable
-    # (legends are identical between MI and REST columns: same sessions,
-    # same colours; only the per-trial counts differ).
+    # Legends on both columns: the MI and REST legends now carry different
+    # per-session quality tags (MI: D1/sustained/band-signal/G1; REST: D4/ES),
+    # so they are no longer interchangeable.
     for row in range(3):
         axes[row][0].legend(loc="best", fontsize=7)
         axes[row][1].legend(loc="best", fontsize=7)
@@ -277,7 +479,9 @@ def _plot_subject_6panel(subject, session_traces, out_path):
         f"Contra: {CONTRA_MOTOR_CLUSTER} | "
         f"Bilateral: {BILATERAL_MOTOR_CLUSTER} | "
         f"Ipsi: {IPSI_MOTOR_CLUSTER}\n"
-        f"{_preproc_caption()} | {_BAND_LABEL}",
+        f"{_preproc_caption()} | {_BAND_LABEL}\n"
+        "legend tags: D1=MI strength, sus=sustained frac, b/s=band/signal, "
+        "G1!=retained outlier; D4=REST specificity, ES!=eyes-closed",
         fontsize=10,
     )
     fig.tight_layout()
@@ -450,6 +654,7 @@ def _redraw_from_csv(out_dir: Path):
 
 
 def main():
+    global TRIAL_REJECT_Z  # CLI --reject-z overrides the module default
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--from-csv", action="store_true",
@@ -472,10 +677,27 @@ def main():
               "car/csd/hjorth variants coexist in erd_refined/ for "
               "side-by-side review."),
     )
+    parser.add_argument(
+        "--reject-z", type=float, default=TRIAL_REJECT_Z,
+        help=("Robust-z threshold for per-trial artifact rejection over the "
+              "bilateral motor montage (post-cue peak |logratio|). <=0 "
+              "disables rejection (for the sweep's rejection-off arm). "
+              f"Default {TRIAL_REJECT_Z:g}."),
+    )
+    parser.add_argument(
+        "--window-end", type=float, default=None,
+        help=("Post-cue end of the ERD analysis/display window in seconds "
+              "(start fixed at -1). Default uses the config value "
+              f"{CONFIG_A_DISPLAY_BASELINE['trial_win'][1]:g}s; pass 4 to "
+              "compare against the original window."),
+    )
     args = parser.parse_args()
     # Apply the spatial-filter override to the shared local CONFIG; the
     # figure caption reads this at plot time so it always matches.
     CONFIG_A_DISPLAY_BASELINE["spatial_filter"] = args.spatial_filter
+    if args.window_end is not None:
+        CONFIG_A_DISPLAY_BASELINE["trial_win"] = (-1.0, float(args.window_end))
+    TRIAL_REJECT_Z = float(args.reject_z)
     subject_filter: set[str] = {
         s.strip() for s in args.subjects.split(",") if s.strip()
     }
@@ -488,6 +710,13 @@ def main():
             s.replace("CLIN_SUBJ_", "") for s in sorted(subject_filter)
         )
         print(f"[variant] subjects={sorted(subject_filter)} → tag '{variant_tag}'")
+    # Tag non-default preprocessing arms so sweep variants coexist without
+    # overwriting the default (rejection on, 5 s window) outputs.
+    if TRIAL_REJECT_Z <= 0:
+        variant_tag += "_noreject"
+    _win_end = CONFIG_A_DISPLAY_BASELINE["trial_win"][1]
+    if abs(_win_end - 5.0) > 1e-9:
+        variant_tag += f"_w{_win_end:g}"
 
     out_dir = clin_pictures_root() / "erd_refined"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -531,10 +760,33 @@ def main():
                 )
                 continue
             tfr_trials = out["tfr_trials"]
+            # Per-trial artifact rejection (ERD-scoped — the shared pipeline is
+            # untouched). Mutates tfr_trials so the extracted traces, figure,
+            # and npz all see the cleaned trial set.
+            reject_report = _reject_artifact_trials(
+                tfr_trials, reject_z=TRIAL_REJECT_Z,
+            )
+            n_after_reject = sum(
+                int(t.data.shape[0]) for t in tfr_trials.values()
+            )
             traces = _extract_session_traces(
                 tfr_trials, out.get("dropped_channels", []),
             )
             session_traces.append((sess, traces))
+
+            # Per-trial side-car for the quality scorer. Written from the
+            # already-extracted small arrays (not the TFR), so peak RSS is
+            # unchanged; lands beside the figures, tagged by spatial filter.
+            _write_per_trial_npz(
+                out_dir / "per_trial" / f"{subject}_{sess}{variant_tag}.npz",
+                subject, sess, traces,
+                {
+                    "n_attempted": out.get("n_attempted", 0),
+                    "n_kept": out.get("n_kept", 0),
+                    "n_after_reject": n_after_reject,
+                    "dropped_channels": out.get("dropped_channels", []),
+                },
+            )
 
             # Cluster-mean traces for the cohort figure + CSV
             for cluster_label, marker_label, key, cluster_chs in cluster_specs:
@@ -559,8 +811,14 @@ def main():
                         "up_pct": float(up_pct[t_idx]),
                         "n_trials": int(n_trials),
                     })
+            rej = " ".join(
+                f"{m}:-{r['n_dropped']}"
+                + ("(>gate,kept-raw)" if r["over_gate"] else "")
+                for m, r in reject_report.items()
+            ) or "—"
             print(
                 f"  {sess}: n_kept={out['n_kept']}/{out['n_attempted']} "
+                f"reject[{rej}] n_after={n_after_reject} "
                 f"dropped={out['dropped_channels'] or '—'} "
                 f"({time.time()-t0:.1f}s)"
             )
