@@ -100,7 +100,12 @@ def preprocess_and_tfr(subject, session, config):
 
     dropped = []
     iters = 0
-    t0, t1 = TRIAL_WIN
+    # Display/analysis window. Defaults to the shared TRIAL_WIN (-1, 4) so the
+    # topomap pass (CONFIG_A, which sets no `trial_win`) is byte-for-byte
+    # unchanged; the ERD pass overrides it to (-1, 5) to cover the full 5 s MI
+    # task. Epoching pads by PAD_TFR on each side and the TFR is cropped back to
+    # (t0, t1), so the window only affects how far post-cue is retained.
+    t0, t1 = config.get("trial_win", TRIAL_WIN)
     while True:
         iters += 1
         raw_mu = raw_bb.copy()
