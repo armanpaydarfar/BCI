@@ -101,6 +101,14 @@ _CLUSTERS = ("bilat", "contra", "ipsi")
 G1_OUTLIER_PCT = 200.0
 G1_OUTLIER_FRAC = 0.05
 
+# REST band-to-signal penalty (D8, REST half). A good REST line sits near zero,
+# so the MI-style band/excursion ratio is undefined; instead penalize the
+# ABSOLUTE median SE-band width (2*SE) over the window — wide REST bands are the
+# "balloon" look. Clean REST bands run <~50%; >~250% is buried. Soft penalty
+# (folded into D8), never a gate, so every session stays represented.
+REST_BAND_LO = 50.0
+REST_BAND_HI = 250.0
+
 
 # ----------------------------------------------------------------------
 # Sub-score ramp helpers (imported by figure-annotation code later)
@@ -327,13 +335,22 @@ def _d3_contrast(mi_scalar: float, rest_scalar: float,
 def _d4_rest_specificity(med_rest: np.ndarray, smask: np.ndarray
                          ) -> tuple[float, bool]:
     """D4: REST specificity, asymmetric. r = median over SCALAR of med_rest.
-    r >= 0 (ERS/flat, benign): lin01_inv(r, 80, 300) — 0% -> 1, 300%+ -> 0.
-    r < 0 (desync over motor at rest = the real failure): lin01(r, -25, -5)
-    — -5% -> ~0.8, <= -25% -> 0. Also returns eyes-closed flag (r > 300)."""
+
+    r >= 0 (ERS/flat): `lin01_inv(r, 0, 300)` — near-zero REST = 1.0, and the
+    score falls off gently with the ERS spike (100% -> 0.67, 200% -> 0.33,
+    300%+ -> 0). This is a SOFT penalty, not a gate: large positive REST ERS is
+    explainable (breathing/eyes-closed alpha) and not treated as a failure, but
+    a lower ERS spike scores better so the preprocessing sweep has a gradient to
+    optimize toward filters that reduce ballooning (per Arman, 2026-06-02). The
+    earlier (80, 300) ramp left 0–80% flat at 1.0, giving the sweep no signal to
+    prefer near-zero REST over moderate ERS.
+
+    r < 0 (desync over motor at rest = the real failure): lin01(r, -25, -5) —
+    -5% -> ~0.8, <= -25% -> 0. Also returns eyes-closed flag (r > 300)."""
     r = _scalar_of_trace(med_rest, smask)
     flag = bool(r > 300.0)
     if r >= 0:
-        return lin01_inv(r, 80.0, 300.0), flag
+        return lin01_inv(r, 0.0, 300.0), flag
     return lin01(r, -25.0, -5.0), flag
 
 
@@ -395,6 +412,24 @@ def _d8_band_to_signal(ptp_mi: np.ndarray, med_mi: np.ndarray,
     excursion = float(np.max(np.abs(med_mi[smask])))
     ratio = bw / max(excursion, 1e-6)
     return lin01_inv(ratio, 0.5, 2.0), ratio
+
+
+def _d8_rest_band(ptp_rest: np.ndarray, smask: np.ndarray
+                  ) -> tuple[float, float]:
+    """REST half of D8: absolute SE-band-width penalty for the REST panel.
+
+    Unlike MI, a clean REST median sits near zero, so dividing the band by the
+    REST excursion would explode (≈0 denominator). Instead penalize the
+    absolute median band width (2*SE) over the window: wide REST bands are the
+    'balloon' look Arman flags on CLIN_SUBJ_007/008. lin01_inv(bw, 50, 250):
+    band <= 50% -> 1.0 (clean), >= 250% -> 0 (buried). Returns (score, raw
+    band%); nan if fewer than 2 trials (SE undefined)."""
+    n = ptp_rest.shape[0]
+    if n < 2:
+        return float("nan"), float("nan")
+    se = np.std(ptp_rest, axis=0, ddof=1) / np.sqrt(n)
+    bw = float(np.median((2.0 * se)[smask]))
+    return lin01_inv(bw, REST_BAND_LO, REST_BAND_HI), bw
 
 
 # ----------------------------------------------------------------------
@@ -499,6 +534,7 @@ def _score_cluster(sess: _Session, cluster: str, lat_class: str,
     reasons: list[str] = []
     rest_eyesclosed_flag = False
     band_ratio = float("nan")
+    rest_band_pct = float("nan")
 
     # Initialise all dims to nan; fill what the data supports.
     dims = {d: float("nan") for d in
@@ -533,6 +569,13 @@ def _score_cluster(sess: _Session, cluster: str, lat_class: str,
             dims["D4"], rest_eyesclosed_flag = _d4_rest_specificity(
                 med_rest, smask_r,
             )
+            # Fold REST band quality into D8: a balloon in EITHER class lowers
+            # it (min over present, non-nan values). Soft penalty, no gate.
+            d8_rest, rest_band_pct = _d8_rest_band(ptp_rest, smask_r)
+            d8_vals = [v for v in (dims["D8"], d8_rest)
+                       if v is not None and not np.isnan(v)]
+            if d8_vals:
+                dims["D8"] = min(d8_vals)
 
         # G1: fraction of kept MI trials with post-cue |ptp| peak > threshold.
         if pmask.any():
@@ -589,6 +632,7 @@ def _score_cluster(sess: _Session, cluster: str, lat_class: str,
         "gate_reasons": " | ".join(reasons),
         "rest_eyesclosed_flag": rest_eyesclosed_flag,
         "band_ratio": _round(band_ratio),
+        "rest_band_pct": _round(rest_band_pct),
         "lat_observed": _round(lat),
         "lat_class_expected": lat_class,
     }
@@ -667,7 +711,7 @@ _CSV_FIELDS = [
     "channels_used",
     "D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "S",
     "eligible", "gates_failed", "gate_reasons",
-    "rest_eyesclosed_flag", "band_ratio",
+    "rest_eyesclosed_flag", "band_ratio", "rest_band_pct",
     "lat_observed", "lat_class_expected",
 ]
 
