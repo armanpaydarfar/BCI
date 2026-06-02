@@ -96,9 +96,14 @@ def parse_training_pool_from_event_log(event_log_path: str | Path) -> list[str]:
 # Constants per `rev01-erd-refinement-plan.md`:
 #   §4.1 CONTRA_MOTOR_CLUSTER (right-arm MI: left hemisphere)
 #   §4.2 BILATERAL_MOTOR_CLUSTER (both hemispheres)
+#   §4.3 IPSI_MOTOR_CLUSTER (right hemisphere — the midline-mirror of
+#       CONTRA; added 2026-06-01 to replace the redundant motor-focal
+#       panel row, since the focal pool overlapped almost entirely with
+#       BILATERAL and offered little marginal information)
 #   §3.1 MOTOR_CLUSTER (intersection of config.MOTOR_CHANNEL_NAMES with
 #       ZONES L-/R-motor + Cz — used as the focal-electrode search pool)
 CONTRA_MOTOR_CLUSTER = ["C3", "FC1", "CP1", "CP5"]
+IPSI_MOTOR_CLUSTER = ["C4", "FC2", "CP2", "CP6"]
 BILATERAL_MOTOR_CLUSTER = [
     "FC1", "FC2", "C3", "C4", "CP1", "CP2", "CP5", "CP6",
 ]
@@ -108,7 +113,7 @@ MOTOR_FOCAL_POOL = [
 
 
 def resolve_motor_cluster(ch_names: Iterable[str]) -> dict[str, list[str]]:
-    """Resolve the three motor-cluster definitions against a session's
+    """Resolve the motor-cluster definitions against a session's
     surviving channel list.
 
     `ch_names` is the channel list present after Config A preprocessing
@@ -119,8 +124,9 @@ def resolve_motor_cluster(ch_names: Iterable[str]) -> dict[str, list[str]]:
     """
     present = set(ch_names)
     return {
-        "contralateral": [c for c in CONTRA_MOTOR_CLUSTER if c in present],
-        "bilateral":     [c for c in BILATERAL_MOTOR_CLUSTER if c in present],
+        "contralateral":  [c for c in CONTRA_MOTOR_CLUSTER if c in present],
+        "ipsilateral":    [c for c in IPSI_MOTOR_CLUSTER if c in present],
+        "bilateral":      [c for c in BILATERAL_MOTOR_CLUSTER if c in present],
         "motor_focal_pool": [c for c in MOTOR_FOCAL_POOL if c in present],
     }
 
@@ -158,11 +164,11 @@ def config_a_pipeline(subject: str, session: str) -> dict:
 # Output paths
 # ----------------------------------------------------------------------
 
-_PICTURES_ROOT = Path.home() / "Pictures" / "clin_analysis_pass1"
+_PICTURES_ROOT = Path.home() / "Pictures" / "clin_analysis"
 
 
 def clin_pictures_root() -> Path:
-    """Return the `~/Pictures/clin_analysis_pass1/` root directory.
+    """Return the `~/Pictures/clin_analysis/` root directory.
 
     Creates it (and parents) on demand. Subdirectories (e.g.
     `eds/`, `erd_refined/`) are created lazily by callers via
