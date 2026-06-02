@@ -55,8 +55,8 @@ Statistics:
   - Bonferroni correction over 6 primary metrics, α' = 0.00833
     (matches pass-2 M5 convention).
 
-Outputs (`~/Pictures/clin_analysis_pass2_gr_ablation/`):
-  per_session/, per_subject/, cohort/, csv/
+Outputs (`~/Pictures/clin_analysis/gr_ablation/`):
+  per_subject/, cohort/, csv/
 
 Analysis-only. Tier 1 / Tier 2 files are READ-ONLY per CLAUDE.md.
 """
@@ -624,54 +624,6 @@ def _bonferroni_verdict(p: float) -> str:
     )
 
 
-def _plot_per_session(row: dict, out_path: Path):
-    """Per-session three-arm bar: Arm A, Arm B, Arm C across 4 metrics."""
-    fig, ax = plt.subplots(figsize=(7, 4.5), constrained_layout=True)
-    metrics = [
-        ("Balanced\nacc",
-         row["bal_acc_off"], row["bal_acc_on"], row["bal_acc_ra"]),
-        ("Acc\n(MI)",
-         row["mi_acc_off"], row["mi_acc_on"], row["mi_acc_ra"]),
-        ("Acc\n(REST)",
-         row["rest_acc_off"], row["rest_acc_on"], row["rest_acc_ra"]),
-        ("Kappa",
-         row["kappa_off"], row["kappa_on"], row["kappa_ra"]),
-    ]
-    x = np.arange(len(metrics))
-    w = 0.27
-    a_vals = [m[1] for m in metrics]
-    b_vals = [m[2] for m in metrics]
-    c_vals = [m[3] for m in metrics]
-    ax.bar(x - w, a_vals, w, label="Arm A (GR-off)",
-           color="tab:orange")
-    ax.bar(x, b_vals, w, label="Arm B (Kumar GR)",
-           color="tab:blue")
-    ax.bar(x + w, c_vals, w, label="Arm C (Zanini RA)",
-           color="tab:green")
-    ax.set_xticks(x)
-    ax.set_xticklabels([m[0] for m in metrics], fontsize=9)
-    ax.axhline(0.5, color="k", lw=0.5, linestyle="--", alpha=0.4)
-    ax.axhline(0, color="k", lw=0.6)
-    all_vals = a_vals + b_vals + c_vals
-    finite = [v for v in all_vals if np.isfinite(v)]
-    if finite:
-        ax.set_ylim(min(-0.1, min(finite) - 0.05),
-                    max(1.05, max(finite) + 0.05))
-    ax.set_title(
-        f"{row['subject']} {row['session']} "
-        f"(n={row['n_trials']}; MI={row['n_mi']}, REST={row['n_rest']}; "
-        f"{row['n_runs_detected']} run(s))\n"
-        f"McNemar B-A p={row['mcnemar_BA_p']:.3g}; "
-        f"B-C p={row['mcnemar_BC_p']:.3g}; "
-        f"C-A p={row['mcnemar_CA_p']:.3g}",
-        fontsize=9,
-    )
-    ax.legend(loc="best", fontsize=8)
-    ax.grid(True, alpha=0.25)
-    fig.savefig(out_path, dpi=130, bbox_inches="tight")
-    plt.close(fig)
-
-
 def _plot_per_subject(
     df_subj: pd.DataFrame, subject: str, out_path: Path,
 ):
@@ -970,8 +922,7 @@ def main():
     )
     args = parser.parse_args()
 
-    out_root = Path.home() / "Pictures" / "clin_analysis_pass2_gr_ablation"
-    (out_root / "per_session").mkdir(parents=True, exist_ok=True)
+    out_root = Path.home() / "Pictures" / "clin_analysis" / "gr_ablation"
     (out_root / "per_subject").mkdir(parents=True, exist_ok=True)
     (out_root / "cohort").mkdir(parents=True, exist_ok=True)
     (out_root / "csv").mkdir(parents=True, exist_ok=True)
@@ -1053,13 +1004,6 @@ def main():
     df_trials = pd.DataFrame(trial_rows)
     df.to_csv(out_root / "csv" / "gr_ablation_session_summary.csv", index=False)
     df_trials.to_csv(out_root / "csv" / "gr_ablation_per_trial.csv", index=False)
-
-    # ----- Per-session plots -----
-    for _, row in df.iterrows():
-        fname = (
-            f"{row['subject']}_{row['session']}_three_arm.png"
-        )
-        _plot_per_session(row.to_dict(), out_root / "per_session" / fname)
 
     # ----- Per-subject plots -----
     for subj in sorted(df["subject"].unique()):

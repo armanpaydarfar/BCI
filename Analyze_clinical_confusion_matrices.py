@@ -5,7 +5,7 @@ Analog of `generate_per_subject_confusion_matrices.py` (which targets
 the PILOT cohort, ses-S001ONLINE only). This version sums across all
 ONLINE sessions and all ONLINE_* runs for each of CLIN_SUBJ_002..008.
 
-Outputs (`~/Pictures/clin_analysis_pass1/confusion_matrices/`):
+Outputs (`~/Pictures/clin_analysis/confusion_matrices/`):
     <SUBJ>_aggregate_confusion_matrix.png
     cohort_aggregate_confusion_matrix.png    (CLIN_SUBJ_003..008 only;
         CLIN_SUBJ_002 excluded from cohort sum due to channel/shrinkage

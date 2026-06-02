@@ -11,15 +11,28 @@ Analysis-only. Tier 1 / Tier 2 files are READ-ONLY per CLAUDE.md;
 covariance + shrinkage math is replicated inline from stable
 `Utils/runtime_common.py:248-255` with citation comments.
 
-Outputs (`~/Pictures/clin_analysis_pass1/eds/`):
-    expert_eds_topoplot_mu.png
-    cohort_eds_topoplot_mu.png
-    cohort_minus_expert_eds_topoplot_mu.png
-    per_subject_eds_topoplot_mu_grid.png
-    eds_per_subject_session_mu.csv
+Outputs (`~/Pictures/clin_analysis/eds/`):
+    cohort_eds_mi_per_class_mu<variant_tag>.png
+    cohort_eds_rest_per_class_mu<variant_tag>.png
+    per_subject_eds_mi_per_class_mu<variant_tag>_grid.png
+    per_subject_eds_rest_per_class_mu<variant_tag>_grid.png
+    eds_per_class_cohort_summary_mu<variant_tag>.csv
+    eds_per_class_per_subject_session_mu<variant_tag>.csv
 
-With `--include-beta`, the four PNG/CSV companions for the beta band
-are also produced.
+Per-class is the default (each class scored against its own pre-cue
+baseline prototype). The pooled formulation (MI prototype vs REST
+prototype, no per-class baseline) is opt-in via `--pooled`, in which
+case the cohort/expert/per-subject pooled topomaps are produced
+instead.
+
+The 2026-05-29 EDS revision (round 1): (a) beta band dropped
+entirely — the deployed decoder is mu-only, so beta EDS doesn't
+attribute to the runtime feature space and was producing
+near-identical lateral-parietal patterns to mu (a band-non-
+specificity finding that lacked a defensible interpretation per
+synthesis §2.3); (b) per-class is now the default headline because
+pooled EDS conflates the MI motor signature with the REST occipital-
+alpha signature.
 """
 
 from __future__ import annotations
@@ -93,7 +106,6 @@ TRIAL_WIN = (-1.0, 4.0)
 # `Analyze_eds_topoplot_CLIN.py:_load_raw_from_xdf_path:151-166` mark
 # the cue onset, so t<0 is the rest-state pre-trial period.
 BASELINE_WIN = (-1.0, 0.0)
-BETA_LO, BETA_HI = 13.0, 30.0
 
 # 15-channel motor subset per config.py:26 (= harmony_stable:config.py:14)
 MOTOR_CHANNEL_NAMES = [
@@ -1509,7 +1521,11 @@ def run_for_band_per_class(
 
 _DEFAULT_CHANNEL_SET = "motor15"
 _DEFAULT_BLINK = "drop_fp"
-_DEFAULT_SPATIAL = "car"
+# Promoted from `csd` to `hjorth` on 2026-06-01 — the Hjorth (k=4
+# nearest-neighbour Laplacian) sweep was the cleanest contralateral mu
+# signature on the CLIN cohort and aligns the EDS spatial filter with
+# the canonical ERD pipeline in `exploration/clinical_analysis/_helpers.py`.
+_DEFAULT_SPATIAL = "hjorth"
 
 
 def _build_variant_tag(channel_set: str, blink: str, spatial: str) -> str:
@@ -1532,10 +1548,6 @@ def _build_variant_tag(channel_set: str, blink: str, spatial: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--include-beta", action="store_true",
-        help="Also compute beta-band EDS (supplementary).",
-    )
     parser.add_argument(
         "--include-clin002", action="store_true",
         help="Include CLIN_SUBJ_002 (13-ch / LedoitWolf older config).",
@@ -1585,15 +1597,16 @@ def main():
               "`CLIN_SUBJ_005`. Empty = full cohort."),
     )
     parser.add_argument(
-        "--per-class-eds", action="store_true",
-        help=("Compute the per-class EDS variant: for each class "
-              "(MI, REST) compute EDS between the post-cue prototype "
-              "and the SAME class's pre-cue baseline prototype. "
-              "Decouples each class's task-evoked signature from the "
-              "other class's variability (useful when one class — "
-              "e.g. eyes-closed Rest — is contaminated by class-"
-              "specific artifact). Produces separate cohort + "
-              "per-subject grid plots for MI and REST."),
+        "--pooled", action="store_true",
+        help=("Use the pooled EDS formulation (MI prototype vs REST "
+              "prototype, no per-class baseline). Default is the "
+              "per-class variant: for each class (MI, REST) compute "
+              "EDS between the post-cue prototype and the SAME "
+              "class's pre-cue baseline prototype. The per-class "
+              "default decouples each class's task-evoked signature "
+              "from the other class's variability — useful because "
+              "REST (eyes-closed) is dominated by occipital alpha "
+              "that doesn't reflect a motor-related decoder feature."),
     )
     args = parser.parse_args()
     subject_filter = {
@@ -1616,8 +1629,6 @@ def main():
             return
 
     bands = [("mu", (MU_LO, MU_HI))]
-    if args.include_beta:
-        bands.append(("beta", (BETA_LO, BETA_HI)))
 
     variant_tag = _build_variant_tag(
         args.channel_set, args.blink_removal, args.spatial_filter,
@@ -1641,16 +1652,7 @@ def main():
         )
 
     for band_label, band in bands:
-        if args.per_class_eds:
-            run_for_band_per_class(
-                band_label, band, cohort, out_dir,
-                include_clin002=args.include_clin002,
-                channel_set=args.channel_set,
-                blink_removal=args.blink_removal,
-                spatial_filter=args.spatial_filter,
-                variant_tag=variant_tag,
-            )
-        else:
+        if args.pooled:
             run_for_band(
                 band_label, band, cohort, out_dir,
                 include_clin002=args.include_clin002,
@@ -1659,6 +1661,15 @@ def main():
                 blink_removal=args.blink_removal,
                 spatial_filter=args.spatial_filter,
                 no_diff_plot=args.no_diff_plot,
+                variant_tag=variant_tag,
+            )
+        else:
+            run_for_band_per_class(
+                band_label, band, cohort, out_dir,
+                include_clin002=args.include_clin002,
+                channel_set=args.channel_set,
+                blink_removal=args.blink_removal,
+                spatial_filter=args.spatial_filter,
                 variant_tag=variant_tag,
             )
 

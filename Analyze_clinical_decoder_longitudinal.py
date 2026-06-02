@@ -23,7 +23,7 @@ Pass 2 (2026-05-28):
   - Bonferroni-corrected verdict appended per metric (critic §M5).
   - LME slope + Bonferroni verdict annotated on each cohort plot (Mi5).
 
-Outputs (`~/Pictures/clin_analysis_pass1/decoder_perf/`):
+Outputs (`~/Pictures/clin_analysis/decoder_perf/`):
     <SUBJ>_decoder_kappa_nkv_acc_over_sessions.png   (per-subject panel)
     cohort_lme_kappa.png    cohort_lme_nkv.png    cohort_lme_acc.png
     decoder_perf_session_summary.csv

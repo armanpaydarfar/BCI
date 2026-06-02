@@ -3,22 +3,36 @@
 `rev01-longitudinal-analysis-plan.md` §3).
 
 For each (subject, session), compute the per-trial mu-band ERD% over
-the Contralateral cluster (primary) and Bilateral cluster (secondary)
-at SCALAR_WIN = (1, 4) s, using Config A preprocessing.
+the Contralateral cluster (primary), Ipsilateral cluster (added
+2026-06-01 as a within-subject lateralisation reference), and
+Bilateral cluster (secondary) at SCALAR_WIN = (1, 4) s, using Config A
+preprocessing. Spatial filter is Hjorth (k=4 nearest-neighbour
+Laplacian) — promoted to canonical 2026-06-01 via
+`_helpers.CONFIG_A`.
 
 Pass 2 (2026-05-28): LMEs now fit per-session response (median primary,
 mean sensitivity), not per-trial, per `rev01-longitudinal-analysis-plan.md`
 §3.3 / §3.4 and the pass-1 critic review §C1/§C2/§M6. Per-trial CSV is
 retained for backward compatibility.
 
+Session-wise ERD definition (see `_per_trial_cluster_erd_pct` docstring):
+  1. Per trial: ERD%_trial = 100·(10^(mean_{ch∈cluster, f∈mu, t∈(1,4)s}
+     log10(P/P_bl)) − 1) — averaging in log space then a single % conversion
+     avoids Jensen-inequality bias.
+  2. Per session: median over trials of ERD%_trial (primary), with
+     erd_mean kept as a sensitivity check in the session-summary CSV.
+  3. Per cohort: median across subjects of per-session medians.
+
 `--from-csv` reloads existing per-trial CSV produced by an earlier run
 to skip the ~25 min Config-A TFR pass. Used in pass-2 to re-fit only the
 LMEs and cohort plots without rerunning preprocessing.
 
-Outputs (`~/Pictures/clin_analysis_pass1/neuromod/`):
+Outputs (`~/Pictures/clin_analysis/neuromod/`):
     <SUBJ>_erd_over_sessions_contra.png    (per-subject, contra cluster)
+    <SUBJ>_erd_over_sessions_ipsi.png      (per-subject, ipsi cluster)
     <SUBJ>_erd_over_sessions_bilat.png     (per-subject, bilateral)
     cohort_lme_erd_contra.png              (cohort)
+    cohort_lme_erd_ipsi.png                (cohort)
     cohort_lme_erd_bilat.png               (cohort)
     erd_per_trial.csv                      (raw per-trial ERD% values)
     erd_session_summary.csv                (per-session mean/median/SE)
@@ -49,8 +63,8 @@ for _p in (str(_REPO_ROOT), str(_SWEEP_DIR)):
         sys.path.insert(0, _p)
 
 from exploration.clinical_analysis._helpers import (  # noqa: E402
-    BILATERAL_MOTOR_CLUSTER, CONTRA_MOTOR_CLUSTER, clin_pictures_root,
-    config_a_pipeline, enumerate_clin_subjects,
+    BILATERAL_MOTOR_CLUSTER, CONTRA_MOTOR_CLUSTER, IPSI_MOTOR_CLUSTER,
+    clin_pictures_root, config_a_pipeline, enumerate_clin_subjects,
     enumerate_online_sessions_for_subject, session_idx_from_label,
 )
 
@@ -82,10 +96,31 @@ def _per_trial_cluster_erd_pct(
     tfr_trials, cluster_channels: list[str], marker: str = "200",
 ) -> tuple[np.ndarray | None, list[str]]:
     """One scalar ERD% per trial, averaged across (cluster channels,
-    mu freqs, SCALAR_WIN). Trial-averaging happens in % space (one
-    scalar per trial), so the per-trial summary is exactly:
-        ERD%_trial = 100 * (10^mean_{c,f,t} logratio - 1)
-    matching the longitudinal-plan §3.1 spec.
+    mu freqs, SCALAR_WIN).
+
+    Definition audit — this is the single source of the session-wise
+    ERD that feeds the longitudinal LMEs:
+
+      Step 1 (in this function, per trial):
+        logratio_trial = mean_{c ∈ cluster, f ∈ mu, t ∈ (1,4)s} log10(P/P_bl)
+        ERD%_trial     = 100 * (10^logratio_trial - 1)
+      → one scalar per trial. The averaging stays in log space across
+        (channels, freqs, time) and is converted to % once per trial,
+        which avoids the Jensen-inequality bias the pass-1 implementation
+        carried (see 75f891b / bf980c9 fix commits).
+
+      Step 2 (in `_compute_from_tfr`, per session):
+        erd_median_session = median over trials of ERD%_trial      ← primary
+        erd_mean_session   = mean   over trials of ERD%_trial      ← sensitivity
+      → erd_median is the response variable in the cohort LME
+        (`metric ~ 1 + session_idx + (1|subject)`); erd_mean is fit
+        as a sensitivity check alongside. CLIN_SUBJ_007 had per-trial
+        ERD% extremes up to +235% that would otherwise flip the mean
+        positive on sessions where the typical trial still desyncs.
+
+      Step 3 (in `_plot_cohort_trajectory`, per cohort):
+        cohort_at_session = median across subjects of their per-session
+                            medians (errorbar uses SE of those medians).
 
     Returns (array of shape (n_trials,), channels_actually_used).
     """
@@ -328,6 +363,7 @@ def _compute_from_tfr(out_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
             sess_idx = session_idx_from_label(sess)
             for cluster_key, cluster in [
                 ("contra", CONTRA_MOTOR_CLUSTER),
+                ("ipsi",   IPSI_MOTOR_CLUSTER),
                 ("bilat",  BILATERAL_MOTOR_CLUSTER),
             ]:
                 per_trial, present = _per_trial_cluster_erd_pct(
@@ -396,7 +432,7 @@ def main():
         df_trials, df_sess = _compute_from_tfr(out_dir)
 
     lme_text_blocks = []
-    for cluster_key in ("contra", "bilat"):
+    for cluster_key in ("contra", "ipsi", "bilat"):
         sub_trials = df_trials[df_trials.cluster == cluster_key].copy()
         sub_sess = df_sess[df_sess.cluster == cluster_key].copy()
         if sub_trials.empty or sub_sess.empty:
