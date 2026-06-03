@@ -954,6 +954,236 @@ def task_capdiag():
     print(f"Wrote: {out}")
 
 
+# ----------------------------------------------------------------------
+# Task: shipped report figures (report_figures/).
+#
+# Canonical methods for the oneshot study = logratio units + 200% ERD cap +
+# cluster-matched rejection (CAR, mu 8-13 Hz, baseline -1..0 s). Same methods
+# as the diagnostic tasks above, but rendered with concise, high-level titles
+# and legends for the write-up. The diagnostic-grade figures (percent ERD, the
+# scored 6-panel with D1/G1 tags, per-run confusion grid, etc.) stay in their
+# own directories (erd_refined/, eds/, ...). Built subject-parameterized so
+# the SUBJ_008 pass and the two-subject consolidation drop in cleanly.
+# ----------------------------------------------------------------------
+def task_report():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    _inject_roots()
+
+    rep = OUT_ROOT / "report_figures"
+    rep.mkdir(parents=True, exist_ok=True)
+    subj = SUBJECT.replace("CLIN_SUBJ_", "Subject ")
+
+    # ---- (1) ERD/ERS timecourse — logratio, mean±SE, cluster-matched, re-zeroed
+    from Analyze_clinical_erd_refined import (
+        MU_LO, MU_HI, MI_MARKER, REST_MARKER, config_a_pipeline,
+        CONTRA_MOTOR_CLUSTER, BILATERAL_MOTOR_CLUSTER, IPSI_MOTOR_CLUSTER,
+    )
+    pipe = config_a_pipeline(SUBJECT, SESSION)
+    tfr_base = pipe["tfr_trials"]
+    erd_rows = [("Contralateral", CONTRA_MOTOR_CLUSTER),
+                ("Bilateral", BILATERAL_MOTOR_CLUSTER),
+                ("Ipsilateral", IPSI_MOTOR_CLUSTER)]
+    erd_cols = [("Motor imagery", MI_MARKER), ("Rest", REST_MARKER)]
+    # sharey="col": the three MI panels share one y-scale and the three REST
+    # panels share another, so the MI desync autoscales to its own range (it
+    # would be squished if forced onto REST's large ERS scale) while clusters
+    # stay directly comparable within each class.
+    fig, axes = plt.subplots(3, 2, figsize=(11, 9), sharex=True, sharey="col")
+    for ri, (cname, chans) in enumerate(erd_rows):
+        tfr_c, _ = _reject_artifact_trials_for_cluster(
+            tfr_base, chans, abs_cap=ERD_ABS_CAP)
+        for ci, (clab, marker) in enumerate(erd_cols):
+            ax = axes[ri, ci]
+            if marker not in tfr_c:
+                ax.set_visible(False)
+                continue
+            t = tfr_c[marker]
+            idx = [t.ch_names.index(c) for c in chans if c in t.ch_names]
+            fmask = (t.freqs >= MU_LO) & (t.freqs <= MU_HI)
+            pt = t.data[:, idx][:, :, fmask].mean(axis=(1, 2))  # logratio (n,t)
+            bmask = (t.times >= -1.0) & (t.times <= 0.0)
+            pt = pt - pt[:, bmask].mean(axis=1, keepdims=True)  # baseline re-zero
+            n = pt.shape[0]
+            mean = pt.mean(axis=0)
+            se = (pt.std(axis=0, ddof=1) / np.sqrt(n)
+                  if n > 1 else np.zeros_like(mean))
+            ax.axhline(0, color="k", lw=0.6)
+            ax.axvline(0, color="grey", lw=0.6, ls=":")
+            ax.plot(t.times, mean, color="tab:blue", lw=1.6)
+            ax.fill_between(t.times, mean - se, mean + se,
+                            color="tab:blue", alpha=0.25)
+            if ri == 0:
+                ax.set_title(clab, fontsize=12)
+            if ci == 0:
+                ax.set_ylabel(f"{cname}\nERD/ERS (logratio)", fontsize=10)
+            if ri == 2:
+                ax.set_xlabel("Time from cue (s)")
+            ax.grid(True, alpha=0.3)
+    fig.suptitle(f"{subj} — μ (8–13 Hz) ERD/ERS time course (mean ± SE)",
+                 fontsize=14)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(rep / "erd_timecourse.png", dpi=150)
+    plt.close(fig)
+    print("  wrote erd_timecourse.png")
+
+    # ---- (2) ERD/ERS topography (mu) — MI + REST strips, logratio grand-avg
+    import generate_plots_config_a as gp
+    tfr_cap, _rep, _pipe = _capped_tfr_trials()
+    tfr_avg = {mk: tt.average() for mk, tt in tfr_cap.items()}
+    rest_avg, mi_avg = tfr_avg.get("100"), tfr_avg.get("200")
+    vlim = gp._compute_dynamic_vlim(rest_avg, mi_avg)
+    if mi_avg is not None:
+        gp._plot_topo_strip(
+            mi_avg, MU_LO, MU_HI, vlim,
+            f"{subj} — μ ERD/ERS topography · Motor imagery",
+            str(rep / "erd_topography_mi.png"))
+    if rest_avg is not None:
+        gp._plot_topo_strip(
+            rest_avg, MU_LO, MU_HI, vlim,
+            f"{subj} — μ ERD/ERS topography · Rest",
+            str(rep / "erd_topography_rest.png"))
+    print("  wrote erd_topography_{mi,rest}.png")
+
+    # ---- (3) EDS topomaps (mu) — reuse the canonical compute, clean titles.
+    # The canonical EDS plotters take (title, save_path) as args; wrap the
+    # single-panel plotter to redirect the per-class cohort panel (== this one
+    # subject) into report_figures with a high-level title, and skip the
+    # per-subject grid (degenerate at n=1; it becomes the consolidation figure
+    # once SUBJ_008 is added).
+    import Analyze_eds_topoplot_CLIN as eds
+    eds.EXPERT_SOURCE_SUBJECT = SUBJECT
+    eds.clin_pictures_root = lambda: OUT_ROOT  # CSVs land in eds/ (diagnostic)
+    _orig_panel = eds._plot_topomap_panel
+
+    def _clean_eds_panel(z_vec, channels, title, save_path, *a, **k):
+        name = Path(save_path).name
+        if name.startswith("cohort_eds_mi"):
+            _orig_panel(z_vec, channels,
+                        f"{subj} — EDS (expert divergence) · Motor imagery (μ)",
+                        str(rep / "eds_mi.png"), *a, **k)
+        elif name.startswith("cohort_eds_rest"):
+            _orig_panel(z_vec, channels,
+                        f"{subj} — EDS (expert divergence) · Rest (μ)",
+                        str(rep / "eds_rest.png"), *a, **k)
+        # other panels (diffs) intentionally not shipped
+
+    eds._plot_topomap_panel = _clean_eds_panel
+    eds._plot_per_subject_grid = lambda *a, **k: None  # consolidation: later
+    try:
+        sys.argv = ["eds", "--subjects", SUBJECT, "--no-diff-plot"]
+        eds.main()
+    finally:
+        eds._plot_topomap_panel = _orig_panel
+    print("  wrote eds_{mi,rest}.png")
+
+    # ---- (4) Decoder performance across runs (trial κ, NKV, accuracy)
+    import Analyze_clinical_decoder_longitudinal as dec
+    from Analyze_experiment_logs_cross_subject import find_decoder_csv
+    runs = _substantive_run_dirs()
+    metric_rows = []
+    for run_id, rd in runs:
+        df = pd.read_csv(find_decoder_csv(str(rd)))
+        df["RunID"] = f"{SUBJECT}__{SESSION}__{rd.name}"
+        df["GlobalTrialID"] = df["RunID"] + "_" + df["Trial"].astype(str)
+        m = dec._session_metrics([df])
+        metric_rows.append((run_id, m))
+    fig, ax = plt.subplots(figsize=(8, 5))
+    x = range(len(metric_rows))
+    series = [("trial_kappa", "Trial κ (chance-corrected)"),
+              ("nkv", "NKV (κ × decision rate)"),
+              ("acc_decided", "Accuracy — decided trials"),
+              ("acc_inclusive", "Accuracy — all trials")]
+    for col, lab in series:
+        ax.plot(x, [m.get(col) for _, m in metric_rows], marker="o", label=lab)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels([r for r, _ in metric_rows])
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_xlabel("Run")
+    ax.set_ylabel("Metric")
+    n_tot = sum(int(m.get("n_total", 0)) for _, m in metric_rows)
+    ax.set_title(f"{subj} — decoder performance across runs (n={n_tot} trials)")
+    ax.legend(loc="lower left", fontsize=9)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(rep / "decoder_performance.png", dpi=200)
+    plt.close(fig)
+    print("  wrote decoder_performance.png")
+
+    # ---- (5) Pooled confusion matrix (whole session, all substantive runs)
+    import Analyze_clinical_confusion_matrices as cmmod
+    from Analyze_experiment_logs_cross_subject import (
+        compute_confusion_matrix_from_csv,
+    )
+    pooled = []
+    for run_id, rd in runs:
+        d = pd.read_csv(find_decoder_csv(str(rd)))
+        d["RunID"] = f"{SUBJECT}__{SESSION}__{rd.name}"
+        d["GlobalTrialID"] = d["RunID"] + "_" + d["Trial"].astype(str)
+        pooled.append(d)
+    cm = compute_confusion_matrix_from_csv(pd.concat(pooled, ignore_index=True))
+    if cm is not None:
+        cmmod._plot_subject_cm(
+            cm, subj, 1, len(runs), str(rep / "confusion_matrix.png"))
+        print("  wrote confusion_matrix.png")
+
+    # ---- (6) Feedback bar dynamics — Lean% and time-to-threshold per trial
+    import Analyze_clinical_bar_dynamics_longitudinal as bar
+    df_tr = bar._load_session_trials(SUBJECT, SESSION)
+    if not df_tr.empty:
+        run_map = {rd.name: rid for rid, rd in runs}
+        df_tr["run"] = df_tr["run_id"].map(run_map)
+        per_run = bar._per_run_median(df_tr)
+        per_run["run"] = per_run["run_id"].map(run_map)
+        groups = ["All"] + sorted(r for r in per_run["run"].dropna().unique())
+        colors = {"MI": "tab:orange", "REST": "tab:blue"}
+
+        def _vals(metric, group, cls):
+            d = df_tr[df_tr["Class"] == cls]
+            if group != "All":
+                d = d[d["run"] == group]
+            return d[metric].dropna().values
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.5))
+        for ax, metric, ylab in (
+                (ax1, "LeanPct", "Lean toward target (%)"),
+                (ax2, "TimeToThresh_s", "Time to threshold (s)")):
+            handles = {}
+            for gi, g in enumerate(groups):
+                for cls, off in (("MI", -0.18), ("REST", +0.18)):
+                    v = _vals(metric, g, cls)
+                    if len(v) == 0:
+                        continue
+                    bp = ax.boxplot(v, positions=[gi + off], widths=0.3,
+                                    patch_artist=True, showfliers=True,
+                                    medianprops=dict(color="black"),
+                                    flierprops=dict(marker=".", markersize=4,
+                                                    markerfacecolor=colors[cls],
+                                                    markeredgecolor=colors[cls],
+                                                    alpha=0.5))
+                    for box in bp["boxes"]:
+                        box.set(facecolor=colors[cls], alpha=0.55)
+                    handles[cls] = bp["boxes"][0]
+            ax.axvline(0.5, color="grey", lw=0.8, ls="--")
+            ax.set_xticks(range(len(groups)))
+            ax.set_xticklabels(groups)
+            ax.set_xlabel("Session / run")
+            ax.set_ylabel(ylab)
+            ax.grid(True, axis="y", alpha=0.3)
+            if handles:
+                ax.legend(handles.values(), handles.keys(), loc="best")
+        fig.suptitle(f"{subj} — feedback bar dynamics "
+                     f"(box = per-trial distribution)")
+        fig.tight_layout()
+        fig.savefig(rep / "bar_dynamics.png", dpi=200)
+        plt.close(fig)
+        print("  wrote bar_dynamics.png")
+
+    print(f"\nShipped report figures -> {rep}")
+
+
 _TASKS = {
     "inventory": task_inventory,
     "eds": task_eds,
@@ -966,6 +1196,7 @@ _TASKS = {
     "bar": task_bar,
     "erddiag": task_erddiag,
     "capdiag": task_capdiag,
+    "report": task_report,
 }
 
 
