@@ -98,12 +98,16 @@ TRIAL_REJECT_Z = 5.0
 TRIAL_REJECT_MAX_FRAC = 0.50
 
 # Absolute artifact cap: a trial whose post-cue peak |ERD%| exceeds this is
-# dropped regardless of its robust-z. The relative z-rule catches outliers in a
-# clean session but misses catastrophic trials in a *pervasively* noisy one
-# (CLIN_SUBJ_007/008 REST: residual 500–2900% trials whose z<5 because the MAD
-# is inflated by the surrounding noise). A mu-band ERD% of several hundred
-# percent is physiologically impossible, so this cap is pure-artifact removal.
-TRIAL_REJECT_ABS_PCT = 600.0
+# dropped regardless of its robust-z. Set to 200% to match the G1 diagnostic
+# threshold (evaluate_erd_quality.py:101) — cap closes the asymmetry where
+# trials in the 200-600% band passed the old cleaner (600) but tripped the
+# G1 gate (200). Cohort cap-sweep (clin-cohort-evidence-synthesis 2026-06-03)
+# confirmed cap=200 + cluster-matched rejection raises cohort eligible rows
+# from 31 to 92 of 102 without regressing any subject. Physiologically a
+# sustained mu ERD sits in [0, -30]%; ERS peaks above ±200% are muscle bursts,
+# not real signal, and per-trial diagnostics confirm those trials are
+# sustained outliers (high frac_post_over_50pct) not transient spikes.
+TRIAL_REJECT_ABS_PCT = 200.0
 
 import mne  # noqa: E402
 
@@ -124,8 +128,11 @@ mne.set_log_level("ERROR")
 MI_MARKER = "200"
 REST_MARKER = "100"
 
-# Description of the shaded band drawn around each median trace.
-_BAND_LABEL = "shaded = median ± SE (std/√n across trials)"
+# Description of the shaded band drawn around each mean trace.
+# Mean (not median) across trials: cap=200 rejection drops the explosive
+# trials that historically motivated the median, so the kept-trial mean
+# is now the statistically appropriate central tendency.
+_BAND_LABEL = "shaded = mean ± SE (std/√n across trials)"
 
 
 def _preproc_caption():
@@ -142,7 +149,8 @@ def _preproc_caption():
         f"μ {MU_LO:g}–{MU_HI:g} Hz | "
         f"baseline {cfg['spectral_baseline']} s | "
         f"window {cfg['trial_win']} s | "
-        f"trial-reject {reject}"
+        f"trial-reject {reject} (cluster-matched) | "
+        f"display: dB (10·log10), substrate: %"
     )
 
 
@@ -153,6 +161,74 @@ def _preproc_caption():
 def _logratio_to_pct(x):
     """Mirrors generate_plots_config_a.py:335-336."""
     return 100.0 * (10.0 ** x - 1.0)
+
+
+def _reject_artifact_trials_for_cluster(tfr_trials, cluster_chs,
+                                        reject_z=TRIAL_REJECT_Z,
+                                        max_frac=TRIAL_REJECT_MAX_FRAC,
+                                        abs_cap=TRIAL_REJECT_ABS_PCT):
+    """Non-mutating cluster-matched version of `_reject_artifact_trials`.
+
+    Returns (new_tfr_trials, report). Logic mirrors `_reject_artifact_trials`
+    line-for-line, except (a) the rejection substrate is the supplied
+    `cluster_chs` instead of hardcoded `BILATERAL_MOTOR_CLUSTER`, and (b)
+    the input dict is NOT mutated — a fresh dict with sliced EpochsTFR
+    entries is returned, so the same tfr_base can feed multiple cluster
+    rejections in sequence.
+
+    Used by `_extract_session_traces` to give each cluster (contra/bilat/
+    ipsi) its own rejected pool. Rationale: G1 (evaluate_erd_quality.py:
+    587-600) is evaluated per cluster, but the hardcoded-bilat substrate
+    over-dilutes focal-channel spikes when the cluster being scored has
+    only 4 channels (contra/ipsi). Cluster-matched rejection closes that
+    asymmetry without changing the scorer.
+    """
+    new_trials = {}
+    report = {}
+    for marker, tfr in tfr_trials.items():
+        n_before = int(tfr.data.shape[0])
+        info = {"n_before": n_before, "n_dropped": 0,
+                "kept": True, "over_gate": False}
+        report[marker] = info
+        new_trials[marker] = tfr  # default to no-op
+        if reject_z <= 0 or n_before < 4:
+            continue
+        present = [c for c in cluster_chs if c in tfr.ch_names]
+        if not present:
+            continue
+        ch_idxs = [tfr.ch_names.index(c) for c in present]
+        fmask = (tfr.freqs >= MU_LO) & (tfr.freqs <= MU_HI)
+        pct = _logratio_to_pct(
+            tfr.data[:, ch_idxs][:, :, fmask],
+        ).mean(axis=(1, 2))
+        tmask = tfr.times >= 0.0
+        scalar = np.max(np.abs(pct[:, tmask]), axis=1)
+        abs_drop = scalar > abs_cap
+        med = np.median(scalar)
+        mad = np.median(np.abs(scalar - med))
+        if mad > 0:
+            z = (scalar - med) / (1.4826 * mad)
+            z_drop = np.abs(z) > reject_z
+        else:
+            z_drop = np.zeros_like(scalar, dtype=bool)
+        drop = z_drop | abs_drop
+        n_drop = int(drop.sum())
+        if n_drop == 0:
+            continue
+        max_drop = int(np.floor(max_frac * n_before))
+        if n_drop > max_drop:
+            info["over_gate"] = True
+            worst = np.argsort(scalar)[::-1][:max_drop]
+            keep_mask = np.ones(n_before, dtype=bool)
+            keep_mask[worst] = False
+            n_drop = max_drop
+        else:
+            keep_mask = ~drop
+        if n_drop == 0:
+            continue
+        new_trials[marker] = tfr[np.where(keep_mask)[0]]
+        info["n_dropped"] = n_drop
+    return new_trials, report
 
 
 def _reject_artifact_trials(tfr_trials, reject_z=TRIAL_REJECT_Z,
@@ -265,22 +341,29 @@ def _reject_artifact_trials(tfr_trials, reject_z=TRIAL_REJECT_Z,
 
 def _cluster_timecourse(tfr_trials, cluster_channels, marker="200",
                         return_per_trial=False):
-    """Cluster-averaged ERD%(t), median ± SE across trials.
+    """Cluster-averaged ERD%(t), arithmetic mean ± SE across trials.
 
-    Median (not mean) across trials: the per-trial arithmetic mean of
-    P/P_bl is outlier-sensitive in clinical data — one high-ERS trial
-    can flip the post-cue average positive even when most trials show
-    desync. Median isolates the typical-trial response. The shaded band
-    is the standard error of the per-trial distribution (sample
-    std / sqrt(n)), centred on the median. Baseline sits at 0 by
-    construction (each trial's pct over the baseline window averages to
-    0 per the apply_baseline guarantee, and the median of zeros is 0).
+    Mean (not median) across trials: with the canonical cap=200 rejection
+    closing G1's threshold, the explosive ERS trials that historically
+    motivated the median (one 3700% trial would flip a mean positive) are
+    now dropped upstream. With a clean kept-trial pool, mean is the
+    statistically appropriate central tendency in % space — matches the
+    classical Pfurtscheller formulation and the topomap pipeline's
+    `tfr.average()` (generate_plots_config_a.py:157), and the SE band
+    matches its central tendency. Baseline sits at 0 by construction (per-
+    trial baseline window averages to 0 in % per the apply_baseline
+    guarantee; mean of zeros is 0).
+
+    The returned variable is still called `mean_pct` (kept for caller
+    stability) but is now an arithmetic mean across trials in % units.
+    Callers that render to dB convert at display time
+    (`10·log10(1 + mean_pct/100)`).
 
     Returns (times, mean_pct, low_pct, up_pct, n_trials, surviving_channels)
     or None. When `return_per_trial=True`, appends the per-trial cluster-mean
-    ERD% matrix `per_trial_pct[n_trials, n_time]` as a 7th element — the same
-    array the median/SE are derived from, exposed so the quality scorer can
-    consume the full trial distribution (it is otherwise discarded here).
+    ERD% matrix `per_trial_pct[n_trials, n_time]` as a 7th element — the
+    full trial distribution, exposed so the quality scorer (median-based
+    rubric) and the display layer (mean) can use the same substrate.
     """
     if marker not in tfr_trials:
         return None
@@ -297,7 +380,7 @@ def _cluster_timecourse(tfr_trials, cluster_channels, marker="200",
     if n < 1:
         return None
     per_trial_pct = data_pct.mean(axis=(1, 2))  # over cluster ch + mu freqs
-    mean_pct = np.median(per_trial_pct, axis=0)
+    mean_pct = np.mean(per_trial_pct, axis=0)  # arithmetic mean across trials
     if n > 1:
         sem = np.std(per_trial_pct, axis=0, ddof=1) / np.sqrt(n)
         low_pct = mean_pct - sem
@@ -322,46 +405,66 @@ def _cluster_timecourse(tfr_trials, cluster_channels, marker="200",
 # Per-subject 6-panel figure (3 metric rows × 2 class cols)
 # ----------------------------------------------------------------------
 
-def _extract_session_traces(tfr_trials, dropped_channels):
-    """Return a small dict of (session-level) traces needed for the
-    6-panel figure (3 cluster metrics × {MI, REST}). Doing this
-    once-per-session avoids holding all tfr_trials in RAM across
-    sessions (each tfr_trials is ~1 GB for a 100-trial, 22-channel
-    session at the default mu+beta TFR grid).
+def _extract_session_traces(tfr_base, dropped_channels):
+    """Return per-cluster trace dict for the 6-panel figure, with each
+    cluster's trace extracted from its OWN cluster-matched rejected pool.
+
+    `tfr_base` is the pre-rejection `tfr_trials` dict (one entry per
+    marker). For each cluster (contra/bilat/ipsi), this function calls
+    `_reject_artifact_trials_for_cluster(tfr_base, cluster_chs)` to get a
+    cluster-specific kept-trial pool, then extracts the cluster's trace
+    from that pool. Cluster trial counts can therefore DIFFER within one
+    session — bilat-8 dilutes focal spikes more than contra-4, so bilat's
+    pool is the most stringent (most trials kept) while contra/ipsi drop
+    more aggressively when their cluster carries a focal artifact.
+
+    The session-level `n_after_reject` in the npz meta is set to the
+    bilateral pool's count (most stringent substrate). The scorer's
+    session-level G2 (evaluate_erd_quality.py:479) reads that value, so
+    keeping bilat as the canonical session-viability proxy preserves the
+    canonical G2 semantics without modifying the scorer.
 
     The returned dict carries the 6-tuple traces (used by plotting and the
     CSV) under their `<cluster>_<marker>` keys, plus a `per_trial` sub-dict
     holding the per-trial cluster-mean ERD% matrix for each key — the
     substrate the quality scorer consumes (written to the npz side-car).
     Per-trial arrays are kilobytes (n_trials × n_time), so stashing them
-    does not change peak RSS, which is dominated by the ~1 GB tfr_trials.
+    does not change peak RSS.
     """
     cluster_specs = [
-        ("contra_mi",   CONTRA_MOTOR_CLUSTER,    MI_MARKER),
-        ("contra_rest", CONTRA_MOTOR_CLUSTER,    REST_MARKER),
-        ("bilat_mi",    BILATERAL_MOTOR_CLUSTER, MI_MARKER),
-        ("bilat_rest",  BILATERAL_MOTOR_CLUSTER, REST_MARKER),
-        ("ipsi_mi",     IPSI_MOTOR_CLUSTER,      MI_MARKER),
-        ("ipsi_rest",   IPSI_MOTOR_CLUSTER,      REST_MARKER),
+        ("contra", CONTRA_MOTOR_CLUSTER),
+        ("bilat",  BILATERAL_MOTOR_CLUSTER),
+        ("ipsi",   IPSI_MOTOR_CLUSTER),
     ]
     traces: dict = {"dropped_channels": list(dropped_channels)}
     per_trial: dict = {}
-    for key, cluster, marker in cluster_specs:
-        res = _cluster_timecourse(
-            tfr_trials, cluster, marker, return_per_trial=True,
+    per_cluster_report: dict = {}
+    for cluster_label, cluster_chs in cluster_specs:
+        # Cluster-matched rejection: each cluster's trace uses its own
+        # cleaned pool. Non-mutating: tfr_base is unchanged for the next
+        # cluster's rejection pass.
+        tfr_pool, rej = _reject_artifact_trials_for_cluster(
+            tfr_base, cluster_chs,
         )
-        if res is None:
-            traces[key] = None
-            continue
-        times, mean_pct, low_pct, up_pct, n, present, ptp = res
-        # 6-tuple kept for plotting/CSV; per-trial array kept separately.
-        traces[key] = (times, mean_pct, low_pct, up_pct, n, present)
-        per_trial[key] = {
-            "per_trial_pct": ptp,           # (n_trials, n_time) ERD%
-            "times": times,
-            "channels_used": present,
-        }
+        per_cluster_report[cluster_label] = rej
+        for marker_label, marker in (("mi", MI_MARKER),
+                                      ("rest", REST_MARKER)):
+            key = f"{cluster_label}_{marker_label}"
+            res = _cluster_timecourse(
+                tfr_pool, cluster_chs, marker, return_per_trial=True,
+            )
+            if res is None:
+                traces[key] = None
+                continue
+            times, mean_pct, low_pct, up_pct, n, present, ptp = res
+            traces[key] = (times, mean_pct, low_pct, up_pct, n, present)
+            per_trial[key] = {
+                "per_trial_pct": ptp,
+                "times": times,
+                "channels_used": present,
+            }
     traces["per_trial"] = per_trial
+    traces["_per_cluster_report"] = per_cluster_report
     return traces
 
 
@@ -412,42 +515,62 @@ def _write_per_trial_npz(out_path, subject, session, traces, out_meta):
     np.savez_compressed(out_path, **payload)
 
 
-def _panel_score_tag(cls, times, median, ptp):
+def _panel_score_tag(cls, times, _displayed_trace, ptp):
     """Compact per-session quality tag appended to a panel's legend entry.
 
-    Computed with the same functions/thresholds `evaluate_erd_quality` uses, so
-    what the figure shows and what the scorer records cannot drift. MI panels
-    report D1 (strength), sustained fraction, band-to-signal ratio, and a `G1!`
-    marker when a retained trial exceeds the outlier threshold; REST panels
-    report D4 (specificity) and an `ES!` eyes-closed marker. `median` is the
-    plotted median trace; `ptp` is the per-trial ERD% matrix (or None).
+    Computed with the same functions/thresholds `evaluate_erd_quality` uses,
+    so what the figure annotation reports and what the scorer records cannot
+    drift. The rubric is calibrated in PERCENT space and uses the MEDIAN
+    across trials internally (scorer:553), so this helper derives the median
+    trace from `ptp` regardless of what is actually plotted — the legend tag
+    stays rubric-correct even when the display layer renders mean+dB.
+
+    `_displayed_trace` is accepted for caller-compat but no longer read.
     """
     smask = _scalar_mask(times)
+    # No per-trial data → nothing to score.
+    if ptp is None or ptp.shape[0] == 0:
+        return ""
+    median_pct = np.median(ptp, axis=0)
     if cls == "mi":
-        d1 = _d1_mi_strength(median, smask)
-        d2 = _d2_sustained(median, smask)
-        bs, flag = "", ""
-        if ptp is not None and ptp.shape[0] > 0:
-            _d8, ratio = _d8_band_to_signal(ptp, median, smask)
-            if not np.isnan(ratio):
-                bs = f" b/s={ratio:.1f}"
-            pmask = _postcue_mask(times)
-            if pmask.any():
-                trial_peaks = np.max(np.abs(ptp[:, pmask]), axis=1)
-                n_out = int((trial_peaks > G1_OUTLIER_PCT).sum())
-                if n_out / ptp.shape[0] > G1_OUTLIER_FRAC:
-                    flag = f"  G1!({n_out}/{ptp.shape[0]}>{G1_OUTLIER_PCT:.0f}%)"
+        d1 = _d1_mi_strength(median_pct, smask)
+        d2 = _d2_sustained(median_pct, smask)
+        _d8, ratio = _d8_band_to_signal(ptp, median_pct, smask)
+        bs = f" b/s={ratio:.1f}" if not np.isnan(ratio) else ""
+        flag = ""
+        pmask = _postcue_mask(times)
+        if pmask.any():
+            trial_peaks = np.max(np.abs(ptp[:, pmask]), axis=1)
+            n_out = int((trial_peaks > G1_OUTLIER_PCT).sum())
+            if n_out / ptp.shape[0] > G1_OUTLIER_FRAC:
+                flag = f"  G1!({n_out}/{ptp.shape[0]}>{G1_OUTLIER_PCT:.0f}%)"
         return f" | D1={d1:.2f} sus={d2:.2f}{bs}{flag}"
-    d4, eyes = _d4_rest_specificity(median, smask)
+    d4, eyes = _d4_rest_specificity(median_pct, smask)
     return f" | D4={d4:.2f}{'  ES!' if eyes else ''}"
+
+
+def _pct_to_db(pct):
+    """Convert ERD% (Pfurtscheller, P/P_bl - 1) to decibels (10·log10).
+
+    dB = 10·log10(P/P_bl) = 10·log10(1 + pct/100). Same data, scale-symmetric
+    in multiplicative power space. Baseline window at pct=0 maps to dB=0.
+
+    Inverse of `_logratio_to_pct(x/10)`. Used at the display layer only —
+    the per-trial substrate stays in % so the scorer (calibrated in %)
+    keeps working unchanged.
+    """
+    return 10.0 * np.log10(1.0 + pct / 100.0)
 
 
 def _plot_subject_6panel(subject, session_traces, out_path):
     """Plot 3 rows (Contra, Bilat, Ipsi) × 2 cols (MI, REST).
 
-    Y-axis is shared within each row so MI and REST are on the same
-    scale for direct visual comparison. X-axis is shared across all
-    panels.
+    Y-axis: ERD in dB (10·log10(P/P_baseline)), scale-symmetric in
+    multiplicative power space. Conversion from the underlying % substrate
+    happens here at display time only — per-trial npzs stay in % so the
+    scorer keeps reading rubric-correct values. Y-axis is shared within
+    each row so MI and REST are on the same scale for direct visual
+    comparison. X-axis is shared across all panels.
     """
     if not session_traces:
         return
@@ -458,17 +581,17 @@ def _plot_subject_6panel(subject, session_traces, out_path):
     n_sess = max(1, len(session_traces))
     # (row, class) -> (title, key_in_traces, cluster_for_legend)
     panel_specs = [
-        (0, "mi",   "Contralateral ERD% — MI",
+        (0, "mi",   "Contralateral ERD — MI",
          "contra_mi",   CONTRA_MOTOR_CLUSTER),
-        (0, "rest", "Contralateral ERD% — REST",
+        (0, "rest", "Contralateral ERD — REST",
          "contra_rest", CONTRA_MOTOR_CLUSTER),
-        (1, "mi",   "Bilateral ERD% — MI",
+        (1, "mi",   "Bilateral ERD — MI",
          "bilat_mi",    BILATERAL_MOTOR_CLUSTER),
-        (1, "rest", "Bilateral ERD% — REST",
+        (1, "rest", "Bilateral ERD — REST",
          "bilat_rest",  BILATERAL_MOTOR_CLUSTER),
-        (2, "mi",   "Ipsilateral ERD% — MI",
+        (2, "mi",   "Ipsilateral ERD — MI",
          "ipsi_mi",     IPSI_MOTOR_CLUSTER),
-        (2, "rest", "Ipsilateral ERD% — REST",
+        (2, "rest", "Ipsilateral ERD — REST",
          "ipsi_rest",   IPSI_MOTOR_CLUSTER),
     ]
     col_of_class = {"mi": 0, "rest": 1}
@@ -491,17 +614,20 @@ def _plot_subject_6panel(subject, session_traces, out_path):
             ptp_arr = ptp["per_trial_pct"] if ptp else None
             score_tag = _panel_score_tag(cls, times, mean_pct, ptp_arr)
             label = f"{sess} (n={n_trials}; {tag}){score_tag}"
-            ax.plot(times, mean_pct, color=color, label=label, linewidth=1.4)
-            ax.fill_between(times, low_pct, up_pct, color=color, alpha=0.15)
+            # Display in dB; per-trial % substrate stays unchanged on disk
+            # so the scorer keeps reading rubric-correct values.
+            mean_db = _pct_to_db(mean_pct)
+            low_db = _pct_to_db(low_pct)
+            up_db = _pct_to_db(up_pct)
+            ax.plot(times, mean_db, color=color, label=label, linewidth=1.4)
+            ax.fill_between(times, low_db, up_db, color=color, alpha=0.15)
             ax.set_title(title)
             ax.axhline(0, color="k", lw=0.6)
             ax.axvline(0, color="k", ls="--", lw=0.7)
             ax.axvline(1.0, color="k", ls=":", lw=0.7)
             ax.grid(True, alpha=0.25)
             drew = True
-        # y-label on the left column only (sharey="row" mirrors the
-        # tick labels)
-        axes[row][0].set_ylabel("ERD %")
+        axes[row][0].set_ylabel("ERD (dB)")
 
     if not drew:
         plt.close(fig)
@@ -591,9 +717,12 @@ def _plot_cohort_6panel(cohort_traces, out_path):
             ) if entries else None
             if stack is None or stack.size == 0:
                 continue
-            mean_pct = stack.mean(axis=0)
+            # Cohort grand mean per session in % space, then convert to dB
+            # at display time (matching the per-subject 6-panel convention).
+            cohort_mean_pct = stack.mean(axis=0)
+            cohort_mean_db = _pct_to_db(cohort_mean_pct)
             ax.plot(
-                t, mean_pct, color=colors[idx],
+                t, cohort_mean_db, color=colors[idx],
                 label=f"S{idx:03d} (n={stack.shape[0]} subj)",
                 linewidth=1.6,
             )
@@ -604,7 +733,7 @@ def _plot_cohort_6panel(cohort_traces, out_path):
         ax.grid(True, alpha=0.25)
         ax.legend(loc="best", fontsize=8)
         if col == 0:
-            ax.set_ylabel("ERD %")
+            ax.set_ylabel("ERD (dB)")
         if row == 2:
             ax.set_xlabel("Time (s)")
     fig.suptitle(
@@ -800,19 +929,24 @@ def main():
                     f"  {sess}: FAILED ({type(e).__name__}: {e})"
                 )
                 continue
-            tfr_trials = out["tfr_trials"]
-            # Per-trial artifact rejection (ERD-scoped — the shared pipeline is
-            # untouched). Mutates tfr_trials so the extracted traces, figure,
-            # and npz all see the cleaned trial set.
-            reject_report = _reject_artifact_trials(
-                tfr_trials, reject_z=TRIAL_REJECT_Z,
-            )
-            n_after_reject = sum(
-                int(t.data.shape[0]) for t in tfr_trials.values()
-            )
+            tfr_base = out["tfr_trials"]
+            # Cluster-matched per-trial artifact rejection runs INSIDE
+            # _extract_session_traces (each cluster gets its own pool;
+            # tfr_base is not mutated). The session-level n_after_reject
+            # reported here is taken from the bilateral pool (most
+            # stringent substrate; canonical G2 reads this single value).
             traces = _extract_session_traces(
-                tfr_trials, out.get("dropped_channels", []),
+                tfr_base, out.get("dropped_channels", []),
             )
+            per_cluster_report = traces.pop("_per_cluster_report", {})
+            bilat_rep = per_cluster_report.get("bilat", {})
+            n_after_reject = sum(
+                info["n_before"] - info["n_dropped"]
+                for info in bilat_rep.values()
+            ) if bilat_rep else out.get("n_kept", 0)
+            # Combined reject_report for the console line (per-cluster MI
+            # drops, the publication-line metric for quick scan).
+            reject_report = bilat_rep  # legacy compat: bilat treated as "the" report
             session_traces.append((sess, traces))
 
             # Per-trial side-car for the quality scorer. Written from the
@@ -864,7 +998,7 @@ def main():
                 f"({time.time()-t0:.1f}s)"
             )
             # Release heavy TFR objects immediately
-            del out, tfr_trials
+            del out, tfr_base
             gc.collect()
 
         if session_traces:
