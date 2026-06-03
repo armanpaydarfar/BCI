@@ -987,27 +987,27 @@ def task_report():
     subj = REPORT_SUBJECT_LABEL.get(
         SUBJECT, SUBJECT.replace("CLIN_SUBJ_", "Subject "))
 
-    # ---- (1) ERD/ERS timecourse — logratio, mean±SE, cluster-matched, re-zeroed
+    # ---- (1) ERD/ERS timecourse — logratio, mean±SE, cluster-matched, re-zeroed.
+    # Report version: one standalone 2-panel (MI | Rest) figure per cluster, so
+    # the write-up can include whichever cluster it needs. The diagnostic 6-panel
+    # (task_erdmean) keeps all three clusters in one figure. MI and Rest panels
+    # autoscale independently (desync is small, the Rest ERS is large).
     from Analyze_clinical_erd_refined import (
         MU_LO, MU_HI, MI_MARKER, REST_MARKER, config_a_pipeline,
         CONTRA_MOTOR_CLUSTER, BILATERAL_MOTOR_CLUSTER, IPSI_MOTOR_CLUSTER,
     )
     pipe = config_a_pipeline(SUBJECT, SESSION)
     tfr_base = pipe["tfr_trials"]
-    erd_rows = [("Contralateral", CONTRA_MOTOR_CLUSTER),
-                ("Bilateral", BILATERAL_MOTOR_CLUSTER),
-                ("Ipsilateral", IPSI_MOTOR_CLUSTER)]
+    erd_clusters = [("Contralateral", "contra", CONTRA_MOTOR_CLUSTER),
+                    ("Bilateral", "bilat", BILATERAL_MOTOR_CLUSTER),
+                    ("Ipsilateral", "ipsi", IPSI_MOTOR_CLUSTER)]
     erd_cols = [("Motor imagery", MI_MARKER), ("Rest", REST_MARKER)]
-    # sharey="col": the three MI panels share one y-scale and the three REST
-    # panels share another, so the MI desync autoscales to its own range (it
-    # would be squished if forced onto REST's large ERS scale) while clusters
-    # stay directly comparable within each class.
-    fig, axes = plt.subplots(3, 2, figsize=(11, 9), sharex=True, sharey="col")
-    for ri, (cname, chans) in enumerate(erd_rows):
+    for cname, ckey, chans in erd_clusters:
         tfr_c, _ = _reject_artifact_trials_for_cluster(
             tfr_base, chans, abs_cap=ERD_ABS_CAP)
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4), sharex=True)
         for ci, (clab, marker) in enumerate(erd_cols):
-            ax = axes[ri, ci]
+            ax = axes[ci]
             if marker not in tfr_c:
                 ax.set_visible(False)
                 continue
@@ -1026,19 +1026,17 @@ def task_report():
             ax.plot(t.times, mean, color="tab:blue", lw=1.6)
             ax.fill_between(t.times, mean - se, mean + se,
                             color="tab:blue", alpha=0.25)
-            if ri == 0:
-                ax.set_title(clab, fontsize=12)
-            if ci == 0:
-                ax.set_ylabel(f"{cname}\nERD/ERS (logratio)", fontsize=10)
-            if ri == 2:
-                ax.set_xlabel("Time from cue (s)")
+            ax.set_title(f"{clab}  (n={n})", fontsize=12)
+            ax.set_xlabel("Time from cue (s)")
             ax.grid(True, alpha=0.3)
-    fig.suptitle(f"{subj} — μ (8–13 Hz) ERD/ERS time course (mean ± SE)",
-                 fontsize=14)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
-    fig.savefig(rep / "erd_timecourse.png", dpi=150)
-    plt.close(fig)
-    print("  wrote erd_timecourse.png")
+        axes[0].set_ylabel("ERD/ERS (logratio)")
+        fig.suptitle(
+            f"{subj} — μ (8–13 Hz) ERD/ERS · {cname} motor cluster (mean ± SE)",
+            fontsize=13)
+        fig.tight_layout(rect=(0, 0, 1, 0.94))
+        fig.savefig(rep / f"erd_timecourse_{ckey}.png", dpi=150)
+        plt.close(fig)
+        print(f"  wrote erd_timecourse_{ckey}.png")
 
     # ---- (2) ERD/ERS topography (mu) — MI + REST strips, logratio grand-avg
     import generate_plots_config_a as gp
