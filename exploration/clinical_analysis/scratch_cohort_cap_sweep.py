@@ -153,6 +153,16 @@ def main():
         sessions = enumerate_online_sessions_for_subject(subject)
         print(f"\n=== {subject} ({len(sessions)} sessions) ===")
         for sess in sessions:
+            # Resume-aware: skip TFR compute if every cap variant has
+            # already produced its per-trial npz. Cheap, idempotent.
+            expected_npzs = [
+                PER_TRIAL_DIR / f"{subject}_{sess}_{tag}.npz"
+                for tag, _ in CAP_VARIANTS
+            ]
+            if all(p.exists() for p in expected_npzs):
+                print(f"  [skip] {sess}: all "
+                      f"{len(CAP_VARIANTS)} cap variants already exist")
+                continue
             t_sess = time.time()
             print(f"  [tfr] {sess} preprocess + TFR…")
             try:
