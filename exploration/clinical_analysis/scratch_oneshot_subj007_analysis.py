@@ -1026,7 +1026,7 @@ def task_report():
             ax.plot(t.times, mean, color="tab:blue", lw=1.6)
             ax.fill_between(t.times, mean - se, mean + se,
                             color="tab:blue", alpha=0.25)
-            ax.set_title(f"{clab}  (n={n})", fontsize=12)
+            ax.set_title(clab, fontsize=12)
             ax.set_xlabel("Time from cue (s)")
             ax.grid(True, alpha=0.3)
         axes[0].set_ylabel("ERD/ERS (logratio)")
@@ -1114,8 +1114,7 @@ def task_report():
     ax.set_ylim(-0.05, 1.05)
     ax.set_xlabel("Run")
     ax.set_ylabel("Metric")
-    n_tot = sum(int(m.get("n_total", 0)) for _, m in metric_rows)
-    ax.set_title(f"{subj} — decoder performance across runs (n={n_tot} trials)")
+    ax.set_title(f"{subj} — decoder performance across runs")
     ax.legend(loc="lower left", fontsize=9)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
