@@ -69,12 +69,14 @@ from generate_plots_config_a import preprocess_and_tfr  # noqa: E402
 from Analyze_clinical_erd_refined import (  # noqa: E402
     CONFIG_A_DISPLAY_BASELINE, MU_HI, MU_LO,
     _BAND_LABEL, _logratio_to_pct, _preproc_caption,
-    _reject_artifact_trials,
 )
 from exploration.clinical_analysis._helpers import (  # noqa: E402
     BILATERAL_MOTOR_CLUSTER, CONTRA_MOTOR_CLUSTER, IPSI_MOTOR_CLUSTER,
     enumerate_clin_subjects, enumerate_online_sessions_for_subject,
 )
+# Cluster-matched rejection helper from Phase 1 (notes-to-oneshot-agent Fix 1).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scratch_cohort_cap_sweep import reject_for_cluster  # noqa: E402
 
 
 # ----------------------------------------------------------------------
@@ -118,6 +120,19 @@ def _per_trial_cluster_trace(tfr, cluster_chs, unit):
     is averaged over (channels, freqs) per trial, yielding a
     (n_trials, n_time) substrate.
 
+    Logratio re-zero (notes-to-oneshot-agent Fix 2): MNE's
+    `apply_baseline(mode="logratio")` (generate_plots_config_a.py:154)
+    computes log10(P_t / arith_mean(P_baseline)) per (trial, ch, freq, time),
+    whose baseline-window mean is mean(log(P)) - log(mean(P)) ≤ 0 by Jensen.
+    For SUBJ_003 S001 bilat_mi this offset is ~-0.05 logratio units. The %
+    path is Jensen-free in linear space so it doesn't need this correction;
+    for the logratio path we subtract the per-trial baseline-window mean,
+    which is equivalent to using geomean(P_baseline) — the textbook
+    definition that the user expects from a logratio plot.
+
+    Baseline window is hardcoded to (-1, 0) per CONFIG_A_DISPLAY_BASELINE
+    (Analyze_clinical_erd_refined.py:CONFIG_A_DISPLAY_BASELINE).
+
     Returns (None, [], None) when the cluster has no channels present.
     """
     present = [c for c in cluster_chs if c in tfr.ch_names]
@@ -133,7 +148,13 @@ def _per_trial_cluster_trace(tfr, cluster_chs, unit):
     else:
         raise ValueError(f"unknown unit {unit!r}")
     per_trial = data.mean(axis=(1, 2))  # (n_trials, n_time)
-    return np.asarray(tfr.times, dtype=np.float64), present, per_trial
+    times = np.asarray(tfr.times, dtype=np.float64)
+    if unit == "log":
+        bmask = (times >= -1.0) & (times <= 0.0)
+        if bmask.any():
+            bl = per_trial[:, bmask].mean(axis=1, keepdims=True)
+            per_trial = per_trial - bl
+    return times, present, per_trial
 
 
 def _aggregate_trials(per_trial, aggregator):
@@ -163,22 +184,43 @@ def _aggregate_trials(per_trial, aggregator):
     return central, low, high
 
 
-def _extract_session_traces(tfr_trials, aggregator, unit):
-    """6-key traces dict for one session under one viz variant."""
+def _extract_session_traces(tfr_base, aggregator, unit, abs_cap,
+                            cluster_pools_cache=None):
+    """6-key traces dict for one session under one viz variant.
+
+    Cluster-matched rejection (notes-to-oneshot-agent Fix 1): each cluster
+    (contra/bilat/ipsi) gets its own rejected pool, derived from per-cluster
+    post-cue peak |ERD%| against `abs_cap`. The cluster's trace is extracted
+    from THAT cluster's pool, so cluster n_trials can differ within one
+    session.
+
+    `cluster_pools_cache` (optional) is a dict the caller can pass to share
+    the rejected pools across viz variants (rejection only depends on the
+    cap, not on aggregator/unit). Pass {} on the first call for a session;
+    reuse for subsequent variants of the same session.
+    """
+    if cluster_pools_cache is None:
+        cluster_pools_cache = {}
     cluster_specs = [
-        ("contra_mi",   CONTRA_MOTOR_CLUSTER,    MI_MARKER),
-        ("contra_rest", CONTRA_MOTOR_CLUSTER,    REST_MARKER),
-        ("bilat_mi",    BILATERAL_MOTOR_CLUSTER, MI_MARKER),
-        ("bilat_rest",  BILATERAL_MOTOR_CLUSTER, REST_MARKER),
-        ("ipsi_mi",     IPSI_MOTOR_CLUSTER,      MI_MARKER),
-        ("ipsi_rest",   IPSI_MOTOR_CLUSTER,      REST_MARKER),
+        ("contra_mi",   CONTRA_MOTOR_CLUSTER,    MI_MARKER,   "contra"),
+        ("contra_rest", CONTRA_MOTOR_CLUSTER,    REST_MARKER, "contra"),
+        ("bilat_mi",    BILATERAL_MOTOR_CLUSTER, MI_MARKER,   "bilat"),
+        ("bilat_rest",  BILATERAL_MOTOR_CLUSTER, REST_MARKER, "bilat"),
+        ("ipsi_mi",     IPSI_MOTOR_CLUSTER,      MI_MARKER,   "ipsi"),
+        ("ipsi_rest",   IPSI_MOTOR_CLUSTER,      REST_MARKER, "ipsi"),
     ]
     out = {}
-    for key, cluster, marker in cluster_specs:
-        if marker not in tfr_trials:
+    for key, cluster, marker, cluster_label in cluster_specs:
+        if cluster_label not in cluster_pools_cache:
+            tfr_cluster, _rej = reject_for_cluster(
+                tfr_base, cluster, abs_cap=abs_cap,
+            )
+            cluster_pools_cache[cluster_label] = tfr_cluster
+        tfr_pool = cluster_pools_cache[cluster_label]
+        if marker not in tfr_pool:
             out[key] = None
             continue
-        tfr = tfr_trials[marker]
+        tfr = tfr_pool[marker]
         times, present, per_trial = _per_trial_cluster_trace(
             tfr, cluster, unit,
         )
@@ -395,29 +437,34 @@ def main():
             except Exception as e:
                 print(f"    FAILED: {type(e).__name__}: {e}; skip session")
                 continue
-            tfr_trials = out["tfr_trials"]
+            tfr_base = out["tfr_trials"]
             dropped = out.get("dropped_channels", [])
             n_att = out.get("n_attempted", 0)
             n_kept = out.get("n_kept", 0)
-            # Apply the winner cap once; same rejected pool feeds all 3
-            # viz variants.
-            rej = _reject_artifact_trials(tfr_trials, abs_cap=cap_val)
-            n_after = sum(int(t.data.shape[0]) for t in tfr_trials.values())
-            rep = " ".join(
-                f"{m}:-{r['n_dropped']}"
-                + ("(capped)" if r["over_gate"] else "")
-                for m, r in rej.items()
-            ) or "—"
-            print(f"    n_kept={n_kept}/{n_att} reject={rep} "
-                  f"n_after={n_after}  ({time.time() - t_sess:.1f}s)")
+            print(f"    n_kept={n_kept}/{n_att} dropped={dropped or '—'} "
+                  f"({time.time() - t_sess:.1f}s)")
 
+            # Cluster-pools cache: rejection only depends on (cluster, cap),
+            # so we compute pools once per cluster and reuse across all 3
+            # viz variants (which differ only in aggregator+unit).
+            cluster_pools_cache: dict = {}
             for tag, aggregator, unit, _note in VIZ_VARIANTS:
-                traces = _extract_session_traces(tfr_trials, aggregator,
-                                                  unit)
+                traces = _extract_session_traces(
+                    tfr_base, aggregator, unit, cap_val,
+                    cluster_pools_cache=cluster_pools_cache,
+                )
+                # Per-key n_after_reject for the npz meta — bilat pool's
+                # MI count is the session-viability proxy (most stringent
+                # cluster substrate).
+                bilat_pool = cluster_pools_cache.get("bilat", {})
+                bilat_mi_n = (int(bilat_pool[MI_MARKER].data.shape[0])
+                              if MI_MARKER in bilat_pool else 0)
+                bilat_rest_n = (int(bilat_pool[REST_MARKER].data.shape[0])
+                                if REST_MARKER in bilat_pool else 0)
                 meta = {
                     "n_attempted": n_att,
                     "n_kept": n_kept,
-                    "n_after_reject": n_after,
+                    "n_after_reject": bilat_mi_n + bilat_rest_n,
                     "dropped_channels": dropped,
                     "aggregator": aggregator,
                     "unit": unit,
@@ -427,7 +474,15 @@ def main():
                     subject, sess, traces, meta,
                 )
                 per_subject_traces[subject][tag].append((sess, traces))
-            del out, tfr_trials
+            # Per-cluster MI drop summary for the console (one line/session).
+            line = []
+            for cl in ("contra", "bilat", "ipsi"):
+                pool = cluster_pools_cache.get(cl, {})
+                n_after_mi = (int(pool[MI_MARKER].data.shape[0])
+                              if MI_MARKER in pool else 0)
+                line.append(f"{cl}_mi={n_after_mi}")
+            print(f"    cluster-matched pools (MI): " + " ".join(line))
+            del out, tfr_base, cluster_pools_cache
             gc.collect()
 
     # Render per-subject × per-variant 6-panel figures.

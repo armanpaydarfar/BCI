@@ -54,7 +54,8 @@ warnings.filterwarnings("ignore")
 # Canonical imports (read-only; no edits to these files).
 from generate_plots_config_a import preprocess_and_tfr  # noqa: E402
 from Analyze_clinical_erd_refined import (  # noqa: E402
-    CONFIG_A_DISPLAY_BASELINE, _cluster_timecourse,
+    CONFIG_A_DISPLAY_BASELINE, MU_HI, MU_LO,
+    _cluster_timecourse, _logratio_to_pct,
     _reject_artifact_trials, _write_per_trial_npz,
 )
 from exploration.clinical_analysis._helpers import (  # noqa: E402
@@ -94,34 +95,110 @@ CANONICAL_NPZ_DIR = Path(
 )
 
 
-def _extract_canonical_traces(tfr_trials, dropped_channels):
-    """Canonical cluster definitions; trace shape mirrors
-    Analyze_clinical_erd_refined._extract_session_traces:325-365."""
+def reject_for_cluster(tfr_trials, cluster_chs,
+                       reject_z=5.0, max_frac=0.50, abs_cap=200.0):
+    """Cluster-substrate-parameterized version of
+    Analyze_clinical_erd_refined._reject_artifact_trials (file:line
+    158-263). Returns a NEW dict of EpochsTFR (does not mutate input)
+    plus a per-marker report. Logic mirrors the canonical helper
+    line-for-line, except `present` is filtered against the supplied
+    `cluster_chs` instead of the hardcoded BILATERAL_MOTOR_CLUSTER
+    (canonical file:line 210). Local helper, not a canonical edit.
+
+    The rejection decision per trial is:
+      * abs_drop: per-trial cluster-mean post-cue peak |ERD%| > abs_cap
+      * z_drop:   |robust-z over the cluster scalar| > reject_z
+      * if more than max_frac of trials qualify, only the max_frac
+        WORST offenders (largest cluster scalar) are dropped; over_gate
+        flag is set so the caller can mark G2 if needed.
+    """
+    new_trials = {}
+    report = {}
+    for marker, tfr in tfr_trials.items():
+        n_before = int(tfr.data.shape[0])
+        info = {"n_before": n_before, "n_dropped": 0,
+                "kept": True, "over_gate": False}
+        report[marker] = info
+        new_trials[marker] = tfr  # default to no-op
+        if reject_z <= 0 or n_before < 4:
+            continue
+        present = [c for c in cluster_chs if c in tfr.ch_names]
+        if not present:
+            continue
+        ch_idxs = [tfr.ch_names.index(c) for c in present]
+        fmask = (tfr.freqs >= MU_LO) & (tfr.freqs <= MU_HI)
+        pct = _logratio_to_pct(
+            tfr.data[:, ch_idxs][:, :, fmask],
+        ).mean(axis=(1, 2))
+        tmask = tfr.times >= 0.0
+        scalar = np.max(np.abs(pct[:, tmask]), axis=1)
+        abs_drop = scalar > abs_cap
+        med = np.median(scalar)
+        mad = np.median(np.abs(scalar - med))
+        if mad > 0:
+            z = (scalar - med) / (1.4826 * mad)
+            z_drop = np.abs(z) > reject_z
+        else:
+            z_drop = np.zeros_like(scalar, dtype=bool)
+        drop = z_drop | abs_drop
+        n_drop = int(drop.sum())
+        if n_drop == 0:
+            continue
+        max_drop = int(np.floor(max_frac * n_before))
+        if n_drop > max_drop:
+            info["over_gate"] = True
+            worst = np.argsort(scalar)[::-1][:max_drop]
+            keep_mask = np.ones(n_before, dtype=bool)
+            keep_mask[worst] = False
+            n_drop = max_drop
+        else:
+            keep_mask = ~drop
+        if n_drop == 0:
+            continue
+        new_trials[marker] = tfr[np.where(keep_mask)[0]]
+        info["n_dropped"] = n_drop
+    return new_trials, report
+
+
+def _extract_cluster_matched_traces(tfr_base, dropped_channels, abs_cap):
+    """Cluster-matched rejection + extraction. For each cluster ∈
+    {bilat, contra, ipsi}, re-runs rejection with that cluster as the
+    substrate and extracts THAT cluster's traces from THAT cluster's
+    cleaned pool. Each cluster_marker key ends up with its own n_trials.
+
+    Returns (traces, per_cluster_report) where per_cluster_report is
+    {cluster: {marker: {n_before, n_dropped, over_gate}}}.
+    """
     cluster_specs = [
-        ("contra_mi",   CONTRA_MOTOR_CLUSTER,    MI_MARKER),
-        ("contra_rest", CONTRA_MOTOR_CLUSTER,    REST_MARKER),
-        ("bilat_mi",    BILATERAL_MOTOR_CLUSTER, MI_MARKER),
-        ("bilat_rest",  BILATERAL_MOTOR_CLUSTER, REST_MARKER),
-        ("ipsi_mi",     IPSI_MOTOR_CLUSTER,      MI_MARKER),
-        ("ipsi_rest",   IPSI_MOTOR_CLUSTER,      REST_MARKER),
+        ("contra", CONTRA_MOTOR_CLUSTER),
+        ("bilat",  BILATERAL_MOTOR_CLUSTER),
+        ("ipsi",   IPSI_MOTOR_CLUSTER),
     ]
     traces = {"dropped_channels": list(dropped_channels)}
     per_trial: dict = {}
-    for key, cluster, marker in cluster_specs:
-        res = _cluster_timecourse(tfr_trials, cluster, marker,
-                                  return_per_trial=True)
-        if res is None:
-            traces[key] = None
-            continue
-        times, mean_pct, low_pct, up_pct, n, present, ptp = res
-        traces[key] = (times, mean_pct, low_pct, up_pct, n, present)
-        per_trial[key] = {
-            "per_trial_pct": ptp,
-            "times": times,
-            "channels_used": present,
-        }
+    per_cluster_report: dict = {}
+    for cluster_label, cluster_chs in cluster_specs:
+        tfr_cluster, rej = reject_for_cluster(
+            tfr_base, cluster_chs, abs_cap=abs_cap,
+        )
+        per_cluster_report[cluster_label] = rej
+        for marker_label, marker in (("mi", MI_MARKER),
+                                      ("rest", REST_MARKER)):
+            key = f"{cluster_label}_{marker_label}"
+            res = _cluster_timecourse(tfr_cluster, cluster_chs, marker,
+                                      return_per_trial=True)
+            if res is None:
+                traces[key] = None
+                continue
+            times, mean_pct, low_pct, up_pct, n, present, ptp = res
+            traces[key] = (times, mean_pct, low_pct, up_pct, n, present)
+            per_trial[key] = {
+                "per_trial_pct": ptp,
+                "times": times,
+                "channels_used": present,
+            }
     traces["per_trial"] = per_trial
-    return traces
+    return traces, per_cluster_report
 
 
 def _write_csv(rows, csv_path):
@@ -179,13 +256,27 @@ def main():
                   f"({time.time() - t_sess:.1f}s)")
 
             for variant_tag, cap_val in CAP_VARIANTS:
-                tfr_var = dict(tfr_base)  # shallow — see header comment
-                rej = _reject_artifact_trials(tfr_var, abs_cap=cap_val)
-                n_after = sum(int(t.data.shape[0])
-                              for t in tfr_var.values())
-                all_reject_reports[(subject, sess, variant_tag)] = rej
-                n_after_by[(subject, sess, variant_tag)] = n_after
-                traces = _extract_canonical_traces(tfr_var, dropped)
+                # Cluster-matched rejection: contra/bilat/ipsi each get
+                # their own kept-trial pool, derived from per-cluster
+                # post-cue peak |ERD%|. Avoids dilution mismatch where a
+                # focal-spike trial passes bilat-8 averaging but fails
+                # contra-4 (notes-to-oneshot-agent-2026-06-03.md Fix 1).
+                traces, per_cluster_rej = _extract_cluster_matched_traces(
+                    tfr_base, dropped, cap_val,
+                )
+                # Session-level n_after_reject (for the npz meta the
+                # scorer reads for G2): use the bilat pool, the most
+                # stringent substrate. Keeps canonical G2 semantics
+                # without modifying evaluate_erd_quality.
+                bilat_rej = per_cluster_rej.get("bilat", {})
+                n_after_bilat = sum(
+                    info["n_before"] - info["n_dropped"]
+                    for info in bilat_rej.values()
+                ) if bilat_rej else n_kept
+                all_reject_reports[(subject, sess, variant_tag)] = (
+                    per_cluster_rej
+                )
+                n_after_by[(subject, sess, variant_tag)] = n_after_bilat
                 _write_per_trial_npz(
                     PER_TRIAL_DIR
                     / f"{subject}_{sess}_{variant_tag}.npz",
@@ -193,18 +284,23 @@ def main():
                     {
                         "n_attempted": n_att,
                         "n_kept": n_kept,
-                        "n_after_reject": n_after,
+                        "n_after_reject": n_after_bilat,
                         "dropped_channels": dropped,
                     },
                 )
-                rep = " ".join(
-                    f"{m}:-{r['n_dropped']}"
-                    + ("(capped)" if r["over_gate"] else "")
-                    for m, r in rej.items()
-                ) or "—"
+                # Console: per-cluster drop counts on the MI marker
+                # (the publication-line metric) for quick scan.
+                line = []
+                for cl in ("contra", "bilat", "ipsi"):
+                    rep = per_cluster_rej.get(cl, {}).get(MI_MARKER, {})
+                    nd = rep.get("n_dropped", 0)
+                    nb = rep.get("n_before", 0)
+                    capped = "*" if rep.get("over_gate") else ""
+                    line.append(f"{cl}_mi:-{nd}/{nb}{capped}")
                 print(f"    [{variant_tag} cap={cap_val:.0f}%] "
-                      f"n_after={n_after} reject={rep}")
-                del tfr_var, traces
+                      f"n_after_bilat={n_after_bilat}  "
+                      + " ".join(line))
+                del traces
             del out, tfr_base
             gc.collect()
 
@@ -225,22 +321,30 @@ def main():
               f"{len(rows)} rows, {elig} eligible")
 
     # ------------------------------------------------------------------
-    # Stage C — cap=600 vs canonical sanity gate.
+    # Stage C — cap=600 vs canonical sanity gate (BILAT ROWS ONLY).
+    # Under cluster-matched rejection (notes-to-oneshot-agent Fix 1),
+    # contra/ipsi rows use cluster-specific rejection pools — they will
+    # NOT match the canonical run (which used bilat substrate for every
+    # cluster). Only the bilat row's substrate is identical to canonical;
+    # only it can be sanity-checked to 4 dp.
     # ------------------------------------------------------------------
-    print("\n=== cap=600 vs canonical sanity check ===")
+    print("\n=== cap=600 vs canonical sanity check (bilat rows only) ===")
     canonical_rows = score_dir(CANONICAL_NPZ_DIR, variant="_car")
     canonical_by_key = {
         (r["subject"], r["session"], r["cluster"]): r
-        for r in canonical_rows
+        for r in canonical_rows if r["cluster"] == "bilat"
     }
     cap600_by_key = {
         (r["subject"], r["session"], r["cluster"]): r
-        for r in scorecards["cap600"]
+        for r in scorecards["cap600"] if r["cluster"] == "bilat"
     }
     sanity_lines = [
         "# cap600 vs canonical /clin_analysis/erd_refined/per_trial/*_car.npz",
-        "# (per_trial substrates were independently regenerated; 4 dp match",
-        "#  confirms reproduction)",
+        "# BILAT ROWS ONLY — under cluster-matched rejection, contra/ipsi",
+        "# use a different rejection substrate than canonical and are not",
+        "# expected to match. Bilat substrate is identical to canonical so",
+        "# a 4 dp match here proves the cluster-matched helper reproduces",
+        "# the canonical bilat path.",
         "",
     ]
     max_abs_diff = 0.0
