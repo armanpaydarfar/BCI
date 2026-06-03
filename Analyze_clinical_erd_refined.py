@@ -627,12 +627,16 @@ def _plot_subject_6panel(subject, session_traces, out_path):
             ax.axvline(1.0, color="k", ls=":", lw=0.7)
             ax.grid(True, alpha=0.25)
             drew = True
-        axes[row][0].set_ylabel("ERD (dB)")
 
     if not drew:
         plt.close(fig)
         return
 
+    # Y-label on the left column of every row (was previously inside the
+    # outer session loop with row=2 leaking from the inner loop, so only
+    # the bottom row got labelled).
+    for r in range(3):
+        axes[r][0].set_ylabel("ERD (dB)")
     for ax in axes[-1]:
         ax.set_xlabel("Time (s)")
     # Legends on both columns: the MI and REST legends now carry different
