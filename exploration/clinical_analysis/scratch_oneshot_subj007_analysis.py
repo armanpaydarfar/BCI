@@ -54,6 +54,15 @@ SESSION = "S001ONLINE"
 ONESHOT_ROOT = r"C:\Users\arman\Documents\oneshot"
 OUT_ROOT = Path(r"C:\Users\arman\Pictures\clin_analysis_oneshot")
 
+# External-facing (shipped report_figures/) subject labels. The oneshot study
+# re-numbers its participants 001, 002, ... for publication so the real CLIN
+# cohort IDs (007, 008) are not exposed. Internal/diagnostic figures keep the
+# real ID. Only task_report uses this map.
+REPORT_SUBJECT_LABEL = {
+    "CLIN_SUBJ_007": "Subject 001",
+    "CLIN_SUBJ_008": "Subject 002",
+}
+
 # Per-trial absolute ERD% reject cap. Lowered from the canonical 600% to 200%
 # (the G1 outlier threshold) for this artifact-heavy oneshot data, per Arman /
 # the cohort-wide cap sweep on 2026-06-03. Applied by passing abs_cap to the
@@ -974,7 +983,9 @@ def task_report():
 
     rep = OUT_ROOT / "report_figures"
     rep.mkdir(parents=True, exist_ok=True)
-    subj = SUBJECT.replace("CLIN_SUBJ_", "Subject ")
+    # Masked, external-facing label (CLIN_SUBJ_007 -> "Subject 001").
+    subj = REPORT_SUBJECT_LABEL.get(
+        SUBJECT, SUBJECT.replace("CLIN_SUBJ_", "Subject "))
 
     # ---- (1) ERD/ERS timecourse — logratio, mean±SE, cluster-matched, re-zeroed
     from Analyze_clinical_erd_refined import (
