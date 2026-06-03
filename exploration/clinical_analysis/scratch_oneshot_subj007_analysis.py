@@ -1062,11 +1062,13 @@ def task_report():
         name = Path(save_path).name
         if name.startswith("cohort_eds_mi"):
             _orig_panel(z_vec, channels,
-                        f"{subj} — EDS (expert divergence) · Motor imagery (μ)",
+                        f"{subj} — EDS (electrode discriminancy score) · "
+                        f"Motor imagery (μ)",
                         str(rep / "eds_mi.png"), *a, **k)
         elif name.startswith("cohort_eds_rest"):
             _orig_panel(z_vec, channels,
-                        f"{subj} — EDS (expert divergence) · Rest (μ)",
+                        f"{subj} — EDS (electrode discriminancy score) · "
+                        f"Rest (μ)",
                         str(rep / "eds_rest.png"), *a, **k)
         # other panels (diffs) intentionally not shipped
 
