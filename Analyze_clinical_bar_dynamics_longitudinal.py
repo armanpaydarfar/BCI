@@ -64,10 +64,9 @@ import pandas as pd
 
 # Fallback shutout (seconds) when a run lacks config_snapshot.json.
 # Standard CLIN_SUBJ_003..008 runs logged CLASSIFY_WINDOW = 1000 ms;
-# CLIN_SUBJ_002 logged 500 ms — read per-run from the snapshot when
-# available (see `_run_shutout_s`).
+# CLIN_SUBJ_002 logged 500 ms (sourced from the unified module so the
+# five SUBJ_002-special-casing scripts stay in sync).
 _DEFAULT_SHUTOUT_S = 1.0
-_CLIN002_SHUTOUT_S = 0.5
 
 _REPO_ROOT = Path(__file__).resolve().parent
 for _p in (str(_REPO_ROOT),):
@@ -75,9 +74,10 @@ for _p in (str(_REPO_ROOT),):
         sys.path.insert(0, _p)
 
 from exploration.clinical_analysis._helpers import (  # noqa: E402
-    DATA_DIR, clin_pictures_root, enumerate_clin_subjects,
+    clin_pictures_root, enumerate_clin_subjects,
     enumerate_online_sessions_for_subject, session_idx_from_label,
 )
+from config import DATA_DIR  # noqa: E402  (moved out of _helpers in 17f6508)
 
 from Analyze_experiment_logs_cross_subject import (  # noqa: E402
     build_unified_prob_cols, compute_lean16hz_per_trial, find_decoder_csv,
@@ -104,12 +104,18 @@ CLASSIFIER_HZ = 16.0
 # Bonferroni α' across the longitudinal pack (longitudinal-plan §5).
 BONFERRONI_ALPHA_PRIMARY = 0.05 / 8
 
-# CLIN_SUBJ_002 used the older runtime with INTEGRATOR_ALPHA = 0.95 and
-# only logs instantaneous P(MI)/P(REST) (rev01-paper-angle.md §1.1).
+# CLIN_SUBJ_002 protocol divergences sourced from the unified module
+# (exploration/clinical_analysis/_subj002.py) so changes to her
+# protocol assumptions propagate consistently across the analysis pack.
 # Replicates LeakyIntegrator.update at
 # `Utils/experiment_utils.py:51-69`: a = a * alpha + p * (1 - alpha),
 # initial state a = 0.5.
-CLIN002_INTEGRATOR_ALPHA = 0.95
+from exploration.clinical_analysis._subj002 import (  # noqa: E402
+    SUBJ002_INTEGRATOR_ALPHA as CLIN002_INTEGRATOR_ALPHA,
+    SUBJ002_CLASSIFY_WINDOW_MS,
+    is_subj002,
+)
+_CLIN002_SHUTOUT_S = SUBJ002_CLASSIFY_WINDOW_MS / 1000.0
 
 
 def _leaky_integrate(p: np.ndarray, alpha: float) -> np.ndarray:

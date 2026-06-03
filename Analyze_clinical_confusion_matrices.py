@@ -29,9 +29,11 @@ for _p in (str(_REPO_ROOT),):
         sys.path.insert(0, _p)
 
 from exploration.clinical_analysis._helpers import (  # noqa: E402
-    DATA_DIR, clin_pictures_root, enumerate_clin_subjects,
+    clin_pictures_root, enumerate_clin_subjects,
     enumerate_online_sessions_for_subject,
 )
+from config import DATA_DIR  # noqa: E402  (moved out of _helpers in 17f6508)
+from exploration.clinical_analysis._subj002 import is_subj002  # noqa: E402
 
 from Analyze_experiment_logs_cross_subject import (  # noqa: E402
     compute_confusion_matrix_from_csv, find_decoder_csv,
@@ -146,8 +148,9 @@ def main():
         print(f"  wrote: {save_path.name}")
 
         # Cohort sum excludes CLIN_SUBJ_002 (different decoder channel
-        # count / shrinkage; per rev01-paper-angle.md §1.1).
-        if subject != "CLIN_SUBJ_002":
+        # count / shrinkage; per rev01-paper-angle.md §1.1 and
+        # exploration/clinical_analysis/_subj002.py).
+        if not is_subj002(subject):
             cohort_cm += cm
             cohort_runs += n_runs
             cohort_sessions += n_sess

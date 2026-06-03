@@ -63,10 +63,13 @@ for _p in (str(_REPO_ROOT), str(_SWEEP_DIR)):
         sys.path.insert(0, _p)
 
 from exploration.clinical_analysis._helpers import (  # noqa: E402
-    DATA_DIR,
     clin_pictures_root,
     enumerate_clin_subjects,
     enumerate_online_sessions_for_subject,
+)
+from config import DATA_DIR  # noqa: E402  (moved out of _helpers in 17f6508)
+from exploration.clinical_analysis._subj002 import (  # noqa: E402
+    SUBJ002_USE_LEDOITWOLF, is_subj002,
 )
 
 # Config A preprocessing constants (sweep_phase2_round2.py:63-73)
@@ -671,8 +674,9 @@ def per_session_eds(
         return None, motor_kept, 0
 
     # CLIN_SUBJ_002 used LedoitWolf + 0.1 shrinkage per its
-    # config_snapshot.json (rev01-paper-angle.md §1.1).
-    use_lw = (subject == "CLIN_SUBJ_002")
+    # config_snapshot.json (rev01-paper-angle.md §1.1, unified in
+    # exploration/clinical_analysis/_subj002.py SUBJ002_USE_LEDOITWOLF).
+    use_lw = is_subj002(subject)
     shr = 0.1 if use_lw else 0.02
     covs = trial_covs(
         data_motor, use_ledoitwolf=use_lw, shrinkage_param=shr,
@@ -994,7 +998,7 @@ def run_for_band(
         # significance/raw columns at the end).
         rows = df_cached.to_dict("records")
         for subject in cohort_subjects:
-            if subject == "CLIN_SUBJ_002" and not include_clin002:
+            if is_subj002(subject) and not include_clin002:
                 continue
             sub = df_cached[df_cached.subject == subject].dropna(
                 subset=["channel", "eds"],
@@ -1027,7 +1031,7 @@ def run_for_band(
             print(f"  {subject}: loaded EDS from CSV ({len(common)} ch)")
     else:
         for subject in cohort_subjects:
-            if subject == "CLIN_SUBJ_002" and not include_clin002:
+            if is_subj002(subject) and not include_clin002:
                 continue
             sessions = enumerate_online_sessions_for_subject(subject)
             print(f"\n=== {subject} ({band_label}, {len(sessions)} sessions) ===")

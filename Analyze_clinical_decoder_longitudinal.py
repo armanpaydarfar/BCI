@@ -49,9 +49,10 @@ for _p in (str(_REPO_ROOT),):
         sys.path.insert(0, _p)
 
 from exploration.clinical_analysis._helpers import (  # noqa: E402
-    DATA_DIR, clin_pictures_root, enumerate_clin_subjects,
+    clin_pictures_root, enumerate_clin_subjects,
     enumerate_online_sessions_for_subject, session_idx_from_label,
 )
+from config import DATA_DIR  # noqa: E402  (moved out of _helpers in 17f6508)
 
 # Reuse parsing helpers from existing cross-subject analyser
 from Analyze_experiment_logs_cross_subject import (  # noqa: E402
@@ -81,11 +82,13 @@ except Exception:
 # acc_decided, Lean_MI, Lean_REST).
 BONFERRONI_ALPHA_PRIMARY = 0.05 / 8
 
-# CLIN_SUBJ_002 used the older runtime with INTEGRATOR_ALPHA = 0.95 and
-# only logs instantaneous P(MI)/P(REST) (rev01-paper-angle.md §1.1).
-# This matches `LeakyIntegrator` at `Utils/experiment_utils.py:51-69`:
+# CLIN_SUBJ_002 protocol divergences sourced from the unified module
+# (exploration/clinical_analysis/_subj002.py). This matches
+# `LeakyIntegrator` at `Utils/experiment_utils.py:51-69`:
 #   a = a * alpha + p * (1 - alpha),  init 0.5.
-CLIN002_INTEGRATOR_ALPHA = 0.95
+from exploration.clinical_analysis._subj002 import (  # noqa: E402
+    SUBJ002_INTEGRATOR_ALPHA as CLIN002_INTEGRATOR_ALPHA,
+)
 
 
 def _bonferroni_verdict(p: float, alpha: float = BONFERRONI_ALPHA_PRIMARY) -> str:

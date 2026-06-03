@@ -87,11 +87,11 @@ for _p in (str(_REPO_ROOT), str(_SWEEP_DIR)):
         sys.path.insert(0, _p)
 
 from exploration.clinical_analysis._helpers import (  # noqa: E402
-    DATA_DIR,
     enumerate_clin_subjects,
     enumerate_online_sessions_for_subject,
     session_idx_from_label,
 )
+from config import DATA_DIR  # noqa: E402  (moved out of _helpers in 17f658)
 from exploration.clinical_analysis.gr_replay import (  # noqa: E402
     GRState,
     gr_apply,
@@ -146,15 +146,6 @@ MOTOR_CHANNELS_15 = [
     "P7",  "P3",  "Pz", "P4", "P8", "POz",
 ]
 
-# CLIN_SUBJ_002 used the older `select_motor_channels(raw,
-# keep_prefixes=("CP","P","C"))` convention (verified at git c5d2886
-# `Utils/preprocessing.py`). From the 30-channel cap after drop_fp
-# removes Fp1/Fpz/Fp2, the surviving channels starting with C/CP/P are:
-MOTOR_CHANNELS_13 = [
-    "C3", "Cz", "C4", "CP5", "CP1", "CP2", "CP6",
-    "P7", "P3", "Pz", "P4", "P8", "POz",
-]
-
 # Run-boundary detection: a >30-s gap between consecutive trial-start
 # markers (codes 100/200) indicates a new ONLINE_* driver process.
 # Calibrated on CLIN_SUBJ_005/S001ONLINE (5 detected boundaries → 6
@@ -167,9 +158,16 @@ RUN_GAP_THRESHOLD_S = 30.0
 BONFERRONI_N_PRIMARY = 6
 BONFERRONI_ALPHA = 0.05 / BONFERRONI_N_PRIMARY  # ≈ 0.00833
 
-# CLIN_SUBJ_002 right-arm sessions (S001 is left-arm; markers 100/200
-# carry opposite semantic content and must be excluded from the cohort).
-CLIN002_RIGHT_ARM_SESSIONS = {"S002ONLINE", "S003ONLINE", "S004ONLINE"}
+# CLIN_SUBJ_002 protocol divergences (motor channel set, right-arm
+# valid sessions, LedoitWolf shrinkage) live in the shared module so
+# the five clinical-analysis scripts that special-case her stay in
+# sync (see exploration/clinical_analysis/_subj002.py).
+from exploration.clinical_analysis._subj002 import (  # noqa: E402
+    SUBJ002_MOTOR_CHANNELS_13 as _SUBJ002_MOTOR_CHANNELS_13,
+    subj002_valid_sessions as _subj002_valid_sessions,
+)
+MOTOR_CHANNELS_13 = list(_SUBJ002_MOTOR_CHANNELS_13)
+CLIN002_RIGHT_ARM_SESSIONS = set(_subj002_valid_sessions())
 
 
 # ----------------------------------------------------------------------
