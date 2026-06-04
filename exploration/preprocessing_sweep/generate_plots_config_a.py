@@ -364,8 +364,16 @@ def plot_grand_topo(all_subject_tfrs, out_dir):
 # ======================================================================
 
 def _rejected_marker_avgs(tfr_trials):
-    """Apply the canonical cap=200 bilateral-cluster (log-space) rejection,
-    then average each marker. Returns {marker: (AverageTFR, n_kept)}.
+    """Apply the canonical cap=200 bilateral-cluster (log-space) rejection and
+    a per-channel baseline re-zero, then average each marker. Returns
+    {marker: (AverageTFR, n_kept)}.
+
+    The re-zero subtracts each trial/channel/freq's baseline-window mean of the
+    logratio (the geometric-mean baseline), so the topomap sits at 0 in the
+    pre-cue window like the erd_refined timecourse — without it, MNE's
+    arithmetic-mean logratio baseline carries the Jensen offset (~-12% / -0.5 dB),
+    leaving the topomaps ~12% deeper than the re-zeroed timecourses. A
+    contra-cluster check confirmed this re-zero brings the two into agreement.
 
     Lazy imports keep this module importable by `Analyze_clinical_erd_refined`
     (which imports `preprocess_and_tfr` from here) without a circular import.
@@ -375,11 +383,17 @@ def _rejected_marker_avgs(tfr_trials):
     rejected, _rep = _reject_artifact_trials_for_cluster(
         tfr_trials, BILATERAL_MOTOR_CLUSTER,
     )
+    bl0, bl1 = CONFIG_A["spectral_baseline"]
     out = {}
     for marker, tfr in rejected.items():
         n = int(tfr.data.shape[0])
-        if n > 0:
-            out[marker] = (tfr.average(), n)
+        if n == 0:
+            continue
+        bmask = (tfr.times >= bl0) & (tfr.times <= bl1)
+        tfr = tfr.copy()
+        tfr.data = tfr.data - tfr.data[:, :, :, bmask].mean(axis=3,
+                                                            keepdims=True)
+        out[marker] = (tfr.average(), n)
     return out
 
 
