@@ -182,6 +182,17 @@ def _per_trial_cluster_logratio(tfr, cluster_channels):
     standard dB ERSP convention, so the timecourse, topomap and neuromod
     longitudinal scalar agree by construction.
 
+    Each trial's baseline window is re-zeroed in log space (subtract the
+    per-trial baseline-window mean). This is required for log-space averaging:
+    MNE's `apply_baseline(mode="logratio")` normalises by the ARITHMETIC mean
+    of baseline power, so the baseline-window mean of the logratio is
+    `mean(log P) - log(mean P)`, which is < 0 by Jensen's inequality (~-0.05
+    logratio ≈ -0.5 dB). The old %-first averaging cancelled this exactly in
+    linear space; log-space averaging does not, so without re-zeroing the
+    baseline sits below 0. Subtracting the per-trial baseline-window mean
+    redefines the reference as the GEOMETRIC mean of baseline power (the
+    standard dB ERSP baseline), so the baseline is 0 by construction.
+
     Returns (per_trial_logratio, present_channels) or (None, []) if no
     cluster channel survived.
     """
@@ -191,6 +202,10 @@ def _per_trial_cluster_logratio(tfr, cluster_channels):
     ch_idxs = [tfr.ch_names.index(c) for c in present]
     fmask = (tfr.freqs >= MU_LO) & (tfr.freqs <= MU_HI)
     log = tfr.data[:, ch_idxs][:, :, fmask].mean(axis=(1, 2))
+    bl0, bl1 = CONFIG_A_DISPLAY_BASELINE["spectral_baseline"]
+    bmask = (tfr.times >= bl0) & (tfr.times <= bl1)
+    if bmask.any():
+        log = log - log[:, bmask].mean(axis=1, keepdims=True)
     return log, present
 
 
