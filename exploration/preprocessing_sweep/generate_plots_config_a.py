@@ -32,6 +32,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import mne
 
+# Make the repo root and this sweep dir importable when run as a script
+# (so `Utils.*`, `exploration.*` and the sweep-local modules all resolve).
+# Idempotent no-op when imported by a caller that already set up sys.path.
+import sys
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
+for _p in (_REPO_ROOT, _THIS_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from sweep_phase2_round2 import (
     apply_blink_removal, apply_spatial_filter,
     ZONES,
@@ -238,6 +248,36 @@ def _build_session_avg_tfr(avg_tfrs):
     return grand
 
 
+def _pool_avgs_weighted(avg_n_list):
+    """n-weighted grand-average of AverageTFRs over a channel intersection.
+
+    In logratio space the n-weighted mean of per-session averages equals the
+    exact trial-pooled mean, so this pools CLIN_SUBJ_002's same-day S003+S004
+    into one session-2 topomap without concatenating EpochsTFR. `avg_n_list`
+    is a list of (AverageTFR, n_trials). Returns one AverageTFR or None.
+    """
+    avg_n_list = [(a, n) for a, n in avg_n_list if a is not None and n > 0]
+    if not avg_n_list:
+        return None
+    avgs = [a for a, _ in avg_n_list]
+    if len(avgs) == 1:
+        return avgs[0]
+    common_set = set(avgs[0].ch_names)
+    for a in avgs[1:]:
+        common_set &= set(a.ch_names)
+    common = [c for c in avgs[0].ch_names if c in common_set]
+    if not common:
+        return None
+    aligned = [a.copy().pick(common, verbose=False) for a in avgs]
+    w = np.array([n for _, n in avg_n_list], dtype=float)
+    w /= w.sum()
+    stack = np.stack([a.data for a in aligned], axis=0)
+    grand = aligned[0].copy()
+    grand.data = np.tensordot(w, stack, axes=(0, 0))
+    grand.nave = int(sum(n for _, n in avg_n_list))
+    return grand
+
+
 def plot_session_topos(subject, session, tfr_avg, out_dir):
     rest = tfr_avg.get("100"); mi = tfr_avg.get("200")
     vlim = _compute_dynamic_vlim(rest, mi)
@@ -323,43 +363,84 @@ def plot_grand_topo(all_subject_tfrs, out_dir):
 # Main
 # ======================================================================
 
+def _rejected_marker_avgs(tfr_trials):
+    """Apply the canonical cap=200 bilateral-cluster (log-space) rejection,
+    then average each marker. Returns {marker: (AverageTFR, n_kept)}.
+
+    Lazy imports keep this module importable by `Analyze_clinical_erd_refined`
+    (which imports `preprocess_and_tfr` from here) without a circular import.
+    """
+    from Analyze_clinical_erd_refined import _reject_artifact_trials_for_cluster
+    from exploration.clinical_analysis._helpers import BILATERAL_MOTOR_CLUSTER
+    rejected, _rep = _reject_artifact_trials_for_cluster(
+        tfr_trials, BILATERAL_MOTOR_CLUSTER,
+    )
+    out = {}
+    for marker, tfr in rejected.items():
+        n = int(tfr.data.shape[0])
+        if n > 0:
+            out[marker] = (tfr.average(), n)
+    return out
+
+
 def main():
     print(f"Output root: {OUT_ROOT}")
     print(f"Config A: {CONFIG_A}")
+    # Feature-family policy for CLIN_SUBJ_002 (ERD is decoder-independent):
+    # drop S001 (left arm); S003+S004 (same day) pool into one timepoint.
+    from exploration.clinical_analysis._helpers import session_idx_from_label
+    from exploration.clinical_analysis._subj002 import (
+        is_subj002, subj002_feature_idx, subj002_feature_sessions,
+    )
     all_subject_tfrs = {}
-
-    total_sessions = sum(len(enumerate_online_sessions(s)) for s in SUBJECTS)
-    idx = 0
 
     for subj in SUBJECTS:
         sessions = enumerate_online_sessions(subj)
-        print(f"\n=== {subj} ({len(sessions)} sessions) ===")
+        if is_subj002(subj):
+            valid = set(subj002_feature_sessions())
+            sessions = [s for s in sessions if s in valid]
+        # Group sessions by longitudinal index (pools SUBJ_002 S003+S004).
+        groups: dict[int, list[str]] = {}
+        for sess in sessions:
+            gidx = (subj002_feature_idx(sess) if is_subj002(subj)
+                    else session_idx_from_label(sess))
+            groups.setdefault(gidx, []).append(sess)
+        print(f"\n=== {subj} ({len(sessions)} sessions -> "
+              f"{len(groups)} timepoints) ===")
         subj_tfr_avgs = []
 
-        for sess in sessions:
-            idx += 1
+        for gidx in sorted(groups):
+            sess_list = groups[gidx]
+            label = "+".join(sess_list)
             t0 = time.time()
-            try:
-                out = preprocess_and_tfr(subj, sess, CONFIG_A)
-            except Exception as e:
-                print(f"  [{idx}/{total_sessions}] {sess}: FAILED ({type(e).__name__}: {e})")
+            per_marker = {"100": [], "200": []}  # marker -> [(AverageTFR, n)]
+            for sess in sess_list:
+                try:
+                    out = preprocess_and_tfr(subj, sess, CONFIG_A)
+                except Exception as e:
+                    print(f"  {sess}: FAILED ({type(e).__name__}: {e})")
+                    continue
+                for marker, (avg, n) in _rejected_marker_avgs(
+                    out["tfr_trials"]
+                ).items():
+                    per_marker.setdefault(marker, []).append((avg, n))
+                del out
+                gc.collect()
+            tfr_avg = {}
+            for marker in ("100", "200"):
+                pooled = _pool_avgs_weighted(per_marker.get(marker, []))
+                if pooled is not None:
+                    tfr_avg[marker] = pooled
+            if not tfr_avg:
                 continue
-
-            plot_session_topos(subj, sess, out["tfr_avg"], DIR_PER_SESS)
-            subj_tfr_avgs.append(out["tfr_avg"])
-
-            print(
-                f"  [{idx}/{total_sessions}] {sess}: "
-                f"n_kept={out['n_kept']}/{out['n_attempted']}  "
-                f"dropped={out['dropped_channels'] or '—'}  "
-                f"({time.time()-t0:.1f}s)"
-            )
+            plot_session_topos(subj, label, tfr_avg, DIR_PER_SESS)
+            subj_tfr_avgs.append(tfr_avg)
+            print(f"  t{gidx} {label}: ({time.time()-t0:.1f}s)")
             gc.collect()
 
         if subj_tfr_avgs:
             plot_subject_topo(subj, subj_tfr_avgs, DIR_PER_SUBJ)
             all_subject_tfrs[subj] = subj_tfr_avgs
-
         gc.collect()
 
     if all_subject_tfrs:
