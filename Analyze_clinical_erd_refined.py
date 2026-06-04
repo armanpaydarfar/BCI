@@ -128,11 +128,11 @@ mne.set_log_level("ERROR")
 MI_MARKER = "200"
 REST_MARKER = "100"
 
-# Description of the shaded band drawn around each mean trace.
-# Mean (not median) across trials: cap=200 rejection drops the explosive
-# trials that historically motivated the median, so the kept-trial mean
-# is now the statistically appropriate central tendency.
-_BAND_LABEL = "shaded = mean ± SE (std/√n across trials)"
+# Description of the shaded band drawn around each mean trace. The mean and
+# the band are computed in LOG space (geometric mean of power ratios), then
+# converted to %/dB — % is asymmetric and an arithmetic % mean is dominated by
+# ERS bins (see `_per_trial_cluster_logratio`).
+_BAND_LABEL = "shaded = mean ± SE (log-space, across trials)"
 
 
 def _preproc_caption():
@@ -163,18 +163,52 @@ def _logratio_to_pct(x):
     return 100.0 * (10.0 ** x - 1.0)
 
 
+def _per_trial_cluster_logratio(tfr, cluster_channels):
+    """Per-trial cluster-mean mu logratio trace: (n_trials, n_time).
+
+    Averages the mu-band logratio across the cluster's channels and mu
+    freqs in LOG space (geometric mean of power ratios), NOT in % space.
+    This is the single source of the per-trial cluster substrate, used by
+    both the artifact rejection and the timecourse.
+
+    Why log space: ERD% is asymmetric — an ERD bin is floored at -100% but
+    an ERS bin is unbounded (+200%, +500%, ...). Arithmetic-averaging % across
+    channels/freqs therefore lets a few ERS bins wash out genuine ERD; on the
+    noisy subjects this collapsed real desync to ~0 (CLIN_SUBJ_008 contra MI:
+    -24% in log space vs -0.5% under the old %-first averaging — a single
+    clean channel like C3 read -31% in log space but -11% %-first, and CP1
+    flipped from -16% to +8%). Log-space averaging is symmetric, matches the
+    topomap's `tfr.average()` (`generate_plots_config_a.py:157`) and the
+    standard dB ERSP convention, so the timecourse, topomap and neuromod
+    longitudinal scalar agree by construction.
+
+    Returns (per_trial_logratio, present_channels) or (None, []) if no
+    cluster channel survived.
+    """
+    present = [c for c in cluster_channels if c in tfr.ch_names]
+    if not present:
+        return None, []
+    ch_idxs = [tfr.ch_names.index(c) for c in present]
+    fmask = (tfr.freqs >= MU_LO) & (tfr.freqs <= MU_HI)
+    log = tfr.data[:, ch_idxs][:, :, fmask].mean(axis=(1, 2))
+    return log, present
+
+
 def _reject_artifact_trials_for_cluster(tfr_trials, cluster_chs,
                                         reject_z=TRIAL_REJECT_Z,
                                         max_frac=TRIAL_REJECT_MAX_FRAC,
                                         abs_cap=TRIAL_REJECT_ABS_PCT):
-    """Non-mutating cluster-matched version of `_reject_artifact_trials`.
+    """Non-mutating, cluster-matched, log-space artifact rejection.
 
-    Returns (new_tfr_trials, report). Logic mirrors `_reject_artifact_trials`
-    line-for-line, except (a) the rejection substrate is the supplied
-    `cluster_chs` instead of hardcoded `BILATERAL_MOTOR_CLUSTER`, and (b)
-    the input dict is NOT mutated — a fresh dict with sliced EpochsTFR
-    entries is returned, so the same tfr_base can feed multiple cluster
-    rejections in sequence.
+    Returns (new_tfr_trials, report). Like the bilateral
+    `_reject_artifact_trials` (kept %-first for the oneshot scratch stream that
+    imports it) but: (a) the rejection substrate is the supplied
+    `cluster_chs` instead of hardcoded `BILATERAL_MOTOR_CLUSTER`; (b) the input
+    dict is NOT mutated — a fresh dict with sliced EpochsTFR entries is
+    returned, so the same tfr_base can feed multiple cluster rejections in
+    sequence; (c) the per-trial scalar is built by `_per_trial_cluster_logratio`
+    (log-averaged across ch+freq, then % once), so the cap=200 test sees the
+    same ERS-robust substrate as the timecourse rather than a %-first average.
 
     Used by `_extract_session_traces` to give each cluster (contra/bilat/
     ipsi) its own rejected pool. Rationale: G1 (evaluate_erd_quality.py:
@@ -193,14 +227,12 @@ def _reject_artifact_trials_for_cluster(tfr_trials, cluster_chs,
         new_trials[marker] = tfr  # default to no-op
         if reject_z <= 0 or n_before < 4:
             continue
-        present = [c for c in cluster_chs if c in tfr.ch_names]
-        if not present:
+        log, present = _per_trial_cluster_logratio(tfr, cluster_chs)
+        if log is None:
             continue
-        ch_idxs = [tfr.ch_names.index(c) for c in present]
-        fmask = (tfr.freqs >= MU_LO) & (tfr.freqs <= MU_HI)
-        pct = _logratio_to_pct(
-            tfr.data[:, ch_idxs][:, :, fmask],
-        ).mean(axis=(1, 2))
+        # Per-trial cluster ERD%(t): log-averaged across ch+freq, then % once
+        # (the ERS-robust substrate; see `_per_trial_cluster_logratio`).
+        pct = _logratio_to_pct(log)
         tmask = tfr.times >= 0.0
         scalar = np.max(np.abs(pct[:, tmask]), axis=1)
         abs_drop = scalar > abs_cap
@@ -341,50 +373,47 @@ def _reject_artifact_trials(tfr_trials, reject_z=TRIAL_REJECT_Z,
 
 def _cluster_timecourse(tfr_trials, cluster_channels, marker="200",
                         return_per_trial=False):
-    """Cluster-averaged ERD%(t), arithmetic mean ± SE across trials.
+    """Cluster-averaged ERD%(t), log-space mean ± SE across trials.
 
-    Mean (not median) across trials: with the canonical cap=200 rejection
-    closing G1's threshold, the explosive ERS trials that historically
-    motivated the median (one 3700% trial would flip a mean positive) are
-    now dropped upstream. With a clean kept-trial pool, mean is the
-    statistically appropriate central tendency in % space — matches the
-    classical Pfurtscheller formulation and the topomap pipeline's
-    `tfr.average()` (generate_plots_config_a.py:157), and the SE band
-    matches its central tendency. Baseline sits at 0 by construction (per-
-    trial baseline window averages to 0 in % per the apply_baseline
-    guarantee; mean of zeros is 0).
+    All averaging over (channels, freqs, trials) happens in LOG space; the
+    result is converted to % once at the end. This is required because % is
+    asymmetric (ERD floored at -100%, ERS unbounded), so an arithmetic % mean
+    is dominated by ERS bins and washes out genuine ERD — see
+    `_per_trial_cluster_logratio` for the SUBJ_008 evidence. Log-space
+    averaging is the geometric mean of power ratios: it matches the topomap's
+    `tfr.average()` (`generate_plots_config_a.py:157`) and the standard dB
+    ERSP convention, so the timecourse, topomap and neuromod scalar agree.
 
-    The returned variable is still called `mean_pct` (kept for caller
-    stability) but is now an arithmetic mean across trials in % units.
-    Callers that render to dB convert at display time
-    (`10·log10(1 + mean_pct/100)`).
+    `mean_pct(t) = _logratio_to_pct(mean_trials(per_trial_logratio(t)))`, i.e.
+    the dB display is `10·mean_logratio`. The SE band is symmetric in log
+    space (→ asymmetric in %). Baseline sits at 0 by construction.
 
-    Returns (times, mean_pct, low_pct, up_pct, n_trials, surviving_channels)
-    or None. When `return_per_trial=True`, appends the per-trial cluster-mean
-    ERD% matrix `per_trial_pct[n_trials, n_time]` as a 7th element — the
-    full trial distribution, exposed so the quality scorer (median-based
-    rubric) and the display layer (mean) can use the same substrate.
+    The per-trial substrate exposed via `return_per_trial` is
+    `per_trial_pct[n_trials, n_time]` = the per-trial cluster ERD% with the
+    same log-space ch+freq averaging (the quality scorer reads it in %, taking
+    a median across trials internally).
+
+    Returns (times, mean_pct, low_pct, up_pct, n_trials, surviving_channels),
+    optionally + per_trial_pct, or None.
     """
     if marker not in tfr_trials:
         return None
     tfr = tfr_trials[marker]
-    present = [c for c in cluster_channels if c in tfr.ch_names]
-    if not present:
+    per_trial_log, present = _per_trial_cluster_logratio(tfr, cluster_channels)
+    if per_trial_log is None:
         return None
-    ch_idxs = [tfr.ch_names.index(c) for c in present]
-    fmask = (tfr.freqs >= MU_LO) & (tfr.freqs <= MU_HI)
-    data_pct = _logratio_to_pct(
-        tfr.data[:, ch_idxs][:, :, fmask],
-    )
-    n = data_pct.shape[0]
+    n = per_trial_log.shape[0]
     if n < 1:
         return None
-    per_trial_pct = data_pct.mean(axis=(1, 2))  # over cluster ch + mu freqs
-    mean_pct = np.mean(per_trial_pct, axis=0)  # arithmetic mean across trials
+    # Per-trial substrate in % (log-averaged over ch+freq, then % once).
+    per_trial_pct = _logratio_to_pct(per_trial_log)
+    # Central tendency across trials in LOG space, then -> %.
+    mean_log = per_trial_log.mean(axis=0)
+    mean_pct = _logratio_to_pct(mean_log)
     if n > 1:
-        sem = np.std(per_trial_pct, axis=0, ddof=1) / np.sqrt(n)
-        low_pct = mean_pct - sem
-        up_pct = mean_pct + sem
+        sem_log = np.std(per_trial_log, axis=0, ddof=1) / np.sqrt(n)
+        low_pct = _logratio_to_pct(mean_log - sem_log)
+        up_pct = _logratio_to_pct(mean_log + sem_log)
     else:
         low_pct = mean_pct.copy()
         up_pct = mean_pct.copy()

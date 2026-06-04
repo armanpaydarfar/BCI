@@ -2,30 +2,32 @@
 """Per-electrode mu-ERD% longitudinal trajectory (Plan A of
 `rev01-longitudinal-analysis-plan.md` §3).
 
-For each (subject, session), compute the per-trial mu-band ERD% over
-the Contralateral cluster (primary), Ipsilateral cluster (added
-2026-06-01 as a within-subject lateralisation reference), and
-Bilateral cluster (secondary) at SCALAR_WIN = (1, 4) s, using Config A
-preprocessing. Spatial filter is CAR — re-locked as cohort canonical
-2026-06-02 after a full car/hjorth/csd sweep (briefly Hjorth on
-2026-06-01); the active filter is whatever `_helpers.CONFIG_A` says.
+For each (subject, session, cluster), the per-trial mu-band ERD% scalar
+is read from the canonical per-trial substrate produced by
+`Analyze_clinical_erd_refined.py` (the `<SUBJ>_<SESS>_car.npz` files under
+`erd_refined/per_trial/`). This is the SAME substrate the 6-panel ERD
+timecourse figures are drawn from — cap=200 cluster-matched trial
+rejection, CAR, display-matched baseline — so the longitudinal LME and the
+timecourse figures cannot diverge. Run `Analyze_clinical_erd_refined.py`
+first to (re)generate that substrate.
 
-Pass 2 (2026-05-28): LMEs now fit per-session response (median primary,
-mean sensitivity), not per-trial, per `rev01-longitudinal-analysis-plan.md`
-§3.3 / §3.4 and the pass-1 critic review §C1/§C2/§M6. Per-trial CSV is
-retained for backward compatibility.
+All averaging happens in LOG (logratio) space and is converted to % only at
+the end — % is asymmetric (ERD floored at -100%, ERS unbounded) so an
+arithmetic % mean is dominated by ERS and washes out real ERD (see
+`Analyze_clinical_erd_refined._per_trial_cluster_logratio`).
 
-Session-wise ERD definition (see `_per_trial_cluster_erd_pct` docstring):
-  1. Per trial: ERD%_trial = 100·(10^(mean_{ch∈cluster, f∈mu, t∈(1,4)s}
-     log10(P/P_bl)) − 1) — averaging in log space then a single % conversion
-     avoids Jensen-inequality bias.
-  2. Per session: median over trials of ERD%_trial (primary), with
-     erd_mean kept as a sensitivity check in the session-summary CSV.
-  3. Per cohort: median across subjects of per-session medians.
+Session-wise ERD definition:
+  1. Per trial: ERD%_trial = back-convert the canonical per-trial ERD%(t)
+     trace (`<cluster>_mi__ptp`, already log-averaged over ch+freq) to
+     logratio, take the mean over SCALAR_WIN = (1, 4) s, convert to %.
+  2. Per session: MEAN over trials taken in LOG space, then -> % (primary;
+     matches the canonical timecourse). Median of the per-trial ERD% is kept
+     as a robustness sensitivity check.
+  3. Per cohort: mean across subjects of per-session means.
 
-`--from-csv` reloads existing per-trial CSV produced by an earlier run
-to skip the ~25 min Config-A TFR pass. Used in pass-2 to re-fit only the
-LMEs and cohort plots without rerunning preprocessing.
+`--from-csv` reloads the per-trial / session-summary CSVs written by an
+earlier run to re-fit only the LMEs and cohort plots without re-reading
+the npz.
 
 Outputs (`~/Pictures/clin_analysis/neuromod/`):
     <SUBJ>_erd_over_sessions_contra.png    (per-subject, contra cluster)
@@ -44,9 +46,7 @@ Analysis-only. No Tier 1 / Tier 2 writes.
 from __future__ import annotations
 
 import argparse
-import gc
 import sys
-import time
 import warnings
 from pathlib import Path
 
@@ -63,17 +63,12 @@ for _p in (str(_REPO_ROOT), str(_SWEEP_DIR)):
         sys.path.insert(0, _p)
 
 from exploration.clinical_analysis._helpers import (  # noqa: E402
-    BILATERAL_MOTOR_CLUSTER, CONTRA_MOTOR_CLUSTER, IPSI_MOTOR_CLUSTER,
-    clin_pictures_root, config_a_pipeline, enumerate_clin_subjects,
-    enumerate_online_sessions_for_subject, session_idx_from_label,
+    clin_pictures_root, session_idx_from_label,
 )
 
-# Mu band + scalar window constants
-from sweep_phase2_round2 import MU_HI, MU_LO, SCALAR_WIN  # noqa: E402
-
-import mne  # noqa: E402
-
-mne.set_log_level("ERROR")
+# Scalar ERD integration window (post-cue, (1, 4) s), shared with the
+# canonical ERD pipeline so the longitudinal scalar matches the timecourse.
+from sweep_phase2_round2 import SCALAR_WIN  # noqa: E402
 
 try:
     import statsmodels.formula.api as smf
@@ -86,59 +81,6 @@ try:
     HAS_SPEARMAN = True
 except Exception:
     HAS_SPEARMAN = False
-
-
-# ----------------------------------------------------------------------
-# Per-trial ERD%
-# ----------------------------------------------------------------------
-
-def _per_trial_cluster_erd_pct(
-    tfr_trials, cluster_channels: list[str], marker: str = "200",
-) -> tuple[np.ndarray | None, list[str]]:
-    """One scalar ERD% per trial, averaged across (cluster channels,
-    mu freqs, SCALAR_WIN).
-
-    Definition audit — this is the single source of the session-wise
-    ERD that feeds the longitudinal LMEs:
-
-      Step 1 (in this function, per trial):
-        logratio_trial = mean_{c ∈ cluster, f ∈ mu, t ∈ (1,4)s} log10(P/P_bl)
-        ERD%_trial     = 100 * (10^logratio_trial - 1)
-      → one scalar per trial. The averaging stays in log space across
-        (channels, freqs, time) and is converted to % once per trial,
-        which avoids the Jensen-inequality bias the pass-1 implementation
-        carried (see 75f891b / bf980c9 fix commits).
-
-      Step 2 (in `_compute_from_tfr`, per session):
-        erd_median_session = median over trials of ERD%_trial      ← primary
-        erd_mean_session   = mean   over trials of ERD%_trial      ← sensitivity
-      → erd_median is the response variable in the cohort LME
-        (`metric ~ 1 + session_idx + (1|subject)`); erd_mean is fit
-        as a sensitivity check alongside. CLIN_SUBJ_007 had per-trial
-        ERD% extremes up to +235% that would otherwise flip the mean
-        positive on sessions where the typical trial still desyncs.
-
-      Step 3 (in `_plot_cohort_trajectory`, per cohort):
-        cohort_at_session = median across subjects of their per-session
-                            medians (errorbar uses SE of those medians).
-
-    Returns (array of shape (n_trials,), channels_actually_used).
-    """
-    if marker not in tfr_trials:
-        return None, []
-    tfr = tfr_trials[marker]
-    present = [c for c in cluster_channels if c in tfr.ch_names]
-    if not present:
-        return None, []
-    ch_idxs = [tfr.ch_names.index(c) for c in present]
-    fmask = (tfr.freqs >= MU_LO) & (tfr.freqs <= MU_HI)
-    tmask = (tfr.times >= SCALAR_WIN[0]) & (tfr.times <= SCALAR_WIN[1])
-    # tfr.data: (trials, channels, freqs, times)
-    per_trial_log = tfr.data[:, ch_idxs][:, :, fmask, :][:, :, :, tmask].mean(
-        axis=(1, 2, 3),
-    )
-    per_trial_pct = 100.0 * (np.power(10.0, per_trial_log) - 1.0)
-    return per_trial_pct, present
 
 
 # ----------------------------------------------------------------------
@@ -262,14 +204,14 @@ def _plot_cohort_trajectory(
     df_sess: pd.DataFrame, cluster_key: str, out_path: Path,
     *, lme_annotation: str | None = None,
 ):
-    """Cohort figure: one line per subject (per-session median, semi-
-    transparent) + cohort median across subjects (bold).
+    """Cohort figure: one line per subject (per-session mean, semi-
+    transparent) + cohort mean across subjects (bold).
 
-    Pass 2 (critic §M6): switched response from per-trial mean to
-    per-session median for both the per-subject thin lines and the cohort
-    bold line. Per `rev01-longitudinal-analysis-plan.md` §3.3, median is
-    robust to single-trial outliers (CLIN_SUBJ_007 had per-trial ERD%
-    extremes up to +235%).
+    The per-session response is the arithmetic MEAN across trials, matching
+    the canonical ERD aggregator (`canonical-update-2026-06-03.md` §3). The
+    cap=200 cluster-matched rejection upstream removes the explosive ERS
+    trials that previously motivated a median, so the mean of the cleaned
+    pool is the appropriate central tendency.
     """
     fig, ax = plt.subplots(figsize=(8, 5))
     subjects = sorted(df_sess["subject"].unique())
@@ -277,25 +219,25 @@ def _plot_cohort_trajectory(
     for i, subj in enumerate(subjects):
         sub = df_sess[df_sess.subject == subj].sort_values("session_idx")
         ax.plot(
-            sub["session_idx"], sub["erd_median"], "o-",
+            sub["session_idx"], sub["erd_mean"], "o-",
             color=cmap(i % 10), alpha=0.5, lw=1.0, markersize=4,
             label=subj,
         )
-    # Cohort grand median (across subjects, per session_idx)
-    cohort = df_sess.groupby("session_idx")["erd_median"].agg(
+    # Cohort grand mean (across subjects, per session_idx)
+    cohort = df_sess.groupby("session_idx")["erd_mean"].agg(
         ["median", "mean", "sem", "count"],
     ).reset_index()
     ax.errorbar(
-        cohort["session_idx"], cohort["median"], yerr=cohort["sem"],
+        cohort["session_idx"], cohort["mean"], yerr=cohort["sem"],
         color="black", lw=2.5, marker="s", markersize=8,
-        label="Cohort median (± SE of session medians)",
+        label="Cohort mean (± SE of session means)",
     )
     ax.axhline(0, color="k", lw=0.6)
     ax.set_xlabel("Session index")
-    ax.set_ylabel("Per-session median ERD %")
+    ax.set_ylabel("Per-session mean ERD %")
     ax.set_title(
         f"CLIN cohort — Mu ERD% over sessions ({cluster_key} cluster)\n"
-        f"(per-session medians; LME on medians)"
+        f"(per-session means; LME on means)"
     )
     ax.grid(True, alpha=0.25)
     ax.legend(loc="best", fontsize=8, ncol=2)
@@ -344,54 +286,80 @@ def _fit_session_lme(
 # Main
 # ----------------------------------------------------------------------
 
-def _compute_from_tfr(out_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run Config-A TFR for every (subject, session) and return
-    (df_trials, df_sess). Side-effects: writes per-trial CSV and session-
-    summary CSV under `out_dir` (these are reused by `--from-csv`)."""
+# Canonical per-trial substrate produced by `Analyze_clinical_erd_refined.py`.
+# Each `<SUBJ>_<SESS>_car.npz` stores, per `<cluster>_<marker>` key, a
+# `__ptp` matrix of shape (n_trials, n_time) holding the per-trial cluster-
+# mean ERD%(t) trace AFTER cap=200 cluster-matched rejection, plus a
+# `__times` axis (`Analyze_clinical_erd_refined.py:475-515`). Sourcing F4
+# from this substrate guarantees the longitudinal LME and the 6-panel
+# timecourse figures are computed on identical trials/aggregation.
+_ERD_PER_TRIAL_DIR = clin_pictures_root() / "erd_refined" / "per_trial"
+
+
+def _compute_from_canonical_npz(
+    out_dir: Path, npz_dir: Path = _ERD_PER_TRIAL_DIR,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build (df_trials, df_sess) from the canonical erd_refined per-trial
+    npz files, not from an independent TFR pass.
+
+    For each session npz and each cluster (contra/ipsi/bilat), the MI
+    per-trial scalar ERD% is the mean of the cap=200-rejected
+    `<cluster>_mi__ptp` trace over SCALAR_WIN = (1, 4) s. Per-session
+    summaries carry both `erd_mean` (primary; matches the canonical mean-
+    across-trials aggregator) and `erd_median` (sensitivity).
+
+    Side-effects: writes per-trial + session-summary CSVs under `out_dir`
+    (reused by `--from-csv`). Raises if the canonical npz dir is missing —
+    run `Analyze_clinical_erd_refined.py` first.
+    """
+    if not npz_dir.is_dir():
+        raise FileNotFoundError(
+            f"Canonical per-trial npz dir not found: {npz_dir}. Run "
+            f"Analyze_clinical_erd_refined.py before this script."
+        )
     rows = []
     session_summary = []
-    for subject in enumerate_clin_subjects():
-        sessions = enumerate_online_sessions_for_subject(subject)
-        print(f"\n=== {subject} ({len(sessions)} sessions) ===")
-        for sess in sessions:
-            t0 = time.time()
-            try:
-                out = config_a_pipeline(subject, sess)
-            except Exception as e:
-                print(f"  {sess}: FAILED ({type(e).__name__}: {e})")
+    for npz_path in sorted(npz_dir.glob("*_car.npz")):
+        d = np.load(npz_path, allow_pickle=True)
+        subject = str(d["subject"])
+        sess = str(d["session"])
+        sess_idx = session_idx_from_label(sess)
+        for cluster_key in ("contra", "ipsi", "bilat"):
+            ptp_key = f"{cluster_key}_mi__ptp"
+            if ptp_key not in d:
                 continue
-            sess_idx = session_idx_from_label(sess)
-            for cluster_key, cluster in [
-                ("contra", CONTRA_MOTOR_CLUSTER),
-                ("ipsi",   IPSI_MOTOR_CLUSTER),
-                ("bilat",  BILATERAL_MOTOR_CLUSTER),
-            ]:
-                per_trial, present = _per_trial_cluster_erd_pct(
-                    out["tfr_trials"], cluster,
-                )
-                if per_trial is None or len(per_trial) == 0:
-                    continue
-                for v in per_trial:
-                    rows.append({
-                        "subject": subject, "session": sess,
-                        "session_idx": sess_idx, "cluster": cluster_key,
-                        "channels_used": ",".join(present),
-                        "erd_pct": float(v),
-                    })
-                session_summary.append({
+            ptp = d[ptp_key]                      # (n_trials, n_time) ERD%
+            times = d[f"{cluster_key}_mi__times"]
+            present = str(d[f"{cluster_key}_mi__channels"])
+            if ptp.ndim != 2 or ptp.shape[0] == 0:
+                continue
+            tmask = (times >= SCALAR_WIN[0]) & (times <= SCALAR_WIN[1])
+            # Average over the window AND across trials in LOG space (the npz
+            # substrate is already log-averaged across ch+freq); convert to %
+            # only at the end. Matches the canonical timecourse so the
+            # longitudinal scalar and the 6-panel figures agree.
+            ptp_log = np.log10(1.0 + ptp / 100.0)        # % -> logratio
+            per_trial_log = ptp_log[:, tmask].mean(axis=1)   # per-trial window mean
+            per_trial = 100.0 * (10.0 ** per_trial_log - 1.0)  # per-trial ERD%
+            for v in per_trial:
+                rows.append({
                     "subject": subject, "session": sess,
                     "session_idx": sess_idx, "cluster": cluster_key,
-                    "channels_used": ",".join(present),
-                    "n_trials": int(len(per_trial)),
-                    "erd_mean": float(per_trial.mean()),
-                    "erd_median": float(np.median(per_trial)),
-                    "erd_se": float(
-                        per_trial.std(ddof=1) / np.sqrt(len(per_trial))
-                    ) if len(per_trial) > 1 else 0.0,
+                    "channels_used": present, "erd_pct": float(v),
                 })
-            print(f"  {sess}: ({time.time()-t0:.1f}s)")
-            del out
-            gc.collect()
+            erd_mean = 100.0 * (10.0 ** per_trial_log.mean() - 1.0)
+            session_summary.append({
+                "subject": subject, "session": sess,
+                "session_idx": sess_idx, "cluster": cluster_key,
+                "channels_used": present,
+                "n_trials": int(len(per_trial)),
+                "erd_mean": float(erd_mean),             # log-space trial mean -> %
+                "erd_median": float(np.median(per_trial)),
+                "erd_se": float(
+                    per_trial.std(ddof=1) / np.sqrt(len(per_trial))
+                ) if len(per_trial) > 1 else 0.0,
+            })
+        print(f"  {subject} {sess}: {len(session_summary)} cluster rows so far")
     df_trials = pd.DataFrame(rows)
     df_sess = pd.DataFrame(session_summary)
     df_trials.to_csv(out_dir / "erd_per_trial.csv", index=False)
@@ -403,9 +371,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--from-csv", action="store_true",
-        help=("Skip the TFR pass and load erd_per_trial.csv + "
+        help=("Skip the npz pass and load erd_per_trial.csv + "
               "erd_session_summary.csv produced by an earlier run. "
-              "Used in pass-2 to refit LMEs without rerunning Config-A."),
+              "Used to refit LMEs / re-plot without re-reading the npz."),
     )
     args = parser.parse_args()
 
@@ -418,9 +386,9 @@ def main():
         if not (trials_csv.exists() and sess_csv.exists()):
             print(
                 f"--from-csv requested but CSVs not found in {out_dir}. "
-                "Falling back to TFR pass."
+                "Falling back to canonical-npz pass."
             )
-            df_trials, df_sess = _compute_from_tfr(out_dir)
+            df_trials, df_sess = _compute_from_canonical_npz(out_dir)
         else:
             df_trials = pd.read_csv(trials_csv)
             df_sess = pd.read_csv(sess_csv)
@@ -429,7 +397,7 @@ def main():
                 f"{len(df_sess)} session-summary rows from CSV."
             )
     else:
-        df_trials, df_sess = _compute_from_tfr(out_dir)
+        df_trials, df_sess = _compute_from_canonical_npz(out_dir)
 
     lme_text_blocks = []
     for cluster_key in ("contra", "ipsi", "bilat"):
@@ -448,25 +416,28 @@ def main():
                 df_subj, subject, cluster_key, out_png,
             )
 
-        # Pass-2: per-session LMEs (primary: median; sensitivity: mean).
-        # Per `rev01-longitudinal-analysis-plan.md` §3.3 / §3.4 and
-        # pass-1 critic §C1.
-        text_med, annot_med = _fit_session_lme(
-            sub_sess, "erd_median",
-            f"ERD% ({cluster_key} cluster) — per-session LME on MEDIAN",
-        )
-        text_mean, _annot_mean = _fit_session_lme(
+        # Per-session LMEs. Primary = MEAN across trials, matching the
+        # canonical ERD aggregator (`canonical-update-2026-06-03.md` §3:
+        # cap=200 rejection drops the explosive ERS trials that historically
+        # motivated the median, so mean is now the appropriate central
+        # tendency on the cleaned pool). Median is retained as a sensitivity
+        # check.
+        text_mean, annot_mean = _fit_session_lme(
             sub_sess, "erd_mean",
-            f"ERD% ({cluster_key} cluster) — per-session LME on MEAN "
-            f"(sensitivity check, per `rev01-longitudinal-analysis-plan.md` §3.3)",
+            f"ERD% ({cluster_key} cluster) — per-session LME on MEAN",
         )
-        lme_text_blocks.extend([text_med, text_mean])
+        text_med, _annot_med = _fit_session_lme(
+            sub_sess, "erd_median",
+            f"ERD% ({cluster_key} cluster) — per-session LME on MEDIAN "
+            f"(sensitivity check)",
+        )
+        lme_text_blocks.extend([text_mean, text_med])
 
-        # Cohort plot (per-session median; annotated with LME slope/p +
-        # Bonferroni verdict). Replaces the pass-1 mean ± SE per-trial plot.
+        # Cohort plot (per-session mean; annotated with LME slope/p +
+        # Bonferroni verdict).
         cohort_png = out_dir / f"cohort_lme_erd_{cluster_key}.png"
         _plot_cohort_trajectory(
-            sub_sess, cluster_key, cohort_png, lme_annotation=annot_med,
+            sub_sess, cluster_key, cohort_png, lme_annotation=annot_mean,
         )
 
     (out_dir / "erd_lme_results.txt").write_text(
