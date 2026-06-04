@@ -13,34 +13,52 @@ maintaining their own copies of these divergence flags
 pipeline. This module is the unified declaration. Scripts import from
 here instead of hardcoding.
 
-Notes-confirmed protocol (from `sub-CLIN_SUBJ_002/notes_06_0{4,5}`):
-  - S001ONLINE: LEFT-arm MI vs rest, 1 online run (operator's decoder,
-    transfer learning). MI/REST marker semantics flip vs the canonical
-    cohort, so S001 is EXCLUDED from cohort analyses.
-  - S002ONLINE: RIGHT-arm MI vs rest, 6 runs (operator's decoder,
-    transfer learning). INCLUDED.
+Per-session protocol (verified 2026-06-04 from `config_snapshot.json`
+`ARM_SIDE`, the event-log `training data:` line, and `notes_06_0{4,5}`):
 
-S003ONLINE and S004ONLINE (both recorded 2025-06-12) lack written notes
-in `sub-CLIN_SUBJ_002/notes_*`. Existing scripts have treated them as
-right-arm transfer-learning sessions based on file-structure inference
-alone. They are INCLUDED by default per the historical convention but
-flagged here for future verification.
+  - S001ONLINE (2025-06-04, 1 run): LEFT-arm MI vs rest. Calibration
+    failed (software-trigger issue), so the operator's overnight decoder
+    was used (transfer learning). MI/REST marker semantics flip vs the
+    right-arm cohort. EXCLUDED — left arm.
+  - S002ONLINE (2025-06-05, 6 runs): RIGHT-arm, operator's decoder
+    ("MY decoder", notes_06_05) — expert transfer learning. INCLUDED.
+  - S003ONLINE (2025-06-12, 2 runs): RIGHT-arm, but the decoder was
+    trained on her OWN `S002ONLINE` data (event-log `training data:`
+    line) — within-subject transfer, NOT expert→patient transfer.
+    EXCLUDED — different paradigm from the rest of the cohort (decision
+    2026-06-04). It remains a valid right-arm MI recording, just not an
+    expert-TL session.
+  - S004ONLINE (2025-06-12, 5 runs): RIGHT-arm, decoder trained on
+    `LAB_SUBJ_001` (the operator pool used cohort-wide) — expert
+    transfer learning. INCLUDED.
 
-To restrict cohort analyses to the two notes-confirmed sessions, set
-`SUBJ002_INCLUDE_S003_S004 = False` below. All downstream scripts will
-honor the choice via the helper functions in this module.
+S001 (left arm) is excluded everywhere. S003's treatment then SPLITS by
+analysis family (see the two constant blocks below):
+  - DECODER family: S003 excluded; sessions S002/S004 -> idx 1/2.
+  - FEATURE family: S003 included and POOLED with S004 (same day) into one
+    longitudinal timepoint; S002 -> 1, {S003, S004} -> 2.
+Downstream scripts pick the matching `subj002_{decoder,feature}_sessions`
+and `subj002_{decoder,feature}_idx` helpers.
 """
 
-# Whether to include the two unverified-by-notes right-arm sessions
-# (S003/S004) alongside the notes-confirmed S002. Default True to
-# preserve the historical gr_ablation convention until the user verifies
-# the S003/S004 protocol; flip to False to use only S002.
-SUBJ002_INCLUDE_S003_S004 = True
+# Two session policies, because S003's status depends on the analysis:
+#
+# DECODER family (gr_ablation, decoder-perf, bar-dynamics): the deployed
+#   decoder's source matters, and S003 used a decoder trained on her OWN
+#   S002 data (within-subject), not the expert/operator pool. So S003 is
+#   EXCLUDED; the two expert-TL sessions S002/S004 are renumbered 1/2.
+#
+# FEATURE family (ERD/neuromod, erd_refined, FD): decoder-independent —
+#   they measure her mu desync / covariance separability during right-arm
+#   MI, which is valid in S003 regardless of decoder source. S003 and S004
+#   are the same day (2025-06-12) and POOL into one longitudinal timepoint
+#   (session 2); S002 is session 1. Hence both S003 and S004 map to idx 2,
+#   and feature scripts pool trials per session_idx.
+_SUBJ002_DECODER_SESSIONS = ("S002ONLINE", "S004ONLINE")
+_SUBJ002_DECODER_IDX = {"S002ONLINE": 1, "S004ONLINE": 2}
 
-# All right-arm online sessions per the historical gr_ablation
-# convention. S001 is always excluded (left-arm).
-_SUBJ002_RIGHT_ARM_ALL = ("S002ONLINE", "S003ONLINE", "S004ONLINE")
-_SUBJ002_NOTES_CONFIRMED = ("S002ONLINE",)
+_SUBJ002_FEATURE_SESSIONS = ("S002ONLINE", "S003ONLINE", "S004ONLINE")
+_SUBJ002_FEATURE_IDX = {"S002ONLINE": 1, "S003ONLINE": 2, "S004ONLINE": 2}
 
 # Motor channel set she was recorded with (older
 # `select_motor_channels(keep_prefixes=("CP","P","C"))` convention,
@@ -69,15 +87,32 @@ SUBJ002_INTEGRATOR_ALPHA = 0.95
 SUBJ002_LATERALIZATION = "bilateral"
 
 
-def subj002_valid_sessions() -> list[str]:
-    """Right-arm online sessions for CLIN_SUBJ_002.
+def subj002_decoder_sessions() -> list[str]:
+    """DECODER-family sessions for CLIN_SUBJ_002 — the two expert-TL
+    right-arm sessions (S002, S004). S001 (left arm) and S003
+    (within-subject transfer) are excluded. See the module docstring."""
+    return list(_SUBJ002_DECODER_SESSIONS)
 
-    Returns the notes-confirmed set if `SUBJ002_INCLUDE_S003_S004` is
-    False, else the full historical right-arm set (S002/S003/S004).
-    """
-    if SUBJ002_INCLUDE_S003_S004:
-        return list(_SUBJ002_RIGHT_ARM_ALL)
-    return list(_SUBJ002_NOTES_CONFIRMED)
+
+def subj002_decoder_idx(session: str) -> int:
+    """DECODER-family longitudinal index (S002 -> 1, S004 -> 2). Raises
+    KeyError for a session outside `subj002_decoder_sessions()`."""
+    return _SUBJ002_DECODER_IDX[session]
+
+
+def subj002_feature_sessions() -> list[str]:
+    """FEATURE-family sessions for CLIN_SUBJ_002 — S002, S003, S004. S003
+    is included (decoder-independent ERD/FD); it pools with S004 into one
+    longitudinal timepoint via `subj002_feature_idx`."""
+    return list(_SUBJ002_FEATURE_SESSIONS)
+
+
+def subj002_feature_idx(session: str) -> int:
+    """FEATURE-family longitudinal index (S002 -> 1, S003 -> 2, S004 -> 2).
+    S003 and S004 share idx 2 so feature scripts pool their trials into one
+    same-day session-2 estimate. Raises KeyError for a session outside
+    `subj002_feature_sessions()`."""
+    return _SUBJ002_FEATURE_IDX[session]
 
 
 def is_subj002(subject: str) -> bool:

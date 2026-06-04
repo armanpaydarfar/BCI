@@ -50,6 +50,29 @@ from exploration.clinical_analysis._helpers import (  # noqa: E402
     enumerate_online_sessions_for_subject, resolve_motor_cluster,
     session_idx_from_label,
 )
+from exploration.clinical_analysis._subj002 import (  # noqa: E402
+    is_subj002, subj002_feature_idx, subj002_feature_sessions,
+)
+
+
+def _cohort_sessions(subject):
+    """Online sessions to analyse for `subject`. ERD is decoder-independent
+    (feature family), so for CLIN_SUBJ_002 this drops only S001 (left arm)
+    and keeps S002/S003/S004; S003 and S004 (same day) later pool into one
+    session-2 estimate via `_cohort_session_idx` (see `_subj002`)."""
+    sessions = enumerate_online_sessions_for_subject(subject)
+    if is_subj002(subject):
+        valid = set(subj002_feature_sessions())
+        return [s for s in sessions if s in valid]
+    return sessions
+
+
+def _cohort_session_idx(subject, sess):
+    """Longitudinal session index. For CLIN_SUBJ_002: S002->1, and S003+S004
+    (same day) both ->2, so they pool into one session-2 estimate."""
+    if is_subj002(subject):
+        return subj002_feature_idx(sess)
+    return session_idx_from_label(sess)
 
 # Mu-band edges for the cluster ERD% average (same as the validated
 # sweep). MU_LO, MU_HI come from sweep_phase2_round2.py:66.
@@ -606,6 +629,60 @@ def _pct_to_db(pct):
     return 10.0 * np.log10(1.0 + pct / 100.0)
 
 
+_CLUSTER_MARKER_KEYS = (
+    "contra_mi", "contra_rest", "bilat_mi", "bilat_rest",
+    "ipsi_mi", "ipsi_rest",
+)
+
+
+def _merge_session_traces(traces_list):
+    """Pool several sessions' per-trial substrates into one session entry.
+
+    Used for CLIN_SUBJ_002's same-day S003+S004 (feature family, see
+    `_subj002`): their per-trial cluster ERD% arrays are concatenated per
+    cluster_marker key and the log-space mean trace + SE band recomputed, so
+    the pooled entry is one session-2 estimate built from all the day's
+    trials. A single-element list is returned unchanged, so non-pooled
+    subjects are unaffected.
+    """
+    if len(traces_list) == 1:
+        return traces_list[0]
+    merged = {"dropped_channels": traces_list[0].get("dropped_channels", [])}
+    merged_pt = {}
+    for key in _CLUSTER_MARKER_KEYS:
+        pts, times, present = [], None, None
+        for tr in traces_list:
+            entry = tr.get("per_trial", {}).get(key)
+            if entry is None:
+                continue
+            pts.append(np.asarray(entry["per_trial_pct"]))
+            times = entry["times"]
+            present = entry["channels_used"]
+        if not pts:
+            merged[key] = None
+            continue
+        pooled = np.concatenate(pts, axis=0)          # (sum n_trials, n_time)
+        n = pooled.shape[0]
+        log = np.log10(1.0 + pooled / 100.0)
+        mean_log = log.mean(axis=0)
+        mean_pct = _logratio_to_pct(mean_log)
+        if n > 1:
+            sem_log = np.std(log, axis=0, ddof=1) / np.sqrt(n)
+            low_pct = _logratio_to_pct(mean_log - sem_log)
+            up_pct = _logratio_to_pct(mean_log + sem_log)
+        else:
+            low_pct = mean_pct.copy()
+            up_pct = mean_pct.copy()
+        present_list = (present.split(",") if isinstance(present, str)
+                        else list(present))
+        merged[key] = (times, mean_pct, low_pct, up_pct, n, present_list)
+        merged_pt[key] = {
+            "per_trial_pct": pooled, "times": times, "channels_used": present,
+        }
+    merged["per_trial"] = merged_pt
+    return merged
+
+
 def _plot_subject_6panel(subject, session_traces, out_path):
     """Plot 3 rows (Contra, Bilat, Ipsi) × 2 cols (MI, REST).
 
@@ -733,9 +810,9 @@ def _plot_cohort_6panel(cohort_traces, out_path):
     ]
     # Determine all session indices present (across all four panels)
     all_idxs = sorted({
-        session_idx_from_label(sess)
+        idx
         for traces in cohort_traces.values()
-        for (_, sess, _, _) in traces
+        for (_subj, idx, _, _) in traces
     })
     cmap = plt.get_cmap("viridis")
     if not all_idxs:
@@ -750,8 +827,7 @@ def _plot_cohort_6panel(cohort_traces, out_path):
         ax = axes[row][col]
         traces = cohort_traces.get(key, [])
         per_idx: dict[int, list[tuple[np.ndarray, np.ndarray]]] = {}
-        for subj, sess, times, mean_pct in traces:
-            idx = session_idx_from_label(sess)
+        for _subj, idx, times, mean_pct in traces:
             per_idx.setdefault(idx, []).append((times, mean_pct))
 
         for idx in sorted(per_idx.keys()):
@@ -963,11 +1039,11 @@ def main():
     for subject in enumerate_clin_subjects():
         if subject_filter and subject not in subject_filter:
             continue
-        sessions = enumerate_online_sessions_for_subject(subject)
+        sessions = _cohort_sessions(subject)
         print(f"\n=== {subject} ({len(sessions)} sessions) ===")
         # Hold only the small extracted traces per session (not the
         # full TFR objects), to keep peak RSS modest on a 16 GB box.
-        session_traces: list[tuple[str, dict]] = []
+        raw_traces: list[tuple[str, dict]] = []
         for sess in sessions:
             t0 = time.time()
             try:
@@ -995,7 +1071,7 @@ def main():
             # Combined reject_report for the console line (per-cluster MI
             # drops, the publication-line metric for quick scan).
             reject_report = bilat_rep  # legacy compat: bilat treated as "the" report
-            session_traces.append((sess, traces))
+            raw_traces.append((sess, traces))
 
             # Per-trial side-car for the quality scorer. Written from the
             # already-extracted small arrays (not the TFR), so peak RSS is
@@ -1011,29 +1087,6 @@ def main():
                 },
             )
 
-            # Cluster-mean traces for the cohort figure + CSV
-            for cluster_label, marker_label, key, cluster_chs in cluster_specs:
-                res = traces[key]
-                if res is None:
-                    continue
-                times, mean_pct, low_pct, up_pct, n_trials, present = res
-                cohort_traces[key].append(
-                    (subject, sess, times, mean_pct)
-                )
-                for t_idx, t_val in enumerate(times):
-                    csv_rows.append({
-                        "subject": subject,
-                        "session": sess,
-                        "session_idx": session_idx_from_label(sess),
-                        "cluster": cluster_label,
-                        "marker": marker_label,
-                        "channels_used": ",".join(present),
-                        "t": float(t_val),
-                        "mean_pct": float(mean_pct[t_idx]),
-                        "low_pct": float(low_pct[t_idx]),
-                        "up_pct": float(up_pct[t_idx]),
-                        "n_trials": int(n_trials),
-                    })
             rej = " ".join(
                 f"{m}:-{r['n_dropped']}"
                 + ("(capped)" if r["over_gate"] else "")
@@ -1049,13 +1102,52 @@ def main():
             del out, tfr_base
             gc.collect()
 
+        # Pool sessions that share a longitudinal index before plotting /
+        # CSV / cohort: for CLIN_SUBJ_002 this merges same-day S003+S004
+        # into one session-2 estimate (feature family). A no-op for every
+        # other (subject, idx), which has a single session. The per-session
+        # npz written above is left un-pooled (the scorer + neuromod read it
+        # per session; neuromod does its own per-session_idx pooling).
+        idx_groups: dict[int, list[tuple[str, dict]]] = {}
+        for sess, traces in raw_traces:
+            idx_groups.setdefault(
+                _cohort_session_idx(subject, sess), []
+            ).append((sess, traces))
+
+        session_traces: list[tuple[str, dict]] = []
+        for idx in sorted(idx_groups):
+            entries = idx_groups[idx]
+            label = "+".join(s for s, _ in entries)
+            merged = _merge_session_traces([t for _, t in entries])
+            session_traces.append((label, merged))
+            for cluster_label, marker_label, key, cluster_chs in cluster_specs:
+                res = merged[key]
+                if res is None:
+                    continue
+                times, mean_pct, low_pct, up_pct, n_trials, present = res
+                cohort_traces[key].append((subject, idx, times, mean_pct))
+                for t_idx, t_val in enumerate(times):
+                    csv_rows.append({
+                        "subject": subject,
+                        "session": label,
+                        "session_idx": idx,
+                        "cluster": cluster_label,
+                        "marker": marker_label,
+                        "channels_used": ",".join(present),
+                        "t": float(t_val),
+                        "mean_pct": float(mean_pct[t_idx]),
+                        "low_pct": float(low_pct[t_idx]),
+                        "up_pct": float(up_pct[t_idx]),
+                        "n_trials": int(n_trials),
+                    })
+
         if session_traces:
             sub_path = (
                 out_dir / f"{subject}_6panel_mi_rest{variant_tag}.png"
             )
             _plot_subject_6panel(subject, session_traces, str(sub_path))
             print(f"  wrote: {sub_path.name}")
-        del session_traces
+        del session_traces, raw_traces
         gc.collect()
 
     # Cohort figure

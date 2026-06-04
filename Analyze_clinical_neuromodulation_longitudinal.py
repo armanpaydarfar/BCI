@@ -65,6 +65,9 @@ for _p in (str(_REPO_ROOT), str(_SWEEP_DIR)):
 from exploration.clinical_analysis._helpers import (  # noqa: E402
     clin_pictures_root, session_idx_from_label,
 )
+from exploration.clinical_analysis._subj002 import (  # noqa: E402
+    is_subj002, subj002_feature_idx, subj002_feature_sessions,
+)
 
 # Scalar ERD integration window (post-cue, (1, 4) s), shared with the
 # canonical ERD pipeline so the longitudinal scalar matches the timecourse.
@@ -318,12 +321,20 @@ def _compute_from_canonical_npz(
             f"Analyze_clinical_erd_refined.py before this script."
         )
     rows = []
-    session_summary = []
     for npz_path in sorted(npz_dir.glob("*_car.npz")):
         d = np.load(npz_path, allow_pickle=True)
         subject = str(d["subject"])
         sess = str(d["session"])
-        sess_idx = session_idx_from_label(sess)
+        # CLIN_SUBJ_002 (feature family): keep S002/S003/S004 (S001 left-arm
+        # excluded) and assign feature indices — S002 -> 1, and S003+S004
+        # (same day) -> 2, so they pool into one session-2 estimate at the
+        # groupby below. Guards against a stale S001 npz lingering.
+        if is_subj002(subject):
+            if sess not in subj002_feature_sessions():
+                continue
+            sess_idx = subj002_feature_idx(sess)
+        else:
+            sess_idx = session_idx_from_label(sess)
         for cluster_key in ("contra", "ipsi", "bilat"):
             ptp_key = f"{cluster_key}_mi__ptp"
             if ptp_key not in d:
@@ -334,10 +345,8 @@ def _compute_from_canonical_npz(
             if ptp.ndim != 2 or ptp.shape[0] == 0:
                 continue
             tmask = (times >= SCALAR_WIN[0]) & (times <= SCALAR_WIN[1])
-            # Average over the window AND across trials in LOG space (the npz
-            # substrate is already log-averaged across ch+freq); convert to %
-            # only at the end. Matches the canonical timecourse so the
-            # longitudinal scalar and the 6-panel figures agree.
+            # Per-trial scalar: mean over the window in LOG space (the npz
+            # substrate is already log-averaged across ch+freq), then -> %.
             ptp_log = np.log10(1.0 + ptp / 100.0)        # % -> logratio
             per_trial_log = ptp_log[:, tmask].mean(axis=1)   # per-trial window mean
             per_trial = 100.0 * (10.0 ** per_trial_log - 1.0)  # per-trial ERD%
@@ -347,21 +356,30 @@ def _compute_from_canonical_npz(
                     "session_idx": sess_idx, "cluster": cluster_key,
                     "channels_used": present, "erd_pct": float(v),
                 })
-            erd_mean = 100.0 * (10.0 ** per_trial_log.mean() - 1.0)
-            session_summary.append({
-                "subject": subject, "session": sess,
-                "session_idx": sess_idx, "cluster": cluster_key,
-                "channels_used": present,
-                "n_trials": int(len(per_trial)),
-                "erd_mean": float(erd_mean),             # log-space trial mean -> %
-                "erd_median": float(np.median(per_trial)),
-                "erd_se": float(
-                    per_trial.std(ddof=1) / np.sqrt(len(per_trial))
-                ) if len(per_trial) > 1 else 0.0,
-            })
-        print(f"  {subject} {sess}: {len(session_summary)} cluster rows so far")
+        print(f"  {subject} {sess}: {len(rows)} per-trial rows so far")
     df_trials = pd.DataFrame(rows)
-    df_sess = pd.DataFrame(session_summary)
+
+    # Per-session summary, grouped by (subject, session_idx) so SUBJ_002's
+    # S003+S004 pool into one same-day session-2 estimate. The central
+    # tendency is taken in LOG space (matches the canonical timecourse);
+    # median of the per-trial % is kept as a robustness check.
+    def _agg(g: pd.DataFrame) -> pd.Series:
+        pct = g["erd_pct"].to_numpy()
+        log = np.log10(1.0 + pct / 100.0)
+        n = len(pct)
+        return pd.Series({
+            "session": "+".join(sorted(g["session"].unique())),
+            "channels_used": g["channels_used"].iloc[0],
+            "n_trials": int(n),
+            "erd_mean": float(100.0 * (10.0 ** log.mean() - 1.0)),
+            "erd_median": float(np.median(pct)),
+            "erd_se": float(pct.std(ddof=1) / np.sqrt(n)) if n > 1 else 0.0,
+        })
+
+    df_sess = (
+        df_trials.groupby(["subject", "session_idx", "cluster"])
+        .apply(_agg).reset_index()
+    )
     df_trials.to_csv(out_dir / "erd_per_trial.csv", index=False)
     df_sess.to_csv(out_dir / "erd_session_summary.csv", index=False)
     return df_trials, df_sess

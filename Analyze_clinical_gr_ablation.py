@@ -164,10 +164,11 @@ BONFERRONI_ALPHA = 0.05 / BONFERRONI_N_PRIMARY  # ≈ 0.00833
 # sync (see exploration/clinical_analysis/_subj002.py).
 from exploration.clinical_analysis._subj002 import (  # noqa: E402
     SUBJ002_MOTOR_CHANNELS_13 as _SUBJ002_MOTOR_CHANNELS_13,
-    subj002_valid_sessions as _subj002_valid_sessions,
+    is_subj002, subj002_decoder_idx,
+    subj002_decoder_sessions as _subj002_decoder_sessions,
 )
 MOTOR_CHANNELS_13 = list(_SUBJ002_MOTOR_CHANNELS_13)
-CLIN002_RIGHT_ARM_SESSIONS = set(_subj002_valid_sessions())
+CLIN002_RIGHT_ARM_SESSIONS = set(_subj002_decoder_sessions())
 
 
 # ----------------------------------------------------------------------
@@ -567,7 +568,11 @@ def _gr_replay_session(
 
     return dict(
         subject=subject, session=session,
-        session_idx=session_idx_from_label(session),
+        # CLIN_SUBJ_002 renumbered (S002->1, S004->2) so her trajectory
+        # starts at 1 after S001/S003 are dropped (decoder family: S003 is
+        # within-subject and excluded; see _subj002).
+        session_idx=(subj002_decoder_idx(session) if is_subj002(subject)
+                     else session_idx_from_label(session)),
         n_trials=int(len(y_true)),
         n_mi=int((y_true == 200).sum()),
         n_rest=int((y_true == 100).sum()),

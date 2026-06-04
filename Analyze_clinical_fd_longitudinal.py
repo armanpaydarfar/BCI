@@ -64,13 +64,16 @@ from pyriemann.utils.distance import distance_riemann  # noqa: E402
 # valid-session filter). Keeping these in a single source-of-truth file
 # avoids the SUBJ_002 handling-drift the synthesis doc flags as P0.
 from Analyze_clinical_gr_ablation import (  # noqa: E402
-    CLIN002_RIGHT_ARM_SESSIONS, MOTOR_CHANNELS_13, MOTOR_CHANNELS_15,
+    MOTOR_CHANNELS_13, MOTOR_CHANNELS_15,
     SCALAR_WIN, TRIAL_WIN, _motor_channels_for, _config_a_mu_epochs,
     _restrict_to_motor, _runtime_shrinkage_for, _trial_covs,
 )
 from exploration.clinical_analysis._helpers import (  # noqa: E402
     clin_pictures_root, enumerate_clin_subjects,
     enumerate_online_sessions_for_subject, session_idx_from_label,
+)
+from exploration.clinical_analysis._subj002 import (  # noqa: E402
+    is_subj002, subj002_feature_idx, subj002_feature_sessions,
 )
 from sweep_phase2_round2 import load_raw_cached  # noqa: E402
 
@@ -137,10 +140,12 @@ def _compute_fd(covs_mi: np.ndarray,
 # Per-session FD via the gr_ablation preprocessing chain
 # ----------------------------------------------------------------------
 
-def _fd_for_session(subject: str, session: str) -> dict | None:
-    """Run the canonical preprocessing on one (subject, session), then
-    compute FD on the deployed-decoder motor channel set. Returns None if
-    the session has too few clean trials to estimate two class means.
+def _covs_for_session(subject: str, session: str):
+    """Per-trial MI/REST covariances for one (subject, session) on the
+    deployed-decoder motor channel set. Returns (covs_mi, covs_rest), or
+    None if the session yields no usable epochs. Trials are returned
+    un-pooled so the caller can concatenate sessions that share a
+    longitudinal index (SUBJ_002 S003+S004) before computing FD.
     """
     raw, events, event_dict = load_raw_cached(subject, session)
     out = _config_a_mu_epochs(raw, events, event_dict)
@@ -153,26 +158,22 @@ def _fd_for_session(subject: str, session: str) -> dict | None:
         return None
     use_lw, lam = _runtime_shrinkage_for(subject, session)
     covs = _trial_covs(data_motor, use_lw=use_lw, lam=lam)
-    mi_mask = labels == MI_LABEL
-    rest_mask = labels == REST_LABEL
-    return _compute_fd(covs[mi_mask], covs[rest_mask])
+    return covs[labels == MI_LABEL], covs[labels == REST_LABEL]
 
 
 # ----------------------------------------------------------------------
-# Valid session enumeration with SUBJ_002 right-arm filter
+# Valid session enumeration (feature family: S003 kept, pooled with S004)
 # ----------------------------------------------------------------------
 
 def _valid_sessions(subject: str) -> list[str]:
-    """Sessions we include in the FD trajectory.
-
-    For SUBJ_002 only her right-arm sessions count
-    (`Analyze_clinical_gr_ablation.py:172`). S001 was left-arm and the
-    marker semantics flip there — including it would invert MI/REST and
-    contaminate her FD trajectory.
+    """Sessions in the FD trajectory. FD is decoder-independent (feature
+    family), so for SUBJ_002 we keep S002/S003/S004 (S001 left-arm dropped);
+    S003+S004 (same day) pool into one timepoint via `subj002_feature_idx`.
     """
     sessions = enumerate_online_sessions_for_subject(subject)
-    if subject == "CLIN_SUBJ_002":
-        return [s for s in sessions if s in CLIN002_RIGHT_ARM_SESSIONS]
+    if is_subj002(subject):
+        valid = set(subj002_feature_sessions())
+        return [s for s in sessions if s in valid]
     return sessions
 
 
@@ -359,26 +360,46 @@ def main():
         motor_chs = _motor_channels_for(subject)
         print(f"\n=== {subject} ({len(sessions)} valid sessions, "
               f"{len(motor_chs)} motor ch) ===")
+        # Group sessions by longitudinal index, pooling per-trial
+        # covariances within a group before computing FD. For SUBJ_002 this
+        # merges same-day S003+S004 into one session-2 FD (S002 -> 1); a
+        # no-op for every other (subject, idx).
+        idx_groups: dict[int, list[str]] = {}
         for sess in sessions:
+            sidx = (subj002_feature_idx(sess) if is_subj002(subject)
+                    else session_idx_from_label(sess))
+            idx_groups.setdefault(sidx, []).append(sess)
+
+        for sidx in sorted(idx_groups):
+            sess_list = idx_groups[sidx]
             t_sess = time.time()
-            try:
-                fd = _fd_for_session(subject, sess)
-            except Exception as e:
-                print(f"  {sess}: FAILED ({type(e).__name__}: {e})")
+            mis, rests = [], []
+            for sess in sess_list:
+                try:
+                    cov = _covs_for_session(subject, sess)
+                except Exception as e:
+                    print(f"  {sess}: FAILED ({type(e).__name__}: {e})")
+                    continue
+                if cov is None:
+                    print(f"  {sess}: no usable trials, skipping")
+                    continue
+                mis.append(cov[0])
+                rests.append(cov[1])
+            if not mis:
                 continue
-            if fd is None:
-                print(f"  {sess}: no usable trials, skipping")
-                continue
-            sidx = session_idx_from_label(sess)
+            covs_mi = np.concatenate(mis, axis=0)
+            covs_rest = np.concatenate(rests, axis=0)
+            fd = _compute_fd(covs_mi, covs_rest)
+            label = "+".join(sess_list)
             row = {
-                "subject": subject, "session": sess,
+                "subject": subject, "session": label,
                 "session_idx": sidx,
                 "fd": fd["fd"], "dist_sq": fd["dist_sq"],
                 "var_mi": fd["var_mi"], "var_rest": fd["var_rest"],
                 "n_mi": fd["n_mi"], "n_rest": fd["n_rest"],
             }
             rows.append(row)
-            print(f"  {sess} (sidx={sidx}): FD={fd['fd']:.4f}  "
+            print(f"  {label} (sidx={sidx}): FD={fd['fd']:.4f}  "
                   f"dist²={fd['dist_sq']:.4f}  var_MI={fd['var_mi']:.4f}  "
                   f"var_REST={fd['var_rest']:.4f}  "
                   f"n_MI={fd['n_mi']} n_REST={fd['n_rest']}  "
