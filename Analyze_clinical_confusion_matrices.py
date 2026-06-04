@@ -33,7 +33,9 @@ from exploration.clinical_analysis._helpers import (  # noqa: E402
     enumerate_online_sessions_for_subject,
 )
 from config import DATA_DIR  # noqa: E402  (moved out of _helpers in 17f6508)
-from exploration.clinical_analysis._subj002 import is_subj002  # noqa: E402
+from exploration.clinical_analysis._subj002 import (  # noqa: E402
+    is_subj002, subj002_decoder_sessions,
+)
 
 from Analyze_experiment_logs_cross_subject import (  # noqa: E402
     compute_confusion_matrix_from_csv, find_decoder_csv,
@@ -95,7 +97,12 @@ def _aggregate_subject_cm(subject: str) -> tuple[np.ndarray, int, int]:
     cm_total = np.zeros((2, 3), dtype=int)
     n_sessions = 0
     n_runs = 0
-    for sess in enumerate_online_sessions_for_subject(subject):
+    sessions = enumerate_online_sessions_for_subject(subject)
+    # CLIN_SUBJ_002 (decoder family): only S002/S004 (S001 left-arm and S003
+    # within-subject excluded), even in her per-subject matrix.
+    if is_subj002(subject):
+        sessions = [s for s in sessions if s in subj002_decoder_sessions()]
+    for sess in sessions:
         logs_dir = Path(DATA_DIR) / f"sub-{subject}" / f"ses-{sess}" / "logs"
         if not logs_dir.is_dir():
             continue

@@ -88,6 +88,7 @@ BONFERRONI_ALPHA_PRIMARY = 0.05 / 8
 #   a = a * alpha + p * (1 - alpha),  init 0.5.
 from exploration.clinical_analysis._subj002 import (  # noqa: E402
     SUBJ002_INTEGRATOR_ALPHA as CLIN002_INTEGRATOR_ALPHA,
+    is_subj002, subj002_decoder_idx, subj002_decoder_sessions,
 )
 
 
@@ -431,6 +432,10 @@ def main():
     rows = []
     for subject in enumerate_clin_subjects():
         sessions = enumerate_online_sessions_for_subject(subject)
+        # CLIN_SUBJ_002 (decoder family): only her expert-TL right-arm
+        # sessions S002/S004 (S001 left-arm and S003 within-subject excluded).
+        if is_subj002(subject):
+            sessions = [s for s in sessions if s in subj002_decoder_sessions()]
         print(f"\n=== {subject} ({len(sessions)} sessions) ===")
         for sess in sessions:
             t0 = time.time()
@@ -447,7 +452,8 @@ def main():
                 continue
             rows.append({
                 "subject": subject, "session": sess,
-                "session_idx": session_idx_from_label(sess),
+                "session_idx": (subj002_decoder_idx(sess) if is_subj002(subject)
+                                else session_idx_from_label(sess)),
                 "n_runs": len(run_dfs), **m,
             })
             print(

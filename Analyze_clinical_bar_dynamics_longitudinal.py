@@ -113,7 +113,7 @@ BONFERRONI_ALPHA_PRIMARY = 0.05 / 8
 from exploration.clinical_analysis._subj002 import (  # noqa: E402
     SUBJ002_INTEGRATOR_ALPHA as CLIN002_INTEGRATOR_ALPHA,
     SUBJ002_CLASSIFY_WINDOW_MS,
-    is_subj002,
+    is_subj002, subj002_decoder_idx, subj002_decoder_sessions,
 )
 _CLIN002_SHUTOUT_S = SUBJ002_CLASSIFY_WINDOW_MS / 1000.0
 
@@ -318,7 +318,10 @@ def _load_session_trials(
             continue
         per_trial["subject"] = subject
         per_trial["session"] = session
-        per_trial["session_idx"] = session_idx_from_label(session)
+        per_trial["session_idx"] = (
+            subj002_decoder_idx(session) if is_subj002(subject)
+            else session_idx_from_label(session)
+        )
         per_trial["run_id"] = run_dir.name
         per_trial["shutout_s"] = shutout_s
         rows.append(per_trial)
@@ -614,6 +617,10 @@ def main():
     all_trials = []
     for subject in enumerate_clin_subjects():
         sessions = enumerate_online_sessions_for_subject(subject)
+        # CLIN_SUBJ_002 (decoder family): only S002/S004 (S001 left-arm and
+        # S003 within-subject excluded).
+        if is_subj002(subject):
+            sessions = [s for s in sessions if s in subj002_decoder_sessions()]
         print(f"\n=== {subject} ({len(sessions)} sessions) ===")
         for sess in sessions:
             t0 = time.time()
