@@ -487,6 +487,102 @@ def task_topostrip():
 
 
 # ----------------------------------------------------------------------
+# Task: spatial-filter comparison for the topomap strips. The report default
+# is CAR (a low-pass-ish reference that leaves broad modulations); CSD (the MNE
+# spherical-spline surface Laplacian) and Hjorth (k=4 nearest-neighbour
+# Laplacian) are spatial high-pass filters expected to sharpen / focalise the
+# ERD. Regenerates MI + REST strips for BOTH subjects under all three filters
+# into erd_topomaps/spatial_compare/ so the focalisation can be compared before
+# deciding whether to switch the report away from CAR. Diagnostic only — does
+# not touch the shipped report_figures/.
+# ----------------------------------------------------------------------
+def task_topocompare():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import mne
+    _inject_roots()
+    import generate_plots_config_a as gp
+    from Analyze_clinical_erd_refined import (
+        MU_LO, MU_HI, config_a_pipeline, _reject_artifact_trials,
+        CONFIG_A_DISPLAY_BASELINE,
+    )
+    out_dir = OUT_ROOT / "erd_topomaps" / "spatial_compare"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    subjects = [("CLIN_SUBJ_007", "Subject 001"),
+                ("CLIN_SUBJ_008", "Subject 002")]
+    filters = ("car", "csd", "hjorth")
+    # Sustained-desync window for the single-panel focalisation comparison
+    # (the MI mu trough plateaus over ~1-3 s in both subjects' timecourses).
+    FOCAL_WIN = (1.0, 3.0)
+    focal = {}  # (sid, sf) -> (scalar_map[n_ch], info)
+    orig_sf = CONFIG_A_DISPLAY_BASELINE["spatial_filter"]
+    try:
+        for sid, slabel in subjects:
+            for sf in filters:
+                CONFIG_A_DISPLAY_BASELINE["spatial_filter"] = sf
+                pipe = config_a_pipeline(sid, SESSION)
+                tfr = pipe["tfr_trials"]
+                # Same bilateral-substrate cap=200 reject as task_topostrip, so
+                # the only difference vs the shipped strip is the spatial filter.
+                _reject_artifact_trials(tfr, abs_cap=ERD_ABS_CAP)
+                tfr_avg = {mk: t.average() for mk, t in tfr.items()}
+                rest, mi = tfr_avg.get("100"), tfr_avg.get("200")
+                vlim = gp._compute_dynamic_vlim(rest, mi)
+                if mi is not None:
+                    gp._plot_topo_strip(
+                        mi, MU_LO, MU_HI, vlim,
+                        f"ERD/ERS – MI | {slabel} | {sf.upper()} | "
+                        f"cap={ERD_ABS_CAP:.0f}% (n={mi.nave})",
+                        str(out_dir / f"{sid}_{SESSION}_mi_{sf}.png"))
+                    fmask = (mi.freqs >= MU_LO) & (mi.freqs <= MU_HI)
+                    tmask = (mi.times >= FOCAL_WIN[0]) & (mi.times <= FOCAL_WIN[1])
+                    scalar = mi.data[:, fmask][:, :, tmask].mean(axis=(1, 2))
+                    focal[(sid, sf)] = (scalar, mi.info)
+                if rest is not None:
+                    gp._plot_topo_strip(
+                        rest, MU_LO, MU_HI, vlim,
+                        f"ERD/ERS – Rest | {slabel} | {sf.upper()} | "
+                        f"cap={ERD_ABS_CAP:.0f}% (n={rest.nave})",
+                        str(out_dir / f"{sid}_{SESSION}_rest_{sf}.png"))
+                print(f"  {sid} {sf}: MI n={getattr(mi, 'nave', 0)} "
+                      f"rest n={getattr(rest, 'nave', 0)}")
+    finally:
+        CONFIG_A_DISPLAY_BASELINE["spatial_filter"] = orig_sf
+
+    # Focalisation grid: rows = subject, cols = filter, one large MI topomap
+    # (mean mu logratio over FOCAL_WIN). Per-panel symmetric vlim (each filter
+    # scaled to its own |max|) so the comparison is of spatial EXTENT, not
+    # amplitude — the Laplacians (CSD/Hjorth) reduce absolute magnitude, which
+    # a shared scale would read as "weaker" rather than "more focal".
+    fig, axes = plt.subplots(len(subjects), len(filters),
+                             figsize=(4.2 * len(filters), 4.0 * len(subjects)),
+                             squeeze=False)
+    for ri, (sid, slabel) in enumerate(subjects):
+        for ci, sf in enumerate(filters):
+            ax = axes[ri][ci]
+            if (sid, sf) not in focal:
+                ax.axis("off")
+                continue
+            scalar, info = focal[(sid, sf)]
+            vmax = float(np.nanmax(np.abs(scalar))) or 1.0
+            im, _ = mne.viz.plot_topomap(
+                scalar, info, axes=ax, cmap="RdBu_r", show=False,
+                vlim=(-vmax, vmax), contours=6, sensors=True)
+            fig.colorbar(im, ax=ax, shrink=0.7, label="logratio")
+            ax.set_title(f"{slabel} · {sf.upper()}\n(|max|={vmax:.2f})",
+                         fontsize=10)
+    fig.suptitle(f"MI μ ERD focalisation by spatial filter "
+                 f"(mean {FOCAL_WIN[0]:g}-{FOCAL_WIN[1]:g} s, "
+                 f"per-panel vlim) — blue = desync", fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    grid_png = out_dir / "focalisation_grid_mi.png"
+    fig.savefig(grid_png, dpi=150)
+    plt.close(fig)
+    print(f"Wrote spatial-filter comparison strips + {grid_png.name} -> {out_dir}")
+
+
+# ----------------------------------------------------------------------
 # Task: ERD mean ± SE timecourses, 6-panel, in BOTH logratio and percent
 # units (cap=ERD_ABS_CAP). Grand-average (mean across trials) to match the
 # topomap; the canonical 6-panel uses median, kept separately for reference.
@@ -1270,13 +1366,19 @@ def task_consolidate():
     # The canonical per-subject grid (_plot_per_subject_grid) is one panel per
     # subject — a side-by-side layout for n=2. Wrap it to relabel the panels
     # with the masked IDs and write a method-only title (no same-site claim).
+    import mne
     import Analyze_eds_topoplot_CLIN as eds
     eds.EXPERT_SOURCE_SUBJECT = "CLIN_SUBJ_007"
     eds.clin_pictures_root = lambda: OUT_ROOT
     _orig_grid = eds._plot_per_subject_grid
     _orig_panel = eds._plot_topomap_panel
 
-    def _clean_grid(per_subj_eds, title, save_path, *a, **k):
+    def _clean_grid(per_subj_eds, title, save_path, cmap="viridis", *a, **k):
+        # The canonical grid hardcodes a 4-column layout; with n=2 subjects its
+        # two trailing blank columns left a large gap and pushed the colorbar
+        # far to the right. Render a tight one-row, one-column-per-subject panel
+        # instead (masked IDs, shared vlim — same z-score/colorbar semantics as
+        # the canonical grid, Analyze_eds_topoplot_CLIN.py:870-922).
         name = Path(save_path).name
         if "_mi_" in name:
             cls, out = "Motor imagery", rep / "consolidated_eds_mi.png"
@@ -1284,11 +1386,33 @@ def task_consolidate():
             cls, out = "Rest", rep / "consolidated_eds_rest.png"
         else:
             return
-        relab = {REPORT_SUBJECT_LABEL.get(s, s): v
-                 for s, v in per_subj_eds.items()}
-        _orig_grid(relab,
-                   f"EDS (electrode discriminancy score) · {cls} (μ)",
-                   str(out), *a, **k)
+        items = [(REPORT_SUBJECT_LABEL.get(s, s), v)
+                 for s, v in sorted(per_subj_eds.items())]
+        panels = []
+        for slabel, (eds_vec, channels) in items:
+            sd = eds_vec.std(ddof=1)
+            z = ((eds_vec - eds_vec.mean()) / sd if sd > 0
+                 else np.zeros_like(eds_vec))
+            panels.append((slabel, z, channels))
+        all_z = np.concatenate([z for _, z, _ in panels]) if panels else []
+        vmax = float(np.nanmax(np.abs(all_z))) if len(all_z) else 1.0
+        vlim = (-vmax, vmax) if vmax > 0 else (None, None)
+        f, axs = plt.subplots(1, len(panels), figsize=(4.4 * len(panels), 4.4),
+                              squeeze=False)
+        last_im = None
+        for ax, (slabel, z, channels) in zip(axs[0], panels):
+            info = eds._make_info_for_channels(channels)
+            last_im, _ = mne.viz.plot_topomap(
+                z, info, axes=ax, cmap=cmap, show=False, names=channels,
+                vlim=vlim)
+            ax.set_title(slabel, fontsize=11)
+        if last_im is not None:
+            f.colorbar(last_im, ax=list(axs[0]), shrink=0.7,
+                       label=f"EDS z-score (shared vlim ±{vmax:.2f})")
+        f.suptitle(f"EDS (electrode discriminancy score) · {cls} (μ)",
+                   fontsize=12)
+        f.savefig(str(out), dpi=150, bbox_inches="tight")
+        plt.close(f)
 
     eds._plot_per_subject_grid = _clean_grid
     eds._plot_topomap_panel = lambda *a, **k: None  # skip cohort single panels
@@ -1345,8 +1469,9 @@ def task_consolidate():
 
     # ---- (4) Pooled confusion matrices side by side (both subjects) ----
     fig, axes = plt.subplots(1, 2, figsize=(13, 5.6))
+    fig.subplots_adjust(wspace=0.08)
     im = None
-    for ax, (sid, slabel, _c) in zip(axes, subjects):
+    for ax_i, (ax, (sid, slabel, _c)) in enumerate(zip(axes, subjects)):
         pooled = []
         for rid, rd in _substantive_run_dirs(sid):
             d = pd.read_csv(find_decoder_csv(str(rd)))
@@ -1361,7 +1486,10 @@ def task_consolidate():
         ax.set_xticks([0, 1, 2])
         ax.set_xticklabels(["Pred MI", "Pred REST", "Ambiguous"])
         ax.set_yticks([0, 1])
-        ax.set_yticklabels(["Actual MI", "Actual REST"])
+        # Row meaning is shared across the two panels; labelling only the left
+        # panel keeps the right panel's "Actual REST" tick text from rendering
+        # into the inter-panel gap and over Subject 001's matrix.
+        ax.set_yticklabels(["Actual MI", "Actual REST"] if ax_i == 0 else [])
         for i in range(2):
             for j in range(3):
                 ax.text(j, i, f"{cm[i, j]}\n({pct[i, j]:.1f}%)", ha="center",
@@ -1384,63 +1512,133 @@ def task_consolidate():
     plt.close(fig)
     print("  wrote consolidated_confusion.png")
 
-    # ---- (5) Bar dynamics (both subjects): rows = subject, cols = metric ----
+    # ---- (5) Bar dynamics (both subjects): whole-session distributions ----
+    # Per Arman (2026-06-05): report the session-level per-trial distribution
+    # only. The earlier per-run breakdown ("All" + R001-R004) inflated apparent
+    # instability and understated Subject 002's control; both subjects now share
+    # each metric panel (x = subject, MI/REST boxes side by side).
     import Analyze_clinical_bar_dynamics_longitudinal as bar
     colmap = {"MI": "tab:orange", "REST": "tab:blue"}
-    fig, axrows = plt.subplots(len(subjects), 2, figsize=(13, 9), squeeze=False)
-    for ri, (sid, slabel, _c) in enumerate(subjects):
-        df_tr = bar._load_session_trials(sid, SESSION)
-        run_map = {rd.name: rid for rid, rd in _substantive_run_dirs(sid)}
-        if not df_tr.empty:
-            df_tr = df_tr.copy()
-            df_tr["run"] = df_tr["run_id"].map(run_map)
-        runs_present = (df_tr["run"].dropna().unique()
-                        if "run" in df_tr else [])
-        groups = ["All"] + sorted(runs_present)
-
-        def _vals(metric, group, cls, _df=df_tr):
-            d = _df[_df["Class"] == cls]
-            if group != "All":
-                d = d[d["run"] == group]
-            return d[metric].dropna().values
-
-        for ci, (metric, ylab) in enumerate(
-                (("LeanPct", "Lean toward target (%)"),
-                 ("TimeToThresh_s", "Time to threshold (s)"))):
-            ax = axrows[ri][ci]
-            handles = {}
-            for gi, g in enumerate(groups):
-                for cls, off in (("MI", -0.18), ("REST", +0.18)):
-                    v = _vals(metric, g, cls)
-                    if len(v) == 0:
-                        continue
-                    bp = ax.boxplot(v, positions=[gi + off], widths=0.3,
-                                    patch_artist=True, showfliers=True,
-                                    medianprops=dict(color="black"),
-                                    flierprops=dict(marker=".", markersize=4,
-                                                    markerfacecolor=colmap[cls],
-                                                    markeredgecolor=colmap[cls],
-                                                    alpha=0.5))
-                    for box in bp["boxes"]:
-                        box.set(facecolor=colmap[cls], alpha=0.55)
-                    handles[cls] = bp["boxes"][0]
-            ax.axvline(0.5, color="grey", lw=0.8, ls="--")
-            ax.set_xticks(range(len(groups)))
-            ax.set_xticklabels(groups)
-            ax.grid(True, axis="y", alpha=0.3)
-            ax.set_ylabel(f"{slabel}\n{ylab}" if ci == 0 else ylab)
-            if ri == len(subjects) - 1:
-                ax.set_xlabel("Session / run")
-            if handles and ri == 0 and ci == 0:
-                ax.legend(handles.values(), handles.keys(), loc="best")
-    fig.suptitle("Online feedback bar dynamics (box = per-trial distribution)",
-                 fontsize=13)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    labels = [slabel for _sid, slabel, _c in subjects]
+    sess_trials = {slabel: bar._load_session_trials(sid, SESSION)
+                   for sid, slabel, _c in subjects}
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
+    for ci, (metric, ylab) in enumerate(
+            (("LeanPct", "Lean toward target (%)"),
+             ("TimeToThresh_s", "Time to threshold (s)"))):
+        ax = axes[ci]
+        handles = {}
+        for si, slabel in enumerate(labels):
+            df_tr = sess_trials[slabel]
+            if df_tr.empty or metric not in df_tr:
+                continue
+            for cls, off in (("MI", -0.18), ("REST", +0.18)):
+                v = df_tr[df_tr["Class"] == cls][metric].dropna().values
+                if len(v) == 0:
+                    continue
+                bp = ax.boxplot(v, positions=[si + off], widths=0.3,
+                                patch_artist=True, showfliers=True,
+                                medianprops=dict(color="black"),
+                                flierprops=dict(marker=".", markersize=4,
+                                                markerfacecolor=colmap[cls],
+                                                markeredgecolor=colmap[cls],
+                                                alpha=0.5))
+                for box in bp["boxes"]:
+                    box.set(facecolor=colmap[cls], alpha=0.55)
+                handles[cls] = bp["boxes"][0]
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels)
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.set_ylabel(ylab)
+        if handles and ci == 0:
+            ax.legend(handles.values(), handles.keys(), loc="best")
+    fig.suptitle("Online feedback bar dynamics, whole session "
+                 "(box = per-trial distribution)", fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(rep / "consolidated_bar.png", dpi=200)
     plt.close(fig)
     print("  wrote consolidated_bar.png")
 
     print(f"\nConsolidated figures -> {rep}")
+
+
+# ----------------------------------------------------------------------
+# Task: consolidated 2-subject ERD topography-over-time for the report
+# (report_figures/consolidated_erd_topography_{mi,rest}.png). Rows = subject,
+# cols = the 8 canonical post-cue 0.5 s windows. CAR spatial filter — matches
+# the rest of the analysis (timecourse, decoder framing). CSD/Hjorth were
+# evaluated (task_topocompare) but rejected 2026-06-05 with Arman: the surface
+# Laplacian focalised onto midline-central rather than the expected
+# contralateral hand area, and only for one subject, so its focalisation was
+# not informative enough to justify a second reference scheme. Per-subject
+# vlim: the two sessions differ ~2x in logratio amplitude, so a shared colour
+# scale would wash Subject 002 out. Kept as its own task (not folded into
+# task_consolidate) so the topography can be re-rendered without regenerating
+# the other five consolidated figures.
+# ----------------------------------------------------------------------
+def task_consolidatetopo():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _inject_roots()
+    import generate_plots_config_a as gp
+    from Analyze_clinical_erd_refined import (
+        MU_LO, MU_HI, config_a_pipeline, _reject_artifact_trials,
+    )
+    rep = OUT_ROOT / "report_figures"
+    rep.mkdir(parents=True, exist_ok=True)
+    subjects = [("CLIN_SUBJ_007", "Subject 001"),
+                ("CLIN_SUBJ_008", "Subject 002")]
+    starts, win = gp.TOPO_TIME_STARTS, gp.TOPO_WINDOW_SIZE
+
+    # Build the CAR MI/REST average TFRs + per-subject vlim once. The default
+    # CONFIG_A_DISPLAY_BASELINE spatial_filter is already "car", so no override.
+    avgs = {}
+    for sid, slabel in subjects:
+        pipe = config_a_pipeline(sid, SESSION)
+        tfr = pipe["tfr_trials"]
+        _reject_artifact_trials(tfr, abs_cap=ERD_ABS_CAP)
+        tfr_avg = {mk: t.average() for mk, t in tfr.items()}
+        rest, mi = tfr_avg.get("100"), tfr_avg.get("200")
+        avgs[sid] = {"label": slabel, "mi": mi, "rest": rest,
+                     "vlim": gp._compute_dynamic_vlim(rest, mi)}
+
+    for cls_key, cls_name in (("mi", "Motor imagery"), ("rest", "Rest")):
+        fig, axes = plt.subplots(
+            len(subjects), len(starts),
+            figsize=(1.7 * len(starts) + 1.0, 2.2 * len(subjects)),
+            squeeze=False, constrained_layout=True)
+        for ri, (sid, _slabel) in enumerate(subjects):
+            a = avgs[sid]
+            avg_tfr, vlim = a[cls_key], a["vlim"]
+            for ci, t0 in enumerate(starts):
+                ax = axes[ri][ci]
+                if avg_tfr is None:
+                    ax.axis("off")
+                    continue
+                avg_tfr.plot_topomap(
+                    tmin=float(t0), tmax=float(t0 + win), fmin=MU_LO,
+                    fmax=MU_HI, axes=ax, cmap=gp.CMAP, show=False,
+                    vlim=vlim, colorbar=False, show_names=False)
+                if ri == 0:
+                    ax.set_title(f"{t0:.1f}–{t0 + win:.1f}s", fontsize=9)
+            # Rotated subject label (plot_topomap clears y-axis labels, so place
+            # it in axes-fraction coords on the leftmost panel).
+            axes[ri][0].text(-0.22, 0.5, a["label"],
+                             transform=axes[ri][0].transAxes, rotation=90,
+                             va="center", ha="center", fontsize=12,
+                             fontweight="bold")
+            sm = plt.cm.ScalarMappable(norm=plt.Normalize(*vlim), cmap=gp.CMAP)
+            sm.set_array([])
+            fig.colorbar(sm, ax=list(axes[ri]), location="right",
+                         shrink=0.85, label="ERD/ERS (logratio)")
+        fig.suptitle(f"μ (8–13 Hz) ERD/ERS topography over time · {cls_name} "
+                     f"· CAR (per-subject scale)", fontsize=13)
+        out = rep / f"consolidated_erd_topography_{cls_key}.png"
+        fig.savefig(out, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  wrote {out.name}")
+    print(f"\nConsolidated topography -> {rep}")
 
 
 _TASKS = {
@@ -1449,6 +1647,7 @@ _TASKS = {
     "erd": task_erd,
     "erdmean": task_erdmean,
     "topostrip": task_topostrip,
+    "topocompare": task_topocompare,
     "quality": task_quality,
     "confusion": task_confusion,
     "decoder": task_decoder,
@@ -1457,6 +1656,7 @@ _TASKS = {
     "capdiag": task_capdiag,
     "report": task_report,
     "consolidate": task_consolidate,
+    "consolidatetopo": task_consolidatetopo,
 }
 
 
