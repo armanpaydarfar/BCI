@@ -1641,6 +1641,291 @@ def task_consolidatetopo():
     print(f"\nConsolidated topography -> {rep}")
 
 
+# ----------------------------------------------------------------------
+# Task: EDS spatial-reference diagnostic. The deployed MDM decoder builds
+# covariances on RAW (hardware-referenced) signals — no CAR
+# (Generate_Riemannian_adaptive.py:360-404; Utils/runtime_common.py has no
+# set_eeg_reference). Kumar 2024 likewise computes covariance directly from
+# bandpassed EEG (Eq. 1), no CAR. But Analyze_eds_topoplot_CLIN applies CAR
+# (line 389/697) over the full ~27-ch set and only then restricts to the
+# motor-15 feature montage. This task recomputes per-class MI EDS and pooled
+# MI-vs-REST EDS under three spatial references — `car` (current),
+# `car15` (CAR on just the 15 feature channels), `none` (raw, = the decoder)
+# — and reports where C3 / CP2 / POz land, to test whether the non-physiological
+# attribution is a CAR artifact. Diagnostic only; no report figures touched.
+# ----------------------------------------------------------------------
+def task_edsdiag():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import mne
+    _inject_roots()
+    import Analyze_eds_topoplot_CLIN as eds
+    eds.EXPERT_SOURCE_SUBJECT = "CLIN_SUBJ_007"
+    eds.clin_pictures_root = lambda: OUT_ROOT
+    out_dir = OUT_ROOT / "eds" / "spatial_diag"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    motor = eds.MOTOR_CHANNEL_NAMES
+    band = (eds.MU_LO, eds.MU_HI)
+    _orig_asf = eds.apply_spatial_filter
+
+    def _patched_asf(epochs, method):
+        # Adds two references the canonical filter doesn't support: `none`
+        # (identity = raw covariance, matching the deployed decoder) and
+        # `car15` (average reference computed over ONLY the motor-15 feature
+        # channels, so the reference is internal to the feature space).
+        if method == "none":
+            return epochs
+        if method == "car15":
+            picks = [c for c in motor if c in epochs.ch_names]
+            idx = [epochs.ch_names.index(c) for c in picks]
+            ep = epochs.copy()
+            d = ep.get_data()
+            d[:, idx, :] = d[:, idx, :] - d[:, idx, :].mean(axis=1, keepdims=True)
+            ep._data = d
+            return ep
+        return _orig_asf(epochs, method)
+
+    key = ["C3", "C4", "Cz", "CP1", "CP2", "CP5", "CP6", "Pz", "POz", "P3", "P4"]
+    subjects = [("CLIN_SUBJ_007", "Subject 001"),
+                ("CLIN_SUBJ_008", "Subject 002")]
+    refs = ("car", "car15", "none")
+    # results[(sid, ref)] = {"mi": (vec, kept), "pooled": (vec, kept)}
+    results = {}
+    eds.apply_spatial_filter = _patched_asf
+    try:
+        for sid, _slab in subjects:
+            for ref in refs:
+                mi_vec, _r, kept, nmi, nrest = eds.per_session_eds_per_class(
+                    sid, SESSION, band, motor, "mu", spatial_filter=ref)
+                pooled_vec, kept_p, _n = eds.per_session_eds(
+                    sid, SESSION, band, motor, "mu", spatial_filter=ref)
+                results[(sid, ref)] = {
+                    "mi": (mi_vec, kept), "pooled": (pooled_vec, kept_p),
+                    "nmi": nmi, "nrest": nrest}
+    finally:
+        eds.apply_spatial_filter = _orig_asf
+
+    def _rank_table(which):
+        # Print z-scored EDS + descending rank for the key channels, per ref.
+        print(f"\n===== {which.upper()} EDS — z-score (rank/Nkept) =====")
+        for sid, slab in subjects:
+            print(f"\n  {slab} ({sid}):")
+            hdr = "    {:<5}".format("ch") + "".join(f"{r:>16}" for r in refs)
+            print(hdr)
+            cols = {}
+            for ref in refs:
+                vec, kept = results[(sid, ref)][which]
+                if vec is None:
+                    cols[ref] = ({}, {}, 0)
+                    continue
+                z = (vec - vec.mean()) / (vec.std(ddof=1) or 1.0)
+                order = np.argsort(-vec)  # rank 1 = highest raw EDS
+                rank = {kept[order[k]]: k + 1 for k in range(len(kept))}
+                cols[ref] = (dict(zip(kept, z)), rank, len(kept))
+            for ch in key:
+                cells = []
+                for ref in refs:
+                    zmap, rank, nk = cols[ref]
+                    if ch in zmap:
+                        cells.append(f"{zmap[ch]:+.2f} ({rank[ch]}/{nk})")
+                    else:
+                        cells.append("—")
+                print("    {:<5}".format(ch) + "".join(f"{c:>16}" for c in cells))
+
+    print(f"\nEDS spatial-reference diagnostic | mu {band[0]:g}-{band[1]:g} Hz | "
+          f"motor-15 | per-class(MI vs own baseline) and pooled(MI vs REST)")
+    for sid, slab in subjects:
+        r = results[(sid, "car")]
+        print(f"  {slab}: n_MI={r['nmi']} n_REST={r['nrest']}")
+    _rank_table("pooled")   # the faithful Kumar variant (two classes)
+    _rank_table("mi")       # the per-class variant currently shipped
+
+    # Topomap comparison: rows = subject, cols = ref, for each of pooled/mi.
+    for which, cls_name in (("pooled", "Pooled MI-vs-REST (Kumar)"),
+                            ("mi", "Per-class MI-vs-baseline (shipped)")):
+        fig, axes = plt.subplots(len(subjects), len(refs),
+                                 figsize=(4.0 * len(refs), 3.8 * len(subjects)),
+                                 squeeze=False)
+        for ri, (sid, slab) in enumerate(subjects):
+            for ci, ref in enumerate(refs):
+                ax = axes[ri][ci]
+                vec, kept = results[(sid, ref)][which]
+                if vec is None or len(kept) < 2:
+                    ax.axis("off")
+                    continue
+                z = (vec - vec.mean()) / (vec.std(ddof=1) or 1.0)
+                vmax = float(np.nanmax(np.abs(z))) or 1.0
+                info = eds._make_info_for_channels(kept)
+                im, _ = mne.viz.plot_topomap(
+                    z, info, axes=ax, cmap="viridis", show=False,
+                    names=kept, vlim=(-vmax, vmax))
+                fig.colorbar(im, ax=ax, shrink=0.7)
+                ax.set_title(f"{slab} · {ref}", fontsize=10)
+        fig.suptitle(f"EDS spatial-reference comparison · {cls_name} (z-scored)",
+                     fontsize=12)
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
+        png = out_dir / f"eds_spatial_diag_{which}.png"
+        fig.savefig(png, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  wrote {png.name}")
+    print(f"\nEDS spatial diagnostic -> {out_dir}")
+
+
+# ----------------------------------------------------------------------
+# Task: pooled (2-subject) EDS figure under RAW covariance (no CAR — matches
+# the online MDM decoder, Generate_Riemannian_adaptive.py:360-404). Three
+# contrasts side by side: MI-vs-REST (the faithful Kumar two-class EDS),
+# MI-vs-baseline, and REST-vs-baseline (the per-class variants). Pooling
+# follows Kumar 2024 (Fig 5 caption): EDS is computed per subject, z-scored
+# across that subject's own electrodes, then averaged across subjects (equal
+# weight — robust at n=2, where one subject's larger class separation would
+# otherwise dominate a raw-EDS average). Channels are intersected across
+# subjects. Exploratory; writes to eds/pooled/, no report figures touched.
+# ----------------------------------------------------------------------
+def task_edspooled():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import mne
+    _inject_roots()
+    import Analyze_eds_topoplot_CLIN as eds
+    eds.EXPERT_SOURCE_SUBJECT = "CLIN_SUBJ_007"
+    eds.clin_pictures_root = lambda: OUT_ROOT
+    out_dir = OUT_ROOT / "eds" / "pooled"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    motor = eds.MOTOR_CHANNEL_NAMES
+    band = (eds.MU_LO, eds.MU_HI)
+    subjects = ["CLIN_SUBJ_007", "CLIN_SUBJ_008"]
+    _orig_asf = eds.apply_spatial_filter
+    eds.apply_spatial_filter = (
+        lambda epochs, method: epochs if method == "none"
+        else _orig_asf(epochs, method))
+
+    # contrast -> per-subject {channel: z-score}
+    contrasts = ("MI vs REST", "MI vs baseline", "REST vs baseline")
+    per_subj = {c: [] for c in contrasts}
+    try:
+        for sid in subjects:
+            mi_rest, kept_p, n_p = eds.per_session_eds(
+                sid, SESSION, band, motor, "mu", spatial_filter="none")
+            mi_base, rest_base, kept_pc, nmi, nrest = (
+                eds.per_session_eds_per_class(
+                    sid, SESSION, band, motor, "mu", spatial_filter="none"))
+            print(f"  {sid}: n_MI={nmi} n_REST={nrest} "
+                  f"kept(pooled)={len(kept_p)} kept(perclass)={len(kept_pc)}")
+            for vec, kept, cname in (
+                    (mi_rest, kept_p, "MI vs REST"),
+                    (mi_base, kept_pc, "MI vs baseline"),
+                    (rest_base, kept_pc, "REST vs baseline")):
+                if vec is None:
+                    per_subj[cname].append({})
+                    continue
+                z = (vec - vec.mean()) / (vec.std(ddof=1) or 1.0)
+                per_subj[cname].append(dict(zip(kept, z)))
+    finally:
+        eds.apply_spatial_filter = _orig_asf
+
+    fig, axes = plt.subplots(1, len(contrasts), figsize=(4.4 * len(contrasts), 4.2),
+                             squeeze=False)
+    for ci, cname in enumerate(contrasts):
+        ax = axes[0][ci]
+        maps = [m for m in per_subj[cname] if m]
+        if not maps:
+            ax.axis("off")
+            continue
+        common = [ch for ch in motor if all(ch in m for m in maps)]
+        if len(common) < 2:
+            ax.axis("off")
+            continue
+        pooled = np.array([np.mean([m[ch] for m in maps]) for ch in common])
+        vmax = float(np.nanmax(np.abs(pooled))) or 1.0
+        info = eds._make_info_for_channels(common)
+        im, _ = mne.viz.plot_topomap(
+            pooled, info, axes=ax, cmap="viridis", show=False,
+            names=common, vlim=(-vmax, vmax))
+        fig.colorbar(im, ax=ax, shrink=0.7, label="mean EDS z (2 subj)")
+        ax.set_title(cname, fontsize=11)
+    fig.suptitle("Pooled 2-subject EDS · μ · raw covariance (no CAR, "
+                 "online-matched)", fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    png = out_dir / "eds_pooled_none.png"
+    fig.savefig(png, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\nWrote {png}")
+
+
+# ----------------------------------------------------------------------
+# Task: the shipped report EDS figure — a SINGLE pooled MI-vs-REST topomap
+# under raw covariance (no CAR), written to
+# report_figures/consolidated_eds_pooled.png. This is the headline EDS for the
+# report (decided 2026-06-05 with Arman), superseding the per-subject per-class
+# grid (consolidated_eds_{mi,rest}.png from task_consolidate, retained as a
+# diagnostic). Rationale established in the EDS audit: (a) MI-vs-REST is the
+# faithful Kumar 2024 two-class contrast (the per-class MI-vs-baseline variant
+# is a divergence); (b) "none" matches the online MDM decoder's raw-covariance
+# feature space (Generate_Riemannian_adaptive.py:360-404), which CAR did not;
+# (c) pooling the two participants (per-subject z, then averaged — equal weight)
+# is more stable than the n=1 per-subject maps and mirrors Kumar's Fig 5
+# subject-averaging.
+# ----------------------------------------------------------------------
+def task_consolidateeds():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import mne
+    _inject_roots()
+    import Analyze_eds_topoplot_CLIN as eds
+    eds.EXPERT_SOURCE_SUBJECT = "CLIN_SUBJ_007"
+    eds.clin_pictures_root = lambda: OUT_ROOT
+    rep = OUT_ROOT / "report_figures"
+    rep.mkdir(parents=True, exist_ok=True)
+
+    motor = eds.MOTOR_CHANNEL_NAMES
+    band = (eds.MU_LO, eds.MU_HI)
+    subjects = ["CLIN_SUBJ_007", "CLIN_SUBJ_008"]
+    _orig_asf = eds.apply_spatial_filter
+    eds.apply_spatial_filter = (
+        lambda epochs, method: epochs if method == "none"
+        else _orig_asf(epochs, method))
+
+    zmaps = []  # per-subject {channel: z-score} for MI-vs-REST
+    try:
+        for sid in subjects:
+            vec, kept, n = eds.per_session_eds(
+                sid, SESSION, band, motor, "mu", spatial_filter="none")
+            if vec is None:
+                print(f"  {sid}: MI-vs-REST EDS unavailable (n={n})")
+                continue
+            z = (vec - vec.mean()) / (vec.std(ddof=1) or 1.0)
+            zmaps.append(dict(zip(kept, z)))
+            print(f"  {sid}: MI-vs-REST EDS over {len(kept)} channels (n={n})")
+    finally:
+        eds.apply_spatial_filter = _orig_asf
+
+    if not zmaps:
+        print("No EDS maps computed; aborting.")
+        return
+    common = [ch for ch in motor if all(ch in m for m in zmaps)]
+    pooled = np.array([np.mean([m[ch] for m in zmaps]) for ch in common])
+    vmax = float(np.nanmax(np.abs(pooled))) or 1.0
+    fig, ax = plt.subplots(figsize=(5.2, 5.0))
+    info = eds._make_info_for_channels(common)
+    im, _ = mne.viz.plot_topomap(
+        pooled, info, axes=ax, cmap="viridis", show=False,
+        names=common, vlim=(-vmax, vmax))
+    fig.colorbar(im, ax=ax, shrink=0.8, label="EDS z-score (pooled, 2 participants)")
+    ax.set_title("Electrode Discriminancy Score (EDS; Kumar et al., 2024)\n"
+                 "MI vs REST · pooled across participants", fontsize=11)
+    fig.tight_layout()
+    out = rep / "consolidated_eds_pooled.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\nWrote {out}")
+
+
 _TASKS = {
     "inventory": task_inventory,
     "eds": task_eds,
@@ -1657,6 +1942,9 @@ _TASKS = {
     "report": task_report,
     "consolidate": task_consolidate,
     "consolidatetopo": task_consolidatetopo,
+    "edsdiag": task_edsdiag,
+    "edspooled": task_edspooled,
+    "consolidateeds": task_consolidateeds,
 }
 
 
