@@ -1917,7 +1917,7 @@ def task_consolidateeds():
         pooled, info, axes=ax, cmap="viridis", show=False,
         names=common, vlim=(-vmax, vmax))
     fig.colorbar(im, ax=ax, shrink=0.8, label="EDS z-score (pooled, 2 participants)")
-    ax.set_title("Electrode Discriminancy Score (EDS; Kumar et al., 2024)\n"
+    ax.set_title("Electrode Discriminancy Score (EDS)\n"
                  "MI vs REST · pooled across participants", fontsize=11)
     fig.tight_layout()
     out = rep / "consolidated_eds_pooled.png"
