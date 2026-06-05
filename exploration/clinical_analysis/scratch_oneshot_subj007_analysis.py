@@ -249,15 +249,19 @@ def _inject_roots():
 # ----------------------------------------------------------------------
 # Per-run log-dir enumeration (substantive runs only)
 # ----------------------------------------------------------------------
-def _substantive_run_dirs():
+def _substantive_run_dirs(subject=None, session=None):
     """Return [(run_id, run_dir Path)] for runs whose decoder_output.csv has
     at least one data row, sorted by launch time and labelled R001.. in order.
-    The two aborted launches (header-only CSV) are dropped.
+    Aborted launches (header-only CSV) are dropped. Defaults to the module
+    SUBJECT/SESSION; pass a subject to enumerate the other participant (used by
+    the two-subject consolidation).
     """
     import pandas as pd
     from Analyze_experiment_logs_cross_subject import find_decoder_csv
 
-    logs_dir = Path(ONESHOT_ROOT) / f"sub-{SUBJECT}" / f"ses-{SESSION}" / "logs"
+    subject = subject or SUBJECT
+    session = session or SESSION
+    logs_dir = Path(ONESHOT_ROOT) / f"sub-{subject}" / f"ses-{session}" / "logs"
     out = []
     run_dirs = sorted(p for p in logs_dir.iterdir()
                       if p.is_dir() and p.name.startswith("ONLINE_"))
@@ -1296,6 +1300,146 @@ def task_consolidate():
         eds._plot_per_subject_grid = _orig_grid
         eds._plot_topomap_panel = _orig_panel
     print("  wrote consolidated_eds_{mi,rest}.png")
+
+    # ---- (3) Decoder performance overlay (both subjects): κ and NKV ----
+    import pandas as pd
+    import Analyze_clinical_decoder_longitudinal as dec
+    from Analyze_experiment_logs_cross_subject import (
+        find_decoder_csv, compute_confusion_matrix_from_csv,
+    )
+
+    def _run_metrics(sid):
+        rows = []
+        for rid, rd in _substantive_run_dirs(sid):
+            df = pd.read_csv(find_decoder_csv(str(rd)))
+            df["RunID"] = f"{sid}__{SESSION}__{rd.name}"
+            df["GlobalTrialID"] = df["RunID"] + "_" + df["Trial"].astype(str)
+            rows.append((rid, dec._session_metrics([df])))
+        return rows
+
+    fig, (axk, axn) = plt.subplots(1, 2, figsize=(11, 4.2))
+    nmax = 0
+    for sid, slabel, scolor in subjects:
+        mr = _run_metrics(sid)
+        nmax = max(nmax, len(mr))
+        x = range(len(mr))
+        axk.plot(x, [m.get("trial_kappa") for _, m in mr],
+                 marker="o", color=scolor, label=slabel)
+        axn.plot(x, [m.get("nkv") for _, m in mr],
+                 marker="o", color=scolor, label=slabel)
+    for ax, ttl in ((axk, "Trial κ (chance-corrected)"),
+                    (axn, "NKV (κ × decision rate)")):
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_xticks(range(nmax))
+        ax.set_xticklabels([f"R{i+1:03d}" for i in range(nmax)])
+        ax.set_xlabel("Run")
+        ax.set_title(ttl)
+        ax.grid(True, alpha=0.3)
+    axk.set_ylabel("Metric")
+    axk.legend(loc="lower left", fontsize=9)
+    fig.suptitle("Calibration-free decoder performance across runs", fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(rep / "consolidated_decoder.png", dpi=200)
+    plt.close(fig)
+    print("  wrote consolidated_decoder.png")
+
+    # ---- (4) Pooled confusion matrices side by side (both subjects) ----
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.6))
+    im = None
+    for ax, (sid, slabel, _c) in zip(axes, subjects):
+        pooled = []
+        for rid, rd in _substantive_run_dirs(sid):
+            d = pd.read_csv(find_decoder_csv(str(rd)))
+            d["RunID"] = f"{sid}__{SESSION}__{rd.name}"
+            d["GlobalTrialID"] = d["RunID"] + "_" + d["Trial"].astype(str)
+            pooled.append(d)
+        cm = compute_confusion_matrix_from_csv(
+            pd.concat(pooled, ignore_index=True))
+        row_tot = cm.sum(axis=1, keepdims=True)
+        pct = np.where(row_tot > 0, 100.0 * cm / np.maximum(row_tot, 1), 0.0)
+        im = ax.imshow(pct, cmap="Blues", vmin=0, vmax=100, aspect="auto")
+        ax.set_xticks([0, 1, 2])
+        ax.set_xticklabels(["Pred MI", "Pred REST", "Ambiguous"])
+        ax.set_yticks([0, 1])
+        ax.set_yticklabels(["Actual MI", "Actual REST"])
+        for i in range(2):
+            for j in range(3):
+                ax.text(j, i, f"{cm[i, j]}\n({pct[i, j]:.1f}%)", ha="center",
+                        va="center", fontsize=11,
+                        color="white" if pct[i, j] > 50 else "black")
+        dec_n = int(cm[:, :2].sum())
+        corr = int(cm[0, 0] + cm[1, 1])
+        amb = int(cm[:, 2].sum())
+        tot = int(cm.sum())
+        dacc = 100.0 * corr / dec_n if dec_n else float("nan")
+        ax.set_title(f"{slabel}\nDecision acc = {dacc:.1f}%  |  "
+                     f"Ambiguous = {amb}/{tot}", fontsize=11)
+    if im is not None:
+        fig.colorbar(im, ax=axes, fraction=0.046, pad=0.04,
+                     label="% of actual class")
+    fig.suptitle("Pooled whole-session confusion (calibration-free)",
+                 fontsize=13)
+    fig.savefig(rep / "consolidated_confusion.png", dpi=200,
+                bbox_inches="tight")
+    plt.close(fig)
+    print("  wrote consolidated_confusion.png")
+
+    # ---- (5) Bar dynamics (both subjects): rows = subject, cols = metric ----
+    import Analyze_clinical_bar_dynamics_longitudinal as bar
+    colmap = {"MI": "tab:orange", "REST": "tab:blue"}
+    fig, axrows = plt.subplots(len(subjects), 2, figsize=(13, 9), squeeze=False)
+    for ri, (sid, slabel, _c) in enumerate(subjects):
+        df_tr = bar._load_session_trials(sid, SESSION)
+        run_map = {rd.name: rid for rid, rd in _substantive_run_dirs(sid)}
+        if not df_tr.empty:
+            df_tr = df_tr.copy()
+            df_tr["run"] = df_tr["run_id"].map(run_map)
+        runs_present = (df_tr["run"].dropna().unique()
+                        if "run" in df_tr else [])
+        groups = ["All"] + sorted(runs_present)
+
+        def _vals(metric, group, cls, _df=df_tr):
+            d = _df[_df["Class"] == cls]
+            if group != "All":
+                d = d[d["run"] == group]
+            return d[metric].dropna().values
+
+        for ci, (metric, ylab) in enumerate(
+                (("LeanPct", "Lean toward target (%)"),
+                 ("TimeToThresh_s", "Time to threshold (s)"))):
+            ax = axrows[ri][ci]
+            handles = {}
+            for gi, g in enumerate(groups):
+                for cls, off in (("MI", -0.18), ("REST", +0.18)):
+                    v = _vals(metric, g, cls)
+                    if len(v) == 0:
+                        continue
+                    bp = ax.boxplot(v, positions=[gi + off], widths=0.3,
+                                    patch_artist=True, showfliers=True,
+                                    medianprops=dict(color="black"),
+                                    flierprops=dict(marker=".", markersize=4,
+                                                    markerfacecolor=colmap[cls],
+                                                    markeredgecolor=colmap[cls],
+                                                    alpha=0.5))
+                    for box in bp["boxes"]:
+                        box.set(facecolor=colmap[cls], alpha=0.55)
+                    handles[cls] = bp["boxes"][0]
+            ax.axvline(0.5, color="grey", lw=0.8, ls="--")
+            ax.set_xticks(range(len(groups)))
+            ax.set_xticklabels(groups)
+            ax.grid(True, axis="y", alpha=0.3)
+            ax.set_ylabel(f"{slabel}\n{ylab}" if ci == 0 else ylab)
+            if ri == len(subjects) - 1:
+                ax.set_xlabel("Session / run")
+            if handles and ri == 0 and ci == 0:
+                ax.legend(handles.values(), handles.keys(), loc="best")
+    fig.suptitle("Online feedback bar dynamics (box = per-trial distribution)",
+                 fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(rep / "consolidated_bar.png", dpi=200)
+    plt.close(fig)
+    print("  wrote consolidated_bar.png")
+
     print(f"\nConsolidated figures -> {rep}")
 
 
