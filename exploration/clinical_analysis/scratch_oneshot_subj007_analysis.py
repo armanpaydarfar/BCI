@@ -1200,6 +1200,105 @@ def task_report():
     print(f"\nShipped report figures -> {rep}")
 
 
+# ----------------------------------------------------------------------
+# Task: two-subject consolidated figures for the proposal (top-level
+# report_figures/). Both oneshot participants on shared axes; the per-session
+# figures stay in report_figures/Subject_00N/. Priority per Arman: the
+# bilateral ERD/ERS overlay (neuromodulation) and the side-by-side EDS grid.
+# Subject IDs are masked (Subject 001/002). Requires both subjects present in
+# the oneshot tree.
+# ----------------------------------------------------------------------
+def task_consolidate():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _inject_roots()
+    rep = OUT_ROOT / "report_figures"
+    rep.mkdir(parents=True, exist_ok=True)
+    subjects = [("CLIN_SUBJ_007", "Subject 001", "tab:blue"),
+                ("CLIN_SUBJ_008", "Subject 002", "tab:orange")]
+
+    # ---- (1) Bilateral ERD/ERS overlay (both subjects, MI | Rest) ----
+    from Analyze_clinical_erd_refined import (
+        MU_LO, MU_HI, MI_MARKER, REST_MARKER, config_a_pipeline,
+        BILATERAL_MOTOR_CLUSTER,
+    )
+    cols = [("Motor imagery", MI_MARKER), ("Rest", REST_MARKER)]
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), sharex=True)
+    for sid, slabel, scolor in subjects:
+        pipe = config_a_pipeline(sid, SESSION)
+        tfr_c, _ = _reject_artifact_trials_for_cluster(
+            pipe["tfr_trials"], BILATERAL_MOTOR_CLUSTER, abs_cap=ERD_ABS_CAP)
+        for ci, (clab, marker) in enumerate(cols):
+            if marker not in tfr_c:
+                continue
+            t = tfr_c[marker]
+            idx = [t.ch_names.index(c) for c in BILATERAL_MOTOR_CLUSTER
+                   if c in t.ch_names]
+            fmask = (t.freqs >= MU_LO) & (t.freqs <= MU_HI)
+            pt = t.data[:, idx][:, :, fmask].mean(axis=(1, 2))
+            bmask = (t.times >= -1.0) & (t.times <= 0.0)
+            pt = pt - pt[:, bmask].mean(axis=1, keepdims=True)
+            n = pt.shape[0]
+            mean = pt.mean(axis=0)
+            se = (pt.std(axis=0, ddof=1) / np.sqrt(n)
+                  if n > 1 else np.zeros_like(mean))
+            axes[ci].plot(t.times, mean, color=scolor, lw=1.7, label=slabel)
+            axes[ci].fill_between(t.times, mean - se, mean + se,
+                                  color=scolor, alpha=0.18)
+    for ci, (clab, _m) in enumerate(cols):
+        ax = axes[ci]
+        ax.axhline(0, color="k", lw=0.6)
+        ax.axvline(0, color="grey", lw=0.6, ls=":")
+        ax.set_title(clab, fontsize=12)
+        ax.set_xlabel("Time from cue (s)")
+        ax.grid(True, alpha=0.3)
+    axes[0].set_ylabel("ERD/ERS (logratio)")
+    axes[0].legend(loc="best", fontsize=9)
+    fig.suptitle("μ (8–13 Hz) ERD/ERS · bilateral sensorimotor cluster "
+                 "(mean ± SE)", fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(rep / "consolidated_erd_timecourse_bilat.png", dpi=150)
+    plt.close(fig)
+    print("  wrote consolidated_erd_timecourse_bilat.png")
+
+    # ---- (2) EDS side-by-side grid (both subjects), neutral method title ----
+    # The canonical per-subject grid (_plot_per_subject_grid) is one panel per
+    # subject — a side-by-side layout for n=2. Wrap it to relabel the panels
+    # with the masked IDs and write a method-only title (no same-site claim).
+    import Analyze_eds_topoplot_CLIN as eds
+    eds.EXPERT_SOURCE_SUBJECT = "CLIN_SUBJ_007"
+    eds.clin_pictures_root = lambda: OUT_ROOT
+    _orig_grid = eds._plot_per_subject_grid
+    _orig_panel = eds._plot_topomap_panel
+
+    def _clean_grid(per_subj_eds, title, save_path, *a, **k):
+        name = Path(save_path).name
+        if "_mi_" in name:
+            cls, out = "Motor imagery", rep / "consolidated_eds_mi.png"
+        elif "_rest_" in name:
+            cls, out = "Rest", rep / "consolidated_eds_rest.png"
+        else:
+            return
+        relab = {REPORT_SUBJECT_LABEL.get(s, s): v
+                 for s, v in per_subj_eds.items()}
+        _orig_grid(relab,
+                   f"EDS (electrode discriminancy score) · {cls} (μ)",
+                   str(out), *a, **k)
+
+    eds._plot_per_subject_grid = _clean_grid
+    eds._plot_topomap_panel = lambda *a, **k: None  # skip cohort single panels
+    try:
+        sys.argv = ["eds", "--subjects", "CLIN_SUBJ_007,CLIN_SUBJ_008",
+                    "--no-diff-plot"]
+        eds.main()
+    finally:
+        eds._plot_per_subject_grid = _orig_grid
+        eds._plot_topomap_panel = _orig_panel
+    print("  wrote consolidated_eds_{mi,rest}.png")
+    print(f"\nConsolidated figures -> {rep}")
+
+
 _TASKS = {
     "inventory": task_inventory,
     "eds": task_eds,
@@ -1213,6 +1312,7 @@ _TASKS = {
     "erddiag": task_erddiag,
     "capdiag": task_capdiag,
     "report": task_report,
+    "consolidate": task_consolidate,
 }
 
 
