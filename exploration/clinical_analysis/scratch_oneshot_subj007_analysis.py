@@ -49,8 +49,11 @@ import numpy as np
 # ----------------------------------------------------------------------
 # Batch constants
 # ----------------------------------------------------------------------
-SUBJECT = "CLIN_SUBJ_007"
-SESSION = "S001ONLINE"
+# Subject/session are env-selectable so the same driver runs both oneshot
+# participants without editing the constant (ONESHOT_SUBJECT=CLIN_SUBJ_008 for
+# the second). Default stays CLIN_SUBJ_007.
+SUBJECT = os.environ.get("ONESHOT_SUBJECT", "CLIN_SUBJ_007")
+SESSION = os.environ.get("ONESHOT_SESSION", "S001ONLINE")
 ONESHOT_ROOT = r"C:\Users\arman\Documents\oneshot"
 OUT_ROOT = Path(r"C:\Users\arman\Pictures\clin_analysis_oneshot")
 
@@ -981,11 +984,14 @@ def task_report():
     import pandas as pd
     _inject_roots()
 
-    rep = OUT_ROOT / "report_figures"
-    rep.mkdir(parents=True, exist_ok=True)
     # Masked, external-facing label (CLIN_SUBJ_007 -> "Subject 001").
     subj = REPORT_SUBJECT_LABEL.get(
         SUBJECT, SUBJECT.replace("CLIN_SUBJ_", "Subject "))
+    # Per-subject subfolder so the two sessions' shipped figures stay separate
+    # (generic filenames would otherwise overwrite). The top-level
+    # report_figures/ is reserved for the consolidated 2-subject figures.
+    rep = OUT_ROOT / "report_figures" / subj.replace(" ", "_")
+    rep.mkdir(parents=True, exist_ok=True)
 
     # ---- (1) ERD/ERS timecourse — logratio, mean±SE, cluster-matched, re-zeroed.
     # Report version: one standalone 2-panel (MI | Rest) figure per cluster, so
