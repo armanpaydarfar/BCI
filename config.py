@@ -354,8 +354,10 @@ ERRP_DECODER_ENABLE = 0
 # Options validated live: "liu_cca_xgb", "xdawn_xgb"
 ERRP_DECODER_BACKEND = "liu_cca_xgb"
 # Epoch window anchored at the event marker (seconds post-event).
-# 0-800 ms captures ERN (~80-150 ms) and Pe (~200-400 ms).
-ERRP_EPOCH_TMIN = 0.0
+# 200-800 ms is centred on the Pe (~200-400 ms). Must match the window the
+# deployed bundles were trained at (PILOT007 liu_cca_xgb/xdawn_xgb = 0.2 s);
+# runtime_common enforces config == bundle feature_spec or raises.
+ERRP_EPOCH_TMIN = 0.2
 ERRP_EPOCH_TMAX = 0.8
 # xDAWN spatial filters per class (4 is standard for P300/ErrP paradigms)
 ERRP_XDAWN_N_FILTERS = 4
