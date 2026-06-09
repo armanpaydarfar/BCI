@@ -54,8 +54,13 @@ import numpy as np
 # the second). Default stays CLIN_SUBJ_007.
 SUBJECT = os.environ.get("ONESHOT_SUBJECT", "CLIN_SUBJ_007")
 SESSION = os.environ.get("ONESHOT_SESSION", "S001ONLINE")
-ONESHOT_ROOT = r"C:\Users\arman\Documents\oneshot"
-OUT_ROOT = Path(r"C:\Users\arman\Pictures\clin_analysis_oneshot")
+# Data + output roots are env-overridable so the same driver can also run the
+# tiagobot healthy-pilot study (ONESHOT_ROOT=...\tiagobot,
+# ONESHOT_OUT=...\Pictures\pilot_analysis, ONESHOT_SUBJECT=PILOT001..008).
+# Defaults stay on the CLIN oneshot tree.
+ONESHOT_ROOT = os.environ.get("ONESHOT_ROOT", r"C:\Users\arman\Documents\oneshot")
+OUT_ROOT = Path(os.environ.get(
+    "ONESHOT_OUT", r"C:\Users\arman\Pictures\clin_analysis_oneshot"))
 
 # External-facing (shipped report_figures/) subject labels. The oneshot study
 # re-numbers its participants 001, 002, ... for publication so the real CLIN
@@ -71,7 +76,7 @@ REPORT_SUBJECT_LABEL = {
 # the cohort-wide cap sweep on 2026-06-03. Applied by passing abs_cap to the
 # local rejection helpers below (no canonical edit; the canonical default of
 # 600% is never reached for any ERD-derived output here).
-ERD_ABS_CAP = 200.0
+ERD_ABS_CAP = float(os.environ.get("ONESHOT_ERD_CAP", "200.0"))
 
 
 # Canonical rejection constants (Analyze_clinical_erd_refined.py:91,98). Held
@@ -384,6 +389,11 @@ def task_eds():
     # source at it so the expert panel resolves under the oneshot root.
     eds.EXPERT_SOURCE_SUBJECT = SUBJECT
     eds.clin_pictures_root = lambda: OUT_ROOT
+    # main() intersects --subjects with CLIN_PRIMARY_SUBJECTS; force the
+    # requested subject into that cohort so non-CLIN studies (the tiagobot
+    # PILOT* pilots) resolve. Identity for the CLIN oneshot (SUBJECT already
+    # a cohort member).
+    eds.CLIN_PRIMARY_SUBJECTS = [SUBJECT]
     sys.argv = ["eds", "--subjects", SUBJECT, "--no-diff-plot"]
     eds.main()
 
@@ -1885,7 +1895,14 @@ def task_consolidateeds():
 
     motor = eds.MOTOR_CHANNEL_NAMES
     band = (eds.MU_LO, eds.MU_HI)
-    subjects = ["CLIN_SUBJ_007", "CLIN_SUBJ_008"]
+    # Subject pool is env-overridable so the same headline-EDS method (raw
+    # covariance, MI-vs-REST, per-subject z then averaged, restricted to the
+    # motor input channels) can pool the tiagobot healthy-pilot cohort.
+    # Defaults to the two CLIN oneshot subjects (identity for the oneshot).
+    subjects = [s.strip() for s in os.environ.get(
+        "ONESHOT_POOL_SUBJECTS", "CLIN_SUBJ_007,CLIN_SUBJ_008").split(",")
+        if s.strip()]
+    eds.EXPERT_SOURCE_SUBJECT = SUBJECT
     _orig_asf = eds.apply_spatial_filter
     eds.apply_spatial_filter = (
         lambda epochs, method: epochs if method == "none"
@@ -1916,7 +1933,8 @@ def task_consolidateeds():
     im, _ = mne.viz.plot_topomap(
         pooled, info, axes=ax, cmap="viridis", show=False,
         names=common, vlim=(-vmax, vmax))
-    fig.colorbar(im, ax=ax, shrink=0.8, label="EDS z-score (pooled, 2 participants)")
+    fig.colorbar(im, ax=ax, shrink=0.8,
+                 label=f"EDS z-score (pooled, {len(zmaps)} participants)")
     ax.set_title("Electrode Discriminancy Score (EDS)\n"
                  "MI vs REST · pooled across participants", fontsize=11)
     fig.tight_layout()
