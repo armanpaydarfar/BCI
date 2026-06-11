@@ -590,6 +590,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, mode, udp_so
                 (pygame.display.get_surface().get_width() // 2 - message.get_width() // 2,
                  pygame.display.get_surface().get_height() // 2 + offsets[i])
             )
+        draw_time_balls(2, screen_width, screen_height)
         pygame.display.flip()
 
         # === Classify every step_size seconds ===
