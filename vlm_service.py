@@ -56,6 +56,26 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 
+# Pull argparse defaults from BCI/config.py (which layers config_local.py over
+# committed defaults). vlm_service.py runs in the `harmony_vlm` conda env with
+# cwd=<harmony_vlm repo>, so config.py is not on sys.path by default — insert
+# the BCI dir explicitly. Falls back to hardcoded safe defaults if the import
+# fails, so a stripped-down deployment without config_local still works.
+_BCI_DIR = Path(__file__).resolve().parent
+if str(_BCI_DIR) not in sys.path:
+    sys.path.insert(0, str(_BCI_DIR))
+try:
+    import config as _bci_config
+except Exception:
+    _bci_config = None
+
+
+def _cfg_default(name: str, fallback):
+    if _bci_config is None:
+        return fallback
+    return getattr(_bci_config, name, fallback)
+
+
 # Live-overlay detection cap. Paint cost on the Linux side is O(N) full-canvas
 # alpha blends (Utils/scene_overlay_renderer.py). Capping N here keeps the
 # overlay budget bounded; one-shot segment/decide command paths intentionally
@@ -164,13 +184,36 @@ def parse_args():
     # TCP overlay socket. Production deployments set this to 0.0.0.0 so the
     # Linux panel/driver can dial in across the LAN; single-machine dev
     # keeps it on 127.0.0.1.
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=5589)
-    p.add_argument("--neon-host", default="", help="Empty string triggers LAN discovery")
-    p.add_argument("--model", default="gemini-2.5-flash", help="VLM model name")
+    p.add_argument("--host", default=_cfg_default("VLM_BIND_HOST", "127.0.0.1"))
+    p.add_argument("--port", type=int, default=_cfg_default("VLM_SERVICE_PORT", 5589))
+    p.add_argument("--neon-host", default=_cfg_default("NEON_COMPANION_HOST", ""),
+                   help="Empty string triggers LAN discovery")
+    p.add_argument("--model", default=_cfg_default("VLM_MODEL", "gemini-2.5-flash"),
+                   help="VLM model name")
+    # IntentReasoner's upstream default (harmony_vlm) is max_tokens=1024,
+    # which truncates the JSON response on scenes with many candidates
+    # (each candidate is ~50-100 output tokens; 18 dets already overflows).
+    # 8192 gives ~4-5x headroom for typical scenes and is well under
+    # Gemini 2.5 Flash's 65,536 output-token ceiling. Billing is per emitted
+    # token, not per cap, so raising it costs nothing when responses are short.
+    p.add_argument("--max-output-tokens", type=int,
+                   default=int(_cfg_default("VLM_MAX_OUTPUT_TOKENS", 8192)),
+                   help="Cap for the VLM JSON response in tokens. Override "
+                        "with VLM_MAX_OUTPUT_TOKENS in config. Default 8192.")
     p.add_argument("--seg-model", default="models/FastSAM-s.pt", help="Relative to repo-dir")
-    p.add_argument("--device", default="cpu")
-    p.add_argument("--enable-depth", action="store_true")
+    # Default "auto" resolves to cuda if torch.cuda.is_available(), else cpu
+    # (see main()). Hosts without a usable GPU degrade gracefully to CPU,
+    # matching CLAUDE.md's "platform-specific optimisations must be gated on
+    # torch.cuda.is_available()" rule.
+    p.add_argument("--device", default="auto",
+                   help="Compute device: 'auto' (default; cuda if available, "
+                        "else cpu), 'cuda', or 'cpu'.")
+    # Depth is on by default; pass --no-enable-depth to disable. Loading
+    # depth_pro.pt adds ~1-2 s and ~1 GB of VRAM on cuda (or ~3 GB RAM on cpu),
+    # but the downstream panel/driver consumes depth whenever perception runs,
+    # so the right default is "on" — opt-out rather than opt-in.
+    p.add_argument("--enable-depth", action=argparse.BooleanOptionalAction,
+                   default=bool(_cfg_default("VLM_ENABLE_DEPTH", True)))
     p.add_argument("--depth-checkpoint", default="models/depth_pro.pt", help="Relative to repo-dir")
     p.add_argument("--session-dir", default=None, help="Where to save depth PNGs etc.")
     p.add_argument("--verbose", action="store_true")
@@ -178,11 +221,14 @@ def parse_args():
     # projects/harmony-bci/gpu-service/architecture-plan.md §3.4). Default `local` preserves
     # today's behaviour (open Neon directly via NeonLiveReader). `remote`
     # consumes envelopes from a Utils/frame_relay.py TCP server instead.
-    p.add_argument("--frame-source", choices=["local", "remote"], default="local",
+    p.add_argument("--frame-source", choices=["local", "remote"],
+                   default=_cfg_default("PERCEPTION_FRAME_SOURCE", "local"),
                    help="local=open Neon directly; remote=consume Utils/frame_relay envelopes")
-    p.add_argument("--remote-frame-host", default=None,
+    p.add_argument("--remote-frame-host",
+                   default=_cfg_default("FRAME_RELAY_DIAL_HOST", None),
                    help="Host of the frame_relay server (required when --frame-source=remote)")
-    p.add_argument("--remote-frame-port", type=int, default=5591,
+    p.add_argument("--remote-frame-port", type=int,
+                   default=_cfg_default("FRAME_RELAY_PORT", 5591),
                    help="Port of the frame_relay server (default 5591)")
     # Remote-stop guard: by default, cmd=stop is honoured only when it
     # arrives from 127.0.0.1. This protects the unattended GPU host from
@@ -717,15 +763,19 @@ class VLMService:
             self._seg_stream_stats["active"] = False
 
     def _cmd_depth(self, req: dict) -> dict:
+        at_gaze = bool(req.get("at_gaze", True))
+        save = bool(req.get("save", False))
         if self.depth_estimator is None:
+            _log("depth: depth_disabled (start vlm_service with --enable-depth)")
             return {"ok": False, "error": "depth_disabled"}
         bundle, _, _ = self._latest()
         if bundle is None:
+            _log("depth: no_frame")
             return {"ok": False, "error": "no_frame"}
 
-        at_gaze = bool(req.get("at_gaze", True))
-        save = bool(req.get("save", False))
         gaze_xy = (float(bundle.gaze.x), float(bundle.gaze.y))
+        _log(f"depth IN: gaze=({gaze_xy[0]:.0f},{gaze_xy[1]:.0f}) "
+             f"at_gaze={at_gaze} save={save}")
 
         t0 = time.time()
         prev_save = self.depth_estimator.save_path
@@ -747,11 +797,19 @@ class VLMService:
             "depth_max_m": float(depth_map.max()),
             "depth_median_m": float(np.median(depth_map)),
         }
+        gaze_str = ""
         if at_gaze:
             h, w = depth_map.shape[:2]
             gx = int(np.clip(round(gaze_xy[0]), 0, w - 1))
             gy = int(np.clip(round(gaze_xy[1]), 0, h - 1))
             resp["depth_at_gaze_m"] = float(depth_map[gy, gx])
+            gaze_str = f" at_gaze={resp['depth_at_gaze_m']:.2f}m"
+        _log(f"depth OUT: shape={depth_map.shape[0]}x{depth_map.shape[1]} "
+             f"median={resp['depth_median_m']:.2f}m "
+             f"range=[{resp['depth_min_m']:.2f},{resp['depth_max_m']:.2f}]m"
+             f"{gaze_str}"
+             f"{' saved' if saved_path else ''} "
+             f"elapsed={elapsed * 1000.0:.0f}ms")
         return resp
 
     def _cmd_reason(self, req: dict) -> dict:
@@ -793,9 +851,11 @@ class VLMService:
         waypoints_out: list[dict] = []
         depth_at_gaze_m: Optional[float] = None
         if self.depth_estimator is not None:
+            _depth_t0 = time.time()
             depth_map, _ = self.depth_estimator.estimate(
                 bundle.video.bgr, f_px=self._focal_px(), gaze_xy=gaze_xy,
             )
+            _depth_elapsed_ms = (time.time() - _depth_t0) * 1000.0
             K = self.reader.camera_matrix
             wps = compute_3d_waypoints(dets, depth_map, K)
             waypoints_out = [
@@ -811,6 +871,8 @@ class VLMService:
             gx = int(np.clip(round(gaze_xy[0]), 0, w - 1))
             gy = int(np.clip(round(gaze_xy[1]), 0, h - 1))
             depth_at_gaze_m = float(depth_map[gy, gx])
+            _log(f"  depth (in-decide): shape={depth_map.shape[0]}x{depth_map.shape[1]} "
+                 f"at_gaze={depth_at_gaze_m:.2f}m elapsed={_depth_elapsed_ms:.0f}ms")
 
         # Pick the waypoint whose detection bounding box contains the gaze px
         hit_det = None
@@ -871,9 +933,11 @@ class VLMService:
         waypoints_out: list[dict] = []
         depth_at_gaze: Optional[float] = None
         if self.depth_estimator is not None:
+            _depth_t0 = time.time()
             depth_map, _ = self.depth_estimator.estimate(
                 frame_bgr, f_px=self._focal_px(), gaze_xy=gaze_xy,
             )
+            _depth_elapsed_ms = (time.time() - _depth_t0) * 1000.0
             wps = compute_3d_waypoints(dets, depth_map, self.reader.camera_matrix)
             waypoints_out = [
                 {
@@ -888,6 +952,8 @@ class VLMService:
             gx = int(np.clip(round(gaze_xy[0]), 0, w - 1))
             gy = int(np.clip(round(gaze_xy[1]), 0, h - 1))
             depth_at_gaze = float(depth_map[gy, gx])
+            _log(f"  depth (in-frame): shape={depth_map.shape[0]}x{depth_map.shape[1]} "
+                 f"at_gaze={depth_at_gaze:.2f}m elapsed={_depth_elapsed_ms:.0f}ms")
 
         hit_det = None
         hit_waypoint: Optional[dict] = None
@@ -1442,6 +1508,14 @@ def main() -> None:
     # Change cwd so relative model paths (FastSAM-s.pt, depth_pro.pt) resolve correctly.
     os.chdir(repo_dir)
 
+    # Resolve --device=auto now that repo_dir is set up but before any model
+    # loading. Gated on torch.cuda.is_available() so the same default works on
+    # GPU hosts (cuda) and CPU-only Linux hosts (cpu).
+    if args.device == "auto":
+        import torch as _torch_probe
+        args.device = "cuda" if _torch_probe.cuda.is_available() else "cpu"
+        _log(f"--device auto-resolved to {args.device}")
+
     # Read .env values and force-set them in os.environ so that a pre-existing
     # empty-string value inherited from the parent process doesn't shadow the file.
     # Using dotenv_values (returns a plain dict) then updating os.environ directly
@@ -1518,7 +1592,11 @@ def main() -> None:
         )
 
     _log(f"loading reasoner: {args.model}…")
-    reasoner = IntentReasoner(api_key=api_key, model=args.model)
+    reasoner = IntentReasoner(
+        api_key=api_key,
+        model=args.model,
+        max_tokens=args.max_output_tokens,
+    )
     fix_det = FixationDetector()
 
     service = VLMService(

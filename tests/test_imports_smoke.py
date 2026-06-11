@@ -87,13 +87,24 @@ _COMPILE_EXCLUDE_FILES = {
 # Modules safe to fully import inside a pre-commit hook. Each entry must
 # import without spawning a window, opening a port, writing files, or
 # requiring a device. The list intentionally omits anything driver-style.
+#
+# FES_listener is wrapped in a pytest.param so it can be marked skipif on
+# Windows — its rehamove SWIG dependency is a Linux-only `.so`
+# (`STM_interface/1_packages/rehamoveLibrary/_rehamovelib.so`). Per
+# Plan §6.1, cross-platform parity is deferred until a Windows CI runner
+# exists; until then the test is a no-op on win32.
+_LINUX_ONLY = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="rehamove SWIG extension (_rehamovelib.so) is Linux-only; "
+           "Plan §6.1 cross-platform parity is deferred."
+)
 _SAFE_IMPORT_MODULES = [
     # Configuration
     "config",
     "config_local",
     # Post-refactor Tier 1 entrypoints (Plan §5.1.a, §5.1.b)
     "UTIL_marker_stream",
-    "FES_listener",
+    pytest.param("FES_listener", marks=_LINUX_ONLY),
     # Utils library modules
     "Utils.artifact_rejection",
     "Utils.EEGStreamState",
@@ -197,10 +208,14 @@ def test_util_marker_stream_imports_without_hardware():
     )
 
 
+@_LINUX_ONLY
 def test_fes_listener_imports_without_hardware():
     """Refactor 5.1.b contract: importing FES_listener must not open the
     Rehamove serial port or bind the FES UDP socket. Module-level
-    `FES_device` and `sock` should be None until `main()` runs."""
+    `FES_device` and `sock` should be None until `main()` runs.
+
+    Skipped on Windows: depends on `_rehamovelib.so` (Linux SWIG ext).
+    Plan §6.1 defers cross-platform parity until a Windows CI runner exists."""
     mod = importlib.import_module("FES_listener")
     assert mod.FES_device is None, (
         "FES_listener.FES_device should be None at import; "
