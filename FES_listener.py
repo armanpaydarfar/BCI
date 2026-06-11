@@ -1,3 +1,19 @@
+"""
+FES_listener.py
+
+UDP listener that triggers Functional Electrical Stimulation (FES) pulses.
+
+Protocol (UDP payload is a plain text token):
+- `FES_SENS_GO`: start sensory stimulation (uses sensory thresholds/durations)
+- `FES_MOTOR_GO`: start motor stimulation (uses motor thresholds/durations)
+- `FES_STOP`: stop the currently running stimulation loop early
+- `ping`: health check; replies with a UDP "pong"
+
+Assumptions:
+- The script runs in a loop and blocks on UDP receives.
+- Each trigger results in a time-bounded pulse loop at `FES_frequency` Hz.
+"""
+
 import time
 import json
 import socket
@@ -11,19 +27,32 @@ dirP = os.path.abspath(os.getcwd())
 sys.path.append(dirP + '/STM_interface/1_packages/rehamoveLibrary')
 from rehamove import *  # Import our library
 
-# Configuration
-filename = 'STM_interface/RehamoveConfig_simple.json'
-with open(filename, "r") as file:
-    fes_config = json.load(file)
+# Module-level state populated by main(); kept at import so the module can be
+# imported under pytest without opening the FES serial port or binding a UDP
+# socket. See Harmony_Test_Suite_Plan.md §5.1.b.
+fes_config = None
+FES_device = None
+FES_frequency = None
+sock = None
 
-FES_device = Rehamove("/dev/ttyUSB0")  # Update port as necessary
-FES_frequency = fes_config["FES_frequency"]
 
-# Set up UDP socket
-UDP_IP = config.UDP_FES["IP"]  # Use loopback IP for local communication
-UDP_PORT = config.UDP_FES["PORT"]       # Use the same port as in your EEG script
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind((UDP_IP, UDP_PORT))
+def _setup():
+    """Load the Rehamove channel config, open the FES serial device, and bind
+    the FES UDP listener. Side effects deferred from import time so the module
+    can be imported without hardware (Plan §5.1.b)."""
+    global fes_config, FES_device, FES_frequency, sock
+
+    filename = 'STM_interface/RehamoveConfig_simple.json'
+    with open(filename, "r") as file:
+        fes_config = json.load(file)
+
+    FES_device = Rehamove("/dev/ttyUSB0")  # Update port as necessary
+    FES_frequency = fes_config["FES_frequency"]
+
+    UDP_IP = config.UDP_FES["IP"]  # Use loopback IP for local communication
+    UDP_PORT = config.UDP_FES["PORT"]  # Use the same port as in your EEG script
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((UDP_IP, UDP_PORT))
 
 def trigger_fes(channel_name, mode = 'SENSORY'):
     """Trigger FES for a specific channel and duration."""
@@ -55,22 +84,28 @@ def trigger_fes(channel_name, mode = 'SENSORY'):
         #time.sleep(1/FES_frequency)
     print(f"Stimulation on {channel_name} completed. Returning to listening mode.")
 
-while True:
-    # Receive a trigger
-    data, addr = sock.recvfrom(1024)  # Buffer size is 1024 bytes
-    trigger = str(data.decode()).strip()  # Decode the received message and strip extra spaces
+def main():
+    _setup()
+    while True:
+        # Receive a trigger
+        data, addr = sock.recvfrom(1024)  # Buffer size is 1024 bytes
+        trigger = str(data.decode()).strip()  # Decode the received message and strip extra spaces
 
-    if trigger == "ping":  # Respond to ping
-        print("Received ping. Listener is active.")
-        sock.sendto(b"pong", addr)  # Reply with a pong
-    elif trigger == "FES_SENS_GO":  # Red arrow trigger
-        channel = config.FES_CHANNEL
-        trigger_fes(channel, mode = 'SENSORY')
-    elif trigger == "FES_MOTOR_GO":
-        channel = config.FES_CHANNEL
-        trigger_fes(channel, mode = "MOTOR")
-    else:
-        print(f"Received unrecognized trigger: {trigger}")
+        if trigger == "ping":  # Respond to ping
+            print("Received ping. Listener is active.")
+            sock.sendto(b"pong", addr)  # Reply with a pong
+        elif trigger == "FES_SENS_GO":  # Red arrow trigger
+            channel = config.FES_CHANNEL
+            trigger_fes(channel, mode='SENSORY')
+        elif trigger == "FES_MOTOR_GO":
+            channel = config.FES_CHANNEL
+            trigger_fes(channel, mode="MOTOR")
+        else:
+            print(f"Received unrecognized trigger: {trigger}")
 
-    # After processing the trigger, the script continues listening for new triggers
+        # After processing the trigger, the script continues listening for new triggers
+
+
+if __name__ == "__main__":
+    main()
 

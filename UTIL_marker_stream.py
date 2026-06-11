@@ -1,3 +1,25 @@
+"""
+UTIL_marker_stream.py
+
+UDP -> LSL marker streaming bridge.
+
+This script listens on a UDP port for marker messages produced by experiment
+drivers, converts them into a LSL `MarkerStream`, and timestamps them using
+the associated EEG LSL stream.
+
+UDP message formats accepted:
+- `"<marker_int>"` (marker only; uses EEG LSL time as timestamp)
+- `"<marker_int>,<prob_mi>,<prob_rest>"` (marker + classifier probabilities)
+
+Output LSL stream:
+- Stream type/name: `Markers` / `MarkerStream`
+- Channels: 4 floats:
+  1) marker (float representation of int)
+  2) timestamp (LSL time, via EEG inlet)
+  3) prob_mi (float, or -1.0 default if not provided)
+  4) prob_rest (float, or -1.0 default if not provided)
+"""
+
 import socket
 import threading
 import time
@@ -8,32 +30,12 @@ from pathlib import Path
 from pylsl import StreamInfo, StreamOutlet, StreamInlet, resolve_stream, local_clock
 import config
 
-# ─────────────────────────────────────────────────────────
-# SET UP LOGGING INSIDE SUBJECT FOLDER
-# ─────────────────────────────────────────────────────────
-
-subject_log_dir = Path(config.DATA_DIR) / f"sub-{config.TRAINING_SUBJECT}" / "marker_logs"
-subject_log_dir.mkdir(parents=True, exist_ok=True)
-
-timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-log_filename = subject_log_dir / f"marker_utility_{timestamp}.log"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.FileHandler(log_filename, mode='w'),
-        logging.StreamHandler()
-    ]
-)
-
-# ─────────────────────────────────────────────────────────
-# SETUP LSL STREAM
-# ─────────────────────────────────────────────────────────
-
-info = StreamInfo('MarkerStream', 'Markers', 4, 0, 'float32', 'marker_stream_id')
-outlet = StreamOutlet(info)
-
+# Module-level state populated by main(); kept at import so the module can be
+# imported under pytest without creating log directories or opening an LSL
+# outlet on the system. See Harmony_Test_Suite_Plan.md §5.1.a.
+subject_log_dir = None
+log_filename = None
+outlet = None
 message_queue = queue.Queue()
 
 # ─────────────────────────────────────────────────────────
@@ -78,30 +80,42 @@ def udp_listener(udp_port):
         except ValueError:
             logging.warning(f"Invalid UDP message: {data}")
 
+def parse_marker_message(message):
+    """Parse a UDP marker payload into ``(marker_value, prob_mi, prob_rest)``.
+
+    Supported wire formats (see module docstring):
+        ``"<marker_int>"``                          → (int, None, None)
+        ``"<marker_int>,<prob_mi>,<prob_rest>"``    → (int, float, float)
+
+    Raises ``ValueError`` for any other arity or unparseable component.
+    Pure function — no I/O, no logging — so the parsing contract can be
+    tested in isolation (Plan §6 #11).
+    """
+    parts = [p.strip() for p in message.strip().split(',')]
+    if len(parts) == 1:
+        return int(parts[0]), None, None
+    if len(parts) == 3:
+        return int(parts[0]), float(parts[1]), float(parts[2])
+    raise ValueError(
+        f"Unexpected UDP marker arity ({len(parts)} parts): {message!r}; "
+        f"expected '<marker>' or '<marker>,<prob_mi>,<prob_rest>'."
+    )
+
+
 def process_udp_messages(eeg_inlet):
     while True:
         message, udp_received_time, addr = message_queue.get()
         logging.info(f"Processing UDP message: {message} from {addr}")
 
         try:
-            parts = message.strip().split(',')
-
-            if len(parts) == 1:
-                marker_value = int(parts[0])
-                timestamp = get_current_eeg_timestamp(eeg_inlet, udp_received_time)
+            marker_value, prob_mi, prob_rest = parse_marker_message(message)
+            timestamp = get_current_eeg_timestamp(eeg_inlet, udp_received_time)
+            if prob_mi is None:
                 send_marker(marker_value, timestamp)
-
-            elif len(parts) == 3:
-                marker_value = int(parts[0])
-                prob_mi = float(parts[1])
-                prob_rest = float(parts[2])
-                timestamp = get_current_eeg_timestamp(eeg_inlet, udp_received_time)
+            else:
                 send_marker(marker_value, timestamp, prob_mi, prob_rest)
 
-            else:
-                logging.warning(f"Unexpected UDP marker format: {message}")
-
-        except Exception as e:
+        except ValueError as e:
             logging.warning(f"Failed to parse UDP marker: {message} | Error: {e}")
 
         message_queue.task_done()
@@ -114,12 +128,39 @@ def handle_udp_requests(eeg_inlet):
 
     logging.info(f"Marker utility started on local port {local_port}.")
 
+def _setup_logging_and_outlet():
+    """Create the subject log directory, attach the file/console log handlers,
+    and open the `MarkerStream` LSL outlet. Side effects deferred to main()
+    so the module can be imported without hardware (Plan §5.1.a)."""
+    global subject_log_dir, log_filename, outlet
+
+    subject_log_dir = Path(config.DATA_DIR) / f"sub-{config.TRAINING_SUBJECT}" / "marker_logs"
+    subject_log_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_filename = subject_log_dir / f"marker_utility_{ts}.log"
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename, mode='w'),
+            logging.StreamHandler()
+        ]
+    )
+
+    info = StreamInfo('MarkerStream', 'Markers', 4, 0, 'float32', 'marker_stream_id')
+    outlet = StreamOutlet(info)
+
+
 def main():
+    _setup_logging_and_outlet()
+
     eeg_inlet = get_eeg_inlet()
     handle_udp_requests(eeg_inlet)
 
     logging.info("Marker utility is running (only streaming markers). Ctrl+C to exit.")
-    
+
     try:
         while True:
             time.sleep(1)

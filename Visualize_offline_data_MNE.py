@@ -1,17 +1,34 @@
+import argparse
 import os
 import pyxdf
 import numpy as np
 import matplotlib.pyplot as plt
 import mne
 from scipy.signal import welch
-import config
 from scipy.stats import zscore
 # Custom utility functions
 from Utils.preprocessing import concatenate_streams
 from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 
-subject = "CLIN_SUBJ_003"
-session = "S001ONLINE"
+# XDF EEG amplitudes: same convention as visualize_online_data.py — time_series is
+# microvolt-scale. Keep raw._data on that scale (no ×/÷ 1e6). MNE may still label
+# channels as V in metadata; we set unit=201 below for µV where applicable.
+#
+# This script is standalone: it does not read from config.py. Set defaults below
+# or override via CLI flags (--subject, --session, --fs).
+
+subject = "F25CLASS_SUBJ_008"
+session = "S001OFFLINE"
+FS = 512  # Hz, EEG sampling rate
+
+_parser = argparse.ArgumentParser(description="Standalone offline-XDF visualizer.")
+_parser.add_argument("--subject", type=str, default=None, help="override module-level `subject`")
+_parser.add_argument("--session", type=str, default=None, help="override module-level `session`")
+_parser.add_argument("--fs", type=float, default=None, help="override FS (Hz)")
+_args, _ = _parser.parse_known_args()
+if _args.subject is not None: subject = _args.subject
+if _args.session is not None: session = _args.session
+if _args.fs is not None:      FS = float(_args.fs)
 
 # Construct the EEG directory path dynamically
 xdf_dir = os.path.join("/home/arman-admin/Documents/CurrentStudy", f"sub-{subject}", f"ses-{session}", "eeg/")
@@ -83,10 +100,6 @@ marker_data = marker_data[keep]
 marker_timestamps = marker_timestamps[keep]
 print(f"🧹 Removed {removed} markers >= 1000; kept {marker_data.size}.")
 
-
-
-
-
 #print(marker_stream['time_series'])
 #print(marker_timestamps)
 print("\n EEG Channels from XDF:", channel_names)
@@ -109,18 +122,14 @@ valid_indices = [channel_names.index(ch) for ch in valid_eeg_channels]  # Get in
 eeg_data = eeg_data[valid_indices, :]  # Keep only valid EEG data
 
 # Create MNE Raw Object
-sfreq = config.FS
+sfreq = FS
 info = mne.create_info(ch_names=valid_eeg_channels, sfreq=sfreq, ch_types="eeg")
 raw = mne.io.RawArray(eeg_data, info)
 
 first_channel_unit = raw.info["chs"][0]["unit"]
 print(f"First Channel Unit (FIFF Code): {first_channel_unit}")
 
-# Convert data from Volts to microvolts (µV)
-# Convert raw data from Volts to microvolts (µV) IMMEDIATELY AFTER LOADING
-raw._data /= 1e6  # Convert V → µV
-
-# Update channel metadata in MNE so the scaling is correctly reflected
+# Update channel metadata so MNE knows amplitudes are treated as µV-scale (same numeric array as XDF).
 
 for ch in raw.info['chs']:
     ch['unit'] = 201  # 201 corresponds to µV in MNE’s standard units
@@ -149,13 +158,21 @@ raw.rename_channels(rename_dict)
 # Optional: Restrict to a subset of channels (e.g., motor region)
 # ==========================================
 # You can comment this line out or modify the list in-script as needed
-MOTOR_CHANNEL_NAMES = ['C3','Cz','C4','CP5','CP1','CP2','CP6','P7','P3','Pz','P4','P8','POz']
 
+'''
+ANALYSIS_CHANNEL_NAMES = [
+    'F7', 'F3', 'Fz', 'F4', 'F8',
+    'FC5', 'FC6',
+    'C3', 'Cz', 'C4',
+    'CP5', 'CP1', 'CP2', 'CP6',
+    'P7', 'P3', 'Pz', 'P4', 'P8',
+    'PO7', 'PO3', 'POz', 'PO4', 'PO8'
+]
 # Filter to only keep channels present in both raw and the target list
-keep_channels = [ch for ch in MOTOR_CHANNEL_NAMES if ch in raw.ch_names]
+keep_channels = [ch for ch in ANALYSIS_CHANNEL_NAMES if ch in raw.ch_names]
 raw.pick_channels(keep_channels)
 print(f"✅ Keeping only motor channels: {keep_channels}")
-
+'''
 
 
 
@@ -300,11 +317,11 @@ window_size = 0.5  # Each window covers 500ms
 time_windows = np.linspace(0.1, 5.0 - window_size, num_windows)  # Avoid end clipping
 
 
-'''
+
 # Config
-channel_name = "FC1"
+channel_name = "CP1"
 target_marker = 200  # for example, MI trials
-trial_index = 0      # 0 = first trial, 1 = second, etc.
+trial_index = 0   # 0 = first trial, 1 = second, etc.
 
 # Get channel index
 channel_index = epochs.ch_names.index(channel_name)
@@ -315,6 +332,7 @@ epochs_for_marker = epochs[target_marker]  # or epochs['200'] if using string ke
 # Get data: shape (n_trials, n_channels, n_times)
 data = epochs_for_marker.get_data()
 #print(data.shape)
+
 # Extract signal for the desired trial and channel
 signal = data[trial_index, channel_index, :]
 times = epochs_for_marker.times
@@ -331,7 +349,7 @@ plt.legend()
 plt.tight_layout()
 plt.show()
 
-'''
+
 '''
 
 # **Step 1: Square all epochs to compute signal power**
@@ -501,7 +519,7 @@ for marker, tfr_avg in tfr_data.items():
         # Extract correct mappable object for color bar
         img = tfr_avg.plot_topomap(
             tmin=t_start, tmax=t_end,
-            axes=ax, cmap="viridis", show=False, vlim=(vmin, vmax), colorbar=False
+            axes=ax, cmap="viridis", show=False, vlim=(vmin, vmax), colorbar=False, show_names = True
         )
 
         # Extract the colorbar mappable from the plot

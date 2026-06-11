@@ -10,22 +10,19 @@ from sklearn.covariance import LedoitWolf
 from pyriemann.estimation import Shrinkage
 from pyriemann.utils.geodesic import geodesic_riemann
 from pyriemann.utils.base import invsqrtm
+from pyriemann.tangentspace import tangent_space
 import pandas as pd
 from sklearn.metrics import confusion_matrix
 # Visualization utils (UI draws)
 from Utils.visualization import (
-    draw_arrow_fill,
-    draw_ball_fill,
-    draw_fixation_cross,
-    draw_time_balls,
+    draw_class_feedback_cues,
+    draw_class_fixation_idle,
 )
 # Experiment utilities
 from Utils.experiment_utils import (
     generate_trial_sequence,
     LeakyIntegrator,
     RollingScaler,
-    save_transform,
-    load_transform
 )
 
 # UDP helper
@@ -33,6 +30,8 @@ from Utils.networking import send_udp_message,display_multiple_messages_with_udp
 
 # --------- Runtime "globals" (wired by each driver right after init) ---------
 # These names intentionally match what the original functions referenced.
+# Contract: drivers must assign these before calling runtime functions. For example,
+# `udp_socket_fes` and `FES_toggle` must be valid if FES is enabled.
 config = None
 logger = None
 model = None
@@ -53,6 +52,12 @@ FES_toggle = None
 # Adaptive recentering state
 Prev_T = None
 counter = 0
+Prev_T_beta = None
+counter_beta = 0
+_decoder_checked = False
+
+# ErrP decoder state (loaded separately; gated on config.ERRP_DECODER_ENABLE)
+errp_model = None
 
 
 # ----------------- Common helpers -----------------
@@ -102,19 +107,25 @@ def append_trial_probabilities_to_csv(trial_probabilities, mode, trial_number,
                                       mi_threshold, rest_threshold, logger,
                                       phase):
     correct_class = 200 if mode == 0 else 100
-    trial_probabilities = np.array(trial_probabilities)
+    trial_probabilities = np.array(trial_probabilities, dtype=float)
 
-    if trial_probabilities.shape[1] != 3:
-        logger.log_event(f"❌ Error: Unexpected shape {trial_probabilities.shape}. Expected (N,3). Skipping save.")
+    # Expect: [ts, P(REST)_inst, P(MI)_inst, P(MI)_avg, P(REST)_avg]
+    if trial_probabilities.ndim != 2 or trial_probabilities.shape[1] != 5:
+        logger.log_event(
+            f"❌ Error: Unexpected shape {trial_probabilities.shape}. "
+            f"Expected (N,5): [ts, P(REST)_inst, P(MI)_inst, P(MI)_avg, P(REST)_avg]. Skipping save."
+        )
         return
 
     for row in trial_probabilities:
-        timestamp, prob_rest, prob_mi = row
+        ts, prest_inst, pmi_inst, pmi_avg, prest_avg = row.tolist()
         logger.log_decoder_output(
             trial=trial_number,
-            timestamp=timestamp,
-            prob_mi=prob_mi,
-            prob_rest=prob_rest,
+            timestamp=ts,
+            prob_mi_inst=pmi_inst,
+            prob_rest_inst=prest_inst,
+            prob_mi_avg=pmi_avg,
+            prob_rest_avg=prest_avg,
             true_label=correct_class,
             predicted_label=predicted_label,
             early_cutout=early_cutout,
@@ -127,6 +138,7 @@ def append_trial_probabilities_to_csv(trial_probabilities, mode, trial_number,
         f"✅ Logged {len(trial_probabilities)} rows for Trial {trial_number} | "
         f"True: {correct_class}, Predicted: {predicted_label}, Early Cut: {early_cutout}, Phase: {phase}"
     )
+
 
 
 def display_fixation_period(duration=3, eeg_state=None):
@@ -144,11 +156,8 @@ def display_fixation_period(duration=3, eeg_state=None):
         # Fill screen with background color
         pygame.display.get_surface().fill(config.black)
 
-        # Draw UI elements
-        draw_fixation_cross(screen_width, screen_height)
-        draw_ball_fill(0, screen_width, screen_height)
-        draw_arrow_fill(0, screen_width, screen_height)
-        draw_time_balls(0, screen_width, screen_height)
+        vis_style = getattr(config, "CLASS_VISUAL_STYLE", "classic")
+        draw_class_fixation_idle(vis_style, screen_width, screen_height)
 
         pygame.display.flip()
 
@@ -178,7 +187,8 @@ def calculate_fill_levels(running_avg_confidence, mode):
         mode (int): 0 for MI trial (fill square), 1 for Rest trial (fill ball).
 
     Returns:
-        tuple: (fill_arrow, fill_ball) - Values between 0 and 1 indicating fill levels.
+        tuple: (fill_arrow, fill_ball) - Values between 0 and 1 indicating fill levels
+        for the MI arrow and REST ball UI (roles swap in Rest mode).
     """
     # Ensure probability stays within configured bounds
     prob = max(0, min(1, running_avg_confidence))
@@ -208,6 +218,9 @@ def handle_fes_activation(mode, running_avg_confidence, fes_active):
     Returns:
         bool: Updated FES state after processing.
     """
+    # Thresholding logic (kept here for traceability):
+    # - MI (mode==0): running_avg_confidence > 0.5 -> activate
+    # - Rest (mode==1): running_avg_confidence < 0.5 -> deactivate
     # Determine if FES should be active:
     # - If mode is MI (0) and confidence > 0.5 → Turn on FES
     # - If mode is Rest (1) and confidence < 0.5 → Turn on FES
@@ -235,41 +248,273 @@ def handle_fes_activation(mode, running_avg_confidence, fes_active):
     # No change in state
     return fes_active
 
+
+def _is_xgb_bundle(obj):
+    return isinstance(obj, dict) and "model" in obj and "scaler" in obj and "label_to_bin" in obj
+
+
+def _covariance_from_window(window_2d):
+    cov = (window_2d @ window_2d.T)
+    tr = np.trace(cov)
+    if tr <= 0:
+        tr = 1e-12
+    return cov / tr
+
+
+def _shrink_single_cov(cov, raw_window=None):
+    def _runtime_shrinkage_lambda() -> float:
+        backend = str(getattr(config, "DECODER_BACKEND", "mdm")).strip().lower()
+        if backend.startswith("xgb"):
+            return float(getattr(config, "SHRINKAGE_PARAM_XGB", getattr(config, "SHRINKAGE_PARAM", 0.1)))
+        return float(getattr(config, "SHRINKAGE_PARAM_MDM", getattr(config, "SHRINKAGE_PARAM", 0.02)))
+
+    if config.LEDOITWOLF:
+        if raw_window is None:
+            raise RuntimeError(
+                "LEDOITWOLF requires the raw EEG window to be passed to _shrink_single_cov. "
+                "LedoitWolf must be fit to raw observations (n_timepoints x n_channels), not the precomputed covariance."
+            )
+        # Fit LW to raw data to estimate the optimal shrinkage coefficient, then apply it
+        # to the already trace-normalised covariance (raw_window is n_channels x n_timepoints).
+        lam = LedoitWolf().fit(raw_window.T).shrinkage_
+        n = cov.shape[0]
+        return (1 - lam) * cov + lam * (np.trace(cov) / n) * np.eye(n)
+    lam = _runtime_shrinkage_lambda()
+    return np.squeeze(
+        Shrinkage(shrinkage=lam).fit_transform(np.expand_dims(cov, axis=0)),
+        axis=0,
+    )
+
+
+def _tangent_with_fitted_ref_single(cov, state_name="mu"):
+    if not isinstance(model, dict):
+        raise RuntimeError("XGBoost decoder bundle is not loaded.")
+
+    ref_key = "tangent_ref_beta" if state_name == "beta" else "tangent_ref_mu"
+    ref = model.get(ref_key, None)
+    if ref is None:
+        raise RuntimeError(
+            f"XGBoost bundle missing required fitted {ref_key}. "
+            "Retrain XGB model with fitted tangent-space references."
+        )
+    return tangent_space(np.expand_dims(cov, axis=0), ref, metric="riemann")[0]
+
+
+def _adaptive_recenter_cov(cov, state_name="mu", *, update_recentering: bool = True):
+    """
+    Apply online adaptive recentering to one covariance matrix.
+    Uses independent state per branch (mu/beta) to avoid cross-band leakage.
+    """
+    if not config.RECENTERING:
+        return cov
+
+    global Prev_T, counter, Prev_T_beta, counter_beta
+
+    if state_name == "beta":
+        if counter_beta == 0 or Prev_T_beta is None:
+            Prev_T_beta = cov
+        T_test = geodesic_riemann(Prev_T_beta, cov, 1 / (counter_beta + 1))
+        T_invsqrtm = invsqrtm(Prev_T_beta)
+        cov_rec = T_invsqrtm @ cov @ T_invsqrtm.T
+        if bool(update_recentering):
+            Prev_T_beta = T_test
+            counter_beta += 1
+        return cov_rec
+
+    if counter == 0 or Prev_T is None:
+        Prev_T = cov
+    T_test = geodesic_riemann(Prev_T, cov, 1 / (counter + 1))
+    T_invsqrtm = invsqrtm(Prev_T)
+    cov_rec = T_invsqrtm @ cov @ T_invsqrtm.T
+    if bool(update_recentering):
+        Prev_T = T_test
+        counter += 1
+    return cov_rec
+
+
+def _default_erd_bands_from_config():
+    """
+    Match offline `xgb_feature_pipeline` convention when a bundle has no
+    `feature_spec["erd_bands"]` (legacy or hand-built pickle).
+    """
+    bands = getattr(config, "XGB_ERD_BANDS", None)
+    if bands is not None:
+        return [tuple(map(float, b)) for b in bands]
+    # Default to mu-only unless configured otherwise.
+    return [(float(config.LOWCUT), float(config.HIGHCUT))]
+
+
+def _log_bandpower(signal, fs, band):
+    lo, hi = float(band[0]), float(band[1])
+    n_t = signal.shape[1]
+    freqs = np.fft.rfftfreq(n_t, d=1.0 / fs)
+    fft = np.fft.rfft(signal, axis=1)
+    power = (np.abs(fft) ** 2) / float(max(n_t, 1))
+    mask = (freqs >= lo) & (freqs < hi)
+    if np.any(mask):
+        bp = power[:, mask].mean(axis=1)
+    else:
+        bp = np.zeros(signal.shape[0], dtype=float)
+    return np.log10(bp + 1e-12)
+
+
+def _build_xgb_features(eeg_state, window_size_samples, *, update_recentering: bool = True):
+    """
+    Build online XGBoost features to match offline ordering:
+    [cov_mu] + [cov_beta] + [erd]
+    """
+    feature_spec = model.get("feature_spec", {})
+    use_cov_mu = bool(feature_spec.get("use_cov_mu", True))
+    use_cov_beta = bool(feature_spec.get("use_cov_beta", False))
+    n_cov_mu = int(feature_spec.get("n_cov_mu", 0))
+    n_cov_beta = int(feature_spec.get("n_cov_beta", 0))
+    n_erd = int(feature_spec.get("n_erd", 0))
+
+    if n_erd > 0:
+        mu_win, beta_win, _ = eeg_state.get_multiband_baseline_corrected_window(window_size_samples)
+    elif use_cov_beta:
+        mu_win, beta_win, _ = eeg_state.get_multiband_baseline_corrected_window(window_size_samples)
+    else:
+        mu_win, _ = eeg_state.get_baseline_corrected_window(window_size_samples)
+        beta_win = None
+
+    feature_blocks = []
+
+    if use_cov_mu:
+        cov_mu = _shrink_single_cov(_covariance_from_window(mu_win), mu_win)
+        cov_mu = _adaptive_recenter_cov(cov_mu, "mu", update_recentering=update_recentering)
+        feature_blocks.append(_tangent_with_fitted_ref_single(cov_mu, "mu"))
+
+    if use_cov_beta:
+        if beta_win is None:
+            raise RuntimeError("XGBoost model expects beta covariance features, but beta stream is unavailable.")
+        cov_beta = _shrink_single_cov(_covariance_from_window(beta_win), beta_win)
+        cov_beta = _adaptive_recenter_cov(cov_beta, "beta", update_recentering=update_recentering)
+        feature_blocks.append(_tangent_with_fitted_ref_single(cov_beta, "beta"))
+
+    if n_erd > 0:
+        bands = feature_spec.get("erd_bands") or _default_erd_bands_from_config()
+        apply_csd = bool(feature_spec.get("apply_csd_erd_only", False))
+        if apply_csd:
+            try:
+                from Utils.xgb_feature_pipeline import apply_surface_laplacian_csd
+                mu_erd = apply_surface_laplacian_csd(mu_win, list(eeg_state.channel_names), fs=config.FS)
+                beta_erd = apply_surface_laplacian_csd(beta_win, list(eeg_state.channel_names), fs=config.FS)
+            except Exception as e:
+                logger.log_event(f"⚠️ Online CSD failed, falling back to non-CSD ERD: {e}")
+                mu_erd = mu_win
+                beta_erd = beta_win
+        else:
+            mu_erd = mu_win
+            beta_erd = beta_win
+
+        baseline_mu, baseline_beta = eeg_state.get_multiband_baseline_segments()
+        if baseline_mu is None or baseline_beta is None:
+            raise RuntimeError("Missing baseline segments for ERD feature computation.")
+        if apply_csd:
+            try:
+                from Utils.xgb_feature_pipeline import apply_surface_laplacian_csd
+                baseline_mu = apply_surface_laplacian_csd(baseline_mu, list(eeg_state.channel_names), fs=config.FS)
+                baseline_beta = apply_surface_laplacian_csd(baseline_beta, list(eeg_state.channel_names), fs=config.FS)
+            except Exception:
+                pass
+
+        erd_vals = []
+        for (lo, hi) in bands:
+            if float(hi) <= float(config.HIGHCUT):
+                w = _log_bandpower(mu_erd, config.FS, (lo, hi))
+                b = _log_bandpower(baseline_mu, config.FS, (lo, hi))
+            else:
+                w = _log_bandpower(beta_erd, config.FS, (lo, hi))
+                b = _log_bandpower(baseline_beta, config.FS, (lo, hi))
+            erd_vals.append((w - b).reshape(-1, 1))
+        erd_vec = np.hstack(erd_vals).reshape(-1)
+        feature_blocks.append(erd_vec)
+
+    feat = np.concatenate(feature_blocks, axis=0).reshape(1, -1)
+    if n_cov_mu and use_cov_mu and feat.shape[1] < n_cov_mu:
+        raise RuntimeError("Feature construction failed for covariance mu block.")
+    if n_cov_beta and use_cov_beta and feat.shape[1] < (n_cov_mu + n_cov_beta):
+        raise RuntimeError("Feature construction failed for covariance beta block.")
+    if n_erd and feat.shape[1] < (n_cov_mu + n_cov_beta + n_erd):
+        raise RuntimeError("Feature construction failed for ERD block.")
+    return feat
+
+
+def _predict_with_active_decoder(eeg_state, window_size_samples, *, update_recentering: bool = True):
+    if not _is_xgb_bundle(model):
+        raise RuntimeError("XGBoost decoder bundle is not loaded.")
+    feat = _build_xgb_features(eeg_state, window_size_samples, update_recentering=update_recentering)
+    expected = int(model["scaler"].n_features_in_)
+    if feat.shape[1] != expected:
+        raise RuntimeError(f"XGBoost feature length mismatch. expected={expected}, got={feat.shape[1]}")
+    x = model["scaler"].transform(feat)
+    probs_bin = model["model"].predict_proba(x)[0]
+    rest_label = min(model["label_to_bin"], key=lambda k: model["label_to_bin"][k])
+    mi_label = max(model["label_to_bin"], key=lambda k: model["label_to_bin"][k])
+    rest_idx = int(model["label_to_bin"][rest_label])
+    mi_idx = int(model["label_to_bin"][mi_label])
+    prob_rest = float(probs_bin[rest_idx])
+    prob_mi = float(probs_bin[mi_idx])
+    pred = int(mi_label if prob_mi >= prob_rest else rest_label)
+    return np.array([prob_rest, prob_mi], dtype=float), pred
+
 def classify_real_time(eeg_state, window_size_samples, all_probabilities, predictions, mode, leaky_integrator, update_recentering=True):
+    global _decoder_checked
     global counter
     global Prev_T
 
     pygame.display.flip()
     pygame.event.get()  # Heartbeat to OS
 
+    if _is_xgb_bundle(model):
+        try:
+            probabilities, predicted_label = _predict_with_active_decoder(
+                eeg_state,
+                window_size_samples,
+                update_recentering=bool(update_recentering),
+            )
+        except ValueError:
+            return leaky_integrator.accumulated_probability, predictions, all_probabilities
+
+        if not _decoder_checked:
+            expected = int(model["scaler"].n_features_in_)
+            logger.log_event(f"XGBoost decoder initialized. expected_features={expected}")
+            _decoder_checked = True
+
+        correct_label = 200 if mode == 0 else 100
+        current_confidence = float(probabilities[1] if correct_label == 200 else probabilities[0])
+        predictions.append(int(predicted_label))
+        all_probabilities.append([time.time(), float(probabilities[0]), float(probabilities[1])])
+        return current_confidence, predictions, all_probabilities
+
+    # ---------------- Legacy MDM path (unchanged behavior) ----------------
     try:
         window, _ = eeg_state.get_baseline_corrected_window(window_size_samples)
     except ValueError:
         return leaky_integrator.accumulated_probability, predictions, all_probabilities
 
-    # === Covariance Matrix ===
     cov_matrix = (window @ window.T) / np.trace(window @ window.T)
 
     if config.LEDOITWOLF:
-        cov_matrix = np.array([LedoitWolf().fit(cov_matrix).covariance_])
+        lam = LedoitWolf().fit(window.T).shrinkage_
+        n = cov_matrix.shape[0]
+        cov_matrix = np.array([(1 - lam) * cov_matrix + lam * (np.trace(cov_matrix) / n) * np.eye(n)])
     else:
         cov_matrix = np.expand_dims(cov_matrix, axis=0)
-        shrinkage = Shrinkage(shrinkage=config.SHRINKAGE_PARAM)
+        lam = float(getattr(config, "SHRINKAGE_PARAM_MDM", getattr(config, "SHRINKAGE_PARAM", 0.02)))
+        shrinkage = Shrinkage(shrinkage=lam)
         cov_matrix = shrinkage.fit_transform(cov_matrix)
 
-    # === Adaptive Recentering ===
     if config.RECENTERING:
         cov_matrix = np.squeeze(cov_matrix, axis=0)
-
         if counter == 0 or Prev_T is None:
             Prev_T = cov_matrix
-
         T_test = geodesic_riemann(Prev_T, cov_matrix, 1 / (counter + 1))
         T_invsqrtm = invsqrtm(Prev_T)
         cov_matrix = T_invsqrtm @ cov_matrix @ T_invsqrtm.T
         cov_matrix = np.expand_dims(cov_matrix, axis=0)
 
-    # === Classification ===
     probabilities = model.predict_proba(cov_matrix)[0]
     predicted_label = model.classes_[np.argmax(probabilities)]
 
@@ -277,29 +522,18 @@ def classify_real_time(eeg_state, window_size_samples, all_probabilities, predic
     correct_class_idx = np.where(model.classes_ == correct_label)[0][0]
     current_confidence = probabilities[correct_class_idx]
 
-    # === Determine if recentering update should occur ===
     should_update_T = False
     if config.RECENTERING and update_recentering:
-        if config.USE_CONFIDENCE_GATE:
-            correct_label = 200 if mode == 0 else 100
-            correct_class_idx = np.where(model.classes_ == correct_label)[0][0]
-            current_confidence = probabilities[correct_class_idx]
-            predicted_correct = (predicted_label == correct_label)
-            confident_enough = (current_confidence >= config.RECENTERING_CONFIDENCE_THRESHOLD)
-            should_update_T = predicted_correct and confident_enough
-        else:
-            # Always update if gating is disabled
-            should_update_T = True
+        # Adaptive reference update is unconditional (matches the historical
+        # behavior of USE_CONFIDENCE_GATE == 0).
+        should_update_T = True
 
     if should_update_T:
         Prev_T = T_test
         counter += 1
 
-
-    # === Update Logs ===
     predictions.append(predicted_label)
     all_probabilities.append([time.time(), probabilities[0], probabilities[1]])
-
     return current_confidence, predictions, all_probabilities
 
 
@@ -332,6 +566,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, mode, udp_so
     accuracy_threshold = config.THRESHOLD_MI if mode == 0 else config.THRESHOLD_REST 
 
     all_probabilities = []
+    running_average_list = []
     predictions = []
     running_avg_confidence = 0.5
     current_confidence = 0.5
@@ -359,6 +594,7 @@ def hold_messages_and_classify(messages, colors, offsets, duration, mode, udp_so
         pygame.display.flip()
 
         # === Classify every step_size seconds ===
+        just_classified = False
         if now >= next_tick:
             current_confidence, predictions, all_probabilities = classify_real_time(
                 eeg_state, window_size_samples,
@@ -376,11 +612,21 @@ def hold_messages_and_classify(messages, colors, offsets, duration, mode, udp_so
                     f"{config.TRIGGERS['ROBOT_PROBS']},{prob_mi:.5f},{prob_rest:.5f}",
                     quiet=True
                 )
+            just_classified = True
 
             if current_confidence > 0:
                 num_predictions += 1
 
             running_avg_confidence = leaky_integrator.update(current_confidence)
+            if just_classified and all_probabilities:
+                ts, prest_inst, pmi_inst = all_probabilities[-1]
+                if mode == 0:  # MI context
+                    pmi_avg   = running_avg_confidence
+                    prest_avg = 1.0 - running_avg_confidence
+                else:          # REST context
+                    prest_avg = running_avg_confidence
+                    pmi_avg   = 1.0 - running_avg_confidence
+                all_probabilities[-1] = [ts, prest_inst, pmi_inst, pmi_avg, prest_avg]
 
             if num_predictions >= min_predictions_before_stop and running_avg_confidence < config.RELAXATION_RATIO * accuracy_threshold:
                 early_stop = True
@@ -420,7 +666,10 @@ def hold_messages_and_classify(messages, colors, offsets, duration, mode, udp_so
 
 
 
-def show_feedback(duration=5, mode=0, eeg_state = None):
+def show_feedback(duration=5, mode=0, eeg_state=None,
+                  headline_text=None,
+                  subtext=None,
+                  object_text=None):
     """
     Displays feedback animation, collects EEG data, and performs real-time classification
     using a sliding window approach with early stopping based on posterior probabilities.
@@ -433,6 +682,7 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
     FES_active = False
     all_probabilities = []
     predictions = []
+    running_avg_list = []
     leaky_integrator = LeakyIntegrator(alpha=config.INTEGRATOR_ALPHA)  # Confidence smoothing
     min_predictions = config.MIN_PREDICTIONS
     earlystop_flag = False
@@ -453,15 +703,8 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
     # Send UDP triggers
     if mode == 0:  # Red Arrow Mode (Motor Imagery)
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_BEGIN"], logger=logger)
-        if FES_toggle == 1:
-            send_udp_message(udp_socket_fes, config.UDP_FES["IP"], config.UDP_FES["PORT"], "FES_SENS_GO", logger=logger)
-            FES_active = True
-        else:
-            logger.log_event("FES is disabled.")
-            FES_active = False
     else:  # Blue Ball Mode (Rest)
         send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["REST_BEGIN"], logger=logger)
-        FES_active = False
 
     clock = pygame.time.Clock()
     running_avg_confidence = 0.5  # Initial placeholder
@@ -472,6 +715,7 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
         eeg_state.update()
 
         now = time.time()
+        just_classified = False
         if now >= next_tick:
             current_confidence, predictions, all_probabilities = classify_real_time(
                 eeg_state,
@@ -491,6 +735,7 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
                     f"{config.TRIGGERS['MI_PROBS' if mode == 0 else 'REST_PROBS']},{prob_mi:.5f},{prob_rest:.5f}",
                     quiet=True
                 )
+            just_classified=True
 
 
         running_avg_confidence = leaky_integrator.update(current_confidence)
@@ -499,21 +744,70 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
 
         screen.fill(config.black)
         MI_fill, Rest_fill = calculate_fill_levels(running_avg_confidence, mode)
+        if just_classified and all_probabilities:
+            ts, prest_inst, pmi_inst = all_probabilities[-1]
+            if mode == 0:  # MI trial: confidence is P(MI)
+                pmi_avg   = running_avg_confidence
+                prest_avg = 1.0 - running_avg_confidence
+            else:          # REST trial: confidence is P(REST)
+                prest_avg = running_avg_confidence
+                pmi_avg   = 1.0 - running_avg_confidence
+            all_probabilities[-1] = [ts, prest_inst, pmi_inst, pmi_avg, prest_avg]
 
+        # -------------------------------------------------
+        # Core visualization (classic vs modern — config.CLASS_VISUAL_STYLE)
+        # -------------------------------------------------
+        vis_style = getattr(config, "CLASS_VISUAL_STYLE", "classic")
+        accum_bar = running_avg_confidence if str(vis_style).lower() == "modern" else None
         if mode == 0:
-            draw_arrow_fill(MI_fill, screen_width, screen_height)
-            draw_fixation_cross(screen_width, screen_height)
-            draw_ball_fill(Rest_fill, screen_width, screen_height)
-            draw_time_balls(2, screen_width, screen_height)
-            message = pygame.font.SysFont(None, 96).render(f"Move {config.ARM_SIDE.upper()} Arm", True, config.white)
+            draw_class_feedback_cues(
+                vis_style, 0, MI_fill, Rest_fill, screen_width, screen_height, 2,
+                accumulation=accum_bar,
+            )
+            cue_color = config.red
         else:
-            draw_ball_fill(Rest_fill, screen_width, screen_height)
-            draw_fixation_cross(screen_width, screen_height)
-            draw_arrow_fill(MI_fill, screen_width, screen_height)
-            draw_time_balls(3, screen_width, screen_height)
-            message = pygame.font.SysFont(None, 96).render("Rest", True, config.white)
+            draw_class_feedback_cues(
+                vis_style, 1, MI_fill, Rest_fill, screen_width, screen_height, 3,
+                accumulation=accum_bar,
+            )
+            cue_color = config.blue
 
-        screen.blit(message, (screen_width // 2 - message.get_width() // 2, screen_height // 2 + 300))
+        # -------------------------------------------------
+        # Text overlay (backwards compatible)
+        # -------------------------------------------------
+        headline_font = pygame.font.SysFont(None, 96)
+        subtext_font = pygame.font.SysFont(None, 56)
+        object_font = pygame.font.SysFont(None, 52)
+
+        # Legacy fallback if no text passed
+        if headline_text is None:
+            if mode == 0:
+                headline_text = f"Move {config.ARM_SIDE.upper()} Arm"
+            else:
+                headline_text = "Rest"
+
+        headline_surface = headline_font.render(headline_text, True, cue_color)
+        screen.blit(
+            headline_surface,
+            (screen_width // 2 - headline_surface.get_width() // 2,
+            screen_height // 2 + 260)
+        )
+
+        if subtext is not None:
+            sub_surface = subtext_font.render(subtext, True, cue_color)
+            screen.blit(
+                sub_surface,
+                (screen_width // 2 - sub_surface.get_width() // 2,
+                screen_height // 2 + 330)
+            )
+
+        if object_text is not None:
+            obj_surface = object_font.render(object_text, True, config.white)
+            screen.blit(
+                obj_surface,
+                (screen_width // 2 - obj_surface.get_width() // 2,
+                screen_height // 2 - 360)
+            )
         pygame.display.flip()
         clock.tick(60)
         # --- Early-stop logic (supports correct-only or either-threshold) ---
@@ -585,3 +879,217 @@ def show_feedback(duration=5, mode=0, eeg_state = None):
     send_udp_message(udp_socket_marker, config.UDP_MARKER["IP"], config.UDP_MARKER["PORT"], config.TRIGGERS["MI_END" if mode==0 else "REST_END"], logger=logger)
     pygame.time.delay(300)  # ~300 ms delay to allow the visual feedback to complete rendering
     return final_class, running_avg_confidence, leaky_integrator, all_probabilities, earlystop_flag
+
+
+# =============================================================================
+# ErrP decoder — load and real-time classification
+# =============================================================================
+# These functions are gated on config.ERRP_DECODER_ENABLE and are fully
+# independent of the MI pipeline. Calling them when ERRP_DECODER_ENABLE == 0
+# is a no-op. The MI model, thresholds, and adaptive recentering state are
+# untouched by any ErrP function.
+# =============================================================================
+
+def load_errp_model(path: str) -> bool:
+    """
+    Load the ErrP model bundle from `path` into the module-level `errp_model` global.
+
+    The bundle is a dict produced by generate_errp_decoder.py:
+      {
+        "xdawn":        fitted XdawnCovariances,
+        "classifier":   fitted MDM or Pipeline(TangentSpace, LogisticRegression),
+        "backend":      "xdawn_mdm" | "xdawn_lr",
+        "tl_star":      float,   # lower decision threshold (below → correct / no-ErrP)
+        "th_star":      float,   # upper decision threshold (above → error / ErrP)
+        "feature_spec": { "tmin", "tmax", "epoch_samples", "n_filters", "ch_names", ... },
+        ...
+      }
+
+    Returns True on success, False on failure (logs the error).
+    """
+    global errp_model
+    import pickle
+    try:
+        with open(path, "rb") as fh:
+            errp_model = pickle.load(fh)
+        if logger:
+            logger.log_event(
+                f"✅ ErrP model loaded: {path}  "
+                f"backend={errp_model.get('backend','?')}  "
+                f"tl={errp_model.get('tl_star', float('nan')):.3f}  "
+                f"th={errp_model.get('th_star', float('nan')):.3f}"
+            )
+        return True
+    except FileNotFoundError:
+        if logger:
+            logger.log_event(f"❌ ErrP model not found: {path}", level="error")
+        return False
+    except Exception as exc:
+        if logger:
+            logger.log_event(f"❌ ErrP model load failed: {exc}", level="error")
+        return False
+
+
+_XDAWN_BACKENDS = ("xdawn_mdm", "xdawn_lr", "xdawn_xgb")
+_CCA_BACKENDS   = ("liu_cca_lda", "liu_cca_xgb")
+_errp_ea_warned = False
+
+
+def fit_errp_ea_bootstrap(eeg_state, *, min_epochs: int | None = None) -> bool:
+    """Fit the per-session Euclidean Alignment reference on the ErrP buffer.
+
+    Intended to be called once at session start after the driver has
+    spent `config.ERRP_EA_BOOTSTRAP_SEC` updating the buffer with idle
+    EEG. Slices the tail of the filtered buffer into back-to-back
+    pseudo-epochs of length `ERRP_EPOCH_TMAX × FS` and passes them to
+    `EEGStreamState.fit_ea_bootstrap`, which stores the reference on
+    the state object.  Subsequent `classify_errp_real_time` calls will
+    apply it automatically when the bundle was trained with EA.
+
+    Returns True on success, False if the buffer did not hold enough
+    samples (logs the error either way).
+    """
+    if min_epochs is None:
+        min_epochs = int(getattr(config, "ERRP_EA_MIN_EPOCHS", 20))
+
+    tmax          = float(getattr(config, "ERRP_EPOCH_TMAX", 0.8))
+    epoch_samples = int(round(tmax * float(config.FS)))
+
+    try:
+        eeg_state.fit_ea_bootstrap(epoch_samples, n_pseudo_epochs=min_epochs)
+    except ValueError as exc:
+        if logger:
+            logger.log_event(f"❌ EA bootstrap failed: {exc}", level="error")
+        return False
+
+    if logger:
+        logger.log_event(
+            f"✅ ErrP EA reference fit: {min_epochs} pseudo-epochs "
+            f"({min_epochs * epoch_samples / float(config.FS):.1f} s)."
+        )
+    return True
+
+
+def classify_errp_real_time(eeg_state, event_ts: float | None = None) -> tuple[float, int | None]:
+    """
+    Classify a single ErrP epoch from the real-time EEG buffer.
+
+    Dispatches on `errp_model["backend"]`:
+      - xdawn_mdm / xdawn_lr / xdawn_xgb → xDAWN augmented covariances,
+        then MDM / Pipeline(TangentSpace, LR or CalibratedXGB).
+      - liu_cca_lda / liu_cca_xgb       → LiuCCAFeaturizer (template-
+        based CCA + temporal/PSD features), then DiagonalLDA or
+        CalibratedXGB.
+
+    Epoch extraction:
+      - If `event_ts` is provided, use `eeg_state.get_event_baseline_window`
+        to subtract the per-channel mean of the pre-event window
+        [ERRP_BASELINE_TMIN, ERRP_BASELINE_TMAX] s from the post-event
+        window, then crop to the bundle's [tmin, tmax]. Matches the
+        offline pipeline byte-for-byte.
+      - If `event_ts` is None, falls back to the MI-style rolling baseline
+        path so pre-Phase-9 callers (ExperimentDriver_ErrP_Online.py) keep
+        working.
+
+    Euclidean Alignment:
+      - If the bundle's feature_spec reports `ea_alignment=True` and
+        `fit_errp_ea_bootstrap` has populated `eeg_state.ea_reference`,
+        the window is left-multiplied by R^{-1/2} before the featurizer.
+      - If the bundle needs EA but no reference is set, we log once and
+        proceed without alignment (graceful degradation over crash).
+
+    Returns:
+        (prob_error, decision)
+        decision: 1 (ErrP) | 0 (no ErrP) | None (ambiguous; between thresholds)
+    """
+    global errp_model, _errp_ea_warned
+
+    _errp_enable = bool(getattr(config, "ERRP_DECODER_ENABLE", 0))
+    if not _errp_enable or errp_model is None:
+        return 0.0, None
+
+    spec          = errp_model.get("feature_spec", {})
+    backend       = str(errp_model.get("backend", "xdawn_mdm"))
+    fs            = float(config.FS)
+    # Config is the source of truth for the epoch window.  The bundle's
+    # feature_spec records the window it was trained with; we require them to
+    # agree so a bundle trained at one window cannot be silently deployed
+    # against a config at a different window.
+    tmin = float(getattr(config, "ERRP_EPOCH_TMIN"))
+    tmax = float(getattr(config, "ERRP_EPOCH_TMAX"))
+    if "tmin" in spec or "tmax" in spec:
+        spec_tmin = float(spec.get("tmin", tmin))
+        spec_tmax = float(spec.get("tmax", tmax))
+        if (spec_tmin, spec_tmax) != (tmin, tmax):
+            raise ValueError(
+                f"ErrP bundle feature_spec window ({spec_tmin}, {spec_tmax}) s "
+                f"disagrees with config ERRP_EPOCH_TMIN/TMAX ({tmin}, {tmax}) s. "
+                f"Either retrain the bundle at the config window or update config "
+                f"to match the bundle."
+            )
+    epoch_samples = int(round((tmax - tmin) * fs))
+    tl            = float(errp_model.get("tl_star", 0.3))
+    th            = float(errp_model.get("th_star", 0.7))
+    ea_required   = bool(spec.get("ea_alignment", False))
+
+    # ── Epoch extraction ─────────────────────────────────────────────────
+    try:
+        if event_ts is not None:
+            base_tmin = float(getattr(config, "ERRP_BASELINE_TMIN", -0.200))
+            base_tmax = float(getattr(config, "ERRP_BASELINE_TMAX",  0.0))
+            baseline_samples = int(round((base_tmax - base_tmin) * fs))
+            # Request the full post-event window [0, tmax] so we can crop
+            # to the bundle's [tmin, tmax] in the same frame the trainer used.
+            post_full = int(round(tmax * fs))
+            window_full, _ = eeg_state.get_event_baseline_window(
+                event_ts, post_full, baseline_samples
+            )
+            start = int(round(tmin * fs))
+            window = window_full[:, start:start + epoch_samples]
+        else:
+            window, _ = eeg_state.get_baseline_corrected_window(epoch_samples)
+    except ValueError:
+        return 0.0, None  # Buffer not yet full
+
+    # ── Euclidean Alignment (optional, gated on bundle) ──────────────────
+    if ea_required:
+        if getattr(eeg_state, "ea_reference", None) is not None:
+            window = eeg_state.apply_ea_to_window(window)
+        elif not _errp_ea_warned:
+            if logger:
+                logger.log_event(
+                    "⚠️ ErrP bundle was trained with EA but no session EA "
+                    "reference is set — classifying without alignment. "
+                    "Call fit_errp_ea_bootstrap(eeg_state) at session start."
+                )
+            _errp_ea_warned = True
+
+    epoch_3d = window[np.newaxis]  # (1, n_ch, n_samp)
+
+    # ── Backend dispatch ─────────────────────────────────────────────────
+    try:
+        clf = errp_model["classifier"]
+        if backend in _XDAWN_BACKENDS:
+            xdc      = errp_model["xdawn"]
+            features = xdc.transform(epoch_3d)       # augmented covariances
+        elif backend in _CCA_BACKENDS:
+            featurizer = errp_model["cca_featurizer"]
+            features   = featurizer.transform(epoch_3d)  # (1, 72) flat feature vector
+        else:
+            raise ValueError(f"Unsupported ErrP backend: {backend!r}")
+
+        prob_err = float(clf.predict_proba(features)[0, 1])  # column 1 = P(error)
+    except Exception as exc:
+        if logger:
+            logger.log_event(f"⚠️ ErrP classification failed: {exc}")
+        return 0.0, None
+
+    # ── Dual-threshold decision ──────────────────────────────────────────
+    if prob_err >= th:
+        decision = 1
+    elif prob_err <= tl:
+        decision = 0
+    else:
+        decision = None
+
+    return prob_err, decision

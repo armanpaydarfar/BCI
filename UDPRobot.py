@@ -1,4 +1,21 @@
-import socket, json, time, threading
+#!/usr/bin/env python3
+# UDPRobot.py
+#
+# Minimal UDP console for Harmony robot.
+# - Binds to CONTROL_IP:CONTROL_PORT (0.0.0.0:8080)
+# - Sends commands to ROBOT_IP:ROBOT_PORT (192.168.2.1:8080)
+# - Appends ";seq=<ms>" to "q" telemetry requests
+# - Prints any incoming UDP packets (ACKs, JSON telemetry, etc.)
+#
+# Commands you can type:
+#   q (telemetry), h (home), x/y/z/a (presets),
+#   7-coordinate joint angles, g (go), p (pause),
+#   r (resume), s (stop), e (exit robot). ";dur=x" supported.
+
+import socket
+import json
+import time
+import threading
 from datetime import datetime
 
 # Robot's IP and port
@@ -44,12 +61,13 @@ def rx_loop():
 threading.Thread(target=rx_loop, daemon=True).start()
 
 def send(cmd: str):
-    # attach seq for queries
-    if cmd.strip() == "q":
+    """Send a raw command to the robot, adding ;seq=... to q telemetry."""
+    msg = cmd.strip()
+    if msg == "q":
         seq = int(time.time() * 1000) & 0xFFFFFFFF
-        cmd = f"q;seq={seq}"
-    sock.sendto(cmd.encode(), (ROBOT_IP, ROBOT_PORT))
-    print(f"[{timestamp()}] Sent: {cmd}")
+        msg = f"q;seq={seq}"
+    sock.sendto(msg.encode("utf-8"), (ROBOT_IP, ROBOT_PORT))
+    print(f"[{timestamp()}] Sent: {msg}")
 
 print("Commands: q (telemetry), h (home), x/y/z/a (presets), 7-coordinate joint angles, "
       "g (go), p (pause), r (resume), s (stop), e (exit robot). ;dur=x supported.")
@@ -65,5 +83,8 @@ try:
 except KeyboardInterrupt:
     pass
 finally:
-    print(f"[{timestamp()}] Closing socket.")
-    sock.close()
+    print(f"\n[{timestamp()}] Closing socket.")
+    try:
+        sock.close()
+    except Exception:
+        pass

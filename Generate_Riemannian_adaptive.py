@@ -1,8 +1,9 @@
 import os
+import sys
 import numpy as np
 import pickle
 import mne
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, GroupKFold
 from sklearn.metrics import accuracy_score
 from pyriemann.estimation import Shrinkage
 from pyriemann.classification import MDM, FgMDM
@@ -13,7 +14,7 @@ from sklearn.preprocessing import StandardScaler
 from Utils.stream_utils import load_xdf, get_channel_names_from_xdf
 from Utils.preprocessing import select_channels
 import glob  # Required for multi-file loading
-from scipy.stats import zscore
+from scipy.stats import zscore, beta as scipy_beta
 from pyriemann.utils.mean import mean_riemann
 from scipy.linalg import sqrtm
 import seaborn as sns
@@ -24,6 +25,8 @@ from Utils.preprocessing import (
     initialize_filter_bank,
     apply_streaming_filters
 )
+from Utils.artifact_rejection import apply_training_artifact_rejection
+from Utils.marker_pairing import build_trial_windows_chronological
 
 from sklearn.metrics import (
     accuracy_score,
@@ -46,42 +49,112 @@ EPOCHS_START_END = {
 
 
 
-def plot_posterior_probabilities(posterior_probs):
+def plot_posterior_probabilities(
+    posterior_probs,
+    beta_a: float | None = None,
+    beta_b: float | None = None,
+    n_bins: int | None = None,
+):
     """
-    Plots the histogram of posterior probabilities for each class,
-    with a dotted vertical line at the class mean.
+    Histogram of P(correct class) per class with KL diagnostics.
+
+    Plots P(correct class) for each class: P(MI) for MI trials and
+    P(REST) = 1 - P(MI) for REST trials.  Both should be high for a
+    well-discriminating classifier; the target shape is Beta(beta_a, beta_b).
+
+    Overlays per-class:
+      - MLE-fitted Beta curve (support fixed to [0, 1])
+      - Reference Beta(beta_a, beta_b) curve showing the target shape
+    Annotation box shows KL(empirical ‖ reference) for MI, REST, and combined.
 
     Parameters:
-        posterior_probs (dict): Dictionary containing posterior probabilities for each class.
+        posterior_probs: dict of {label (100|200): array of P(correct class)}
+        beta_a:  Reference Beta alpha (default: config.XGB_TUNE_BETA_ALPHA or 18)
+        beta_b:  Reference Beta beta  (default: config.XGB_TUNE_BETA_BETA  or  5)
+        n_bins:  Histogram bins for KL computation (default: config.XGB_TUNE_KL_BINS or 15)
     """
-    plt.figure(figsize=(10, 6))
-    bins = np.linspace(0, 1, 20)  # Set bins for histogram
+    if beta_a is None:
+        beta_a = float(getattr(config, "XGB_TUNE_BETA_ALPHA", 18))
+    if beta_b is None:
+        beta_b = float(getattr(config, "XGB_TUNE_BETA_BETA", 5))
+    if n_bins is None:
+        n_bins = int(getattr(config, "XGB_TUNE_KL_BINS", 15))
 
-    # Convert numerical labels to "Rest" and "MI"
+    ref_mode = (beta_a - 1.0) / (beta_a + beta_b - 2.0)
+    ref_mean = beta_a / (beta_a + beta_b)
+
     label_map = {100: "Rest", 200: "MI"}
-    renamed_probs = {label_map.get(int(label), str(label)): probs
-                     for label, probs in posterior_probs.items()}
+    renamed_probs = {
+        label_map.get(int(lbl), str(lbl)): np.asarray(probs).flatten()
+        for lbl, probs in posterior_probs.items()
+    }
+    palette = {"Rest": "steelblue", "MI": "darkorange"}
 
-    # Define class colors (feel free to adjust)
-    palette = {"Rest": "skyblue", "MI": "darkorange"}
+    fig, ax = plt.subplots(figsize=(11, 7))
+    plot_bins = np.linspace(0.0, 1.0, 21)
+    x_curve = np.linspace(0.005, 0.995, 300)
 
+    kl_values = {}
     for label, probs in renamed_probs.items():
-        probs = np.array(probs).flatten()
-        color = palette.get(label, None)
+        color = palette.get(label, "gray")
+        sns.histplot(
+            probs, bins=plot_bins, alpha=0.45, color=color,
+            stat="density", ax=ax, label=f"{label} (n={len(probs)})",
+        )
+        mean_val = float(np.mean(probs))
+        ax.axvline(mean_val, color=color, linestyle="--", linewidth=1.5,
+                   label=f"{label} mean = {mean_val:.3f}")
+        # MLE Beta fit with support fixed to [0, 1]
+        try:
+            a_fit, b_fit, _loc, _scale = scipy_beta.fit(
+                np.clip(probs, 1e-4, 1 - 1e-4), floc=0, fscale=1
+            )
+            ax.plot(x_curve, scipy_beta.pdf(x_curve, a_fit, b_fit),
+                    color=color, linewidth=2.0, linestyle="-",
+                    label=f"{label} Beta fit: α={a_fit:.1f}, β={b_fit:.1f}")
+        except Exception:
+            pass
+        kl_values[label] = _kl_vs_beta(probs, beta_a, beta_b, n_bins)
 
-        sns.histplot(probs, bins=bins, alpha=0.6, label=f"{label} Probability",
-                     kde=True, color=color)
+    # Reference Beta curve (target shape)
+    ax.plot(
+        x_curve, scipy_beta.pdf(x_curve, beta_a, beta_b),
+        color="black", linewidth=2.0, linestyle=":",
+        label=(
+            f"Reference Beta({beta_a:.2g},{beta_b:.2g})"
+            f"  mode={ref_mode:.2f}  mean={ref_mean:.2f}"
+        ),
+    )
 
-        # Add mean line in same color
-        mean_val = np.mean(probs)
-        plt.axvline(mean_val, color=color, linestyle="--", linewidth=1.5,
-                    label=f"{label} Mean = {mean_val:.2f}")
+    kl_mi   = kl_values.get("MI",   float("nan"))
+    kl_rest = kl_values.get("Rest", float("nan"))
+    kl_comb = (
+        0.5 * (kl_mi + kl_rest)
+        if not (np.isnan(kl_mi) or np.isnan(kl_rest))
+        else float("nan")
+    )
+    kl_text = (
+        f"KL vs Beta({beta_a:.2g},{beta_b:.2g})  [{n_bins}-bin]\n"
+        f"  MI   : {kl_mi:.4f} nats\n"
+        f"  REST : {kl_rest:.4f} nats\n"
+        f"  Comb : {kl_comb:.4f} nats"
+    )
+    ax.text(
+        0.02, 0.97, kl_text,
+        transform=ax.transAxes, verticalalignment="top",
+        fontfamily="monospace", fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85),
+    )
 
-    plt.xlabel("Predicted Probability")
-    plt.ylabel("Frequency")
-    plt.title("Posterior Probability Distribution Across Classes")
-    plt.legend(title="True Class")
-    plt.grid(True, linestyle="--", alpha=0.6)
+    ax.set_xlabel("P(correct class)")
+    ax.set_ylabel("Density")
+    ax.set_title(
+        "Posterior Probability Distribution Across Classes\n"
+        "[P(MI) for MI trials  ·  P(REST) = 1−P(MI) for REST trials]"
+    )
+    ax.legend(loc="lower left", fontsize=9)
+    ax.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
     plt.show()
 
 def validate_trial_pairs(marker_values, marker_timestamps, eeg_timestamps, sfreq, EPOCHS_START_END, min_duration=1.0):
@@ -96,24 +169,27 @@ def validate_trial_pairs(marker_values, marker_timestamps, eeg_timestamps, sfreq
         EPOCHS_START_END: dict of {start_marker: end_marker}
         min_duration: float, minimum seconds required to allow 1s skip
     """
-    print("\n🔍 Pre-validating trial start/end pairs...")
-    
-    for start_marker, end_marker in EPOCHS_START_END.items():
-        start_indices = np.where(marker_values == int(start_marker))[0]
-        end_indices = np.where(marker_values == int(end_marker))[0]
+    epochs_int = {int(a): int(b) for a, b in EPOCHS_START_END.items()}
+    max_ep = float(config.MAX_EPOCH_MARKER_DURATION_SEC)
+    trial_windows, mp_stats = build_trial_windows_chronological(
+        marker_timestamps,
+        marker_values,
+        epochs_int,
+        max_duration_sec=max_ep,
+        min_duration_sec=min_duration,
+    )
+    print("\n🔍 Pre-validating trial start/end pairs (chronological FIFO)...")
+    print(f"   [marker_pairing] {mp_stats} (max_epoch={max_ep:g}s)")
 
-        print(f"\n🔹 Validating marker pair {start_marker} → {end_marker}")
-        print(f"   Found {len(start_indices)} start markers, {len(end_indices)} end markers")
+    for start_marker in sorted(epochs_int.keys()):
+        end_marker = epochs_int[start_marker]
+        tw = [(a, b) for a, b, c in trial_windows if c == start_marker]
+        n_starts = int(np.sum(marker_values == int(start_marker)))
+        n_ends = int(np.sum(marker_values == int(end_marker)))
+        print(f"\n🔹 Marker pair {start_marker} → {end_marker}")
+        print(f"   Raw counts: {n_starts} starts, {n_ends} ends → {len(tw)} paired trials after FIFO + filters")
 
-        if len(start_indices) != len(end_indices):
-            print("   ⚠️ Mismatch in marker counts — trimming to shortest length")
-            min_len = min(len(start_indices), len(end_indices))
-            start_indices = start_indices[:min_len]
-            end_indices = end_indices[:min_len]
-
-        for i, (s_idx, e_idx) in enumerate(zip(start_indices, end_indices)):
-            t_start = marker_timestamps[s_idx]
-            t_end = marker_timestamps[e_idx]
+        for i, (t_start, t_end) in enumerate(tw):
             duration = t_end - t_start
             safe_to_skip = duration > min_duration
 
@@ -122,7 +198,7 @@ def validate_trial_pairs(marker_values, marker_timestamps, eeg_timestamps, sfreq
             else:
                 print(f"   ✅ Trial {i}: {duration:.2f}s → OK to skip 1s")
 
-        print(f"   Finished validating {len(start_indices)} trials for marker {start_marker}")
+        print(f"   Finished validating {len(tw)} trials for marker {start_marker}")
 
 def segment_and_label_one_run(eeg_stream, marker_stream):
     """
@@ -184,23 +260,24 @@ def segment_and_label_one_run(eeg_stream, marker_stream):
     segments_all = []
     labels_all = []
 
-    # === Precompute all trial windows ===
-    trial_windows = []
-    for start_marker, end_marker in EPOCHS_START_END.items():
-        start_indices = np.where(marker_values == int(start_marker))[0]
-        end_indices = np.where(marker_values == int(end_marker))[0]
-        if len(start_indices) != len(end_indices):
-            min_len = min(len(start_indices), len(end_indices))
-            start_indices = start_indices[:min_len]
-            end_indices = end_indices[:min_len]
-        for s_idx, e_idx in zip(start_indices, end_indices):
-            ts_start = marker_timestamps[s_idx]
-            ts_end = marker_timestamps[e_idx]
-            if ts_end - ts_start > 1.0:
-                trial_windows.append((ts_start, ts_end, int(start_marker)))
+    # === Precompute all trial windows (chronological FIFO; avoids mis-paired k-th with k-th) ===
+    epochs_int = {int(a): int(b) for a, b in EPOCHS_START_END.items()}
+    max_ep = float(config.MAX_EPOCH_MARKER_DURATION_SEC)
+    trial_windows, mp_stats = build_trial_windows_chronological(
+        marker_timestamps,
+        marker_values,
+        epochs_int,
+        max_duration_sec=max_ep,
+        min_duration_sec=1.0,
+    )
+    if mp_stats.get("skipped_long_duration", 0) > 0:
+        print(
+            f"[marker_pairing] dropped {mp_stats['skipped_long_duration']} epoch(s) "
+            f"longer than {max_ep:g}s (mis-paired or duplicate markers?)",
+            file=sys.stderr,
+        )
 
     # === Sort windows and get min/max bounds ===
-    trial_windows.sort()
     filter_warmup = 1.0 
     trial_bounds = [(start - 1.0, end) for (start, end, _) in trial_windows]
     valid_start = trial_bounds[0][0] - filter_warmup
@@ -244,12 +321,43 @@ def segment_and_label_one_run(eeg_stream, marker_stream):
             segments_all.append(segment)
             labels_all.append(label)
 
+    segments_arr = np.array(segments_all)
+    labels_arr = np.array(labels_all)
+    if segments_arr.shape[0] != labels_arr.shape[0]:
+        raise RuntimeError(
+            f"internal ordering bug: segments {segments_arr.shape[0]} vs labels {labels_arr.shape[0]}"
+        )
+    return segments_arr, labels_arr
 
-    return np.array(segments_all), np.array(labels_all)
 
 
+def _resolve_shrinkage_param(model_type: str | None = None, shrinkage_param: float | None = None) -> float:
+    """
+    Resolve shrinkage lambda with model-aware defaults.
 
-def compute_processed_covariances(segments, labels):
+    Priority:
+      1) explicit `shrinkage_param`
+      2) model-specific defaults (mdm/xgb)
+    """
+    if shrinkage_param is not None:
+        return float(shrinkage_param)
+
+    mdm_default = float(getattr(config, "SHRINKAGE_PARAM_MDM", 0.02))
+    xgb_default = float(getattr(config, "SHRINKAGE_PARAM_XGB", mdm_default))
+
+    mt = (model_type or "").strip().lower()
+    if mt in ("xgb", "xgb_cov", "xgb_cov_erd"):
+        return xgb_default
+    if mt in ("mdm",):
+        return mdm_default
+
+    backend = str(getattr(config, "DECODER_BACKEND", "mdm")).strip().lower()
+    if backend.startswith("xgb"):
+        return xgb_default
+    return mdm_default
+
+
+def compute_processed_covariances(segments, labels, *, model_type: str | None = None, shrinkage_param: float | None = None):
     """
     Computes regularized and optionally whitened covariance matrices from EEG segments.
 
@@ -271,12 +379,20 @@ def compute_processed_covariances(segments, labels):
 
     if config.LEDOITWOLF:
         print("Applying Ledoit-Wolf shrinkage...")
-        cov_matrices = np.array([
-            LedoitWolf().fit(cov).covariance_ for cov in cov_matrices
-        ])
+        # Fit LW to raw segment data (n_timepoints x n_channels) to estimate the optimal
+        # shrinkage coefficient, then apply it to the already trace-normalised covariance.
+        # Fitting to the precomputed covariance matrix was wrong: sklearn's LedoitWolf expects
+        # raw observations, not an SPD matrix.
+        regularized = []
+        for seg, cov in zip(segments, cov_matrices):
+            lam = LedoitWolf().fit(seg.T).shrinkage_
+            n = cov.shape[0]
+            regularized.append((1 - lam) * cov + lam * (np.trace(cov) / n) * np.eye(n))
+        cov_matrices = np.array(regularized)
     else:
-        print(f"Applying shrinkage (λ={config.SHRINKAGE_PARAM})...")
-        shrinker = Shrinkage(shrinkage=config.SHRINKAGE_PARAM)
+        lam = _resolve_shrinkage_param(model_type=model_type, shrinkage_param=shrinkage_param)
+        print(f"Applying shrinkage (λ={lam})...")
+        shrinker = Shrinkage(shrinkage=lam)
         cov_matrices = shrinker.fit_transform(cov_matrices)
 
     if config.RECENTERING:
@@ -287,6 +403,129 @@ def compute_processed_covariances(segments, labels):
     print(f"Processed covariance matrices shape: {cov_matrices.shape}")
     return cov_matrices
 
+
+
+# ---------- fixed-threshold sweep --------------------------------------------
+def _print_fixed_threshold_sweep(all_scores, all_true_bin, th_star=None,
+                                  sweep=(0.55, 0.60, 0.65, 0.70)):
+    """
+    Report window-level TPR, TNR, PPV, and coverage at each fixed operational
+    threshold.  t_low is set symmetrically as (1 - t_high), mirroring the online
+    driver where REST triggers at (1 - THRESHOLD_REST).
+
+    This is a window-level proxy for integrator behaviour: a model that
+    consistently produces high P(MI) on MI windows will drive the leaky
+    integrator above the same threshold online.  The row nearest th_star
+    is marked as the model's recommendation.
+    """
+    print("\n====== Fixed-Threshold Sweep (window-level; proxy for online integrator) ======")
+    print(f"  {'t_high':>6}  {'t_low':>6}  {'TPR':>6}  {'TNR':>6}  {'PPV':>6}  {'Coverage':>9}")
+    for t_high in sweep:
+        t_low = 1.0 - t_high
+        pred = np.full_like(all_true_bin, -1)
+        pred[all_scores >= t_high] = 1
+        pred[all_scores <= t_low]  = 0
+        decided = pred != -1
+        coverage = decided.mean()
+        if decided.any():
+            yd, pd = all_true_bin[decided], pred[decided]
+            TP = int(((pd == 1) & (yd == 1)).sum())
+            TN = int(((pd == 0) & (yd == 0)).sum())
+            FP = int(((pd == 1) & (yd == 0)).sum())
+            FN = int(((pd == 0) & (yd == 1)).sum())
+            tpr = TP / (TP + FN) if (TP + FN) else float("nan")
+            tnr = TN / (TN + FP) if (TN + FP) else float("nan")
+            ppv = TP / (TP + FP) if (TP + FP) else float("nan")
+        else:
+            tpr = tnr = ppv = float("nan")
+        note = (
+            "  <- model rec."
+            if th_star is not None and abs(t_high - th_star) == min(abs(t - th_star) for t in sweep)
+            else ""
+        )
+        print(
+            f"  {t_high:>6.2f}  {t_low:>6.2f}  "
+            f"{tpr:>6.3f}  {tnr:>6.3f}  {ppv:>6.3f}  "
+            f"{coverage:>8.1%}{note}"
+        )
+
+
+
+# ---------- KL divergence vs target Beta distribution ------------------------
+def _kl_vs_beta(
+    probs: np.ndarray,
+    beta_a: float,
+    beta_b: float,
+    n_bins: int,
+) -> float:
+    """
+    KL divergence KL(empirical ‖ Beta(beta_a, beta_b)) via an n_bins equal-width
+    histogram over [0, 1].
+
+    Empty empirical bins contribute 0 (convention: 0 * log(0) = 0).
+    Target bin mass is floored at 1e-12 to avoid division by zero.
+    """
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    counts, _ = np.histogram(probs, bins=bin_edges)
+    emp_p = counts / counts.sum()
+    target_p = np.maximum(np.diff(scipy_beta.cdf(bin_edges, beta_a, beta_b)), 1e-12)
+    kl = 0.0
+    for p, q in zip(emp_p, target_p):
+        if p > 0.0:
+            kl += p * np.log(p / q)
+    return float(kl)
+
+
+def _compute_kl_breakdown(
+    all_scores: np.ndarray,
+    all_true_bin: np.ndarray,
+    beta_a: float,
+    beta_b: float,
+    n_bins: int,
+) -> dict:
+    """
+    Compute per-class and combined KL divergence on held-out P(MI) scores.
+
+    Operates on P(correct class) per window:
+      - P(MI)   for windows where true label is MI
+      - P(REST) = 1 - P(MI) for windows where true label is REST
+
+    Args:
+        all_scores:   P(MI) for all held-out windows, shape (N,).
+        all_true_bin: Binary labels (0=REST, 1=MI), shape (N,).
+        beta_a, beta_b: Shape parameters of the target Beta distribution.
+        n_bins: Number of histogram bins for the empirical distribution.
+
+    Returns:
+        dict with keys kl_mi, kl_rest, kl_combined.
+    """
+    mi_probs   = all_scores[all_true_bin == 1]
+    rest_probs = 1.0 - all_scores[all_true_bin == 0]
+    kl_mi   = _kl_vs_beta(mi_probs,   beta_a, beta_b, n_bins) if len(mi_probs)   >= 2 else float("nan")
+    kl_rest = _kl_vs_beta(rest_probs, beta_a, beta_b, n_bins) if len(rest_probs) >= 2 else float("nan")
+    return {
+        "kl_mi":       kl_mi,
+        "kl_rest":     kl_rest,
+        "kl_combined": 0.5 * (kl_mi + kl_rest),
+    }
+
+
+def _print_kl_report(
+    all_scores: np.ndarray,
+    all_true_bin: np.ndarray,
+    beta_a: float,
+    beta_b: float,
+    n_bins: int,
+) -> None:
+    """Print a human-readable KL divergence breakdown vs the target Beta distribution."""
+    r = _compute_kl_breakdown(all_scores, all_true_bin, beta_a, beta_b, n_bins)
+    print(
+        f"\n====== KL Divergence vs Beta({beta_a:.2g}, {beta_b:.2g}) "
+        f"[{n_bins}-bin histogram] ======"
+    )
+    print(f"  KL(MI)       : {r['kl_mi']:.4f} nats")
+    print(f"  KL(REST)     : {r['kl_rest']:.4f} nats")
+    print(f"  KL(combined) : {r['kl_combined']:.4f} nats")
 
 
 # ---------- plotting helpers -------------------------------------------------
@@ -386,6 +625,61 @@ def _plot_confusion_with_reject(true_all, pred_all, rest_label, mi_label):
             plt.text(j, i, str(mat[i, j]), ha="center", va="center", fontsize=11)
 
     plt.title("Confusion with Reject (counts)")
+    plt.tight_layout()
+    plt.show()
+
+
+def _plot_confusion_fixed_threshold(all_scores, all_true_bin, rest_label, mi_label, t_high=0.65):
+    """
+    Same 2×3 confusion-with-reject layout as _plot_confusion_with_reject, but
+    applies a fixed symmetric threshold instead of learned per-fold thresholds.
+
+    A window is classified as MI if P(MI) >= t_high, as REST if P(MI) <= (1 - t_high),
+    and as ambiguous otherwise.  This mirrors the symmetric scheme in
+    _print_fixed_threshold_sweep so the two are directly comparable.
+
+    t_high is a P(correct class) threshold — the same value applies to both
+    classes, which is why t_low = 1 - t_high.
+    """
+    import matplotlib.pyplot as plt
+
+    t_low = 1.0 - t_high
+    scores = np.asarray(all_scores, dtype=float)
+    y_bin  = np.asarray(all_true_bin, dtype=int)
+
+    pred = np.full(len(scores), -1, dtype=int)
+    pred[scores >= t_high] = 1
+    pred[scores <= t_low]  = 0
+
+    true_orig = np.where(y_bin == 1, mi_label, rest_label)
+    pred_orig = np.full(len(scores), -1, dtype=int)
+    pred_orig[pred == 1] = mi_label
+    pred_orig[pred == 0] = rest_label
+
+    REST, MI, AMB = rest_label, mi_label, -1
+    mat = np.array([
+        np.sum((true_orig == REST) & (pred_orig == REST)),
+        np.sum((true_orig == REST) & (pred_orig == AMB)),
+        np.sum((true_orig == REST) & (pred_orig == MI)),
+        np.sum((true_orig == MI)   & (pred_orig == REST)),
+        np.sum((true_orig == MI)   & (pred_orig == AMB)),
+        np.sum((true_orig == MI)   & (pred_orig == MI)),
+    ], dtype=int).reshape(2, 3)
+
+    coverage = (pred != -1).mean()
+
+    plt.figure(figsize=(6.5, 4.8))
+    im = plt.imshow(mat, cmap="Blues")
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.xticks([0, 1, 2], ["REST", "AMB", "MI"])
+    plt.yticks([0, 1], ["REST (true)", "MI (true)"])
+    for i in range(2):
+        for j in range(3):
+            plt.text(j, i, str(mat[i, j]), ha="center", va="center", fontsize=11)
+    plt.title(
+        f"Confusion — Fixed P(correct)≥{t_high:.2f}  "
+        f"(coverage {coverage:.1%}, ambig {1.0-coverage:.1%})"
+    )
     plt.tight_layout()
     plt.show()
 
@@ -508,13 +802,14 @@ def _dual_thresholds(y_true_bin, scores, c_fp=1.0, c_fn=1.0, c_reject=0.3,
 def train_riemannian_model(
     cov_matrices,
     labels,
+    session_ids=None,
     n_splits=8,
     use_dual_thresholds=True,
     c_fp=1.0, c_fn=1.0, c_reject=0.3,
     n_grid=201,
     min_gap=0.0,
-    target_ambig=0.3,          # keep ~20% ambiguity by default
-    # --- NEW constraint knobs (decided-only metrics) ---
+    target_ambig=float(getattr(config, "TARGET_AMBIG", 0.20)),  # desired ambiguity fraction U/N
+    # --- constraint knobs (decided-only metrics) ---
     tpr_min=None,              # e.g., 0.85 for MI recall >= 85%
     fpr_max=None,              # e.g., 0.10 for false MI rate <= 10%
     ppv_min=None,              # e.g., 0.80 for MI precision >= 80%
@@ -524,9 +819,16 @@ def train_riemannian_model(
     """
     Trains MDM with k-fold CV, learns dual thresholds to mirror online driver,
     prints aggregated report, and generates diagnostic plots.
+
+    CV mode is controlled by config.CV_MODE:
+      "kfold"       — shuffled KFold(n_splits).
+      "session_loo" — GroupKFold respecting session boundaries; requires
+                      session_ids to be provided.  At most
+                      min(n_sessions, config.N_LOO_SPLITS) folds are used.
     """
 
-    print("\n🚀 Starting K-Fold Cross Validation with Riemannian MDM...\n")
+    cv_mode = str(getattr(config, "CV_MODE", "kfold")).lower()
+    n_loo_splits = int(getattr(config, "N_LOO_SPLITS", 5))
 
     # Informational note: when target_ambig is set, c_reject is ignored during selection
     if target_ambig is not None and (c_reject not in (None, 0.0)):
@@ -538,7 +840,22 @@ def train_riemannian_model(
         raise ValueError("Function expects binary classes.")
     rest_label, mi_label = classes[0], classes[1]
 
-    kf  = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    if cv_mode == "session_loo":
+        if session_ids is None:
+            raise ValueError("session_ids must be provided when CV_MODE == 'session_loo'.")
+        n_sessions = len(np.unique(session_ids))
+        k = min(n_sessions, n_loo_splits)
+        splitter = GroupKFold(n_splits=k)
+        split_iter = splitter.split(cov_matrices, groups=session_ids)
+        print(
+            f"\n🚀 Starting Session-LOO CV with Riemannian MDM "
+            f"[{k} folds over {n_sessions} sessions]...\n"
+        )
+    else:
+        splitter = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        split_iter = splitter.split(cov_matrices)
+        print(f"\n🚀 Starting K-Fold Cross Validation with Riemannian MDM [{n_splits} folds]...\n")
+
     mdm = MDM()
 
     # Aggregation containers
@@ -547,7 +864,7 @@ def train_riemannian_model(
     all_true, all_pred, all_scores, all_true_bin = [], [], [], []
     posterior_probs = {lbl: [] for lbl in classes}
 
-    for fold_idx, (tr, te) in enumerate(kf.split(cov_matrices), 1):
+    for fold_idx, (tr, te) in enumerate(split_iter, 1):
         X_tr, X_te = cov_matrices[tr], cov_matrices[te]
         y_tr, y_te = labels[tr], labels[te]
 
@@ -632,9 +949,11 @@ def train_riemannian_model(
     NPV = TN / (TN + FN) if (TN + FN) else np.nan   # REST precision
 
     tl_star, th_star = float(np.median(t_lows)), float(np.median(t_highs))
+    roc_auc = float(roc_auc_score(all_true_bin, all_scores)) if np.unique(all_true_bin).size == 2 else float("nan")
 
     print("\n====== Aggregated Report ======")
     print(f"Argmax Accuracy (mean): {np.mean(acc_argmax):.4f}")
+    print(f"ROC AUC (fold-test aggregated): {roc_auc:.4f}")
     print(f"Learned thresholds (medians): t_low*={tl_star:.3f}, t_high*={th_star:.3f}")
     print(f"Coverage (decided %): {coverage*100:.2f}% (Ambiguity {(1.0-coverage)*100:.2f}%)")
     print(f"Decided-only Accuracy: {decided_acc:.4f}")
@@ -648,6 +967,8 @@ def train_riemannian_model(
     print(f"U_rest={(all_pred == -1)[all_true == rest_label].sum()}, "
           f"U_mi={(all_pred == -1)[all_true == mi_label].sum()}, "
           f"Total U={U}")
+
+    _print_fixed_threshold_sweep(all_scores, all_true_bin, th_star)
 
     # Mode B thresholds for your online config
     THRESHOLD_REST = 1.0 - tl_star  # compare to P(REST)
@@ -665,7 +986,7 @@ def train_riemannian_model(
 
     _plot_roc_with_point(all_scores, all_true_bin, th_star)
 
-    _plot_confusion_with_reject(all_true, all_pred, rest_label, mi_label)
+    _plot_confusion_fixed_threshold(all_scores, all_true_bin, rest_label, mi_label, t_high=0.65)
 
     # posterior histograms (your original helper)
     for lbl in posterior_probs:
@@ -700,8 +1021,9 @@ def main():
 
     all_cov_matrices = []
     all_labels = []
+    all_session_ids = []
 
-    for xdf_path in xdf_files:
+    for sess_idx, xdf_path in enumerate(xdf_files):
         print(f"\n📂 Processing file: {xdf_path}")
         eeg_stream, marker_stream = load_xdf(xdf_path)
 
@@ -716,31 +1038,22 @@ def main():
         print(f"🔹 Class distribution: {label_summary}")
 
 
-    
-        # === HARD REJECTION BASED ON PEAK AMPLITUDE ===
-        REJECTION_THRESHOLD_UV = 30  # μV
-
-        # Compute max abs amplitude per segment
-        max_vals = np.max(np.abs(segments), axis=(1, 2))  # shape: (n_segments,)
-        keep_mask = max_vals <= REJECTION_THRESHOLD_UV
-
-        # Apply rejection
-        segments = segments[keep_mask]
-        labels = labels[keep_mask]
-
-        print(f"Retained {len(segments)} segments after rejecting {np.sum(~keep_mask)} high-amplitude artifacts.")
+        segments, labels, _ = apply_training_artifact_rejection(segments, labels)
+        print(f"Retained {len(segments)} segments after artifact rejection.")
 
         
-        cov_matrices = compute_processed_covariances(segments, labels)
+        cov_matrices = compute_processed_covariances(segments, labels, model_type="mdm")
         
         #print(mean_riemann(cov_matrices))
         all_cov_matrices.append(cov_matrices)
         all_labels.append(labels)
+        all_session_ids.append(np.full(len(labels), sess_idx, dtype=int))
 
     all_labels = np.concatenate(all_labels)
     all_cov_matrices = np.concatenate(all_cov_matrices)
+    all_session_ids = np.concatenate(all_session_ids)
     print("Training Riemannian Classifier...")
-    Reimans_model = train_riemannian_model(all_cov_matrices, all_labels)
+    Reimans_model = train_riemannian_model(all_cov_matrices, all_labels, session_ids=all_session_ids)
 
     #  Save the trained model
     # Define model save path (subject-level, not session-specific)

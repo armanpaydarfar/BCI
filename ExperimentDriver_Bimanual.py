@@ -1,3 +1,14 @@
+"""
+ExperimentDriver_Bimanual.py
+
+Online EEG experiment driver for the bimanual (robot-assisted) workflow.
+
+Key idea:
+- Decode MI/REST from the live EEG stream.
+- Orchestrate robot state transitions over UDP (including a master-arm
+  unlock/lock phase) in sync with trial phases and acknowledgements.
+"""
+
 import pygame
 import socket
 import time
@@ -33,7 +44,7 @@ from Utils.EEGStreamState import EEGStreamState
 from Utils.networking import send_udp_message,display_multiple_messages_with_udp
 
 # Stream utilities (LSL channel names)
-from Utils.stream_utils import get_channel_names_from_lsl
+from Utils.stream_utils import get_channel_names_from_lsl, require_marker_stream
 
 # Configuration parameters
 import config
@@ -76,9 +87,10 @@ loggable_fields = [
     "WORKING_DIR", "DATA_DIR", "MODEL_PATH",
     "TRAINING_SUBJECT",
     # Online-specific fields
-    "CLASSIFY_WINDOW", "ACCURACY_THRESHOLD", "THRESHOLD_MI", "THRESHOLD_REST",
+    "CLASSIFY_WINDOW", "THRESHOLD_MI", "THRESHOLD_REST",
     "RELAXATION_RATIO", "MIN_PREDICTIONS", "SURFACE_LAPLACIAN_TOGGLE",
-    "SELECT_MOTOR_CHANNELS", "INTEGRATOR_ALPHA", "SHRINKAGE_PARAM",
+    "SELECT_MOTOR_CHANNELS", "INTEGRATOR_ALPHA",
+    "SHRINKAGE_PARAM_MDM", "SHRINKAGE_PARAM_XGB",
     "LEDOITWOLF", "RECENTERING", "UPDATE_DURING_MOVE"
 ]
 config_log_subset = {
@@ -90,12 +102,20 @@ logger.save_config_snapshot(config_log_subset)
 eeg_dir = logger.log_base / "eeg"
 adaptive_T_path = eeg_dir / "adaptive_T.pkl"
 
-Prev_T, counter = load_transform(adaptive_T_path)
+Prev_T, counter, Prev_T_beta, counter_beta = load_transform(adaptive_T_path)
 if Prev_T is None:
     counter = 0
-    logger.log_event("ℹ️ No adaptive transform found — starting fresh with counter = 0.")
+if Prev_T_beta is None:
+    counter_beta = 0
+if Prev_T is None and Prev_T_beta is None:
+    logger.log_event("ℹ️ No adaptive transforms — cold start for μ and β.")
 else:
-    logger.log_event(f"✅ Loaded adaptive transform with counter = {counter}")
+    parts = []
+    if Prev_T is not None:
+        parts.append(f"μ counter={counter}")
+    if Prev_T_beta is not None:
+        parts.append(f"β counter={counter_beta}")
+    logger.log_event("✅ Loaded adaptive transform: " + ", ".join(parts))
 
 logger.log_event("Logger initialized for online experimental driver.")
 
@@ -130,7 +150,14 @@ logger.log_event(f"FES toggle status: {'Enabled' if FES_toggle else 'Disabled'}.
 
 # Construct the correct model path based on the subject
 subject_model_dir = os.path.join(config.DATA_DIR, f"sub-{config.TRAINING_SUBJECT}", "models")
-subject_model_path = os.path.join(subject_model_dir, f"sub-{config.TRAINING_SUBJECT}_model.pkl")
+decoder_backend = str(getattr(config, "DECODER_BACKEND", "mdm")).lower()
+if decoder_backend == "xgb_cov":
+    model_filename = f"sub-{config.TRAINING_SUBJECT}_xgb_cov_features.pkl"
+elif decoder_backend == "xgb_cov_erd":
+    model_filename = f"sub-{config.TRAINING_SUBJECT}_xgb_cov_erd_features.pkl"
+else:
+    model_filename = f"sub-{config.TRAINING_SUBJECT}_model.pkl"
+subject_model_path = os.path.join(subject_model_dir, model_filename)
 
 # Load the trained model from the subject directory
 try:
@@ -186,9 +213,11 @@ _RC.udp_socket_fes    = udp_socket_fes
 
 _RC.FES_toggle = FES_toggle
 
-# Adaptive recentering state
+# Adaptive recentering state (μ / β); persistence controlled by config.SAVE_ADAPTIVE_T
 _RC.Prev_T = Prev_T
 _RC.counter = counter
+_RC.Prev_T_beta = Prev_T_beta
+_RC.counter_beta = counter_beta
 
 
 def perform_master_positioning(
@@ -295,7 +324,20 @@ def perform_master_positioning(
 
 
 def main():
+    """
+    Run the bimanual experiment trial loop.
+
+    This function is the primary entry point when the driver is launched
+    directly (e.g., from `control_panel.py`). It manages:
+    - LSL EEG stream resolution
+    - `EEGStreamState` creation and streaming window extraction
+    - per-trial robot/FES triggers and ACK-gated robot motions
+    - user/backdoor input handling and the end-of-run summary outputs
+    """
     # === Main Game Loop Initialization ===
+
+    # Require both streams before any trial data is recorded.
+    require_marker_stream(logger=logger)
 
     # Connect to EEG stream
     logger.log_event("Resolving EEG data stream via LSL...")
@@ -598,7 +640,13 @@ def main():
 
     if current_trial == len(trial_sequence) and config.SAVE_ADAPTIVE_T:
         try:
-            save_transform(Prev_T, counter, adaptive_T_path)
+            save_transform(
+                _RC.Prev_T,
+                _RC.counter,
+                adaptive_T_path,
+                T_beta=_RC.Prev_T_beta,
+                counter_beta=_RC.counter_beta,
+            )
         except Exception as e:
             logger.log_event(f"⚠️ Could not save transform to {adaptive_T_path}: {e}")
 

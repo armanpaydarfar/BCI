@@ -36,7 +36,9 @@ class LoggerManager:
         with open(self.decoder_csv_path, mode='w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                "Trial", "Timestamp", "P(MI)", "P(REST)",
+                "Trial", "Timestamp",
+                "P(MI)_inst", "P(REST)_inst",
+                "P(MI)_avg", "P(REST)_avg",
                 "True Label", "Predicted Label", "Early Cutout",
                 "MI Threshold", "REST Threshold", "Phase"
             ])
@@ -54,15 +56,30 @@ class LoggerManager:
     def log_event(self, message: str, level="info"):
         getattr(logging, level)(message)
 
-    def log_decoder_output(self, trial, timestamp, prob_mi, prob_rest, true_label, predicted_label,
-                        early_cutout, mi_threshold, rest_threshold, phase):
+    def log_decoder_output(
+            self, trial, timestamp,
+            prob_mi_inst, prob_rest_inst,
+            prob_mi_avg, prob_rest_avg,
+            true_label, predicted_label,
+            early_cutout, mi_threshold, rest_threshold, phase
+        ):
         with open(self.decoder_csv_path, mode='a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                trial, timestamp, prob_mi, prob_rest,
-                true_label, predicted_label, early_cutout,
-                mi_threshold, rest_threshold, phase
+                trial,
+                timestamp,
+                prob_mi_inst,
+                prob_rest_inst,
+                prob_mi_avg,
+                prob_rest_avg,
+                true_label,
+                predicted_label,
+                early_cutout,
+                mi_threshold,
+                rest_threshold,
+                phase
             ])
+
 
 
     def log_trial_summary(self, trial_number, true_label, predicted_label,

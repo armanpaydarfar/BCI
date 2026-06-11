@@ -1,91 +1,276 @@
-# Configuration file for EEG experiments
+# Configuration for EEG experiments — runtime drivers, utilities, and training schemes.
+# Visualization and analysis scripts should not read from this file; they own their own params.
+import os
 
-# Relevant Directories
-WORKING_DIR = "/home/arman-admin/Projects/Harmony/"
-DATA_DIR = "/home/arman-admin/Documents/CurrentStudy"
+# =============================================================================
+# Paths and subject
+# =============================================================================
+# WORKING_DIR / DATA_DIR are machine-local — set them in config_local.py.
+# The defaults here are sentinels; a fresh checkout still imports cleanly,
+# but realtime code that depends on these paths will fail loudly until
+# config_local.py is created (see config_local.example.py).
+WORKING_DIR = ""
+DATA_DIR = ""
+TRAINING_SUBJECT = "PILOT007"
 
-TRAINING_SUBJECT = "CLIN_SUBJ_006"
-# EEG Settings
-CAP_TYPE = 32
-LOWCUT = 8  # Hz
-HIGHCUT = 13  # Hz
-LOWCUT_ERRP = 1 #Hz
-HIGHCUT_ERRP = 10 #Hz
+# =============================================================================
+# EEG acquisition and channels
+# =============================================================================
 FS = 512  # Sampling frequency (Hz)
+CAP_TYPE = 32
+LOWCUT = 8   # Hz — motor imagery mu band
+HIGHCUT = 13
+LOWCUT_ERRP = 1   # Hz — ErrP band
+HIGHCUT_ERRP = 10
+FILTER_BUFFER_SIZE = 2048  # ~4 s at 512 Hz
 MOTOR_CHANNEL_NAMES = ['FC1','FC2','C3', 'Cz', 'C4', 'CP5', 'CP1', 'CP2', 'CP6', 'P7','P3', 'Pz', 'P4', 'P8', 'POz']
-ERRP_CHANNEL_NAMES = ['F3', 'Fz', 'F4', 'FC1', 'FC2', 'Cz']
-EOG_CHANNEL_NAMES = ['AUX1'] # List of EOG channel names to use
-EOG_TOGGLE = 0  # Toggle to enable or disable EOG processing (1 = enabled, 0 = disabled)
+EOG_CHANNEL_NAMES   = ['AUX1']
 
-
-# Experiment Parameters
+# =============================================================================
+# Experiment design — trials, timing, feedback geometry
+# =============================================================================
 ARM_SIDE = "Right"
-EXPERIMENT_TYPE = "BASE" # BIMANUAL or BASE
-TOTAL_TRIALS = 20  # Total number of trials
-TOTAL_TRIALS_ERRP = 45 # Total number of trials for ErrP experiment
-MAX_REPEATS = 3  # Maximum consecutive repeats of the same condition
-N_SPLITS = 5  # Number of splits for KFold cross-validation
-TIME_MI = 5 # time for motor imagery and rest
-TIME_ROB = 7 # time allocated for robot to move
-TIME_STATIONARY = 2 # time for stationary feedback after no movement/failed movement trial
-TIME_MASTER_MOVE = 5 # allowed timing for participant to position robot with master arm. Bimanual experiment.
-TIMING = True #obsolete
-SHAPE_MAX = 0.7 #maximum fill 
-SHAPE_MIN = 0.5 #minimum fill 
-ROBOT_TRAJECTORY = ["a"] # Not using
-BIG_BROTHER_MODE = False #this toggle exports the game to the second monitor automatically, while retaining the running log in the first windows linux terminal
-SEND_PROBS = False
+EXPERIMENT_TYPE = "BASE"  # BIMANUAL or BASE
+TOTAL_TRIALS = 20
+MAX_REPEATS = 3
 
+TIME_MI = 5          # Motor imagery / rest cue duration (s)
+TIME_ROB = 7         # Robot movement window (s)
+TIME_STATIONARY = 2  # Stationary feedback after failed/no movement (s)
+TIME_MASTER_MOVE = 5 # Bimanual: time to position master arm (s)
+TIMING = True        # If True, drivers use automatic countdown paths where implemented
 
-# Early-stop policy: "correct_only" (current behavior) or "either"
-EARLYSTOP_MODE = "correct_only"
+# Segmentation: begin→end spans longer than TIME_MI + 0.5 s are dropped (mis-pairs / missing end).
+# Slack absorbs clock/marker jitter; set to 0 for a hard cap at TIME_MI.
+MAX_EPOCH_MARKER_DURATION_SEC = float(TIME_MI) + 0.5
 
-
-
-# Classification Parameters
-CLASSIFY_WINDOW = 1000  # Duration of EEG data window for classification (milliseconds)
-FILTER_BUFFER_SIZE = 2048 #4s at 512 Hz
-BASELINE_DURATION = 1 #seconds
-ACCURACY_THRESHOLD = 0.6  # OBS Accuracy threshold to determine "Correct" (plan to obsolete)
-THRESHOLD_MI = 0.6 #Threshold for MI "correct"
-THRESHOLD_REST = 0.6 #Threshold for REST "Correct"
-RELAXATION_RATIO = 0.4 # relaxation ratio for sustained MI during movement
-MIN_PREDICTIONS = 8 # Min number of predictions during Online experiment before the decoder can end early
+# Feedback fill mapping
+SHAPE_MAX = 0.7
+SHAPE_MIN = 0.5
+CLASS_VISUAL_STYLE = "classic"  # "classic" or "modern"
+BIG_BROTHER_MODE = True         # If True, force pygame window to external display (0,0) at 1920x1080
+ROBOT_TRAJECTORY = ["a"]        # Opcode pool for random trajectory choice where used
+SEND_PROBS = False              # If True, stream classifier probs over UDP marker channel
+EARLYSTOP_MODE = "correct_only"       # "correct_only" or "either"
+# =============================================================================
+# Runtime decoder — online classification and thresholds
+# =============================================================================
+DECODER_BACKEND = "xgb_cov"   # "mdm" | "xgb_cov" | "xgb_cov_erd"
+CLASSIFY_WINDOW = 1000        # EEG window length for classification (ms)
+BASELINE_DURATION = 1         # seconds
+THRESHOLD_MI = 0.6
+THRESHOLD_REST = 0.6
+RELAXATION_RATIO = 0.5
+MIN_PREDICTIONS = 16
 STEP_SIZE = 1/16
-CLASSIFICATION_OFFSET = 0 # Offset for "classification window" starting point
-#CLASSIFICATION_SCHEME_OPT = "TIMESERIES"
-CLASSIFICATION_SCHEME_OPT = "FREQUENCY"
-SURFACE_LAPLACIAN_TOGGLE = 0 #apply the surface laplacian spatial filter during online
-SELECT_MOTOR_CHANNELS = 1 # toggle to select motor channels or not (can be used to select other channels too)
-SELECT_ERRP_CHANNELS = 0 #toggle to select ERRP channels
-INTEGRATOR_ALPHA = 0.96 # defines how fast the accumulated probability may change as new data comes in
-SHRINKAGE_PARAM = 0.02 # hyperparameter for shrinkage regularization
-LEDOITWOLF = 0 #Set to true to use ledoit wolf shrinkage regularization - otherwise pyreimannian will be used w/ shrinkage param shown above
+INTEGRATOR_ALPHA = 0.97
+SELECT_MOTOR_CHANNELS = 1
+SELECT_ERRP_CHANNELS = 0
+SURFACE_LAPLACIAN_TOGGLE = 1
 
-# adaptive Recentering parameters for config
-RECENTERING = 1 # adaptive recentering toggle
-USE_CONFIDENCE_GATE = 0 #update Previous transform ONLY in the event of lean condition
-UPDATE_DURING_MOVE = 0 #this toggle defines whether or not the reimannian adaptive recentering scheme updates when the robot is moving. 0 = no, 1 = yes. The algo will update always during MI
-SAVE_ADAPTIVE_T = False #this toggle saves "Adaptive_T" to the EEG directory during an active session between runs - this way, we can continue w/ the current estimated whitening transform. Disabling this will start a fresh transform each time
+# =============================================================================
+# Covariance, shrinkage, and adaptive recentering
+# =============================================================================
+# Model-specific covariance shrinkage defaults.
+SHRINKAGE_PARAM_MDM = 0.02  # MDM path (runtime + MDM-centric analyses)
+SHRINKAGE_PARAM_XGB = 0.02  # XGB feature pipelines (covariance preprocessing before tangent features)
+LEDOITWOLF = 0
 
+RECENTERING = 1
+UPDATE_DURING_MOVE = 0
+SAVE_ADAPTIVE_T = False
 
-# FES Parameters
-FES_toggle = 1
+# Dual-threshold ambiguity target for learned reject/decide thresholds (U/N fraction).
+TARGET_AMBIG = 0.20
+
+# =============================================================================
+# Training — artifact rejection (sliding-window training segments)
+# =============================================================================
+# Amplitude unit of segment arrays from XDF + streaming filters. Default "microvolts"
+# matches project XDF convention (see Utils.stream_utils.load_xdf docstring).
+ARTIFACT_REJECT_ENABLE = 1                 # 0 = keep all windows
+ARTIFACT_REJECT_MODE = "max_abs"           # "max_abs" | "peak_to_peak" | "zscore"
+ARTIFACT_MAX_ABS_UV = 30.0                 # used when MODE == max_abs
+ARTIFACT_P2P_UV = 150.0                    # used when MODE == peak_to_peak
+ARTIFACT_ZSCORE_SD = 3.0                   # used when MODE == zscore
+ARTIFACT_SEGMENT_AMPLITUDE_UNIT = "microvolts"  # "microvolts" | "volts"
+ARTIFACT_REJECT_VERBOSE = 1
+
+# =============================================================================
+# Training — cross-validation
+# =============================================================================
+CV_MODE = "session_loo"   # "kfold" | "session_loo"
+N_SPLITS = 5              # KFold splits — used when CV_MODE == "kfold"
+# session_loo: GroupKFold respecting session boundaries.  N_LOO_SPLITS caps the
+# number of folds so that large datasets (e.g. 21 sessions) don't explode.
+# When n_sessions <= N_LOO_SPLITS the split degenerates to true leave-one-session-out.
+N_LOO_SPLITS = 100
+
+# =============================================================================
+# XGBoost — training and hyperparameter tuning
+# =============================================================================
+XGB_MAX_DEPTH    = 6
+XGB_N_ESTIMATORS = 300
+XGB_LEARNING_RATE = 0.05
+XGB_USE_COV_MU   = 1
+XGB_USE_COV_BETA = 1  # mu-only default; enable beta explicitly when needed
+# Online beta band is HIGHCUT..XGB_ERD_BETA_HIGH (consumed by Utils/EEGStreamState.py
+# when DECODER_BACKEND is xgb_cov / xgb_cov_erd).
+XGB_ERD_BETA_HIGH = 30.0
+XGB_ERD_BANDS    = [(float(LOWCUT), float(HIGHCUT))]  # mu-only unless overridden
+XGB_IMPORTANCE_TOP_K = 20
+
+# Hyperparameter search (tune_xgb_hyperparams.py)
+XGB_TUNE_CRITERION = "auc"   # "kl" | "auc"
+# KL criterion target: Beta(BETA_ALPHA, BETA_BETA). Beta(6.1, 2.3) → mode≈0.80, mean≈0.73.
+XGB_TUNE_BETA_ALPHA = 6.1
+XGB_TUNE_BETA_BETA  = 2.3
+XGB_TUNE_KL_BINS    = 15
+
+# =============================================================================
+# Gaze / object-selection experiment
+# =============================================================================
+# Bind vs dial split: GAZE_UDP_IP is the address clients dial (panel +
+# experiment driver). GAZE_BIND_HOST is the address gaze_runner.py binds
+# its UDP socket on. In production, set GAZE_BIND_HOST = "0.0.0.0" on the
+# Windows GPU host and GAZE_UDP_IP = <windows_lan_ip> on Linux. Both
+# default to 127.0.0.1 for the single-machine dev configuration.
+# Machine-local — override in config_local.py.
+GAZE_UDP_IP = "127.0.0.1"
+GAZE_BIND_HOST = "127.0.0.1"
+GAZE_UDP_PORT = 5588
+GAZE_UDP_TIMEOUT = 0.15
+GAZE_SELECTION_WINDOW = 5.0
+GAZE_AVG_WINDOW = 2.0
+GAZE_MIN_DWELL_SEC = 0.75
+GO_NOGO_PROMPT_SEC = 1.25
+GAZE_SAMPLE_WIDTH = 1600.0
+GAZE_SAMPLE_HEIGHT = 1200.0
+# POSE_LIBRARY_PATH derives from WORKING_DIR — defined at the bottom of
+# this file so it picks up any config_local.py override.
+
+# =============================================================================
+# Pupil Labs Neon — device connection
+# =============================================================================
+# IP address of the phone running the Pupil Labs Companion app.
+# Leave empty ("") to use mDNS auto-discovery, which works on home/hotspot
+# networks but is blocked on most enterprise/IoT VLANs.
+# Find the IP in the Companion app: tap the streaming icon → note the
+# address shown (e.g. "10.42.0.100"). Machine-local — override in
+# config_local.py per network.
+NEON_COMPANION_HOST = ""
+
+# =============================================================================
+# Perception frame source — local Neon vs. remote frame_relay
+# =============================================================================
+# Selects how vlm_service.py and gaze_runner.py acquire scene frames.
+#   "local"  — service opens the Neon device directly (today's behaviour;
+#              works on a single machine that owns the Companion phone).
+#   "remote" — service consumes envelopes from a Utils/frame_relay.py TCP
+#              server. Production topology: Linux runs the relay against
+#              the Neon device, Windows runs the perception services with
+#              --frame-source=remote.
+# Reference: SoftwareDocs/GPU_Service_Host_Architecture_Plan.md §3.4.
+# Machine-local — override in config_local.py.
+PERCEPTION_FRAME_SOURCE = "local"
+
+# Where do the perception services (vlm_service.py, gaze_runner.py) run
+# from this panel's perspective? On the Linux device host this is True
+# (services live on the Windows GPU host); on Windows or single-machine
+# dev this is False. Drives panel UX: when True, Start/Stop buttons that
+# would spawn local conda subprocesses are disabled and replaced with
+# remote-status badges fed by `cmd: status` UDP pings.
+# Machine-local — override in config_local.py.
+SERVICES_HOSTED_REMOTELY = False
+
+# Bind host for the relay server (the machine that owns Neon). 0.0.0.0
+# accepts connections from any LAN peer; 127.0.0.1 keeps it loopback-only
+# for single-machine validation. Machine-local — override in config_local.py.
+FRAME_RELAY_HOST = "127.0.0.1"
+# Dial host for the relay client (the machine that runs the models). Set
+# this to the relay host's LAN IP in production. For loopback validation
+# leave it as 127.0.0.1. Machine-local — override in config_local.py.
+FRAME_RELAY_DIAL_HOST = "127.0.0.1"
+FRAME_RELAY_PORT = 5591
+# Default 15 Hz — chosen to fit a UT IoT / cellular uplink budget. With
+# both vlm_service and gaze_runner pulling concurrently the steady-state
+# wire load is ~36 Mbit/s at q=75 JPEG; comfortable on a typical IoT VLAN
+# or 5G hotspot. Raise to 30.0 on LAN to match Neon's native scene-camera
+# FPS for sharper fixation timing; at 30 Hz both consumers together push
+# ~72 Mbit/s which UT IoT will not carry. The relay can never exceed the
+# Neon producer (~30 Hz), so values above 30 are silently capped.
+FRAME_RELAY_HZ = 15.0
+# When True (default) the control panel hosts the frame relay in-process,
+# so launching the panel is sufficient on the Neon machine. Set to False
+# when an out-of-process relay is being run separately (e.g. for testing
+# or when a third machine sits between the Neon owner and the model host).
+# Plain-default key — committable from any machine.
+FRAME_RELAY_EMBEDDED = True
+
+# =============================================================================
+# VLM integration (harmony_vlm subprocess)
+# =============================================================================
+# Gaze/object-recognition backend selector:
+#   "legacy" — our gaze_runner service with YOLO + SORT tracker
+#   "vlm"    — our vlm_service subprocess, which imports harmony_vlm's utils/
+#              (FastSAM + Depth Pro + Gemini) and exposes them over UDP
+GAZE_OR_BACKEND = "vlm"
+
+# Sibling directory holding the harmony_vlm clone. Machine-local —
+# override in config_local.py.
+VLM_REPO_DIR = ""
+
+# Conda env used to launch vlm_service.py. Separate from "lsl" because depth-pro
+# pins numpy<2, which is incompatible with pyriemann and opencv in the BCI stack.
+VLM_CONDA_ENV = "harmony_vlm"
+
+# Gemini model for the VLM reasoner. "gemini-2.5-flash" is free-tier available;
+# "gemini-2.5-pro" requires a paid Google AI account.
+VLM_MODEL = "gemini-2.5-flash"
+
+# Whether to load Depth Pro at service startup. Depth Pro on CPU is slow
+# (~1-3 s per call). Disable to skip scene depth while testing VLM reasoning
+# alone; segment/reason/decide endpoints return without depth fields.
+VLM_ENABLE_DEPTH = True
+
+# UDP endpoint for the vlm_service request-reply protocol. Must differ from
+# GAZE_UDP_PORT (5588) since both services can run concurrently on localhost.
+# Bind vs dial split: VLM_SERVICE_HOST is the dial address (panel /
+# experiment driver). VLM_BIND_HOST is the address vlm_service.py binds on
+# (UDP request socket + TCP overlay socket). In production set
+# VLM_BIND_HOST = "0.0.0.0" on Windows and VLM_SERVICE_HOST = <windows_lan_ip>
+# on Linux. Both default to 127.0.0.1 for single-machine dev.
+# Machine-local — override in config_local.py.
+VLM_SERVICE_HOST = "127.0.0.1"
+VLM_BIND_HOST = "127.0.0.1"
+VLM_SERVICE_PORT = 5589
+VLM_SERVICE_TIMEOUT = 0.5
+
+# VLM_SESSION_ROOT derives from DATA_DIR — defined at the bottom of this
+# file so it picks up any config_local.py override.
+
+# =============================================================================
+# FES
+# =============================================================================
+FES_toggle = 0
 FES_CHANNEL = "red"
-FES_TIMING_OFFSET = 7 
-# above for motor FES, cut out X seconds before the full duration of movement. This should represent when the robot will naturally reach the end of motion (in successful case)
+FES_TIMING_OFFSET = 7  # Seconds before end of movement for motor FES cutoff (successful case)
 
-# Screen Dimensions
-#SCREEN_WIDTH = 3840
-#SCREEN_HEIGHT = 2160
+# =============================================================================
+# Arduino actuator
+# =============================================================================
+USE_ARDUINO = True
+# ARDUINO_PORT is the OS-level serial device path; differs between Linux
+# (/dev/ttyACM0) and Windows (COM3 etc.). Machine-local — override in
+# config_local.py.
+ARDUINO_PORT = ""
+ARDUINO_BAUD = 9600
+ARDUINO_CMD_MI   = b"1"
+ARDUINO_CMD_REST = b"0"
 
-SCREEN_WIDTH = 1200
-SCREEN_HEIGHT = 800
-
-USE_PREVIOUS_ONLINE_STATS = False # for z-score normalization of data coming in - this defines the starting point, False = use the stats from the training session, true = use previous online stats
-
-
-# Colors
+# =============================================================================
+# Display colors (RGB)
+# =============================================================================
 black = (0, 0, 0)
 white = (255, 255, 255)
 blue = (0, 0, 255)
@@ -93,15 +278,31 @@ red = (255, 0, 0)
 green = (0, 255, 0)
 orange = (255, 165, 0)
 
-# software triggers
+# =============================================================================
+# Networking — UDP endpoints and protocol strings
+# =============================================================================
+UDP_MARKER = {
+    "IP": "127.0.0.1",
+    "PORT": 12345
+}
+UDP_ROBOT = {
+    "IP": "192.168.2.1",
+    "PORT": 8080
+}
+UDP_FES = {
+    "IP": "127.0.0.1",
+    "PORT": 5005
+}
+UDP_CONTROL_BIND = {
+    "IP": "192.168.2.2",
+    "PORT": 8080
+}
+
 TRIGGERS = {
     "MI_BEGIN": "200",
     "MI_END": "220",
     "MI_EARLYSTOP": "240",
     "MI_PROBS": "2000",
-
-    #"TRAJECTORY_STAGE": "290",
-    #"ACK_TRAJECTORY_STAGE":"295",
     "ROBOT_BEGIN": "300",
     "ACK_ROBOT_BEGIN": "305",
     "ROBOT_END": "320",
@@ -109,66 +310,104 @@ TRIGGERS = {
     "ROBOT_EARLYSTOP": "340",
     "ACK_ROBOT_STOP": "345",
     "ROBOT_PROBS": "3000",
-    #"ROBOT_RESTART": "350",
     "ROBOT_PAUSE": "360",
     "ACK_ROBOT_PAUSE": "365",
     "ROBOT_RESUME": "370",
     "ACK_ROBOT_RESUME": "375",
     "ROBOT_HOME": "380",
     "ACK_ROBOT_HOME": "385",
-
-
     "ERRP_BEGIN": "400",
     "ERRP_END": "420",
-    
-    
     "REST_BEGIN": "100",
     "REST_END": "120",
     "REST_EARLYSTOP": "140",
     "REST_PROBS": "1000",
-
     "MASTER_UNLOCK": "500",
     "ACK_MASTER_UNLOCK": "505",
     "MASTER_LOCK": "520",
     "ACK_MASTER_LOCK": "525",
-
-
 }
 
-# Robot Opcodes (symbolic names → opcode character)
 ROBOT_OPCODES = {
-    "TRAJECTORY_A": "a",      # straight ahead motion
-    "TRAJECTORY_X": "x",      # Slightly raised motion
-    "TRAJECTORY_Y": "y",      # Accross side motion
-    "TRAJECTORY_Z": "z",      # Reach up motion
-    "GO": "g",                # Execute movement (after MI success)
-    "HOME": "h",              # Home
-    "STOP": "s",              # Stop. Will return home automatically after several seconds
-    "PAUSE": "p",             # Pause (several window allowed for resume)
-    "RESUME": "r",            # Resume (resume trajectory if paused)
-    "MASTER_UNLOCK": "m",     # Unlock master arm
-    "MASTER_LOCK": "c",       # Lock master arm
-    "QUERY": "q",             # Query joint angles, torques, velocities, end effector positions.
-    "EXIT": "e"               # Exit / emergency stop
+    "TRAJECTORY_A": "a",
+    "TRAJECTORY_X": "x",
+    "TRAJECTORY_Y": "y",
+    "TRAJECTORY_Z": "z",
+    "GO": "g",
+    "HOME": "h;dur=3",
+    "STOP": "s",
+    "PAUSE": "p",
+    "RESUME": "r",
+    "MASTER_UNLOCK": "m",
+    "MASTER_LOCK": "c",
+    "QUERY": "q",
+    "EXIT": "e"
 }
 
-# UDP Settings
-UDP_MARKER = {
-    "IP": "127.0.0.1",
-    "PORT": 12345
-}
+# =============================================================================
+# ErrP decoder
+# =============================================================================
+# Master toggle: 0 = ErrP pipeline disabled (MI pipeline unaffected), 1 = enabled
+ERRP_DECODER_ENABLE = 0
+# Classifier backend — must match the suffix of the model file on disk:
+#   DATA_DIR/sub-{SUBJECT}/models/sub-{SUBJECT}_errp_{BACKEND}.pkl
+# Options validated live: "liu_cca_xgb", "xdawn_xgb"
+ERRP_DECODER_BACKEND = "liu_cca_xgb"
+# Epoch window anchored at the event marker (seconds post-event).
+# 200-800 ms is centred on the Pe (~200-400 ms). Must match the window the
+# deployed bundles were trained at (PILOT007 liu_cca_xgb/xdawn_xgb = 0.2 s);
+# runtime_common enforces config == bundle feature_spec or raises.
+ERRP_EPOCH_TMIN = 0.2
+ERRP_EPOCH_TMAX = 0.8
+# xDAWN spatial filters per class (4 is standard for P300/ErrP paradigms)
+ERRP_XDAWN_N_FILTERS = 4
+# Artifact rejection threshold for ErrP epochs (µV, max_abs on 1-10 Hz filtered signal)
+ERRP_ARTIFACT_MAX_ABS_UV = 80.0
+# Dual-threshold ambiguity target for ErrP (fraction of trials allowed to be ambiguous)
+ERRP_TARGET_AMBIG = 0.20
+# LogisticRegression regularization (xdawn_lr backend only)
+ERRP_LR_C = 1.0
+# CAR rereferencing for ErrP stream (1 = on, matches offline training path)
+ERRP_CAR_REREFERENCE = 1
+# Bootstrap: seconds of quiet fixation before first trial used to fit EA reference
+ERRP_EA_BOOTSTRAP_SEC = 45.0
+# Minimum pseudo-epochs for EA bootstrap (each epoch = ERRP_EPOCH_TMAX * FS samples)
+ERRP_EA_MIN_EPOCHS = 20
+# ErrP experiment paradigm
+# Probability that the robot stops mid-trajectory (error condition) — online driver
+ERRP_ONLINE_P_STOP = 0.3
+# Minimum/maximum stop time bounds (seconds into trajectory)
+ERRP_STOP_TMIN = 1.0
+ERRP_STOP_TMAX_FRACTION = 0.7
+# Seconds the robot stays paused if no ErrP is detected before homing
+ERRP_NO_RESUME_TIMEOUT = 3.0
+# Total trials for dedicated ErrP experiment driver
+TOTAL_TRIALS_ERRP = 45
+# ErrP channel set — expanded to 14 channels based on cross-subject decoder validation
+ERRP_CHANNEL_NAMES = ['F3', 'Fz', 'F4', 'FC1', 'FC2', 'C3', 'Cz', 'C4', 'CP1', 'CP2', 'Pz', 'POz', 'O1', 'O2']
 
-UDP_ROBOT = {
-    "IP": "192.168.2.1",
-    "PORT": 8080
-}
+# =============================================================================
+# Global runtime flags
+# =============================================================================
+SIMULATION_MODE = False
 
-UDP_FES = {
-    "IP": "127.0.0.1",
-    "PORT": 5005
-}
+# =============================================================================
+# Machine-local overrides
+# =============================================================================
+# config_local.py is per-machine and gitignored. It supplies real values
+# for paths and network endpoints (WORKING_DIR, DATA_DIR, *_HOST, *_DIAL_*,
+# NEON_COMPANION_HOST, ARDUINO_PORT, VLM_REPO_DIR, PERCEPTION_FRAME_SOURCE,
+# SERVICES_HOSTED_REMOTELY). Bootstrap a new machine by copying
+# config_local.example.py to config_local.py and editing in place.
+try:
+    from config_local import *  # noqa: F401, F403
+except ImportError:
+    pass
 
-UDP_CONTROL_BIND = {
-    "IP":   "192.168.2.2",  # your control Control Modul's IP
-    "PORT": 8080
-}
+# =============================================================================
+# Derived paths — placed AFTER the local-override import so they pick up
+# the per-machine WORKING_DIR / DATA_DIR. Defining these earlier would
+# bake the empty defaults into every consumer.
+# =============================================================================
+POSE_LIBRARY_PATH = os.path.join(WORKING_DIR, "poses_with_gaze_20251202_153040.npz")
+VLM_SESSION_ROOT  = os.path.join(DATA_DIR, "vlm_sessions")

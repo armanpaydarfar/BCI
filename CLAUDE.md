@@ -22,6 +22,17 @@ runtime behavior.
   must degrade gracefully to CPU/Linux behaviour when the condition is
   not met.
 
+- **Perception services are Windows-hosted in production.** All ML
+  inference (FastSAM, Depth Pro, Gemini-backed VLM, YOLO + SORT) runs on
+  the Windows GPU host. Linux owns device I/O (Pupil Labs Neon, EEG, FES,
+  robot) and ships frames to Windows via a TCP relay; Windows ships
+  results back over UDP. The toggle is the `PERCEPTION_FRAME_SOURCE`
+  config key (`local` opens Neon directly, `remote` consumes from
+  `Utils/frame_relay.py`); default is `local` so single-machine workflows
+  keep working without config edits. See
+  `Documents/SoftwareDocs/GPU_Service_Host_Architecture_Plan.md` for the
+  full architecture, wire format, and deployment notes.
+
 ---
 
 ## Source of Truth
@@ -108,34 +119,67 @@ realtime but not in the critical path.
 
 ---
 
-## config.py
+## config.py and config_local.py
 
-- `config.py` changes may be proposed and committed from either machine.
+- `config.py` is **global and committed**. It holds algorithm /
+  decoder / EEG / protocol settings, plus *safe defaults* for every
+  machine-local key (loopback IPs, empty paths, `False` flags). Changes
+  here are committed from either machine.
 
-- The following two lines are **always machine-local and must never be
-  committed**:
-  ```python
-  WORKING_DIR = "..."
-  DATA_DIR    = "..."
+- `config_local.py` is **per-machine and gitignored**. It supplies real
+  values for paths and network endpoints on this host. `config.py`
+  imports it via `from config_local import *` at the bottom of the file,
+  so anything defined in `config_local.py` shadows the default.
+
+- A new machine bootstraps with:
+  ```bash
+  cp config_local.example.py config_local.py
+  # edit config_local.py
   ```
+
+- The following keys are machine-local and must only be assigned in
+  `config_local.py`. A pre-commit hook
+  (`~/.claude/hooks/config-py-guard.sh`) blocks any non-default value
+  for these keys appearing in a staged `config.py` diff:
+  - `WORKING_DIR`, `DATA_DIR`
+  - `GAZE_UDP_IP`, `GAZE_BIND_HOST`
+  - `NEON_COMPANION_HOST`
+  - `PERCEPTION_FRAME_SOURCE`, `SERVICES_HOSTED_REMOTELY`
+  - `FRAME_RELAY_HOST`, `FRAME_RELAY_DIAL_HOST`
+  - `VLM_REPO_DIR`
+  - `VLM_SERVICE_HOST`, `VLM_BIND_HOST`
+  - `ARDUINO_PORT`
 
 - All other config changes are safe to commit provided they are
   platform-neutral.
 
 ---
 
-## Reference Literature
+## Reference Literature and Documentation
 
-- `Documents/Studies/` contains papers describing methods implemented
-  or planned in this repo. Read the relevant paper before implementing
-  or critiquing a method that references it.
+Two directories serve as the canonical locations for papers and
+implementation references related to this project. On Linux the paths
+are absolute as shown; on Windows replace `/home/arman-admin` with the
+appropriate Windows home prefix — the subdirectory structure is the
+same on both machines.
 
-- Key file: `NER2023_Liu.pdf` — reference architecture for RBNNet.
-  Any change to `Utils/rbnnet_model.py` should be checked against this
-  paper.
+### `/home/arman-admin/Documents/studies/`
+Contains academic papers providing context for methods implemented or
+planned in this repo. Papers here are reference material — read them
+for background and motivation, but do not assume the implementation
+follows them exactly. Divergences from the paper are intentional and
+documented in the relevant implementation reference.
 
-- When a feature is derived from a paper in this folder, note the
-  reference in the commit message and relevant docstrings.
+### `/home/arman-admin/Documents/SoftwareDocs/`
+Contains implementation references, planning documents, and post-
+implementation technical records for features developed in this repo.
+These are the primary written records for features that may not have
+a separate planning document in the codebase. When working on a
+feature, check here first for an existing reference document before
+reading the code.
+
+When a feature is derived from a paper in `Documents/studies/`, note
+the reference in the commit message and relevant docstrings.
 
 ---
 
@@ -233,9 +277,21 @@ realtime but not in the critical path.
 
 ## Commit Hygiene
 
-- Do not commit unless explicitly asked.
-- Stage files individually — never `git add .` or `git add -A`.
-- Do not commit `WORKING_DIR` / `DATA_DIR` lines from `config.py`.
+- Commit proactively at clean logical boundaries: one coherent diff
+  (feature, bug fix, or refactor step) with no half-finished work.
+- Do not bundle unrelated changes into one commit — split them.
+- After every commit, push to origin immediately so remote stays
+  current. Exception: never auto-push `main` / `master` — confirm with
+  the user first. (A PostToolUse hook handles the push automatically on
+  feature branches.)
+- Stage files individually — never `git add .` or `git add -A`. (A
+  PreToolUse hook blocks the wildcard forms.)
+- Do not commit machine-local keys (paths, network IPs, USB device
+  paths) into `config.py`; they belong in `config_local.py`. (A
+  PreToolUse hook blocks `git commit` if a staged `config.py` diff
+  assigns one of these keys to a non-default value. The full list of
+  guarded keys is in the `config.py and config_local.py` section
+  above.)
 - Commit messages should explain *why*, not just *what*.
 - All commits must be compatible with Linux (CPU) regardless of which
   machine they were developed on.
