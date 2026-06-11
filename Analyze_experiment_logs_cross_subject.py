@@ -49,12 +49,11 @@ CURRENT_STUDY_ROOT = os.path.expanduser("~/Documents/CurrentStudy")
 # ---- Selection (non-interactive) ----
 # You can either list explicit subject IDs (without "sub-") ...
 SUBJECTS = [
-    # "F25CLASS_SUBJ_001",
-    # "F25CLASS_SUBJ_002",
+    # e.g. "SUBJ_XXX", "CLIN_SUBJ_003", ...
 ]
 
 # ... OR use a glob-like prefix filter if SUBJECTS is empty.
-SUBJECT_PREFIX_FILTER = "PILOT00"   # e.g. "F25CLASS_SUBJ_" or "CLIN_SUBJ_" or "" for ALL subjects
+SUBJECT_PREFIX_FILTER = "PILOT00"   # e.g. "SUBJ_" or "CLIN_SUBJ_" or "" for ALL subjects
 
 # Sessions: provide dict subject->list of session folder names (e.g., "ses-S001ONLINE") to include.
 # If None, includes ALL sessions found (subject to exclusion rules).
@@ -64,20 +63,10 @@ SUBJECT_PREFIX_FILTER = "PILOT00"   # e.g. "F25CLASS_SUBJ_" or "CLIN_SUBJ_" or "
 
 #SESSIONS_BY_SUBJECT = None
 '''
+# Example template: map each subject id to the session folders to include.
 SESSIONS_BY_SUBJECT = {
-    "F25CLASS_SUBJ_001": ["ses-S002ONLINE"],
-    "F25CLASS_SUBJ_002": ["ses-S002ONLINE"],
-    "F25CLASS_SUBJ_003": ["ses-S002ONLINE"],
-    
-    "F25CLASS_SUBJ_004": ["ses-S002ONLINE","ses-S003ONLINE"],
-    "F25CLASS_SUBJ_005": ["ses-S002ONLINE","ses-S003ONLINE"],
-    "F25CLASS_SUBJ_006": ["ses-S002ONLINE","ses-S003ONLINE"],
-
-    # Subjects 4–6: no regular sessions → intentionally omitted
-
-    "F25CLASS_SUBJ_007": ["ses-S003ONLINE"],
-    "F25CLASS_SUBJ_008": ["ses-S003ONLINE"],
-    "F25CLASS_SUBJ_009": ["ses-S003ONLINE"],
+    "SUBJ_XXX": ["ses-S002ONLINE"],
+    "SUBJ_YYY": ["ses-S002ONLINE", "ses-S003ONLINE"],
 }
 '''
 

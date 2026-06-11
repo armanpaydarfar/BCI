@@ -129,16 +129,22 @@ FULL22_CHANNELS = [
     "P7", "P3", "Pz", "P4", "P8", "POz",
 ]
 
-# Shared expert pool — the 6 OG_Right CLASS+LAB files identical across
-# CLIN_SUBJ_003..008/training_data/ per rev01-paper-angle.md §1.1.
-EXPERT_OG_RIGHT_BASENAMES = [
-    "sub-CLASS_SUBJ_1032_ses-S001OFFLINE_FES_task-Default_run-001_eeg.xdf",
-    "sub-CLASS_SUBJ_1032_ses-S002OFFLINE_NOFES_task-Default_run-001_eeg.xdf",
-    "sub-CLASS_SUBJ_132_ses-S002OFFLINE_NOFES_task-Default_run-001_eeg.xdf",
-    "sub-CLASS_SUBJ_831_ses-S002OFFLINE_NOFES_task-Default_run-001_eeg.xdf",
-    "sub-LAB_SUBJ_001_ses-S001OFFLINE_task-Default_run-001_eeg.xdf",
-    "sub-LAB_SUBJ_001_ses-S007OFFLINE_task-Default_run-001_eeg.xdf",
-]
+# Shared expert pool — the 6 OG_Right expert files identical across
+# CLIN_SUBJ_003..008/training_data/ per rev01-paper-angle.md §1.1. The healthy
+# source subjects were de-identified to SUBJ_NNN; their filenames are kept in a
+# machine-local file outside the repo so the public history carries no
+# old↔new subject-name mapping. Recreate the file from the private key on each
+# host. See Documents/SoftwareDocs/Subject_Deidentification_Record.md.
+def _expert_og_right_basenames() -> list[str]:
+    path = os.path.join(DATA_DIR, "_deid", "expert_pool_basenames.txt")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"expert-pool basename list not found: {path} — recreate it from "
+            "the private de-identification key (one filename per line; see "
+            "Subject_Deidentification_Record.md)"
+        )
+    with open(path, encoding="utf-8") as fh:
+        return [ln.strip() for ln in fh if ln.strip()]
 EXPERT_SOURCE_SUBJECT = "CLIN_SUBJ_003"   # any CLIN_SUBJ_003..008 works
 
 CLIN_PRIMARY_SUBJECTS = [f"CLIN_SUBJ_{i:03d}" for i in (3, 4, 5, 6, 7, 8)]
@@ -544,7 +550,7 @@ def expert_eds_shared(
     cov_rest_list: list[np.ndarray] = []
     used_channels: list[str] = []
 
-    for basename in EXPERT_OG_RIGHT_BASENAMES:
+    for basename in _expert_og_right_basenames():
         xdf = os.path.join(expert_dir, basename)
         if not os.path.exists(xdf):
             print(f"  [expert/{band_label}] MISSING {basename}; skip")

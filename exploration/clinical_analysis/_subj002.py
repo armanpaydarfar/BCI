@@ -29,7 +29,7 @@ Per-session protocol (verified 2026-06-04 from `config_snapshot.json`
     2026-06-04). It remains a valid right-arm MI recording, just not an
     expert-TL session.
   - S004ONLINE (2025-06-12, 5 runs): RIGHT-arm, decoder trained on
-    `LAB_SUBJ_001` (the operator pool used cohort-wide) — expert
+    the shared operator expert pool used cohort-wide — expert
     transfer learning. INCLUDED.
 
 S001 (left arm) is excluded everywhere. S003's treatment then SPLITS by

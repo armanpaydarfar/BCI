@@ -17,7 +17,7 @@ from Utils.stream_utils import get_channel_names_from_xdf, load_xdf
 # This script is standalone: it does not read from config.py. Set defaults below
 # or override via CLI flags (--subject, --session, --fs).
 
-subject = "F25CLASS_SUBJ_008"
+subject = "CLIN_SUBJ_003"  # default; override via --subject
 session = "S001OFFLINE"
 FS = 512  # Hz, EEG sampling rate
 
