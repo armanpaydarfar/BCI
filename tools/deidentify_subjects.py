@@ -60,8 +60,13 @@ import config  # noqa: E402
 # are deliberately absent: they are not renamed. FS25CLASS / FSCLASS are typo
 # spellings of F25CLASS observed in the data; they are canonicalized below so a
 # misspelled file maps to the SAME new id as its correctly-spelled sibling.
+# Matching is case-insensitive: a title-case spelling like ``Class_Subj_001``
+# must be detected too -- an uppercase-only pattern silently skipped such files
+# (and the residual scan reported a false PASS). _canonical() folds case variants
+# of one subject together by upper-normalizing.
 _IDENTIFYING_TOKEN_RE = re.compile(
-    r"^(CLASS|F25CLASS|S26CLASS|FS25CLASS|FSCLASS|LAB)_SUBJ_([A-Za-z0-9]+)$"
+    r"^(CLASS|F25CLASS|S26CLASS|FS25CLASS|FSCLASS|LAB)_SUBJ_([A-Za-z0-9]+)$",
+    re.IGNORECASE,
 )
 _PREFIX_NORMALIZE = {"FS25CLASS": "F25CLASS", "FSCLASS": "F25CLASS"}
 # Deterministic cohort ordering for the pre-shuffle canonical list.
@@ -88,11 +93,14 @@ def _is_text_file(name: str) -> bool:
 
 
 def _canonical(spelling: str) -> str:
-    """Map any identifying spelling (incl. typos) to its canonical subject id."""
+    """Map any identifying spelling (incl. typo and case variants) to its
+    canonical subject id. Case is upper-normalized so a title-case spelling like
+    ``Class_Subj_001`` folds to the same subject as ``CLASS_SUBJ_001`` (no-op for
+    the already-uppercase canonical names in the frozen key)."""
     m = _IDENTIFYING_TOKEN_RE.match(spelling)
     if not m:
         raise ValueError(f"not an identifying token: {spelling!r}")
-    prefix, num = m.group(1), m.group(2)
+    prefix, num = m.group(1).upper(), m.group(2).upper()
     prefix = _PREFIX_NORMALIZE.get(prefix, prefix)
     return f"{prefix}_SUBJ_{num}"
 
@@ -104,7 +112,7 @@ def _iter_path_tokens(name: str):
     (recordings). We extract the segment after ``sub-`` up to the next ``_ses``
     boundary or end-of-name, then test it against the identifying pattern.
     """
-    for m in re.finditer(r"sub-([A-Za-z0-9]+_SUBJ_[A-Za-z0-9]+)", name):
+    for m in re.finditer(r"sub-([A-Za-z0-9]+_SUBJ_[A-Za-z0-9]+)", name, re.IGNORECASE):
         tok = m.group(1)
         if _IDENTIFYING_TOKEN_RE.match(tok):
             yield tok
@@ -121,6 +129,7 @@ def _iter_content_tokens(text: str):
     for m in re.finditer(
         r"(?<![A-Za-z0-9])(CLASS|F25CLASS|S26CLASS|FS25CLASS|FSCLASS|LAB)_SUBJ_([A-Za-z0-9]+)(?![A-Za-z0-9])",
         text,
+        re.IGNORECASE,
     ):
         counts[m.group(0)] += 1
     return counts
