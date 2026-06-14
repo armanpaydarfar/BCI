@@ -1,0 +1,26 @@
+# Normalize all text to LF in the repo on every platform. Linux is the
+# primary host and the .sh experiment drivers / tool scripts must stay LF
+# to execute; Windows is a secondary dev machine where editors otherwise
+# write CRLF. Enforcing eol=lf repo-wide keeps line endings off every diff
+# regardless of which machine committed. The whole repo is already LF, so
+# this introduces no renormalization — it locks in current state and makes
+# it independent of any per-machine core.autocrlf setting.
+* text=auto eol=lf
+
+# Binary assets git must never line-ending-convert (data, model weights,
+# montages, compiled libs, recordings, archives).
+*.fif binary
+*.npz binary
+*.npy binary
+*.pt binary
+*.pth binary
+*.onnx binary
+*.so binary
+*.xdf binary
+*.pkl binary
+*.h5 binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+*.zip binary
