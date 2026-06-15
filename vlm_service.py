@@ -2,8 +2,8 @@
 """
 vlm_service.py — UDP request-reply service wrapping harmony_vlm's capabilities.
 
-Runs in the `harmony_vlm` conda env and imports harmony_vlm's utils/ via
-sys.path. Loads the Neon live reader, FastSAM, Depth Pro (optional), Gemini,
+Runs in the `harmony_vlm` conda env and imports the in-tree `perception`
+package. Loads the Neon live reader, FastSAM, Depth Pro (optional), Gemini,
 and the I-VT fixation detector once at startup; then exposes each capability
 as a distinct UDP command so the control panel and experiment drivers can
 consume them independently.
@@ -179,7 +179,6 @@ class SnapshotCache:
 
 def parse_args():
     p = argparse.ArgumentParser(description="harmony_vlm UDP service")
-    p.add_argument("--repo-dir", required=True, help="Path to harmony_vlm clone")
     # `--host` is the bind address for both the UDP request socket and the
     # TCP overlay socket. Production deployments set this to 0.0.0.0 so the
     # Linux panel/driver can dial in across the LAN; single-machine dev
@@ -200,7 +199,8 @@ def parse_args():
                    default=int(_cfg_default("VLM_MAX_OUTPUT_TOKENS", 8192)),
                    help="Cap for the VLM JSON response in tokens. Override "
                         "with VLM_MAX_OUTPUT_TOKENS in config. Default 8192.")
-    p.add_argument("--seg-model", default="models/FastSAM-s.pt", help="Relative to repo-dir")
+    p.add_argument("--seg-model", default="FastSAM-s.pt",
+                   help="Segmentation weights: filename within PERCEPTION_MODELS_DIR, or an absolute path")
     # Default "auto" resolves to cuda if torch.cuda.is_available(), else cpu
     # (see main()). Hosts without a usable GPU degrade gracefully to CPU,
     # matching CLAUDE.md's "platform-specific optimisations must be gated on
@@ -214,7 +214,8 @@ def parse_args():
     # so the right default is "on" — opt-out rather than opt-in.
     p.add_argument("--enable-depth", action=argparse.BooleanOptionalAction,
                    default=bool(_cfg_default("VLM_ENABLE_DEPTH", True)))
-    p.add_argument("--depth-checkpoint", default="models/depth_pro.pt", help="Relative to repo-dir")
+    p.add_argument("--depth-checkpoint", default="depth_pro.pt",
+                   help="Depth Pro weights: filename within PERCEPTION_MODELS_DIR, or an absolute path")
     p.add_argument("--session-dir", default=None, help="Where to save depth PNGs etc.")
     p.add_argument("--verbose", action="store_true")
     # Frame source toggle for the GPU-host migration plan (see SoftwareDocs/
@@ -836,7 +837,7 @@ class VLMService:
 
     def _cmd_decide(self, req: dict) -> dict:
         # Import here so this file parses even if harmony_vlm utils aren't loaded
-        from utils.object_detector import compute_3d_waypoints
+        from perception.object_detector import compute_3d_waypoints
 
         cmd_t0 = time.time()
         bundle, fix, _ = self._latest()
@@ -926,7 +927,7 @@ class VLMService:
         alongside JSON-safe waypoint dicts, so one call covers both the cache
         payload and the UDP response payload.
         """
-        from utils.object_detector import compute_3d_waypoints
+        from perception.object_detector import compute_3d_waypoints
 
         dets = self.detector.detect(frame_bgr)
 
@@ -1499,51 +1500,43 @@ def main() -> None:
     if _log_path is not None:
         _log(f"service log file: {_log_path}")
 
-    repo_dir = os.path.abspath(args.repo_dir)
-    if not os.path.isdir(repo_dir):
-        _log(f"FATAL: repo-dir not a directory: {repo_dir}")
-        sys.exit(2)
-    sys.path.insert(0, repo_dir)
-    # .env at repo root holds GOOGLE_API_KEY / OPENAI_API_KEY for IntentReasoner.
-    # Change cwd so relative model paths (FastSAM-s.pt, depth_pro.pt) resolve correctly.
-    os.chdir(repo_dir)
+    # Perception source is in-tree under BCI/perception/ (folded from
+    # harmony_vlm, WS3). The BCI dir is already on sys.path (_BCI_DIR at the
+    # module top), so the perception package and config import directly — no
+    # --repo-dir, no os.chdir, no .env file.
 
-    # Resolve --device=auto now that repo_dir is set up but before any model
-    # loading. Gated on torch.cuda.is_available() so the same default works on
-    # GPU hosts (cuda) and CPU-only Linux hosts (cpu).
+    # Resolve model weights against PERCEPTION_MODELS_DIR (machine-local). A
+    # bare filename joins onto the models dir; an absolute --seg-model /
+    # --depth-checkpoint override is taken as-is.
+    models_dir = _cfg_default("PERCEPTION_MODELS_DIR", "")
+    if not os.path.isabs(args.seg_model):
+        args.seg_model = os.path.join(models_dir, args.seg_model)
+    if args.enable_depth and not os.path.isabs(args.depth_checkpoint):
+        args.depth_checkpoint = os.path.join(models_dir, args.depth_checkpoint)
+
+    # Resolve --device=auto before any model loading. Gated on
+    # torch.cuda.is_available() so the same default works on GPU hosts (cuda)
+    # and CPU-only Linux hosts (cpu).
     if args.device == "auto":
         import torch as _torch_probe
         args.device = "cuda" if _torch_probe.cuda.is_available() else "cpu"
         _log(f"--device auto-resolved to {args.device}")
 
-    # Read .env values and force-set them in os.environ so that a pre-existing
-    # empty-string value inherited from the parent process doesn't shadow the file.
-    # Using dotenv_values (returns a plain dict) then updating os.environ directly
-    # avoids load_dotenv's override=False default and any version-specific behaviour.
-    env_file = os.path.join(repo_dir, ".env")
-    if os.path.isfile(env_file):
-        try:
-            from dotenv import dotenv_values
-            for _k, _v in dotenv_values(env_file).items():
-                if _v is not None:
-                    os.environ[_k] = _v
-        except Exception as _e:
-            _log(f"warning: could not read .env via dotenv ({_e}); falling back to manual parse")
-            with open(env_file) as _fh:
-                for _line in _fh:
-                    _line = _line.strip()
-                    if _line and not _line.startswith("#") and "=" in _line:
-                        _ek, _ev = _line.split("=", 1)
-                        os.environ[_ek.strip()] = _ev.strip().strip('"').strip("'")
+    from perception.neon import NeonLiveReader
+    from perception.object_detector import ObjectDetector
+    from perception.fixation_detector import FixationDetector, FixationState
+    from perception.intent_reasoner import IntentReasoner
 
-    from utils.neon import NeonLiveReader
-    from utils.object_detector import ObjectDetector
-    from utils.fixation_detector import FixationDetector, FixationState
-    from utils.intent_reasoner import IntentReasoner
-
-    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    # Gemini/OpenAI key from BCI config (GOOGLE_API_KEY in config_local.py),
+    # with an env-var fallback for ad-hoc runs.
+    api_key = (
+        _cfg_default("GOOGLE_API_KEY", "")
+        or os.environ.get("GOOGLE_API_KEY")
+        or os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+    )
     if not api_key:
-        _log(f"FATAL: no GOOGLE_API_KEY / OPENAI_API_KEY in env or .env (looked in {env_file})")
+        _log("FATAL: no GOOGLE_API_KEY in config_local.py or environment")
         sys.exit(2)
 
     if args.frame_source == "remote":
@@ -1574,7 +1567,7 @@ def main() -> None:
 
     depth_estimator = None
     if args.enable_depth:
-        from utils.depth_estimator import DepthEstimator
+        from perception.depth_estimator import DepthEstimator
         import torch as _torch
         save_path = None
         if args.session_dir:

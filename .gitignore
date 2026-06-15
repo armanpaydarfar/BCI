@@ -46,3 +46,9 @@ docs/REPO_EXPLORATION_REPORT.md
 # Machine-local config overrides (paths, network IPs, USB device paths).
 # Schema lives in config_local.example.py (committed).
 config_local.py
+
+# Perception model weights (FastSAM-s.pt ~23 MB, depth_pro.pt ~1.9 GB) are
+# fetched out of band and never committed. PERCEPTION_MODELS_DIR normally
+# points outside the tree, but ignore an in-tree models/ dir defensively.
+perception/models/
+perception/output/

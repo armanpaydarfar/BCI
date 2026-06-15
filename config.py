@@ -212,13 +212,18 @@ FRAME_RELAY_EMBEDDED = True
 # =============================================================================
 # Gaze/object-recognition backend selector:
 #   "legacy" — our gaze_runner service with YOLO + SORT tracker
-#   "vlm"    — our vlm_service subprocess, which imports harmony_vlm's utils/
-#              (FastSAM + Depth Pro + Gemini) and exposes them over UDP
+#   "vlm"    — our vlm_service subprocess, which imports the in-tree perception
+#              package (FastSAM + Depth Pro + Gemini) and exposes them over UDP
 GAZE_OR_BACKEND = "vlm"
 
-# Sibling directory holding the harmony_vlm clone. Machine-local —
-# override in config_local.py.
-VLM_REPO_DIR = ""
+# Directory holding the perception model weights (FastSAM-s.pt, depth_pro.pt).
+# Machine-local — override in config_local.py. Weights are fetched out of band
+# and never committed (see perception/ and reference.md §8.3).
+PERCEPTION_MODELS_DIR = ""
+
+# Gemini/OpenAI API key for the VLM reasoner (perception.intent_reasoner).
+# Machine-local secret — set the real value in config_local.py, never here.
+GOOGLE_API_KEY = ""
 
 # Conda env used to launch vlm_service.py. Separate from "lsl" because depth-pro
 # pins numpy<2, which is incompatible with pyriemann and opencv in the BCI stack.
@@ -396,8 +401,9 @@ SIMULATION_MODE = False
 # =============================================================================
 # config_local.py is per-machine and gitignored. It supplies real values
 # for paths and network endpoints (WORKING_DIR, DATA_DIR, *_HOST, *_DIAL_*,
-# NEON_COMPANION_HOST, ARDUINO_PORT, VLM_REPO_DIR, PERCEPTION_FRAME_SOURCE,
-# SERVICES_HOSTED_REMOTELY). Bootstrap a new machine by copying
+# NEON_COMPANION_HOST, ARDUINO_PORT, PERCEPTION_MODELS_DIR, GOOGLE_API_KEY,
+# PERCEPTION_FRAME_SOURCE, SERVICES_HOSTED_REMOTELY). Bootstrap a new machine
+# by copying
 # config_local.example.py to config_local.py and editing in place.
 try:
     from config_local import *  # noqa: F401, F403

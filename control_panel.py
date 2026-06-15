@@ -117,7 +117,7 @@ VLM_SERVICE_HOST    = getattr(_HCFG, "VLM_SERVICE_HOST", "127.0.0.1") if _HCFG e
 # what vlm_service.py binds on (both UDP request and TCP overlay).
 VLM_BIND_HOST       = getattr(_HCFG, "VLM_BIND_HOST", VLM_SERVICE_HOST) if _HCFG else VLM_SERVICE_HOST
 VLM_SERVICE_PORT    = int(getattr(_HCFG, "VLM_SERVICE_PORT", 5589)) if _HCFG else 5589
-VLM_REPO_DIR        = getattr(_HCFG, "VLM_REPO_DIR", None) if _HCFG else None
+PERCEPTION_MODELS_DIR = getattr(_HCFG, "PERCEPTION_MODELS_DIR", None) if _HCFG else None
 VLM_CONDA_ENV       = getattr(_HCFG, "VLM_CONDA_ENV", "harmony_vlm") if _HCFG else "harmony_vlm"
 VLM_MODEL           = getattr(_HCFG, "VLM_MODEL", "gemini-2.5-flash") if _HCFG else "gemini-2.5-flash"
 VLM_ENABLE_DEPTH    = bool(getattr(_HCFG, "VLM_ENABLE_DEPTH", True)) if _HCFG else True
@@ -219,7 +219,7 @@ def _resolve_conda_env_python(env_name: str) -> Optional[str]:
     return out if out and os.path.isfile(out) else None
 
 
-VLM_ENV_PYTHON: Optional[str] = _resolve_conda_env_python(VLM_CONDA_ENV) if VLM_REPO_DIR else None
+VLM_ENV_PYTHON: Optional[str] = _resolve_conda_env_python(VLM_CONDA_ENV) if PERCEPTION_MODELS_DIR else None
 print(f"[control_panel] VLM_ENV_PYTHON = {VLM_ENV_PYTHON!r}", flush=True)
 
 
@@ -448,7 +448,7 @@ LOCAL_CONFIG_KEYS = frozenset({
     "NEON_COMPANION_HOST",
     "PERCEPTION_FRAME_SOURCE", "SERVICES_HOSTED_REMOTELY",
     "FRAME_RELAY_HOST", "FRAME_RELAY_DIAL_HOST",
-    "VLM_REPO_DIR",
+    "PERCEPTION_MODELS_DIR", "GOOGLE_API_KEY",
     "VLM_SERVICE_HOST", "VLM_BIND_HOST",
     "ARDUINO_PORT",
 })
@@ -1350,7 +1350,6 @@ class ControlPanel(QMainWindow):
                 "bind_port": FRAME_RELAY_PORT,
                 "hz": FRAME_RELAY_HZ,
                 "neon_host": NEON_COMPANION_HOST,
-                "repo_dir": VLM_REPO_DIR,
             }
         # GAZE_OR_BACKEND selects which perception service the panel
         # subscribes to (same semantic as ExperimentDriver_Online_GazeTracking
@@ -2598,8 +2597,9 @@ class ControlPanel(QMainWindow):
         if not os.path.exists(VLM_SERVICE_PY):
             QMessageBox.warning(self, "Missing", f"Not found:\n{VLM_SERVICE_PY}")
             return
-        if not VLM_REPO_DIR or not os.path.isdir(VLM_REPO_DIR):
-            QMessageBox.warning(self, "VLM repo missing", f"VLM_REPO_DIR not a dir:\n{VLM_REPO_DIR}")
+        if not PERCEPTION_MODELS_DIR or not os.path.isdir(PERCEPTION_MODELS_DIR):
+            QMessageBox.warning(self, "Perception models missing",
+                                f"PERCEPTION_MODELS_DIR not a dir:\n{PERCEPTION_MODELS_DIR}")
             return
 
         # Reap any orphaned vlm_service.py left over from a previous crash or
@@ -2658,7 +2658,6 @@ class ControlPanel(QMainWindow):
             )
         self.vlm_service.cmd = (
             f'"{py}" -u "{VLM_SERVICE_PY}" '
-            f'--repo-dir "{VLM_REPO_DIR}" '
             f'--host {VLM_BIND_HOST} --port {int(VLM_SERVICE_PORT)} '
             f'--neon-host "{NEON_COMPANION_HOST}" '
             f'--model {VLM_MODEL} {device_flag} '

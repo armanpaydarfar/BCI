@@ -63,8 +63,11 @@ FRAME_RELAY_DIAL_HOST = "127.0.0.1"
 # =============================================================================
 # VLM service
 # =============================================================================
-# Sibling clone of the harmony_vlm repo on this machine.
-VLM_REPO_DIR     = "/path/to/harmony_vlm"
+# Directory holding the perception model weights on this machine
+# (FastSAM-s.pt, depth_pro.pt — fetched out of band, see reference.md §8.3).
+PERCEPTION_MODELS_DIR = "/path/to/perception/models"
+# Gemini API key for the VLM reasoner (from https://aistudio.google.com/).
+GOOGLE_API_KEY   = ""
 # Dial host (panel + driver) and bind host (vlm_service.py). Same
 # convention as GAZE_UDP_IP / GAZE_BIND_HOST.
 VLM_SERVICE_HOST = "127.0.0.1"

@@ -32,7 +32,6 @@ class VLMLauncher:
     def __init__(
         self,
         *,
-        repo_dir: str | Path,
         conda_env: str,
         model: str,
         enable_depth: bool,
@@ -46,7 +45,6 @@ class VLMLauncher:
         overlay_port: int = 5590,
         logger=None,
     ) -> None:
-        self.repo_dir = Path(repo_dir)
         self.conda_env = str(conda_env)
         self.model = str(model)
         self.enable_depth = bool(enable_depth)
@@ -67,8 +65,6 @@ class VLMLauncher:
 
         if not self.service_script.exists():
             raise FileNotFoundError(f"vlm_service script not found at {self.service_script}")
-        if not (self.repo_dir / "demo.py").exists():
-            raise FileNotFoundError(f"harmony_vlm repo not found at {self.repo_dir}")
 
     def _log(self, msg: str) -> None:
         if self._logger is not None:
@@ -85,7 +81,6 @@ class VLMLauncher:
             "--no-capture-output",
             "-n", self.conda_env,
             "python", "-u", str(self.service_script),
-            "--repo-dir", str(self.repo_dir),
             "--host", self.service_host,
             "--port", str(self.service_port),
             "--neon-host", self.neon_host,
@@ -117,7 +112,7 @@ class VLMLauncher:
         # the python worker, not just `conda run`. On POSIX use start_new_session;
         # on Windows use CREATE_NEW_PROCESS_GROUP and tear down with taskkill /T.
         popen_kwargs = dict(
-            cwd=str(self.repo_dir),
+            cwd=str(self.service_script.parent),
             stdout=self._stdout_fh,
             stderr=self._stderr_fh,
         )
