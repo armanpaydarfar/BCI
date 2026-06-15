@@ -225,10 +225,6 @@ PERCEPTION_MODELS_DIR = ""
 # Machine-local secret — set the real value in config_local.py, never here.
 GOOGLE_API_KEY = ""
 
-# Conda env used to launch vlm_service.py. Separate from "lsl" because depth-pro
-# pins numpy<2, which is incompatible with pyriemann and opencv in the BCI stack.
-VLM_CONDA_ENV = "harmony_vlm"
-
 # Gemini model for the VLM reasoner. "gemini-2.5-flash" is free-tier available;
 # "gemini-2.5-pro" requires a paid Google AI account.
 VLM_MODEL = "gemini-2.5-flash"

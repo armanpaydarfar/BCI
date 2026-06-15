@@ -118,7 +118,6 @@ VLM_SERVICE_HOST    = getattr(_HCFG, "VLM_SERVICE_HOST", "127.0.0.1") if _HCFG e
 VLM_BIND_HOST       = getattr(_HCFG, "VLM_BIND_HOST", VLM_SERVICE_HOST) if _HCFG else VLM_SERVICE_HOST
 VLM_SERVICE_PORT    = int(getattr(_HCFG, "VLM_SERVICE_PORT", 5589)) if _HCFG else 5589
 PERCEPTION_MODELS_DIR = getattr(_HCFG, "PERCEPTION_MODELS_DIR", None) if _HCFG else None
-VLM_CONDA_ENV       = getattr(_HCFG, "VLM_CONDA_ENV", "harmony_vlm") if _HCFG else "harmony_vlm"
 VLM_MODEL           = getattr(_HCFG, "VLM_MODEL", "gemini-2.5-flash") if _HCFG else "gemini-2.5-flash"
 VLM_ENABLE_DEPTH    = bool(getattr(_HCFG, "VLM_ENABLE_DEPTH", True)) if _HCFG else True
 VLM_SESSION_ROOT    = getattr(_HCFG, "VLM_SESSION_ROOT", None) if _HCFG else None
@@ -174,53 +173,6 @@ def _sleep_inhibit(enable: bool) -> None:
     except Exception:
         # Best-effort — sleep inhibit is a hardening, not a correctness gate.
         pass
-
-
-def _resolve_conda_env_python(env_name: str) -> Optional[str]:
-    """Return the absolute path to a conda env's python interpreter.
-
-    Invoking the env's python directly avoids `conda run`, which on Windows
-    QProcess is unreliable (.bat resolution) and on POSIX swallows signals
-    (the inner python becomes an orphan when the wrapper is killed).
-
-    Resolution order:
-      1. Sibling of the panel's own env: <sys.prefix>/../<env_name>/python(.exe)
-         — fastest path; works whenever the panel and the target env share
-         a parent envs/ directory (true for stock conda installs).
-      2. $CONDA_PREFIX/../<env_name>/python(.exe) — same idea via env var.
-      3. `conda run` shell-out — last resort, slow.
-    """
-    py_name = "python.exe" if _IS_WINDOWS else "python"
-    py_subdir = "" if _IS_WINDOWS else "bin"
-
-    candidates = []
-    parent = os.path.dirname(sys.prefix)
-    if parent:
-        candidates.append(os.path.join(parent, env_name, py_subdir, py_name))
-    cp = os.environ.get("CONDA_PREFIX")
-    if cp:
-        cp_parent = os.path.dirname(cp)
-        if cp_parent:
-            candidates.append(os.path.join(cp_parent, env_name, py_subdir, py_name))
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-
-    try:
-        out = subprocess.check_output(
-            ["conda", "run", "-n", env_name, "python", "-c",
-             "import sys; print(sys.executable)"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=15,
-        ).strip()
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-        return None
-    return out if out and os.path.isfile(out) else None
-
-
-VLM_ENV_PYTHON: Optional[str] = _resolve_conda_env_python(VLM_CONDA_ENV) if PERCEPTION_MODELS_DIR else None
-print(f"[control_panel] VLM_ENV_PYTHON = {VLM_ENV_PYTHON!r}", flush=True)
 
 
 def _detect_lan_ip() -> Optional[str]:
@@ -283,10 +235,10 @@ else:
 def _kill_orphan_vlm_service() -> None:
     """Kill any leftover vlm_service.py processes from a prior crash.
 
-    `conda run` does not forward SIGTERM to its child, so a hard stop on the
-    panel can leave the inner python alive holding the UDP port. POSIX uses
-    `pkill -f`; Windows walks tasklist for python.exe with the script in its
-    command line and kills with taskkill.
+    A killed launch can leave the service's python alive (mid-startup, or
+    children it spawned) holding the UDP port. POSIX uses `pkill -f`; Windows
+    walks tasklist for python.exe with the script in its command line and
+    kills with taskkill.
     """
     if _IS_WINDOWS:
         try:
@@ -2603,7 +2555,7 @@ class ControlPanel(QMainWindow):
             return
 
         # Reap any orphaned vlm_service.py left over from a previous crash or
-        # incomplete stop (conda run does not forward SIGTERM to child processes).
+        # incomplete stop (a killed service can leave its python holding the port).
         _kill_orphan_vlm_service()
 
         if _is_port_in_use(int(VLM_SERVICE_PORT), VLM_SERVICE_HOST):
@@ -2629,21 +2581,14 @@ class ControlPanel(QMainWindow):
         # On the Windows dev box (RTX 4070 Ti) we want FastSAM + Depth Pro on
         # CUDA; the Linux deployment is CPU-only (no NVIDIA driver).
         device_flag = "--device cuda" if _IS_WINDOWS else "--device cpu"
-        # Invoke the env's python directly. `conda run` is fragile here — on
-        # Windows QProcess can't always resolve the conda.bat shim, and on POSIX
-        # it doesn't forward SIGTERM, leaving the inner python as an orphan.
-        if not VLM_ENV_PYTHON:
-            QMessageBox.warning(
-                self,
-                "harmony_vlm env not found",
-                f"Could not resolve python for conda env {VLM_CONDA_ENV!r}.\n"
-                "Verify the env exists with `conda env list`.",
-            )
-            return
-        py = VLM_ENV_PYTHON
+        # Launch vlm_service.py with the panel's own interpreter. Since WS3
+        # unified the env (perception deps now live in this env), there is no
+        # separate harmony_vlm env to resolve — same env, still a separate
+        # process so a blocking model call can't stall the panel.
+        py = sys.executable
         self._append_log("VLM", f"[{self._ts()}] using python: {py}\n")
-        # --neon-host "" forces discover_one_device in harmony_vlm's NeonLiveReader
-        # (utils/neon/reader.py:224), matching our gaze_system.py:250 pattern.
+        # --neon-host "" forces discover_one_device in perception.neon's
+        # NeonLiveReader (neon/reader.py), matching our gaze_system.py:250 pattern.
         # GPU-host topology: when PERCEPTION_FRAME_SOURCE=remote, vlm_service
         # consumes envelopes from the Linux frame_relay rather than opening
         # Neon itself. Dial host comes from FRAME_RELAY_DIAL_HOST.
@@ -2686,9 +2631,8 @@ class ControlPanel(QMainWindow):
         # otherwise spam "unreachable" lines into the VLM log while the
         # service tears down.
         self._seg_stream_log_timer.stop()
-        # Ask vlm_service to exit gracefully before killing the conda wrapper.
-        # conda run does not forward SIGTERM to child processes, so without this
-        # the inner Python process survives as an orphan holding the UDP port.
+        # Ask vlm_service to exit gracefully before killing the process. A hard
+        # kill alone can leave children it spawned orphaned holding the UDP port.
         try:
             self._vlm_udp_request({"cmd": "stop"}, timeout_s=0.5)
         except Exception:
