@@ -33,6 +33,20 @@ runtime behavior.
   `Documents/SoftwareDocs/GPU_Service_Host_Architecture_Plan.md` for the
   full architecture, wire format, and deployment notes.
 
+- **Perception source lives in-tree under `perception/`.** The FastSAM /
+  Depth Pro / Gemini-reasoner / Neon-reader code was folded from the
+  `harmony_vlm` repo into the `perception/` package (WS3, 2026-06-15),
+  vendored with attribution headers; edit it here, not upstream. It runs
+  in the single unified conda env (`environment.yml` — the separate
+  `harmony_vlm` env is retired), still as a separate process behind the
+  UDP/GPU-host split above. Model weights resolve from the machine-local
+  `PERCEPTION_MODELS_DIR` and the Gemini key from `GOOGLE_API_KEY` in
+  `config_local.py`. `perception/`'s live modules (object_detector,
+  depth_estimator, fixation_detector, intent_reasoner, pupil_reader,
+  visualize_neon, neon/) are import-safe; the rest are **staged** for
+  WS4/WS5 and not importable until their deps land — see
+  `perception/__init__.py`.
+
 ---
 
 ## Source of Truth
