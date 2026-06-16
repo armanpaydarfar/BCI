@@ -132,9 +132,20 @@ Typical layout per subject (`sub-<SUBJECT_ID>`):
 
 ## 4. Setup / Environment
 
-- **Conda environment**  
-  - The repository provides `environment.yml` defining a **conda environment** named `lsl`.  
-  - It includes Python `3.12`, MNE, LSL utilities (`mne-lsl`, `pylsl` via pip), Qt/PySide6, PyQt, scientific Python stack, OpenCV, and visualization libraries.
+- **Conda environment (two install roles)**  
+  - **`control`** — the Linux operator host. `environment.yml` defines the
+    **superset** conda env named `lsl`: Python `3.12`, MNE, LSL utilities
+    (`mne-lsl`, `pylsl` via pip), Qt/PySide6, PyQt, scientific Python stack,
+    OpenCV, visualization, *and* a CPU build of the perception stack — so a
+    single-box dev machine runs both the experiment and perception from one
+    env. Create with `conda env create -f environment.yml` (or
+    `tools/bootstrap_machine.sh`, which defaults to `--role control`).
+  - **`server`** — the GPU perception host (Windows now, Linux later). Runs the
+    perception stack only, with a CUDA torch build. Create the env named
+    `harmony-server` from the single cross-platform file:
+    `conda env create -f environment.server.yml` (same file on Linux and
+    Windows — pip selects the right torch wheel per platform). On Linux,
+    `tools/bootstrap_machine.sh --role server` does this for you.
 
 - **Python version**  
   - `environment.yml` pins `python=3.12.x`. New development should target this version (or a compatible minor release) unless the environment is updated.

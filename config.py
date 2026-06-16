@@ -208,7 +208,7 @@ FRAME_RELAY_HZ = 15.0
 FRAME_RELAY_EMBEDDED = True
 
 # =============================================================================
-# VLM integration (harmony_vlm subprocess)
+# VLM integration (in-tree perception package, run as a subprocess)
 # =============================================================================
 # Gaze/object-recognition backend selector:
 #   "legacy" — our gaze_runner service with YOLO + SORT tracker
