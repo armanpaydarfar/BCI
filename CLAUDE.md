@@ -329,8 +329,30 @@ not appear in `environment.yml`.
 
 ## Dependency and Environment
 
-- The conda environment is named `lsl`, Python 3.12.
-- `environment.yml` is the reference for the Linux machine. Do not
-  introduce dependencies that cannot be satisfied on Linux.
-- Windows-only packages (e.g. `triton-windows`) must never appear in
-  `environment.yml` or `requirements.txt`.
+Two install **roles**, selected at setup time (see
+`tools/bootstrap_machine.sh --role`):
+
+- **`control`** — the Linux operator host. The **superset** env: device I/O,
+  EEG/LSL decoder pipeline, Qt control panel, gaze, *and* a CPU build of the
+  perception stack, so a single-box dev machine
+  (`PERCEPTION_FRAME_SOURCE=local`, the default) runs everything from one env.
+  - Env: `environment.yml`, conda env named `lsl`, Python 3.12.
+  - This is the reference Linux env. Do not introduce dependencies that
+    cannot be satisfied on Linux. Windows-only packages (e.g.
+    `triton-windows`) must never appear in `environment.yml` or
+    `requirements.txt`.
+  - **Control is Linux-only** (realtime/online is Linux-only).
+
+- **`server`** — the GPU perception host. Runs the perception stack only
+  (`vlm_service.py` + live `perception/` modules); no device I/O, decoder, or
+  Qt. The perception-only subset of the control env plus a **CUDA** torch
+  build. Env name `harmony-server`. Two per-OS files, identical except the
+  CUDA torch pin (the one per-OS knob):
+  - `environment.server.linux.yml` (future Linux GPU server)
+  - `environment.server.windows.yml` (current production box, RTX 4070 Ti)
+  - Keep the conda core versions in the server files in sync with
+    `environment.yml` so a single-box dev machine stays consistent.
+
+The perception source was folded in-tree in WS3 — there is **no** sibling
+`harmony_vlm` repo or env to clone/create (`VLM_REPO_DIR` / `VLM_CONDA_ENV`
+are retired).

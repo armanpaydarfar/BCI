@@ -1,3 +1,15 @@
+# Control-module env (role = "control") — the Linux operator host.
+#
+# This is the SUPERSET env: device I/O (Neon, EEG, FES, robot), the EEG/LSL
+# decoder pipeline, the Qt control panel, gaze tracking, AND a CPU build of the
+# perception stack — so a single-box dev machine (PERCEPTION_FRAME_SOURCE=local,
+# the default) runs both the experiment and perception from this one env.
+#
+# A dedicated GPU server (role = "server") does NOT use this file; it uses the
+# perception-only, CUDA-enabled subset in environment.server.<os>.yml. Linux is
+# the only control/realtime platform (CLAUDE.md); Windows is server-only.
+#
+# Create:  conda env create -f environment.yml          (or via tools/bootstrap_machine.sh)
 name: lsl
 channels:
   # conda-forge only (WS3): the conda-forge pyriemann 0.8 build runs on
