@@ -1,8 +1,8 @@
 """
 vlm_launcher.py — spawn vlm_service.py as a managed subprocess.
 
-The service runs in the `harmony_vlm` conda env (separate from `lsl` because
-depth-pro pins numpy<2, incompatible with pyriemann/opencv in the BCI stack).
+The service runs in the same conda env as the rest of BCI (WS3 unified the
+env), as a separate process so a blocking model call can't stall the caller.
 stdout/stderr are redirected to files under the session directory so the
 child can't deadlock on a full pipe buffer and so the control panel can tail
 the logs independently.
@@ -32,8 +32,6 @@ class VLMLauncher:
     def __init__(
         self,
         *,
-        repo_dir: str | Path,
-        conda_env: str,
         model: str,
         enable_depth: bool,
         session_root: str | Path,
@@ -46,8 +44,6 @@ class VLMLauncher:
         overlay_port: int = 5590,
         logger=None,
     ) -> None:
-        self.repo_dir = Path(repo_dir)
-        self.conda_env = str(conda_env)
         self.model = str(model)
         self.enable_depth = bool(enable_depth)
         self.session_root = Path(session_root)
@@ -67,8 +63,6 @@ class VLMLauncher:
 
         if not self.service_script.exists():
             raise FileNotFoundError(f"vlm_service script not found at {self.service_script}")
-        if not (self.repo_dir / "demo.py").exists():
-            raise FileNotFoundError(f"harmony_vlm repo not found at {self.repo_dir}")
 
     def _log(self, msg: str) -> None:
         if self._logger is not None:
@@ -81,11 +75,7 @@ class VLMLauncher:
 
     def _build_cmd(self, session_dir: Path) -> list[str]:
         cmd = [
-            "conda", "run",
-            "--no-capture-output",
-            "-n", self.conda_env,
-            "python", "-u", str(self.service_script),
-            "--repo-dir", str(self.repo_dir),
+            sys.executable, "-u", str(self.service_script),
             "--host", self.service_host,
             "--port", str(self.service_port),
             "--neon-host", self.neon_host,
@@ -113,11 +103,12 @@ class VLMLauncher:
         self._stdout_fh = open(session_dir / "vlm.stdout.log", "wb")
         self._stderr_fh = open(session_dir / "vlm.stderr.log", "wb")
 
-        # Put the child in its own process group so a single signal reaches
-        # the python worker, not just `conda run`. On POSIX use start_new_session;
-        # on Windows use CREATE_NEW_PROCESS_GROUP and tear down with taskkill /T.
+        # Put the child in its own process group so a single signal reaches the
+        # python worker and any children it spawns. On POSIX use
+        # start_new_session; on Windows use CREATE_NEW_PROCESS_GROUP and tear
+        # down with taskkill /T.
         popen_kwargs = dict(
-            cwd=str(self.repo_dir),
+            cwd=str(self.service_script.parent),
             stdout=self._stdout_fh,
             stderr=self._stderr_fh,
         )
@@ -195,9 +186,9 @@ class VLMLauncher:
                 self._log(f"[vlm_launcher] pid={pid} still alive after SIGKILL")
 
     def _stop_windows(self, pid: int, timeout_s: float) -> None:
-        # taskkill /T walks the job tree from `conda run` down to the python
-        # worker; /F is force. Plain SIGTERM via Popen.terminate() only kills
-        # the conda wrapper and orphans the worker.
+        # taskkill /T walks the job tree down to the python worker and any
+        # children it spawned; /F is force. Plain SIGTERM via Popen.terminate()
+        # can leave grandchildren orphaned on Windows.
         try:
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(pid)],

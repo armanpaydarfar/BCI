@@ -46,3 +46,23 @@ docs/REPO_EXPLORATION_REPORT.md
 # Machine-local config overrides (paths, network IPs, USB device paths).
 # Schema lives in config_local.example.py (committed).
 config_local.py
+
+# Perception model weights (FastSAM-s.pt ~23 MB, depth_pro.pt ~1.9 GB) are
+# fetched out of band and never committed. PERCEPTION_MODELS_DIR normally
+# points outside the tree, but ignore an in-tree models/ dir defensively.
+perception/models/
+perception/output/
+
+# Model weights are never committed: FastSAM/depth_pro resolve from
+# PERCEPTION_MODELS_DIR; the gaze YOLO weight (yolo26n.pt) auto-downloads via
+# ultralytics or sits in the repo root locally.
+*.pt
+
+# Calibration pose libraries are machine-local runtime data. The active one
+# resolves via config.POSE_LIBRARY_PATH; harmony_calibration_exec.py writes a
+# new poses_with_gaze_<stamp>.npz per calibration.
+*.npz
+
+# Orphaned online-run output (confusion_matrix_*.csv) used to land here from a
+# now-retired writer; the live code logs to text only. Ignore defensively.
+/Data/

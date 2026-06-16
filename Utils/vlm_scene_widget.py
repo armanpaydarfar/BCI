@@ -167,8 +167,8 @@ class VLMSceneWidget(QWidget):
         self._relay_dial_port = relay_dial_port
         self._local_relay_server = local_relay_server
         # Config dict for an embedded relay; keys mirror FrameRelayServer
-        # constructor: bind_host, bind_port, hz, neon_host, jpeg_quality,
-        # repo_dir. None = caller doesn't want the panel to host the relay.
+        # constructor: bind_host, bind_port, hz, neon_host, jpeg_quality.
+        # None = caller doesn't want the panel to host the relay.
         self._embedded_relay_cfg = dict(embedded_relay) if embedded_relay else None
         self._embedded_relay = None
         self._embedded_relay_thread: Optional[threading.Thread] = None
@@ -348,7 +348,6 @@ class VLMSceneWidget(QWidget):
                 hz=float(cfg.get("hz", 30.0)),
                 neon_host=str(cfg.get("neon_host", "") or ""),
                 jpeg_quality=int(cfg.get("jpeg_quality", 75)),
-                repo_dir=cfg.get("repo_dir"),
                 reader=reader,
                 on_first_publish=self._emit_first_publish,
                 on_handshake_sent=self._emit_handshake,

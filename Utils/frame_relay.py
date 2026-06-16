@@ -226,7 +226,6 @@ class FrameRelayServer:
         hz: float,
         neon_host: str = "",
         jpeg_quality: int = 75,
-        repo_dir: Optional[str] = None,
         reader: Optional[Any] = None,
         on_first_publish: Optional[Callable[[Tuple[str, int]], None]] = None,
         on_handshake_sent: Optional[Callable[[Tuple[str, int]], None]] = None,
@@ -236,13 +235,12 @@ class FrameRelayServer:
         self.hz = float(hz)
         self.neon_host = neon_host or ""
         self.jpeg_quality = int(jpeg_quality)
-        self.repo_dir = repo_dir
         # Optional pre-opened reader (anything that quacks like
         # NeonLiveReader: __iter__ yielding bundles, camera_matrix,
         # distortion_coeffs, width/height/fps/close). Used by the
         # operator panel to inject Utils.scene_only_neon_reader.SceneOnlyNeonReader,
         # which mirrors neon_viewer.py's clean SDK call pattern.
-        # When None, _open_reader falls back to harmony_vlm's
+        # When None, _open_reader falls back to the in-tree perception.neon
         # NeonLiveReader (matched-API path).
         self._reader = reader
 
@@ -385,19 +383,20 @@ class FrameRelayServer:
     # ── internals ──────────────────────────────────────────────────────────
 
     def _open_reader(self):
-        """Import NeonLiveReader from the harmony_vlm clone and connect."""
-        if self.repo_dir:
-            repo_dir = os.path.abspath(self.repo_dir)
-            if not os.path.isdir(repo_dir):
-                raise SystemExit(f"frame_relay: --repo-dir not a directory: {repo_dir}")
-            if repo_dir not in sys.path:
-                sys.path.insert(0, repo_dir)
+        """Import NeonLiveReader from the in-tree perception package and connect."""
+        # frame_relay.py lives in BCI/Utils/; perception is a top-level BCI
+        # package, so ensure the BCI root is importable. `python -m
+        # Utils.frame_relay` already puts cwd on the path; this guard covers
+        # being imported with a different cwd (e.g. the control panel).
+        bci_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if bci_root not in sys.path:
+            sys.path.insert(0, bci_root)
         try:
-            from utils.neon import NeonLiveReader  # type: ignore
+            from perception.neon import NeonLiveReader  # type: ignore
         except ImportError as e:
             raise SystemExit(
-                f"frame_relay: cannot import harmony_vlm utils.neon ({e}). "
-                "Pass --repo-dir <harmony_vlm clone> or run with the harmony_vlm conda env."
+                f"frame_relay: cannot import perception.neon ({e}). "
+                "Ensure the BCI perception dependencies are installed (environment.yml)."
             ) from e
         _log(f"connecting to Neon (host={self.neon_host or 'auto-discover'})…")
         return NeonLiveReader(host=self.neon_host or None)
@@ -629,9 +628,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--neon-host", default="",
                    help="Companion phone IP; empty = mDNS auto-discovery")
     p.add_argument("--jpeg-quality", type=int, default=75, help="JPEG quality 1-100")
-    p.add_argument("--repo-dir", default=None,
-                   help="Path to harmony_vlm clone (needed for utils.neon import "
-                        "if not running inside the harmony_vlm conda env)")
     return p.parse_args()
 
 
@@ -643,7 +639,6 @@ def main() -> None:
         hz=args.hz,
         neon_host=args.neon_host,
         jpeg_quality=args.jpeg_quality,
-        repo_dir=args.repo_dir,
     )
     try:
         server.serve_forever()

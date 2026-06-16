@@ -1,0 +1,52 @@
+# Perception GPU server (role = "server") — cross-platform (Linux or Windows).
+#
+# Runs the perception stack only: vlm_service.py + the live perception/ modules
+# (FastSAM segmentation, Depth Pro, Gemini/OpenAI intent reasoning, Neon live
+# reader). It does NOT run device I/O, the EEG/LSL decoder pipeline, or the Qt
+# control panel — those live in the "control" superset env (environment.yml,
+# Linux operator host). Frames arrive over the TCP relay
+# (PERCEPTION_FRAME_SOURCE=remote); results go back over UDP.
+#
+# This is the perception-only subset of environment.yml (conda-forge numerical
+# core + pip perception layer) plus a CUDA torch build. Core versions are
+# pinned to match the control env so a single-box dev machine stays consistent.
+# It is a curated spec (not a frozen export), so it carries no OS-specific
+# conda packages — conda solves the core per-platform and pip selects the
+# correct platform wheel for torch/opencv automatically. One file therefore
+# works on both Linux and native Windows.
+#
+# CUDA: pip pulls the latest CUDA torch/torchvision. PyPI now ships CUDA
+# builds by default, and because the line below is --extra-index-url (a
+# supplement to PyPI, not a replacement), pip picks the highest version it
+# finds — validated here as torch 2.12.0+cu130, CUDA-True on an RTX 4070 Ti.
+# The cu124 index is a fallback so an older CUDA series stays installable if a
+# box's driver needs it. To pin a specific series for reproducibility, set
+# explicit torch==/torchvision== versions; if two hosts ever need *different*
+# CUDA, split this into per-OS files at that point.
+#
+# Validated 2026-06-16 on a Windows/WSL2 RTX 4070 Ti host: conda-forge solve +
+# pip install succeed, torch.cuda.is_available() is True, and all live
+# perception modules import. (Live Neon round-trips still need the camera.)
+name: harmony-server
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12.7
+  - numpy=1.26.4        # <2: depth-pro and the conda-forge pyriemann build need it
+  - scipy=1.14.1
+  - pillow=11.0.0
+  - tqdm=4.67.0
+  - pytest          # test runner for tests/ + the .githooks pre-commit gate (this box is the server-role dev machine)
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - torch
+      - torchvision
+      - opencv-python
+      - ultralytics>=8.2
+      - timm
+      - openai>=1.30
+      - google-genai
+      - pupil-labs-realtime-api>=1.4
+      - depth-pro @ git+https://github.com/apple/ml-depth-pro.git@9efe5c1def37a26c5367a71df664b18e1306c708

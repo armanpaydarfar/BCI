@@ -33,6 +33,20 @@ runtime behavior.
   `Documents/SoftwareDocs/projects/harmony-bci/gpu-service/architecture-plan.md` for the
   full architecture, wire format, and deployment notes.
 
+- **Perception source lives in-tree under `perception/`.** The FastSAM /
+  Depth Pro / Gemini-reasoner / Neon-reader code was folded from the
+  `harmony_vlm` repo into the `perception/` package (WS3, 2026-06-15),
+  vendored with attribution headers; edit it here, not upstream. It runs
+  in the single unified conda env (`environment.yml` — the separate
+  `harmony_vlm` env is retired), still as a separate process behind the
+  UDP/GPU-host split above. Model weights resolve from the machine-local
+  `PERCEPTION_MODELS_DIR` and the Gemini key from `GOOGLE_API_KEY` in
+  `config_local.py`. `perception/`'s live modules (object_detector,
+  depth_estimator, fixation_detector, intent_reasoner, pupil_reader,
+  visualize_neon, neon/) are import-safe; the rest are **staged** for
+  WS4/WS5 and not importable until their deps land — see
+  `perception/__init__.py`.
+
 ---
 
 ## Source of Truth
@@ -146,7 +160,7 @@ realtime but not in the critical path.
   - `NEON_COMPANION_HOST`
   - `PERCEPTION_FRAME_SOURCE`, `SERVICES_HOSTED_REMOTELY`
   - `FRAME_RELAY_HOST`, `FRAME_RELAY_DIAL_HOST`
-  - `VLM_REPO_DIR`
+  - `PERCEPTION_MODELS_DIR`, `GOOGLE_API_KEY`
   - `VLM_SERVICE_HOST`, `VLM_BIND_HOST`
   - `ARDUINO_PORT`
 
@@ -324,8 +338,32 @@ not appear in `environment.yml`.
 
 ## Dependency and Environment
 
-- The conda environment is named `lsl`, Python 3.12.
-- `environment.yml` is the reference for the Linux machine. Do not
-  introduce dependencies that cannot be satisfied on Linux.
-- Windows-only packages (e.g. `triton-windows`) must never appear in
-  `environment.yml` or `requirements.txt`.
+Two install **roles**, selected at setup time (see
+`tools/bootstrap_machine.sh --role`):
+
+- **`control`** — the Linux operator host. The **superset** env: device I/O,
+  EEG/LSL decoder pipeline, Qt control panel, gaze, *and* a CPU build of the
+  perception stack, so a single-box dev machine
+  (`PERCEPTION_FRAME_SOURCE=local`, the default) runs everything from one env.
+  - Env: `environment.yml`, conda env named `lsl`, Python 3.12.
+  - This is the reference Linux env. Do not introduce dependencies that
+    cannot be satisfied on Linux. Windows-only packages (e.g.
+    `triton-windows`) must never appear in `environment.yml` or
+    `requirements.txt`.
+  - **Control is Linux-only** (realtime/online is Linux-only).
+
+- **`server`** — the GPU perception host (Linux or Windows). Runs the
+  perception stack only (`vlm_service.py` + live `perception/` modules); no
+  device I/O, decoder, or Qt. The perception-only subset of the control env
+  plus a **CUDA** torch build. Env name `harmony-server`, single
+  cross-platform file `environment.server.yml`: it is a curated spec with no
+  OS-specific conda packages, so conda solves the core per-platform and pip
+  selects the right torch/opencv wheel automatically — one file works on both
+  Linux and Windows. The CUDA wheel tag (`cu124`) is the one knob; split into
+  per-OS files only if two hosts ever need *different* tags. Keep the conda
+  core versions in sync with `environment.yml` so a single-box dev machine
+  stays consistent.
+
+The perception source was folded in-tree in WS3 — there is **no** sibling
+`harmony_vlm` repo or env to clone/create (`VLM_REPO_DIR` / `VLM_CONDA_ENV`
+are retired).

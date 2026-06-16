@@ -1,16 +1,27 @@
 #!/usr/bin/env bash
-# bootstrap_machine.sh — first-time setup for a Harmony control computer
-# (Linux operator host). Idempotent: re-running is safe.
+# bootstrap_machine.sh — first-time setup for a Harmony host. Idempotent:
+# re-running is safe.
 #
-# Performs the deterministic parts of new-machine setup:
-#   1. Create config_local.py from config_local.example.py and prompt for
-#      the must-set keys (WORKING_DIR, DATA_DIR, VLM_REPO_DIR).
+# Two roles (--role, default control):
+#   control  Linux operator host — device I/O + EEG/LSL decoder + Qt control
+#            panel + CPU perception. Runs the full setup below; env =
+#            environment.yml (conda env 'lsl').
+#   server   GPU perception host — perception stack only. env =
+#            environment.server.yml (conda env 'harmony-server'); skips the
+#            control-only steps (subject skeleton, robot/EEG checklist).
+#            environment.server.yml is cross-platform; Windows servers can't
+#            run this bash script, so create the env directly:
+#            conda env create -f environment.server.yml
+#
+# control steps (perception was folded in-tree in WS3, so there is no longer a
+# sibling harmony_vlm repo to clone):
+#   1. Create config_local.py from config_local.example.py and prompt for the
+#      must-set keys (WORKING_DIR, DATA_DIR).
 #   2. Materialize a CurrentStudy/sub-PILOT007 BIDS-ish skeleton with one
 #      example session (ses-S001) plus models/ and training_data/.
-#   3. Create the conda 'lsl' env from environment.yml (skip if present).
-#   4. Clone the sibling harmony_vlm repo to VLM_REPO_DIR (skip if present).
-#   5. Wire up the repo-local pre-commit hook (.githooks/pre-commit).
-#   6. Optionally run tools/setup_linux_ufw.sh (asks for sudo).
+#   3. Create the conda env (skip if present).
+#   4. Wire up the repo-local pre-commit hook (.githooks/pre-commit).
+#   5. Optionally run tools/setup_linux_ufw.sh (asks for sudo).
 #
 # Then prints a checklist of irreducibly manual steps (eegoSports,
 # LabRecorder, Pupil Labs Companion, dialout group, robot networking).
@@ -19,10 +30,9 @@
 #   bash tools/bootstrap_machine.sh [flags]
 #
 # Flags (all optional — script is interactive otherwise):
-#   --data-dir=PATH       Skip the DATA_DIR prompt
-#   --vlm-repo-dir=PATH   Skip the VLM_REPO_DIR prompt
+#   --role=ROLE           control (default) or server
+#   --data-dir=PATH       Skip the DATA_DIR prompt (control only)
 #   --no-conda            Skip conda env creation
-#   --no-vlm              Skip cloning harmony_vlm
 #   --no-firewall         Skip the ufw step
 #   --non-interactive     Fail if any unfilled key has no flag/default
 #   -h, --help            Print this header
@@ -51,19 +61,17 @@ prompt_default() {
 
 # --- arg parsing -----------------------------------------------------------
 
+ROLE="control"
 DATA_DIR_ARG=""
-VLM_REPO_DIR_ARG=""
 DO_CONDA=true
-DO_VLM=true
 DO_FIREWALL=true
 NON_INTERACTIVE=false
 
 for arg in "$@"; do
     case "$arg" in
+        --role=*)          ROLE="${arg#*=}" ;;
         --data-dir=*)      DATA_DIR_ARG="${arg#*=}" ;;
-        --vlm-repo-dir=*)  VLM_REPO_DIR_ARG="${arg#*=}" ;;
         --no-conda)        DO_CONDA=false ;;
-        --no-vlm)          DO_VLM=false ;;
         --no-firewall)     DO_FIREWALL=false ;;
         --non-interactive) NON_INTERACTIVE=true ;;
         -h|--help)
@@ -73,6 +81,10 @@ for arg in "$@"; do
         *) err "unknown flag: $arg"; exit 2 ;;
     esac
 done
+
+if [ "$ROLE" != "control" ] && [ "$ROLE" != "server" ]; then
+    err "--role must be 'control' or 'server' (got: $ROLE)"; exit 2
+fi
 
 # --- sanity ----------------------------------------------------------------
 
@@ -94,23 +106,25 @@ section "config_local.py"
 
 if [ -f config_local.py ]; then
     skip "config_local.py already exists — leaving it alone (edit by hand if you need to change values)"
+elif [ "$ROLE" = "server" ]; then
+    cp config_local.example.py config_local.py
+    ok "created config_local.py from example"
+    warn "server role: edit config_local.py for the perception keys — PERCEPTION_MODELS_DIR, GOOGLE_API_KEY, and the relay/UDP hosts (FRAME_RELAY_*, VLM_*)"
 else
     cp config_local.example.py config_local.py
     ok "created config_local.py from example"
 
     DEFAULT_WORKING="$REPO_ROOT/"
     DEFAULT_DATA="$HOME/Documents/CurrentStudy"
-    DEFAULT_VLM="$(dirname "$REPO_ROOT")/harmony_vlm"
 
     prompt_default WORKING_DIR  "WORKING_DIR (repo root)"             "$DEFAULT_WORKING"
     prompt_default DATA_DIR     "DATA_DIR (XDFs / training data)"     "${DATA_DIR_ARG:-$DEFAULT_DATA}"
-    prompt_default VLM_REPO_DIR "VLM_REPO_DIR (sibling harmony_vlm)"  "${VLM_REPO_DIR_ARG:-$DEFAULT_VLM}"
 
-    # Replace the three placeholder lines in config_local.py. Each
-    # example value is unique so anchor on the full assignment.
-    python3 - "$WORKING_DIR" "$DATA_DIR" "$VLM_REPO_DIR" <<'PY'
+    # Replace the two placeholder lines in config_local.py. Each example value
+    # is unique so anchor on the full assignment.
+    python3 - "$WORKING_DIR" "$DATA_DIR" <<'PY'
 import sys, pathlib, re
-working, data, vlm = sys.argv[1:]
+working, data = sys.argv[1:]
 p = pathlib.Path("config_local.py")
 text = p.read_text()
 def replace(text, key, val):
@@ -118,24 +132,23 @@ def replace(text, key, val):
     return pat.sub(f'{key} = {val!r}', text, count=1)
 text = replace(text, "WORKING_DIR", working)
 text = replace(text, "DATA_DIR", data)
-text = replace(text, "VLM_REPO_DIR", vlm)
 p.write_text(text)
 PY
-    ok "wrote WORKING_DIR / DATA_DIR / VLM_REPO_DIR into config_local.py"
+    ok "wrote WORKING_DIR / DATA_DIR into config_local.py"
     warn "all other keys keep their example defaults — open config_local.py and edit hosts/ports if your machine isn't single-machine loopback"
 fi
 
-# Re-read the values from config_local.py so subsequent steps use the
-# real-on-disk values, not whatever was prompted (covers the
-# already-existed branch).
+# Re-read DATA_DIR from config_local.py so subsequent steps use the real
+# on-disk value, not whatever was prompted (covers the already-existed branch).
 DATA_DIR="$(python3 -c 'import config_local; print(config_local.DATA_DIR)')"
-VLM_REPO_DIR="$(python3 -c 'import config_local; print(config_local.VLM_REPO_DIR)')"
 
 # --- step 2: CurrentStudy/sub-PILOT007 skeleton ----------------------------
 
 section "CurrentStudy/sub-PILOT007 skeleton"
 
-if [ -z "$DATA_DIR" ]; then
+if [ "$ROLE" = "server" ]; then
+    skip "server role — no subject data layout needed"
+elif [ -z "$DATA_DIR" ]; then
     warn "DATA_DIR is empty — skipping subject skeleton"
 else
     SUB_ROOT="$DATA_DIR/sub-PILOT007"
@@ -163,36 +176,39 @@ fi
 
 # --- step 3: conda env -----------------------------------------------------
 
-section "conda env 'lsl'"
+if [ "$ROLE" = "server" ]; then
+    ENV_NAME="harmony-server"; ENV_FILE="environment.server.yml"
+else
+    ENV_NAME="lsl"; ENV_FILE="environment.yml"
+fi
+
+section "conda env '$ENV_NAME'"
 
 if [ "$DO_CONDA" = "false" ]; then
     skip "--no-conda passed"
+elif [ ! -f "$ENV_FILE" ]; then
+    warn "$ENV_FILE not found — skipping conda env creation"
 elif ! command -v conda >/dev/null 2>&1; then
     warn "conda not on PATH — skipping; install Miniconda then re-run with no flags"
-elif conda env list | awk '{print $1}' | grep -qx "lsl"; then
-    skip "conda env 'lsl' already exists"
+elif conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
+    skip "conda env '$ENV_NAME' already exists"
 else
-    conda env create -f environment.yml -n lsl
-    ok "created conda env 'lsl'"
+    # Both env files are conda-forge-only by design (avoids the Anaconda
+    # defaults-channel commercial ToS). But recent conda (24+/26+) does a ToS
+    # pre-flight on the *globally configured* channels before honoring the
+    # file, so a default install (channels: [defaults]) aborts here even for a
+    # conda-forge env. Warn with the fix rather than silently editing the
+    # user's conda config or accepting Anaconda's ToS on their behalf.
+    if conda config --show channels 2>/dev/null | grep -qE '^[[:space:]]*-[[:space:]]+defaults[[:space:]]*$'; then
+        warn "conda is configured with the 'defaults' channel; conda env create may abort on its ToS gate."
+        warn "  This repo is conda-forge-only. To fix (no Anaconda ToS needed):"
+        warn "    conda config --system --remove channels defaults && conda config --system --add channels conda-forge && conda config --set channel_priority strict"
+    fi
+    conda env create -f "$ENV_FILE" -n "$ENV_NAME"
+    ok "created conda env '$ENV_NAME'"
 fi
 
-# --- step 4: sibling harmony_vlm clone -------------------------------------
-
-section "sibling harmony_vlm repo"
-
-if [ "$DO_VLM" = "false" ]; then
-    skip "--no-vlm passed"
-elif [ -z "$VLM_REPO_DIR" ]; then
-    warn "VLM_REPO_DIR is empty — skipping clone"
-elif [ -d "$VLM_REPO_DIR/.git" ]; then
-    skip "$VLM_REPO_DIR already a git repo"
-else
-    mkdir -p "$(dirname "$VLM_REPO_DIR")"
-    git clone https://github.com/vivianchen98/harmony_vlm.git "$VLM_REPO_DIR"
-    ok "cloned harmony_vlm to $VLM_REPO_DIR"
-fi
-
-# --- step 5: repo-local pre-commit hook ------------------------------------
+# --- step 4: repo-local pre-commit hook ------------------------------------
 
 section "repo pre-commit hook"
 
@@ -208,7 +224,7 @@ else
     fi
 fi
 
-# --- step 6: ufw -----------------------------------------------------------
+# --- step 5: ufw -----------------------------------------------------------
 
 section "ufw (frame_relay TCP 5591)"
 
@@ -234,6 +250,16 @@ fi
 
 section "Manual steps remaining (script can't do these)"
 
+if [ "$ROLE" = "server" ]; then
+cat <<'EOF'
+[ ] NVIDIA driver + CUDA runtime installed; `nvidia-smi` lists the GPU
+[ ] torch sees CUDA: python -c "import torch; print(torch.cuda.is_available())"
+[ ] Perception weights present at PERCEPTION_MODELS_DIR (FastSAM-s.pt, depth_pro.pt)
+[ ] GOOGLE_API_KEY set in config_local.py (Gemini intent reasoning)
+[ ] Reachable from the control host: relay dial-in (FRAME_RELAY_DIAL_HOST)
+    and UDP result push (VLM_* hosts/ports) — open the firewall accordingly
+EOF
+else
 cat <<'EOF'
 [ ] eegoSports (Linux build) installed and on PATH; LSL stream visible
 [ ] LabRecorder installed
@@ -247,5 +273,6 @@ cat <<'EOF'
 [ ] Edit any non-loopback hosts in config_local.py for cross-machine setups
     (FRAME_RELAY_*, VLM_*, GAZE_* — see config_local.example.py for guidance)
 EOF
+fi
 
 ok "bootstrap complete"
