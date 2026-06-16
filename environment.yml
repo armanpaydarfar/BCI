@@ -340,6 +340,7 @@ dependencies:
   - python-picard=0.8
   - python-tzdata=2024.2
   - python_abi=3.12
+  - pytest          # test runner for tests/ + the .githooks pre-commit gate; unpinned so conda picks a build compatible with the pinned core
   - pytz=2024.2
   - pyvista=0.44.1
   - pyvistaqt=0.11.1

@@ -37,6 +37,7 @@ dependencies:
   - scipy=1.14.1
   - pillow=11.0.0
   - tqdm=4.67.0
+  - pytest          # test runner for tests/ + the .githooks pre-commit gate (this box is the server-role dev machine)
   - pip
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu124
