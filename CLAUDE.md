@@ -225,6 +225,15 @@ note the reference in the commit message and relevant docstrings.
   as if it were observed in the repo. If the actual implementation is
   unknown, say so and read the file before continuing.
 
+- **Verify runtime/tooling behaviour, don't assume it.** Before stating
+  or documenting how a tool, install, or dependency *behaves* (e.g. which
+  torch wheel `pip` resolves by default, how conda selects a build, what a
+  CLI flag does) — especially in load-bearing places like env files,
+  scripts, or docs — confirm it by actually running it and observing the
+  result. Treat existing validated comments as evidence to check against,
+  not noise to override. A plausible behavioural claim written from
+  assumption is as wrong as fabricated code.
+
 ---
 
 ## Proposing Changes
