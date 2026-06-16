@@ -142,9 +142,9 @@ Typical layout per subject (`sub-<SUBJECT_ID>`):
     `tools/bootstrap_machine.sh`, which defaults to `--role control`).
   - **`server`** — the GPU perception host (Windows now, Linux later). Runs the
     perception stack only, with a CUDA torch build. Create the env named
-    `harmony-server` from the per-OS file:
-    `conda env create -f environment.server.linux.yml` (Linux) or
-    `environment.server.windows.yml` (Windows). On Linux,
+    `harmony-server` from the single cross-platform file:
+    `conda env create -f environment.server.yml` (same file on Linux and
+    Windows — pip selects the right torch wheel per platform). On Linux,
     `tools/bootstrap_machine.sh --role server` does this for you.
 
 - **Python version**  

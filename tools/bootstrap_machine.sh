@@ -7,10 +7,11 @@
 #            panel + CPU perception. Runs the full setup below; env =
 #            environment.yml (conda env 'lsl').
 #   server   GPU perception host — perception stack only. env =
-#            environment.server.linux.yml (conda env 'harmony-server'); skips
-#            the control-only steps (subject skeleton, robot/EEG checklist).
-#            Windows servers can't run this bash script — create the env
-#            directly: conda env create -f environment.server.windows.yml
+#            environment.server.yml (conda env 'harmony-server'); skips the
+#            control-only steps (subject skeleton, robot/EEG checklist).
+#            environment.server.yml is cross-platform; Windows servers can't
+#            run this bash script, so create the env directly:
+#            conda env create -f environment.server.yml
 #
 # control steps (perception was folded in-tree in WS3, so there is no longer a
 # sibling harmony_vlm repo to clone):
@@ -176,7 +177,7 @@ fi
 # --- step 3: conda env -----------------------------------------------------
 
 if [ "$ROLE" = "server" ]; then
-    ENV_NAME="harmony-server"; ENV_FILE="environment.server.linux.yml"
+    ENV_NAME="harmony-server"; ENV_FILE="environment.server.yml"
 else
     ENV_NAME="lsl"; ENV_FILE="environment.yml"
 fi
@@ -192,6 +193,17 @@ elif ! command -v conda >/dev/null 2>&1; then
 elif conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
     skip "conda env '$ENV_NAME' already exists"
 else
+    # Both env files are conda-forge-only by design (avoids the Anaconda
+    # defaults-channel commercial ToS). But recent conda (24+/26+) does a ToS
+    # pre-flight on the *globally configured* channels before honoring the
+    # file, so a default install (channels: [defaults]) aborts here even for a
+    # conda-forge env. Warn with the fix rather than silently editing the
+    # user's conda config or accepting Anaconda's ToS on their behalf.
+    if conda config --show channels 2>/dev/null | grep -qE '^[[:space:]]*-[[:space:]]+defaults[[:space:]]*$'; then
+        warn "conda is configured with the 'defaults' channel; conda env create may abort on its ToS gate."
+        warn "  This repo is conda-forge-only. To fix (no Anaconda ToS needed):"
+        warn "    conda config --system --remove channels defaults && conda config --system --add channels conda-forge && conda config --set channel_priority strict"
+    fi
     conda env create -f "$ENV_FILE" -n "$ENV_NAME"
     ok "created conda env '$ENV_NAME'"
 fi

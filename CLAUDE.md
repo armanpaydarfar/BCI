@@ -343,15 +343,17 @@ Two install **roles**, selected at setup time (see
     `requirements.txt`.
   - **Control is Linux-only** (realtime/online is Linux-only).
 
-- **`server`** — the GPU perception host. Runs the perception stack only
-  (`vlm_service.py` + live `perception/` modules); no device I/O, decoder, or
-  Qt. The perception-only subset of the control env plus a **CUDA** torch
-  build. Env name `harmony-server`. Two per-OS files, identical except the
-  CUDA torch pin (the one per-OS knob):
-  - `environment.server.linux.yml` (future Linux GPU server)
-  - `environment.server.windows.yml` (current production box, RTX 4070 Ti)
-  - Keep the conda core versions in the server files in sync with
-    `environment.yml` so a single-box dev machine stays consistent.
+- **`server`** — the GPU perception host (Linux or Windows). Runs the
+  perception stack only (`vlm_service.py` + live `perception/` modules); no
+  device I/O, decoder, or Qt. The perception-only subset of the control env
+  plus a **CUDA** torch build. Env name `harmony-server`, single
+  cross-platform file `environment.server.yml`: it is a curated spec with no
+  OS-specific conda packages, so conda solves the core per-platform and pip
+  selects the right torch/opencv wheel automatically — one file works on both
+  Linux and Windows. The CUDA wheel tag (`cu124`) is the one knob; split into
+  per-OS files only if two hosts ever need *different* tags. Keep the conda
+  core versions in sync with `environment.yml` so a single-box dev machine
+  stays consistent.
 
 The perception source was folded in-tree in WS3 — there is **no** sibling
 `harmony_vlm` repo or env to clone/create (`VLM_REPO_DIR` / `VLM_CONDA_ENV`
