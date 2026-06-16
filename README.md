@@ -132,20 +132,24 @@ Typical layout per subject (`sub-<SUBJECT_ID>`):
 
 ## 4. Setup / Environment
 
-- **Conda environment (two install roles)**  
-  - **`control`** — the Linux operator host. `environment.yml` defines the
-    **superset** conda env named `lsl`: Python `3.12`, MNE, LSL utilities
-    (`mne-lsl`, `pylsl` via pip), Qt/PySide6, PyQt, scientific Python stack,
-    OpenCV, visualization, *and* a CPU build of the perception stack — so a
-    single-box dev machine runs both the experiment and perception from one
-    env. Create with `conda env create -f environment.yml` (or
-    `tools/bootstrap_machine.sh`, which defaults to `--role control`).
-  - **`server`** — the GPU perception host (Windows now, Linux later). Runs the
-    perception stack only, with a CUDA torch build. Create the env named
-    `harmony-server` from the single cross-platform file:
-    `conda env create -f environment.server.yml` (same file on Linux and
-    Windows — pip selects the right torch wheel per platform). On Linux,
-    `tools/bootstrap_machine.sh --role server` does this for you.
+- **Conda environment (one file, two roles)**  
+  - `environment.yml` is a single curated, cross-platform **superset** conda env
+    named `lsl`: Python `3.12`, MNE, `pylsl`/`pyserial` (pip), PySide6, the
+    scientific Python stack (numpy/scipy/scikit-learn/pyriemann/pandas), xgboost,
+    OpenCV, *and* the perception stack. **Every host installs the same deps**, so
+    every module imports everywhere. It is a curated spec (not a frozen export) —
+    conda-forge-only with no OS-pinned packages — so the same file creates on both
+    Linux and native Windows. Create with `conda env create -f environment.yml`
+    (or `tools/bootstrap_machine.sh`, default `--role control`).
+  - **Roles select setup steps, not deps.** `--role control` (Linux operator
+    host) runs the full setup. `--role server` (GPU perception host, Linux or
+    Windows) skips the control-only steps. There is no torch knob: the default
+    PyPI torch wheel is a CUDA build that also runs on CPU, so a plain create
+    works on both GPU and CPU hosts (a CPU-only box can optionally install the
+    `.../whl/cpu` wheel to skip the CUDA download). Only the numerical/decoder
+    core is version-pinned, plus two justified guards — `pandas<3` and
+    `pylsl==1.16.2` (+ conda `liblsl`) for realtime API stability; everything
+    else floats to the per-OS solve.
 
 - **Python version**  
   - `environment.yml` pins `python=3.12.x`. New development should target this version (or a compatible minor release) unless the environment is updated.
@@ -154,7 +158,7 @@ Typical layout per subject (`sub-<SUBJECT_ID>`):
   - **EEG / LSL tools**:
     - **eegoSports** (Linux build; used instead of antNeuro software) streaming EEG over **LSL**.
     - **LabRecorder** to record all related LSL streams (EEG, markers, and any other LSL streams used in your setup) into `.xdf`.
-    - **mne-lsl** / `mne-lsl viewer` for inspecting/debugging available LSL streams.
+    - **mne-lsl** / `mne-lsl viewer` for inspecting/debugging available LSL streams — optional, not bundled in `environment.yml` (the runtime uses `pylsl` directly); install separately with `pip install mne-lsl` if you want the viewer.
   - **Gaze / video**:
     - Pupil Labs / Neon APIs (e.g., `pupil_labs.realtime_api`) if using Neon-based gaze tracking.  
     - OBS Studio (only if you intentionally run legacy scripts under `OBS/`).  

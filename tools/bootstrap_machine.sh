@@ -2,16 +2,19 @@
 # bootstrap_machine.sh — first-time setup for a Harmony host. Idempotent:
 # re-running is safe.
 #
-# Two roles (--role, default control):
+# One env file, two roles. environment.yml is a single curated cross-platform
+# superset — every host installs the same deps, so every module imports
+# everywhere. "Role" selects which setup steps run, NOT a different dependency
+# set (--role, default control):
 #   control  Linux operator host — device I/O + EEG/LSL decoder + Qt control
-#            panel + CPU perception. Runs the full setup below; env =
-#            environment.yml (conda env 'lsl').
-#   server   GPU perception host — perception stack only. env =
-#            environment.server.yml (conda env 'harmony-server'); skips the
-#            control-only steps (subject skeleton, robot/EEG checklist).
-#            environment.server.yml is cross-platform; Windows servers can't
-#            run this bash script, so create the env directly:
-#            conda env create -f environment.server.yml
+#            panel + perception. Runs the full setup below.
+#   server   GPU perception host — perception stack only. Skips the control-only
+#            steps (subject skeleton, robot/EEG checklist).
+# Both roles create conda env 'lsl' from environment.yml. The default torch wheel
+# is already a CUDA build that also runs on CPU, so a plain create works on both
+# GPU and CPU hosts with no torch swap (server role just verifies CUDA is
+# visible). A Windows server can't run this bash script — create the env directly:
+#   conda env create -f environment.yml
 #
 # control steps (perception was folded in-tree in WS3, so there is no longer a
 # sibling harmony_vlm repo to clone):
@@ -176,11 +179,7 @@ fi
 
 # --- step 3: conda env -----------------------------------------------------
 
-if [ "$ROLE" = "server" ]; then
-    ENV_NAME="harmony-server"; ENV_FILE="environment.server.yml"
-else
-    ENV_NAME="lsl"; ENV_FILE="environment.yml"
-fi
+ENV_NAME="lsl"; ENV_FILE="environment.yml"
 
 section "conda env '$ENV_NAME'"
 
@@ -206,6 +205,20 @@ else
     fi
     conda env create -f "$ENV_FILE" -n "$ENV_NAME"
     ok "created conda env '$ENV_NAME'"
+
+    # torch: the default PyPI wheel is already a CUDA build (currently cu13x)
+    # that also runs on CPU, so a plain create works on both GPU and CPU hosts
+    # with no swap. For a server, just confirm the GPU is visible.
+    if [ "$ROLE" = "server" ]; then
+        section "torch / CUDA check (server role)"
+        if conda run -n "$ENV_NAME" python -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+            ok "torch sees CUDA"
+        else
+            warn "torch.cuda.is_available() is False — check the NVIDIA driver/CUDA runtime."
+            warn "  To pin a specific CUDA series (e.g. an older driver needs cu124):"
+            warn "    conda run -n $ENV_NAME pip install --force-reinstall --extra-index-url https://download.pytorch.org/whl/cu124 torch torchvision"
+        fi
+    fi
 fi
 
 # --- step 4: repo-local pre-commit hook ------------------------------------

@@ -338,31 +338,46 @@ not appear in `environment.yml`.
 
 ## Dependency and Environment
 
-Two install **roles**, selected at setup time (see
-`tools/bootstrap_machine.sh --role`):
+**One env file for every host.** `environment.yml` is a single curated,
+cross-platform **superset** (conda env `lsl`, Python 3.12): device I/O, the
+EEG/LSL decoder pipeline, the Qt control panel, gaze, *and* the perception
+stack are all installed everywhere, so every module imports on every unit.
+"Role" is *what you run and which torch build you carry*, not a different
+dependency set.
 
-- **`control`** — the Linux operator host. The **superset** env: device I/O,
-  EEG/LSL decoder pipeline, Qt control panel, gaze, *and* a CPU build of the
-  perception stack, so a single-box dev machine
-  (`PERCEPTION_FRAME_SOURCE=local`, the default) runs everything from one env.
-  - Env: `environment.yml`, conda env named `lsl`, Python 3.12.
-  - This is the reference Linux env. Do not introduce dependencies that
-    cannot be satisfied on Linux. Windows-only packages (e.g.
-    `triton-windows`) must never appear in `environment.yml` or
-    `requirements.txt`.
-  - **Control is Linux-only** (realtime/online is Linux-only).
+- It is a **curated spec, not a frozen export** — conda-forge-only with no
+  OS-pinned packages, so conda solves the per-OS transitive closure and pip
+  selects the right platform wheel. The same file creates on Linux and native
+  Windows. (The old `environment.server.yml` and the `harmony-server` env are
+  retired; do not reintroduce a second env file unless two hosts genuinely need
+  *different* CUDA tags.)
+- **Pin only the numerical/decoder core** (`python`, `numpy`, `scipy`,
+  `scikit-learn`, `pyriemann`) — drift there compounds over SPD-matrix training.
+  Everything else floats to the per-OS solve; that float is what lets one file
+  co-solve on both platforms. A version *range* or exact pin on a specific
+  package is fine when justified (it does not break cross-platform); a full
+  lockfile-style freeze of the whole list does. Two such guards exist:
+  `pandas<3` (the 2.x analysis scripts predate the 3.0 breaking major) and
+  `pylsl==1.16.2` (the realtime drivers + Tier-1 stream files call the
+  deprecated `resolve_stream(...)`, which pylsl 1.17+ **removed**; the native
+  `liblsl` it loads comes from conda-forge since the wheel doesn't bundle it).
+- Do not introduce dependencies that cannot be satisfied on Linux. Windows-only
+  packages (e.g. `triton-windows`) must never appear in `environment.yml`.
+- **torch needs no role knob.** The default PyPI torch wheel is already a CUDA
+  build (currently `cu13x`) that *also* runs on CPU, so a plain `conda env
+  create` yields a working torch on both a GPU server (CUDA-accelerated) and a
+  CPU-only host (`cuda.is_available()=False`). Optional, never required: a
+  CPU-only box can `pip install --index-url .../whl/cpu` to skip the CUDA
+  download, or a host with an older driver can pin a specific `cuNNN` series.
+- Roles select *steps*, not deps: `--role control` (Linux operator host) runs
+  the full setup; `--role server` (GPU perception host, Linux or Windows) skips
+  the control-only steps and just verifies CUDA is visible. **Realtime/online is
+  Linux-only** regardless of what's installed.
 
-- **`server`** — the GPU perception host (Linux or Windows). Runs the
-  perception stack only (`vlm_service.py` + live `perception/` modules); no
-  device I/O, decoder, or Qt. The perception-only subset of the control env
-  plus a **CUDA** torch build. Env name `harmony-server`, single
-  cross-platform file `environment.server.yml`: it is a curated spec with no
-  OS-specific conda packages, so conda solves the core per-platform and pip
-  selects the right torch/opencv wheel automatically — one file works on both
-  Linux and Windows. The CUDA wheel tag (`cu124`) is the one knob; split into
-  per-OS files only if two hosts ever need *different* tags. Keep the conda
-  core versions in sync with `environment.yml` so a single-box dev machine
-  stays consistent.
+Staged perception deps (`dt-apriltags`, `pyrealsense2`, `piper`, `msgpack`,
+`pyzmq`) and the optional non-default segmentation backend (`efficient_sam` /
+`segment_anything`) are deliberately omitted — they belong to modules fenced as
+non-import-safe in `perception/__init__.py`.
 
 The perception source was folded in-tree in WS3 — there is **no** sibling
 `harmony_vlm` repo or env to clone/create (`VLM_REPO_DIR` / `VLM_CONDA_ENV`

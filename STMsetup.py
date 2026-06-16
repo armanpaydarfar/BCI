@@ -19,7 +19,6 @@ import pygame
 import time
 import random
 from pygame.locals import *
-import pyautogui
 
 
 import os
