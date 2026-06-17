@@ -49,6 +49,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -79,32 +80,157 @@ def _cfg_default(name: str, fallback):
 # Live-overlay detection cap. Paint cost on the Linux side is O(N) full-canvas
 # alpha blends (Utils/scene_overlay_renderer.py). Capping N here keeps the
 # overlay budget bounded; one-shot segment/decide command paths intentionally
-# bypass this filter so the reasoner sees the full mask set.
+# bypass this top-K filter so the reasoner sees the full mask set.
+#
+# These are the *defaults*; the values are configurable per-deployment via
+# --overlay-top-k / --overlay-contain-ratio / --overlay-area-ratio (WS4 E2),
+# resolved into VLMService instance attributes from config/CLI in main().
 _OVERLAY_TOP_K = 20
 _OVERLAY_CONTAIN_RATIO = 0.85
 _OVERLAY_AREA_RATIO = 0.5
 
 
-def _filter_overlay_dets(dets):
+@dataclass(frozen=True)
+class SegConstraints:
+    """Optional geometry/depth constraints biasing FastSAM toward small
+    tabletop objects (WS4 F1). Every field defaults to the "off" sentinel
+    (None), so the filter is a no-op until a threshold is set via CLI/config —
+    preserving today's unfiltered segment/decide/segment_stream output.
+
+    - max_area_ratio: drop dets whose bbox area exceeds this fraction of the
+      frame (the parked max-area filter — kills door-frame+table blobs,
+      walls/floors).
+    - min_area_ratio: drop dets whose bbox area is below this fraction (specks).
+    - solidity_min:   drop dets whose mask-area / bbox-area is below this
+      (low-solidity merged/elongated blobs spanning multiple objects). Only
+      enforced when a mask polygon is present.
+    - depth_band:     (near_m, far_m) — drop dets whose median mask depth falls
+      outside this near-field band. Only enforced where a depth map is
+      available (the decide path); see _segment_stream_loop for why the stream
+      stays geometry-only.
+    - gaze_roi:       half-extent (fraction of frame width/height) of a window
+      centred on the current gaze; drop dets whose bbox centre falls outside
+      it. Only enforced where a gaze coordinate is available.
+    """
+    max_area_ratio: Optional[float] = None
+    min_area_ratio: Optional[float] = None
+    solidity_min:   Optional[float] = None
+    depth_band:     Optional[tuple] = None
+    gaze_roi:       Optional[float] = None
+
+    def is_active(self) -> bool:
+        return any(v is not None for v in (
+            self.max_area_ratio, self.min_area_ratio, self.solidity_min,
+            self.depth_band, self.gaze_roi,
+        ))
+
+    @classmethod
+    def from_args(cls, args) -> "SegConstraints":
+        band = getattr(args, "seg_depth_band", None)
+        if band is not None:
+            band = (float(band[0]), float(band[1]))
+        return cls(
+            max_area_ratio=_opt_float(getattr(args, "seg_max_area_ratio", None)),
+            min_area_ratio=_opt_float(getattr(args, "seg_min_area_ratio", None)),
+            solidity_min=_opt_float(getattr(args, "seg_solidity_min", None)),
+            depth_band=band,
+            gaze_roi=_opt_float(getattr(args, "seg_gaze_roi", None)),
+        )
+
+
+def _opt_float(v):
+    return None if v is None else float(v)
+
+
+def _median_mask_depth(det, depth_map) -> Optional[float]:
+    """Median depth (metres) within a detection's mask, or the bbox-centre
+    pixel depth when no mask is present. Mirrors compute_3d_waypoints'
+    mask-depth logic (perception/object_detector.py:98-123) — same rasterise +
+    valid-depth filter — kept local so the vendored module stays byte-identical
+    to upstream. Returns None when no valid depth samples remain.
+    """
+    import cv2
+    h, w = depth_map.shape[:2]
+    if det.mask_polygon is not None and len(det.mask_polygon) >= 3:
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask, [det.mask_polygon], 1)
+        depths = depth_map[mask == 1]
+    else:
+        cx, cy = det.box_center
+        ix = max(0, min(int(round(cx)), w - 1))
+        iy = max(0, min(int(round(cy)), h - 1))
+        depths = np.array([depth_map[iy, ix]])
+    depths = depths[(depths > 0) & np.isfinite(depths) & (depths < 10.0)]
+    if len(depths) == 0:
+        return None
+    return float(np.median(depths))
+
+
+def _apply_seg_constraints(dets, frame_shape, constraints, depth_map=None, gaze_xy=None):
+    """Drop detections that violate the optional F1 geometry/depth constraints.
+
+    No-op (returns dets unchanged) when constraints is None / inactive, so the
+    default service output matches the pre-F1 unfiltered behaviour. depth_band
+    is enforced only when depth_map is given; gaze_roi only when gaze_xy is.
+    """
+    if constraints is None or not constraints.is_active() or not dets:
+        return dets
+
+    h, w = frame_shape[:2]
+    frame_area = float(max(h * w, 1))
+    kept = []
+    for d in dets:
+        x1, y1, x2, y2 = d.box_xyxy
+        bbox_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        ratio = bbox_area / frame_area
+
+        if constraints.max_area_ratio is not None and ratio > constraints.max_area_ratio:
+            continue
+        if constraints.min_area_ratio is not None and ratio < constraints.min_area_ratio:
+            continue
+        if (constraints.solidity_min is not None and d.mask_polygon is not None
+                and bbox_area > 0):
+            import cv2
+            mask_area = abs(cv2.contourArea(d.mask_polygon.reshape(-1, 1, 2).astype(np.int32)))
+            if mask_area / bbox_area < constraints.solidity_min:
+                continue
+        if constraints.gaze_roi is not None and gaze_xy is not None:
+            cx, cy = d.box_center
+            if (abs(cx - gaze_xy[0]) > constraints.gaze_roi * w
+                    or abs(cy - gaze_xy[1]) > constraints.gaze_roi * h):
+                continue
+        if constraints.depth_band is not None and depth_map is not None:
+            md = _median_mask_depth(d, depth_map)
+            near, far = constraints.depth_band
+            if md is None or md < near or md > far:
+                continue
+        kept.append(d)
+    return kept
+
+
+def _filter_overlay_dets(dets, top_k=_OVERLAY_TOP_K,
+                         contain_ratio=_OVERLAY_CONTAIN_RATIO,
+                         area_ratio=_OVERLAY_AREA_RATIO):
     """Reduce detection count for the live segment-stream cache.
 
     Two passes:
       1. Top-K by confidence — caps live-overlay paint cost.
       2. Containment drop — if det B is mostly inside det A
-         (intersection / area(B) > _OVERLAY_CONTAIN_RATIO) AND
-         area(B) < _OVERLAY_AREA_RATIO × area(A), drop B. Targets
+         (intersection / area(B) > contain_ratio) AND
+         area(B) < area_ratio × area(A), drop B. Targets
          FastSAM-everything's parent+children pattern (e.g. monitor
          co-segmented with icons on the monitor); the gaze-pointing
          workflow prefers the parent.
 
     Applied only to the seg-stream cache; segment/decide one-shots are
-    unfiltered.
+    unfiltered. top_k/contain_ratio/area_ratio default to the module constants
+    but are overridden per-deployment via the overlay CLI/config knobs (E2).
     """
     if not dets:
         return dets
 
-    if len(dets) > _OVERLAY_TOP_K:
-        dets = sorted(dets, key=lambda d: float(d.confidence), reverse=True)[:_OVERLAY_TOP_K]
+    if len(dets) > top_k:
+        dets = sorted(dets, key=lambda d: float(d.confidence), reverse=True)[:top_k]
 
     def _bbox_area(d):
         x1, y1, x2, y2 = d.box_xyxy
@@ -127,9 +253,9 @@ def _filter_overlay_dets(dets):
         for j, dj in enumerate(dets):
             if i == j or drop[j] or areas[j] <= 0:
                 continue
-            if areas[j] >= _OVERLAY_AREA_RATIO * areas[i]:
+            if areas[j] >= area_ratio * areas[i]:
                 continue
-            if _intersection(di, dj) / areas[j] > _OVERLAY_CONTAIN_RATIO:
+            if _intersection(di, dj) / areas[j] > contain_ratio:
                 drop[j] = True
 
     return [d for d, dropped in zip(dets, drop) if not dropped]
@@ -213,6 +339,54 @@ def parse_args():
                         "behaviour). Override with VLM_THINKING_BUDGET in config.")
     p.add_argument("--seg-model", default="FastSAM-s.pt",
                    help="Segmentation weights: filename within PERCEPTION_MODELS_DIR, or an absolute path")
+
+    # ── Segmentation tuning (WS4 F1 + E1/E2) ─────────────────────────────────
+    # All default to today's behaviour: conf 0.6, overlay knobs at the module
+    # constants, and every F1 constraint OFF (None) so output is unchanged until
+    # a threshold is set. conf/overlay knobs (E2) make the previously-hardcoded
+    # values configurable; the seg-* constraints (F1/E1) bias toward small
+    # tabletop objects when enabled.
+    seg = p.add_argument_group("segmentation tuning (WS4 F1/E2)")
+    seg.add_argument("--seg-conf-threshold", type=float,
+                     default=float(_cfg_default("SEG_CONF_THRESHOLD", 0.6)),
+                     help="FastSAM min confidence (was hardcoded 0.6). "
+                          "Override with SEG_CONF_THRESHOLD in config.")
+    seg.add_argument("--overlay-top-k", type=int,
+                     default=int(_cfg_default("SEG_OVERLAY_TOP_K", _OVERLAY_TOP_K)),
+                     help="Cap on detections kept for the live overlay "
+                          "(seg-stream cache), by confidence. Default 20.")
+    seg.add_argument("--overlay-contain-ratio", type=float,
+                     default=float(_cfg_default("SEG_OVERLAY_CONTAIN_RATIO", _OVERLAY_CONTAIN_RATIO)),
+                     help="Overlay containment-drop ratio (child mostly inside "
+                          "parent). Default 0.85.")
+    seg.add_argument("--overlay-area-ratio", type=float,
+                     default=float(_cfg_default("SEG_OVERLAY_AREA_RATIO", _OVERLAY_AREA_RATIO)),
+                     help="Overlay containment-drop max child/parent area ratio. "
+                          "Default 0.5.")
+    seg.add_argument("--seg-max-area-ratio", type=float,
+                     default=_cfg_default("SEG_MAX_AREA_RATIO", None),
+                     help="F1: drop dets whose bbox covers more than this "
+                          "fraction of the frame (kills whole-scene blobs). "
+                          "Unset = off.")
+    seg.add_argument("--seg-min-area-ratio", type=float,
+                     default=_cfg_default("SEG_MIN_AREA_RATIO", None),
+                     help="F1: drop dets whose bbox is below this fraction of "
+                          "the frame (specks). Unset = off.")
+    seg.add_argument("--seg-solidity-min", type=float,
+                     default=_cfg_default("SEG_SOLIDITY_MIN", None),
+                     help="F1: drop dets whose mask-area/bbox-area is below this "
+                          "(merged/elongated blobs). Unset = off.")
+    seg.add_argument("--seg-depth-band", type=float, nargs=2, metavar=("NEAR_M", "FAR_M"),
+                     default=_cfg_default("SEG_DEPTH_BAND", None),
+                     help="F1: keep only dets whose median mask depth is within "
+                          "[NEAR_M, FAR_M] metres. decide-only (needs depth). "
+                          "Unset = off.")
+    seg.add_argument("--seg-gaze-roi", type=float, metavar="FRAC",
+                     default=_cfg_default("SEG_GAZE_ROI", None),
+                     help="F1: keep only dets whose bbox centre is within "
+                          "FRAC*frame (half-extent) of the current gaze. "
+                          "Unset = off.")
+
     # Default "auto" resolves to cuda if torch.cuda.is_available(), else cpu
     # (see main()). Hosts without a usable GPU degrade gracefully to CPU,
     # matching CLAUDE.md's "platform-specific optimisations must be gated on
@@ -332,6 +506,17 @@ class VLMService:
         self.reasoner = reasoner
         self.fix_det = fix_det
         self._FixationState = fixation_state_cls
+
+        # WS4 F1/E2: optional segmentation constraints + configurable overlay
+        # reduction knobs, resolved from CLI/config. getattr fallbacks keep the
+        # stub-args test path (and any minimal Namespace) on today's behaviour:
+        # constraints inactive, overlay knobs at the module defaults.
+        self._seg_constraints = SegConstraints.from_args(args)
+        self._overlay_top_k = int(getattr(args, "overlay_top_k", _OVERLAY_TOP_K))
+        self._overlay_contain_ratio = float(
+            getattr(args, "overlay_contain_ratio", _OVERLAY_CONTAIN_RATIO))
+        self._overlay_area_ratio = float(
+            getattr(args, "overlay_area_ratio", _OVERLAY_AREA_RATIO))
 
         self._frame_lock = threading.Lock()
         self._latest_bundle = None
@@ -629,6 +814,12 @@ class VLMService:
         include_masks = bool(req.get("include_masks", False))
         t0 = time.time()
         dets = self.detector.detect(bundle.video.bgr)
+        # F1 constraints (no-op unless enabled). No depth map here, so the
+        # depth-band constraint is skipped; geometry + gaze-ROI still apply.
+        dets = _apply_seg_constraints(
+            dets, bundle.video.bgr.shape, self._seg_constraints,
+            gaze_xy=(float(bundle.gaze.x), float(bundle.gaze.y)),
+        )
         elapsed = time.time() - t0
 
         out = []
@@ -722,7 +913,20 @@ class VLMService:
                 try:
                     t0 = time.perf_counter()
                     dets = self.detector.detect(bundle.video.bgr)
-                    dets = _filter_overlay_dets(dets)
+                    # F1 constraints first (geometry + gaze-ROI only — per-tick
+                    # Depth Pro is too costly for the stream, so depth-band is
+                    # decide-only; see SegConstraints.depth_band). Then the
+                    # overlay top-K / containment reduction with the configured
+                    # (E2) knobs.
+                    dets = _apply_seg_constraints(
+                        dets, bundle.video.bgr.shape, self._seg_constraints,
+                        gaze_xy=(float(bundle.gaze.x), float(bundle.gaze.y)),
+                    )
+                    dets = _filter_overlay_dets(
+                        dets, top_k=self._overlay_top_k,
+                        contain_ratio=self._overlay_contain_ratio,
+                        area_ratio=self._overlay_area_ratio,
+                    )
                     self._cache_dets(dets)
                     win_ticks += 1
                     win_dets += len(dets)
@@ -869,6 +1073,13 @@ class VLMService:
                 bundle.video.bgr, f_px=self._focal_px(), gaze_xy=gaze_xy,
             )
             _depth_elapsed_ms = (time.time() - _depth_t0) * 1000.0
+            # F1 constraints (no-op unless enabled). Depth map is available
+            # here, so the depth-band constraint can run; filter before
+            # waypoints/hit-test/reasoning so all downstream sees the same set.
+            dets = _apply_seg_constraints(
+                dets, bundle.video.bgr.shape, self._seg_constraints,
+                depth_map=depth_map, gaze_xy=gaze_xy,
+            )
             K = self.reader.camera_matrix
             wps = compute_3d_waypoints(dets, depth_map, K)
             waypoints_out = [
@@ -886,6 +1097,12 @@ class VLMService:
             depth_at_gaze_m = float(depth_map[gy, gx])
             _log(f"  depth (in-decide): shape={depth_map.shape[0]}x{depth_map.shape[1]} "
                  f"at_gaze={depth_at_gaze_m:.2f}m elapsed={_depth_elapsed_ms:.0f}ms")
+        else:
+            # No depth estimator: apply the geometry + gaze-ROI constraints
+            # (depth-band needs a depth map and is silently skipped here).
+            dets = _apply_seg_constraints(
+                dets, bundle.video.bgr.shape, self._seg_constraints, gaze_xy=gaze_xy,
+            )
 
         # Pick the waypoint whose detection bounding box contains the gaze px
         hit_det = None
@@ -1569,12 +1786,15 @@ def main() -> None:
         _log(f"connecting to Neon (host={args.neon_host or 'auto-discover'})…")
         reader = NeonLiveReader(host=args.neon_host or None)
 
-    _log(f"loading segmentation model: {args.seg_model} on {args.device}…")
-    # conf_threshold raised from harmony_vlm's 0.4 default — at 0.4 the
+    _log(f"loading segmentation model: {args.seg_model} on {args.device} "
+         f"(conf={args.seg_conf_threshold})…")
+    # conf_threshold default 0.6 raised from harmony_vlm's 0.4 — at 0.4 the
     # FastSAM-everything output is dense enough (40+ masks under bright lab
-    # lighting) to swamp the Linux overlay's per-detection alpha blend.
+    # lighting) to swamp the Linux overlay's per-detection alpha blend. Now
+    # configurable via --seg-conf-threshold / SEG_CONF_THRESHOLD (WS4 E2).
     detector = ObjectDetector(
-        model_size=args.seg_model, device=args.device, conf_threshold=0.6,
+        model_size=args.seg_model, device=args.device,
+        conf_threshold=args.seg_conf_threshold,
     )
 
     depth_estimator = None

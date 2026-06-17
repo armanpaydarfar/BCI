@@ -279,6 +279,31 @@ VLM_MODEL = "gemini-2.5-flash"
 # only for the Gemini backend.)
 VLM_THINKING_BUDGET = None
 
+# Segmentation tuning (WS4 F1 + E1/E2). Machine-neutral — safe to commit.
+# These mirror vlm_service.py's --seg-* / --overlay-* flags; values here are the
+# argparse defaults. Everything below keeps today's behaviour: conf 0.6, the
+# overlay knobs at their long-standing values, and every F1 constraint OFF
+# (None) so segment/decide/segment_stream output is unchanged until tuned.
+SEG_CONF_THRESHOLD = 0.6            # FastSAM min confidence (was hardcoded)
+SEG_OVERLAY_TOP_K = 20              # cap on live-overlay dets by confidence
+SEG_OVERLAY_CONTAIN_RATIO = 0.85   # child-inside-parent containment drop
+SEG_OVERLAY_AREA_RATIO = 0.5       # max child/parent area for the drop
+# F1 constraint filter — all None (off) by default. When set:
+#   SEG_MAX_AREA_RATIO : drop dets whose bbox covers > this fraction of the
+#                        frame (kills door-frame+table blobs, walls, floors).
+#   SEG_MIN_AREA_RATIO : drop dets whose bbox is < this fraction (specks).
+#   SEG_SOLIDITY_MIN   : drop dets whose mask-area/bbox-area < this (merged or
+#                        elongated blobs spanning multiple objects).
+#   SEG_DEPTH_BAND     : (near_m, far_m) tuple — keep only dets whose median
+#                        mask depth is in-band. decide-only (needs a depth map).
+#   SEG_GAZE_ROI       : half-extent (fraction of frame) of a gaze-centred
+#                        window; drop dets whose bbox centre falls outside it.
+SEG_MAX_AREA_RATIO = None
+SEG_MIN_AREA_RATIO = None
+SEG_SOLIDITY_MIN = None
+SEG_DEPTH_BAND = None
+SEG_GAZE_ROI = None
+
 # Whether to load Depth Pro at service startup. Depth Pro on CPU is slow
 # (~1-3 s per call). Disable to skip scene depth while testing VLM reasoning
 # alone; segment/reason/decide endpoints return without depth fields.
