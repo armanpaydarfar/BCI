@@ -1234,6 +1234,34 @@ class VLMService:
             return {"ok": False, "error": "vlm_non_dict_response"}
         return {"ok": True, "elapsed_s": elapsed, **result}
 
+    @staticmethod
+    def _hit_det_and_waypoint(dets, waypoints_out, gaze_xy):
+        """Find the detection whose bbox contains the gaze point, paired with
+        its 3D waypoint BY LABEL — never by positional zip.
+
+        compute_3d_waypoints (perception/object_detector.py) skips detections
+        whose mask region has no valid depth, so ``waypoints_out`` can be
+        shorter than ``dets``; a positional ``zip(dets, waypoints_out)`` would
+        then pair the gaze hit with a *different* object's 3D point. FastSAM
+        emits unique per-frame ``segment_N`` labels that compute_3d_waypoints
+        copies onto each waypoint, so the label lookup is exact. Returns
+        ``hit_waypoint=None`` when the hit detection had no valid depth (correct
+        — there is no 3D point for it), instead of a misattributed one.
+        """
+        hit_det = None
+        for d in dets:
+            x1, y1, x2, y2 = d.box_xyxy
+            if x1 <= gaze_xy[0] <= x2 and y1 <= gaze_xy[1] <= y2:
+                hit_det = d
+                break
+        hit_waypoint = None
+        if hit_det is not None:
+            hit_waypoint = next(
+                (wp for wp in waypoints_out if wp.get("label") == hit_det.label),
+                None,
+            )
+        return hit_det, hit_waypoint
+
     def _cmd_decide(self, req: dict) -> dict:
         # Import here so this file parses even if harmony_vlm utils aren't loaded
         from perception.object_detector import compute_3d_waypoints
@@ -1287,15 +1315,10 @@ class VLMService:
                 dets, bundle.video.bgr.shape, self._seg_constraints, gaze_xy=gaze_xy,
             )
 
-        # Pick the waypoint whose detection bounding box contains the gaze px
-        hit_det = None
-        hit_waypoint = None
-        for d, wp in zip(dets, waypoints_out):
-            x1, y1, x2, y2 = d.box_xyxy
-            if x1 <= gaze_xy[0] <= x2 and y1 <= gaze_xy[1] <= y2:
-                hit_det = d
-                hit_waypoint = wp
-                break
+        # Pick the detection whose bbox contains the gaze, paired to its
+        # waypoint by label (positional zip is unsafe — see
+        # _hit_det_and_waypoint).
+        hit_det, hit_waypoint = self._hit_det_and_waypoint(dets, waypoints_out, gaze_xy)
 
         self._cache_dets(dets, hit_det, hit_waypoint)
 
@@ -1368,14 +1391,7 @@ class VLMService:
             _log(f"  depth (in-frame): shape={depth_map.shape[0]}x{depth_map.shape[1]} "
                  f"at_gaze={depth_at_gaze:.2f}m elapsed={_depth_elapsed_ms:.0f}ms")
 
-        hit_det = None
-        hit_waypoint: Optional[dict] = None
-        for d, wp in zip(dets, waypoints_out):
-            x1, y1, x2, y2 = d.box_xyxy
-            if x1 <= gaze_xy[0] <= x2 and y1 <= gaze_xy[1] <= y2:
-                hit_det = d
-                hit_waypoint = wp
-                break
+        hit_det, hit_waypoint = self._hit_det_and_waypoint(dets, waypoints_out, gaze_xy)
 
         return {
             "detections": dets,
