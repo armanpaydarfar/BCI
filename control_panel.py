@@ -1020,11 +1020,20 @@ class ControlPanel(QMainWindow):
         self.btn_vlm_service_status = QPushButton("Status")
         self.btn_vlm_service_decide = QPushButton("Decide Now")
         self.btn_vlm_service_depth  = QPushButton("Depth Now")
+        # WS4 F5: fast COCO recognition of the gaze object (no Gemini). Only
+        # functional when the service was started with --recognizer-model; the
+        # service returns recognizer_disabled otherwise (surfaced in the log).
+        self.btn_vlm_service_recognize = QPushButton("Confirm Object")
+        self.btn_vlm_service_recognize.setToolTip(
+            "Fast YOLO/COCO naming of the gaze object, no VLM round-trip "
+            "(needs the service started with --recognizer-model)."
+        )
         self.btn_vlm_service_start.clicked.connect(self.on_vlm_service_start)
         self.btn_vlm_service_stop.clicked.connect(self.on_vlm_service_stop)
         self.btn_vlm_service_status.clicked.connect(self.on_vlm_service_status)
         self.btn_vlm_service_decide.clicked.connect(self.on_vlm_service_decide)
         self.btn_vlm_service_depth.clicked.connect(self.on_vlm_service_depth)
+        self.btn_vlm_service_recognize.clicked.connect(self.on_vlm_service_recognize)
 
         # Continuous segmentation toggle + cadence — merged onto the
         # main perception row instead of a separate "Continuous / Pair"
@@ -1066,6 +1075,7 @@ class ControlPanel(QMainWindow):
         actions_row2 = QHBoxLayout()
         actions_row2.setContentsMargins(0, 0, 0, 0)
         for w in (self.btn_vlm_service_status, self.btn_vlm_service_decide,
+                  self.btn_vlm_service_recognize,
                   self.btn_vlm_service_depth, self.btn_vlm_capture_first,
                   self.btn_vlm_decide_pair, self.lbl_vlm_pair_token):
             actions_row2.addWidget(w, 1)
@@ -1095,6 +1105,7 @@ class ControlPanel(QMainWindow):
             self.btn_vlm_seg_stream, self.spin_vlm_seg_hz,
             self.btn_vlm_service_status,
             self.btn_vlm_service_decide,
+            self.btn_vlm_service_recognize,
             self.btn_vlm_service_depth,
             self.btn_vlm_capture_first,
             self.btn_vlm_decide_pair,
@@ -2678,6 +2689,11 @@ class ControlPanel(QMainWindow):
 
     def on_vlm_service_decide(self):
         self._vlm_command_threaded({"cmd": "decide"}, VLM_DECIDE_TIMEOUT_S, "decide")
+
+    def on_vlm_service_recognize(self):
+        # F5: fast COCO recognition of the gaze object (no Gemini). 5 s covers a
+        # warm YOLO inference comfortably while staying well under decide's 40 s.
+        self._vlm_command_threaded({"cmd": "recognize"}, 5.0, "recognize")
 
     def on_vlm_seg_stream_toggled(self, checked: bool) -> None:
         hz = float(self.spin_vlm_seg_hz.value())

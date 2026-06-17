@@ -311,6 +311,15 @@ SEG_GAZE_ROI = None
 # persist briefly as boxes, removing borderline-segment flicker.
 SEG_TRACK = False
 
+# F5 fast object recognition. Empty = the `recognize` command is disabled and no
+# extra model loads (today's behaviour). Set to a YOLO weights filename
+# (resolved under PERCEPTION_MODELS_DIR, e.g. "yolo26n.pt") or an absolute path
+# to enable a fast COCO-class naming of the gaze object ahead of the VLM. The
+# name must NOT contain "fastsam" (ObjectDetector picks FastSAM vs YOLO by
+# filename). Machine-neutral default; the actual weights live under the
+# machine-local PERCEPTION_MODELS_DIR.
+VLM_RECOGNIZER_MODEL = ""
+
 # Whether to load Depth Pro at service startup. Depth Pro on CPU is slow
 # (~1-3 s per call). Disable to skip scene depth while testing VLM reasoning
 # alone; segment/reason/decide endpoints return without depth fields.

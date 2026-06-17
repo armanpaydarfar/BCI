@@ -261,6 +261,33 @@ def _filter_overlay_dets(dets, top_k=_OVERLAY_TOP_K,
     return [d for d, dropped in zip(dets, drop) if not dropped]
 
 
+def _gaze_hit_recognize(dets, gaze_xy):
+    """Pick the detection under the gaze point for the F5 recognizer: the
+    smallest box containing the gaze (most specific object), else the nearest
+    box centre within a fallback radius, else None.
+    """
+    if not dets:
+        return None
+    gx, gy = gaze_xy
+    containing = []
+    for d in dets:
+        x1, y1, x2, y2 = d.box_xyxy
+        if x1 <= gx <= x2 and y1 <= gy <= y2:
+            area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+            containing.append((area, d))
+    if containing:
+        return min(containing, key=lambda t: t[0])[1]
+    best = None
+    best_dist = 80.0  # px fallback radius from the gaze point to a box centre
+    for d in dets:
+        cx, cy = d.box_center
+        dist = ((cx - gx) ** 2 + (cy - gy) ** 2) ** 0.5
+        if dist < best_dist:
+            best_dist = dist
+            best = d
+    return best
+
+
 class SnapshotCache:
     """
     Bounded TTL cache of captured frame+gaze+detections+waypoints snapshots.
@@ -391,6 +418,15 @@ def parse_args():
                      help="F3: temporal tracking/smoothing of the seg-stream "
                           "(SORT, IoU + min_hits/max_age hysteresis; stable "
                           "track_id). Off by default (stateless overlay).")
+    # F5: optional fast COCO recognizer. Empty (default) = the `recognize`
+    # command returns recognizer_disabled and no extra model is loaded. A
+    # filename resolves under PERCEPTION_MODELS_DIR (like --seg-model); the
+    # name must NOT contain "fastsam" so ObjectDetector loads it as a
+    # COCO-labelled YOLO model rather than class-agnostic FastSAM.
+    seg.add_argument("--recognizer-model", default=_cfg_default("VLM_RECOGNIZER_MODEL", ""),
+                     help="F5: YOLO weights for fast COCO recognition of the "
+                          "gaze object (filename within PERCEPTION_MODELS_DIR "
+                          "or absolute path). Empty = recognizer disabled.")
 
     # Default "auto" resolves to cuda if torch.cuda.is_available(), else cpu
     # (see main()). Hosts without a usable GPU degrade gracefully to CPU,
@@ -503,7 +539,8 @@ def _disable_udp_connreset(sock) -> None:
 
 
 class VLMService:
-    def __init__(self, args, *, reader, detector, depth_estimator, reasoner, fix_det, fixation_state_cls):
+    def __init__(self, args, *, reader, detector, depth_estimator, reasoner, fix_det, fixation_state_cls,
+                 recognizer=None):
         self.args = args
         self.reader = reader
         self.detector = detector
@@ -511,6 +548,11 @@ class VLMService:
         self.reasoner = reasoner
         self.fix_det = fix_det
         self._FixationState = fixation_state_cls
+        # WS4 F5: optional fast COCO recognizer (a YOLO ObjectDetector). None
+        # unless --recognizer-model / VLM_RECOGNIZER_MODEL is set; the recognize
+        # command returns recognizer_disabled in that case. Names the gaze
+        # object without a Gemini round-trip.
+        self.recognizer = recognizer
 
         # WS4 F1/E2: optional segmentation constraints + configurable overlay
         # reduction knobs, resolved from CLI/config. getattr fallbacks keep the
@@ -748,6 +790,7 @@ class VLMService:
             "snapshot": lambda: self._cmd_snapshot(),
             "segment": lambda: self._cmd_segment(req),
             "segment_stream": lambda: self._cmd_segment_stream(req),
+            "recognize": lambda: self._cmd_recognize(req),
             "depth": lambda: self._cmd_depth(req),
             "reason": lambda: self._cmd_reason(req),
             "decide": lambda: self._cmd_decide(req),
@@ -842,6 +885,55 @@ class VLMService:
 
         self._cache_dets(dets)
         return {"ok": True, "detections": out, "elapsed_s": elapsed, "n": len(out)}
+
+    def _cmd_recognize(self, req: dict) -> dict:
+        """F5: fast COCO-class naming of the gaze object — no Gemini round-trip.
+
+        Runs the optional YOLO recognizer on the latest frame, hit-tests the
+        gaze point against the detected boxes, and returns the class name of the
+        object being looked at (plus the full detection list). A lightweight
+        confirmation step the operator can fire before paying the high-latency
+        VLM `decide`. Returns ``recognizer_disabled`` when the service was
+        started without --recognizer-model.
+        """
+        if self.recognizer is None:
+            return {"ok": False, "error": "recognizer_disabled"}
+        bundle, _, _ = self._latest()
+        if bundle is None:
+            return {"ok": False, "error": "no_frame"}
+
+        gaze_xy = (float(bundle.gaze.x), float(bundle.gaze.y))
+        t0 = time.time()
+        dets = self.recognizer.detect(bundle.video.bgr)
+        elapsed = time.time() - t0
+
+        out = [
+            {
+                "label": d.label,
+                "confidence": float(d.confidence),
+                "box_xyxy": [float(v) for v in d.box_xyxy],
+                "box_center": [float(v) for v in d.box_center],
+            }
+            for d in dets
+        ]
+        hit = _gaze_hit_recognize(dets, gaze_xy)
+        hit_payload = None
+        if hit is not None:
+            hit_payload = {
+                "label": hit.label,
+                "confidence": float(hit.confidence),
+                "box_xyxy": [float(v) for v in hit.box_xyxy],
+            }
+        _log(f"recognize OUT: hit={(hit_payload or {}).get('label')!r} "
+             f"dets={len(dets)} elapsed={elapsed * 1000:.0f}ms")
+        return {
+            "ok": True,
+            "label": (hit_payload or {}).get("label"),
+            "hit": hit_payload,
+            "detections": out,
+            "n": len(out),
+            "elapsed_s": elapsed,
+        }
 
     def _cmd_segment_stream(self, req: dict) -> dict:
         enabled = bool(req.get("enabled", False))
@@ -1838,6 +1930,8 @@ def main() -> None:
         args.seg_model = os.path.join(models_dir, args.seg_model)
     if args.enable_depth and not os.path.isabs(args.depth_checkpoint):
         args.depth_checkpoint = os.path.join(models_dir, args.depth_checkpoint)
+    if args.recognizer_model and not os.path.isabs(args.recognizer_model):
+        args.recognizer_model = os.path.join(models_dir, args.recognizer_model)
 
     # Resolve --device=auto before any model loading. Gated on
     # torch.cuda.is_available() so the same default works on GPU hosts (cuda)
@@ -1893,6 +1987,17 @@ def main() -> None:
         conf_threshold=args.seg_conf_threshold,
     )
 
+    # WS4 F5: optional fast COCO recognizer (a second, YOLO-backed
+    # ObjectDetector). Only loaded when --recognizer-model is set; otherwise the
+    # recognize command reports recognizer_disabled and nothing extra is loaded.
+    recognizer = None
+    if args.recognizer_model:
+        _log(f"loading fast recognizer: {args.recognizer_model} on {args.device}…")
+        recognizer = ObjectDetector(
+            model_size=args.recognizer_model, device=args.device,
+            conf_threshold=args.seg_conf_threshold,
+        )
+
     depth_estimator = None
     if args.enable_depth:
         from perception.depth_estimator import DepthEstimator
@@ -1929,6 +2034,7 @@ def main() -> None:
         reasoner=reasoner,
         fix_det=fix_det,
         fixation_state_cls=FixationState,
+        recognizer=recognizer,
     )
     service.start_frame_thread()
     # Always run the JSON push loop. Subscribers self-register; if none ever
