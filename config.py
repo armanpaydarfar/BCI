@@ -304,6 +304,13 @@ SEG_SOLIDITY_MIN = None
 SEG_DEPTH_BAND = None
 SEG_GAZE_ROI = None
 
+# F3 temporal tracking/smoothing of the seg-stream (SORT: IoU association +
+# min_hits-to-appear / max_age-to-disappear hysteresis, stable track_id).
+# False = today's stateless per-frame overlay. When True, present objects keep
+# their masks (tagged with a stable id) and confirmed-but-coasting tracks
+# persist briefly as boxes, removing borderline-segment flicker.
+SEG_TRACK = False
+
 # Whether to load Depth Pro at service startup. Depth Pro on CPU is slow
 # (~1-3 s per call). Disable to skip scene depth while testing VLM reasoning
 # alone; segment/reason/decide endpoints return without depth fields.

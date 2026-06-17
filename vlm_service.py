@@ -386,6 +386,11 @@ def parse_args():
                      help="F1: keep only dets whose bbox centre is within "
                           "FRAC*frame (half-extent) of the current gaze. "
                           "Unset = off.")
+    seg.add_argument("--seg-track", action=argparse.BooleanOptionalAction,
+                     default=bool(_cfg_default("SEG_TRACK", False)),
+                     help="F3: temporal tracking/smoothing of the seg-stream "
+                          "(SORT, IoU + min_hits/max_age hysteresis; stable "
+                          "track_id). Off by default (stateless overlay).")
 
     # Default "auto" resolves to cuda if torch.cuda.is_available(), else cpu
     # (see main()). Hosts without a usable GPU degrade gracefully to CPU,
@@ -512,6 +517,7 @@ class VLMService:
         # stub-args test path (and any minimal Namespace) on today's behaviour:
         # constraints inactive, overlay knobs at the module defaults.
         self._seg_constraints = SegConstraints.from_args(args)
+        self._seg_track = bool(getattr(args, "seg_track", False))
         self._overlay_top_k = int(getattr(args, "overlay_top_k", _OVERLAY_TOP_K))
         self._overlay_contain_ratio = float(
             getattr(args, "overlay_contain_ratio", _OVERLAY_CONTAIN_RATIO))
@@ -881,6 +887,15 @@ class VLMService:
         next_run = time.perf_counter()
         last_hz = self._seg_stream_hz
         period = 1.0 / max(last_hz, 1e-6)
+        # WS4 F3: optional temporal tracker. Fresh per stream session so a
+        # restart doesn't inherit stale tracks. Read-only import of the Tier-1
+        # gaze tracker (pure numpy, no I/O — do NOT modify it). None when the
+        # --seg-track gate is off, in which case the stateless path below is
+        # unchanged.
+        tracker = None
+        if self._seg_track:
+            from Utils.gaze.gaze_tracking import SimpleSORTTracker
+            tracker = SimpleSORTTracker()
         # Stats accumulators for the current window. Reset after each
         # periodic emit so each line summarises fresh activity.
         win_start = time.perf_counter()
@@ -927,6 +942,11 @@ class VLMService:
                         contain_ratio=self._overlay_contain_ratio,
                         area_ratio=self._overlay_area_ratio,
                     )
+                    # F3: temporal tracking/smoothing (opt-in). Replaces the
+                    # raw stateless set with confirmed tracks (min_hits to
+                    # appear, max_age to disappear) carrying stable track_ids.
+                    if tracker is not None:
+                        dets = self._apply_seg_tracking(dets, tracker, time.monotonic())
                     self._cache_dets(dets)
                     win_ticks += 1
                     win_dets += len(dets)
@@ -978,6 +998,77 @@ class VLMService:
             # Mark the loop dead so a stale snapshot doesn't make the panel
             # claim the stream is still healthy after a stop.
             self._seg_stream_stats["active"] = False
+
+    def _apply_seg_tracking(self, dets, tracker, t_now: float):
+        """F3: run the SORT tracker over this tick's detections and return the
+        confirmed-track view.
+
+        FastSAM labels (``segment_N``) are index-based and **not** stable across
+        frames, so feeding them as the tracker's class would break IoU
+        association (SimpleSORTTracker only matches within the same class). We
+        sidestep that *without editing the Tier-1 tracker* by giving every
+        detection the same class (0) — the class-consistency check then always
+        passes and association is pure IoU/geometry. The track_id becomes the
+        stable identity.
+
+        Output preserves masks for objects present this frame (matched to a
+        confirmed track by IoU) and emits box-only detections for confirmed
+        tracks that are *coasting* (no detection this frame but still within
+        max_age) — that pairing is what turns frame-to-frame flicker into
+        min_hits-to-appear / max_age-to-disappear behaviour. Every returned
+        Detection carries a ``track_id`` attribute and a ``#<id>`` label.
+        """
+        from perception.object_detector import Detection
+        from Utils.gaze.gaze_tracking import iou_xyxy
+
+        tracker.predict(t_now)
+        tracker.update_with_dets(
+            [{"xyxy": tuple(d.box_xyxy), "cls": 0, "conf": float(d.confidence),
+              "name": str(d.label)} for d in dets],
+            t_now=t_now,
+        )
+        tracks = tracker.get_tracks_as_dets(t_now)  # confirmed, unexpired
+
+        # Greedy 1:1 match each confirmed track to the best-IoU current det.
+        det_for_track: dict = {}
+        claimed: set = set()
+        for tr in tracks:
+            best_d = None
+            best_iou = 0.10  # floor: below this it isn't really the same object
+            for k, d in enumerate(dets):
+                if k in claimed:
+                    continue
+                score = iou_xyxy(tr["xyxy"], tuple(d.box_xyxy))
+                if score >= best_iou:
+                    best_iou = score
+                    best_d = (k, d)
+            if best_d is not None:
+                claimed.add(best_d[0])
+                det_for_track[tr["track_id"]] = best_d[1]
+
+        out = []
+        for tr in tracks:
+            tid = tr["track_id"]
+            d = det_for_track.get(tid)
+            if d is not None:
+                # Present this frame — keep its mask, tag with the stable id.
+                d.track_id = tid
+                d.label = f"#{tid}"
+                out.append(d)
+            else:
+                # Coasting (Kalman-predicted, no det this frame): emit a
+                # box-only detection so it persists through max_age.
+                x1, y1, x2, y2 = tr["xyxy"]
+                cd = Detection(
+                    label=f"#{tid}",
+                    confidence=float(tr.get("conf", 0.0)),
+                    box_xyxy=(float(x1), float(y1), float(x2), float(y2)),
+                    box_center=((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+                    mask_polygon=None,
+                )
+                cd.track_id = tid
+                out.append(cd)
+        return out
 
     def _cmd_depth(self, req: dict) -> dict:
         at_gaze = bool(req.get("at_gaze", True))
@@ -1667,6 +1758,11 @@ def _serialize_detection_for_push(d) -> dict:
             out["mask_polygon"] = poly.reshape(-1, 2).astype(int).tolist()
         except Exception:
             pass
+    # WS4 F3: stable tracker identity, present only when --seg-track is on
+    # (the stateless path's Detections have no track_id attribute).
+    tid = getattr(d, "track_id", None)
+    if tid is not None:
+        out["track_id"] = int(tid)
     return out
 
 
