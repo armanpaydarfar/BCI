@@ -199,6 +199,18 @@ def parse_args():
                    default=int(_cfg_default("VLM_MAX_OUTPUT_TOKENS", 8192)),
                    help="Cap for the VLM JSON response in tokens. Override "
                         "with VLM_MAX_OUTPUT_TOKENS in config. Default 8192.")
+    # Gemini "thinking" budget. None (the default) passes no thinking_config,
+    # preserving Gemini's own high default budget — i.e. today's behaviour.
+    # 0 disables thinking for the lowest latency (collaborator measured the VLM
+    # round-trip dropping from ~8 s to <2 s on gemini-2.5-flash). type=int only
+    # coerces a supplied value; an unset flag keeps the None sentinel that
+    # IntentReasoner reads as "emit no ThinkingConfig". Honoured only by the
+    # Gemini backend. Override with VLM_THINKING_BUDGET in config.
+    p.add_argument("--vlm-thinking-budget", type=int, dest="vlm_thinking_budget",
+                   default=_cfg_default("VLM_THINKING_BUDGET", None),
+                   help="Gemini thinking budget in tokens. 0 = disable thinking "
+                        "for lowest latency; unset = Gemini default (current "
+                        "behaviour). Override with VLM_THINKING_BUDGET in config.")
     p.add_argument("--seg-model", default="FastSAM-s.pt",
                    help="Segmentation weights: filename within PERCEPTION_MODELS_DIR, or an absolute path")
     # Default "auto" resolves to cuda if torch.cuda.is_available(), else cpu
@@ -1589,6 +1601,7 @@ def main() -> None:
         api_key=api_key,
         model=args.model,
         max_tokens=args.max_output_tokens,
+        thinking_budget=args.vlm_thinking_budget,
     )
     fix_det = FixationDetector()
 

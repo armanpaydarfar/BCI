@@ -269,6 +269,16 @@ GOOGLE_API_KEY = ""
 # "gemini-2.5-pro" requires a paid Google AI account.
 VLM_MODEL = "gemini-2.5-flash"
 
+# Gemini "thinking" budget (tokens) for the VLM reasoner. Gemini 2.5 models
+# spend thinking tokens before answering; the default budget is high and is the
+# dominant latency cost on a `decide`. Set 0 to disable thinking for the lowest
+# latency (collaborator measured ~8 s → <2 s on gemini-2.5-flash with budget 0).
+# None (the default) passes no thinking_config, preserving Gemini's own default
+# — i.e. today's behaviour. Machine-neutral: safe to commit. Override with
+# --vlm-thinking-budget on the service. (perception.intent_reasoner honours it
+# only for the Gemini backend.)
+VLM_THINKING_BUDGET = None
+
 # Whether to load Depth Pro at service startup. Depth Pro on CPU is slow
 # (~1-3 s per call). Disable to skip scene depth while testing VLM reasoning
 # alone; segment/reason/decide endpoints return without depth fields.
