@@ -1,16 +1,15 @@
 """
-test_vlm_thinking_budget.py — guard WS4 F4's keep-working invariant.
+test_vlm_thinking_budget.py — guard WS4 F4's --vlm-thinking-budget plumbing.
 
 F4 added the `--vlm-thinking-budget` flag + `VLM_THINKING_BUDGET` config key to
-vlm_service.py and passes the value through to IntentReasoner. The non-negotiable
-constraint is that the default preserves today's behaviour: when neither the flag
-nor the config key is set, the reasoner must receive `thinking_budget=None`, which
-IntentReasoner reads as "emit no ThinkingConfig" (i.e. Gemini's own default
-budget). A supplied value (including 0, which disables thinking for low latency)
-must be coerced to int and pass through unchanged.
+vlm_service.py and passes the value through to IntentReasoner. After the
+on-hardware latency benchmark (2026-06-17), the committed default was flipped to
+**0** (thinking disabled — ~2.9× faster decide). The contract these tests pin:
+the default resolves to the committed config value (0), an explicit `0` is
+honoured, and a positive int is coerced and passes through unchanged so thinking
+can still be re-enabled per-run / per-machine.
 
-Hardware-free: only exercises argparse and IntentReasoner.__init__'s pure-Python
-budget bookkeeping (no Gemini client, no network).
+Hardware-free: only exercises argparse (no Gemini client, no network).
 """
 
 from __future__ import annotations
@@ -33,9 +32,11 @@ def _parse(argv):
         sys.argv = saved
 
 
-def test_default_preserves_current_behaviour():
-    # No flag → None sentinel → IntentReasoner emits no ThinkingConfig.
-    assert _parse([]).vlm_thinking_budget is None
+def test_default_is_committed_config_value():
+    # No flag → the committed config default (VLM_THINKING_BUDGET = 0, the
+    # benchmark-chosen fast path). _cfg_default reads it from config.py.
+    import config
+    assert _parse([]).vlm_thinking_budget == config.VLM_THINKING_BUDGET == 0
 
 
 def test_zero_disables_thinking():
@@ -43,6 +44,8 @@ def test_zero_disables_thinking():
 
 
 def test_explicit_budget_passes_through_as_int():
+    # A positive int re-enables (caps) thinking — the escape hatch from the
+    # disabled-by-default fast path. type=int coerces the supplied value.
     a = _parse(["--vlm-thinking-budget", "2048"])
     assert a.vlm_thinking_budget == 2048
     assert isinstance(a.vlm_thinking_budget, int)

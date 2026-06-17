@@ -270,14 +270,17 @@ GOOGLE_API_KEY = ""
 VLM_MODEL = "gemini-2.5-flash"
 
 # Gemini "thinking" budget (tokens) for the VLM reasoner. Gemini 2.5 models
-# spend thinking tokens before answering; the default budget is high and is the
-# dominant latency cost on a `decide`. Set 0 to disable thinking for the lowest
-# latency (collaborator measured ~8 s → <2 s on gemini-2.5-flash with budget 0).
-# None (the default) passes no thinking_config, preserving Gemini's own default
-# — i.e. today's behaviour. Machine-neutral: safe to commit. Override with
-# --vlm-thinking-budget on the service. (perception.intent_reasoner honours it
-# only for the Gemini backend.)
-VLM_THINKING_BUDGET = None
+# spend thinking tokens before answering, and that is the dominant latency cost
+# on a `decide`. Default 0 = thinking disabled for the lowest latency: an
+# on-hardware benchmark (2026-06-17, gemini-2.5-flash, max_tokens=8192) measured
+# the `reason` round-trip at median 1.83 s with budget 0 vs 5.29 s unset
+# (~2.9× faster, ~3.5 s saved/decide) with no answer-quality regression on the
+# test scene; the collaborator independently reports ~8 s → <2 s. Set None to
+# pass no thinking_config (Gemini's own high default budget — the pre-2026-06-17
+# behaviour); set a positive int to cap thinking without disabling it.
+# Machine-neutral: safe to commit. Override with --vlm-thinking-budget on the
+# service. (perception.intent_reasoner honours it only for the Gemini backend.)
+VLM_THINKING_BUDGET = 0
 
 # Segmentation tuning (WS4 F1 + E1/E2). Machine-neutral — safe to commit.
 # These mirror vlm_service.py's --seg-* / --overlay-* flags; values here are the

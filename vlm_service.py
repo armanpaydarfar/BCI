@@ -352,18 +352,17 @@ def parse_args():
                    default=int(_cfg_default("VLM_MAX_OUTPUT_TOKENS", 8192)),
                    help="Cap for the VLM JSON response in tokens. Override "
                         "with VLM_MAX_OUTPUT_TOKENS in config. Default 8192.")
-    # Gemini "thinking" budget. None (the default) passes no thinking_config,
-    # preserving Gemini's own high default budget — i.e. today's behaviour.
-    # 0 disables thinking for the lowest latency (collaborator measured the VLM
-    # round-trip dropping from ~8 s to <2 s on gemini-2.5-flash). type=int only
-    # coerces a supplied value; an unset flag keeps the None sentinel that
-    # IntentReasoner reads as "emit no ThinkingConfig". Honoured only by the
-    # Gemini backend. Override with VLM_THINKING_BUDGET in config.
+    # Gemini "thinking" budget. The committed default is 0 (thinking disabled)
+    # — benchmark-chosen for ~2.9× lower decide latency (see config.py
+    # VLM_THINKING_BUDGET). A None value passes no thinking_config (Gemini's own
+    # high default budget, the pre-2026-06-17 behaviour); a positive int caps
+    # thinking without disabling it. type=int only coerces a supplied value, so
+    # a config default of None survives. Honoured only by the Gemini backend.
     p.add_argument("--vlm-thinking-budget", type=int, dest="vlm_thinking_budget",
-                   default=_cfg_default("VLM_THINKING_BUDGET", None),
-                   help="Gemini thinking budget in tokens. 0 = disable thinking "
-                        "for lowest latency; unset = Gemini default (current "
-                        "behaviour). Override with VLM_THINKING_BUDGET in config.")
+                   default=_cfg_default("VLM_THINKING_BUDGET", 0),
+                   help="Gemini thinking budget in tokens. 0 (default) = disable "
+                        "thinking for lowest latency; a positive int caps it. "
+                        "Override with VLM_THINKING_BUDGET in config.")
     p.add_argument("--seg-model", default="FastSAM-s.pt",
                    help="Segmentation weights: filename within PERCEPTION_MODELS_DIR, or an absolute path")
 
