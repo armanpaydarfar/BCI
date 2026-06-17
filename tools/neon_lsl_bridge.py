@@ -98,8 +98,9 @@ STATS_INTERVAL_S = 5.0
 # fixed column index.
 #
 # Entries are (label, unit, lsl_type, datum_attribute_or_None).
-# datum_attribute_or_None=None for synthetic channels (worn, unix_t,
-# depth_cm) that aren't a direct copy from the gaze datum.
+# datum_attribute_or_None=None marks the two synthetic channels (worn,
+# depth_cm) that the gaze loop fills directly rather than copying from a gaze
+# datum attribute. unix_t IS a direct copy (attr="timestamp_unix_seconds").
 GAZE_CHANNELS = [
     # ----- Original 5 (unchanged for backward compat) -----
     ("gaze_x_px",                 "pixels",  "PositionX", "x"),

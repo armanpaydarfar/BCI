@@ -82,10 +82,11 @@ class JsonPushSubscriber(QThread):
     HEARTBEAT_S = 10.0  # well below vlm_service's 30 s TTL.
 
     # WS4 F2 transport guard. Continuous result streams whose datagrams carry a
-    # monotonic ts_send_ns; an out-of-order (network-reordered) datagram on
-    # these is dropped so it can't overwrite fresher panel state. One-shot
-    # control payloads (e.g. chain_verify) are exempt — they must always be
-    # delivered for the verification handshake.
+    # ts_send_ns stamp (wall-clock time.time_ns() on the GPU host, monotonic
+    # within a session barring a clock step); an out-of-order (network-reordered)
+    # datagram on these is dropped so it can't overwrite fresher panel state.
+    # One-shot control payloads (e.g. chain_verify) are exempt — they must
+    # always be delivered for the verification handshake.
     _STREAM_TYPES = ("vlm_results", "gaze_results")
     # Age (s) past which the stream is reported stale via is_stale(). The panel
     # surfaces this read-only; it does NOT drive the Receive LED state machine
