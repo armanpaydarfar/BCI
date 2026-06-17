@@ -81,6 +81,17 @@ class JsonPushSubscriber(QThread):
 
     HEARTBEAT_S = 10.0  # well below vlm_service's 30 s TTL.
 
+    # WS4 F2 transport guard. Continuous result streams whose datagrams carry a
+    # monotonic ts_send_ns; an out-of-order (network-reordered) datagram on
+    # these is dropped so it can't overwrite fresher panel state. One-shot
+    # control payloads (e.g. chain_verify) are exempt — they must always be
+    # delivered for the verification handshake.
+    _STREAM_TYPES = ("vlm_results", "gaze_results")
+    # Age (s) past which the stream is reported stale via is_stale(). The panel
+    # surfaces this read-only; it does NOT drive the Receive LED state machine
+    # (a transient stall must not permanently degrade a working Connect).
+    STALE_AFTER_S = 2.0
+
     def __init__(self, host: str, port: int, *, hz: float = 20.0,
                  ttl_s: float = 30.0, parent=None) -> None:
         super().__init__(parent)
@@ -93,6 +104,11 @@ class JsonPushSubscriber(QThread):
         self._subscriber_id: Optional[str] = None
         self._last_subscribe_t: float = 0.0
         self._first_payload_seen: bool = False
+        # Transport-guard state (written on the rx thread, read by the panel).
+        self._last_seq_ns: int = 0           # newest ts_send_ns forwarded
+        self._last_stream_t: float = 0.0     # monotonic of last stream payload
+        self._stream_seen: bool = False
+        self._dropped_out_of_order: int = 0
 
     def stop(self) -> None:
         self._running = False
@@ -138,17 +154,30 @@ class JsonPushSubscriber(QThread):
             # Subscribe replies and push payloads share this socket. Only
             # forward push payloads (they carry a `type` field; the
             # subscribe reply has `ok`/`subscriber_id`).
-            if "type" in payload:
-                self.payload_received.emit(payload)
-                # First-payload state transition. Receivers gate the
-                # "real data flowing" indicator on this rather than on
-                # the subscribe handshake (which only proves the
-                # service answered our subscribe — not that it's
-                # producing output).
-                if not self._first_payload_seen:
-                    self._first_payload_seen = True
-                    ptype = str(payload.get("type", "?"))
-                    self.state_changed.emit(f"receiving:{ptype}")
+            if "type" not in payload:
+                continue
+            ptype = str(payload.get("type", "?"))
+            # WS4 F2 ordering guard: drop a result-stream datagram whose
+            # ts_send_ns predates the newest one already forwarded (UDP can
+            # deliver reordered, and a stale datagram overwriting fresher
+            # detections is exactly what makes the overlay look wrong). Exempt
+            # one-shot control payloads (chain_verify) so verification never
+            # loses a datagram to this filter.
+            if ptype in self._STREAM_TYPES:
+                seq = int(payload.get("ts_send_ns", 0) or 0)
+                if not self._accept_seq(seq):
+                    continue
+                self._last_stream_t = time.monotonic()
+                self._stream_seen = True
+            self.payload_received.emit(payload)
+            # First-payload state transition. Receivers gate the
+            # "real data flowing" indicator on this rather than on
+            # the subscribe handshake (which only proves the
+            # service answered our subscribe — not that it's
+            # producing output).
+            if not self._first_payload_seen:
+                self._first_payload_seen = True
+                self.state_changed.emit(f"receiving:{ptype}")
 
         # Best-effort unsubscribe so the service prunes immediately.
         if self._subscriber_id:
@@ -163,6 +192,42 @@ class JsonPushSubscriber(QThread):
         except OSError:
             pass
         self.state_changed.emit("unsubscribed")
+
+    # ── transport guard ────────────────────────────────────────────────────
+
+    def _accept_seq(self, seq: int) -> bool:
+        """Decide whether a result-stream datagram with ts_send_ns ``seq`` is
+        fresh enough to forward. Drops (returns False) when it predates the
+        newest one already forwarded — UDP reordering / a late stale datagram.
+        ``seq == 0`` (no stamp) is always accepted and never advances the
+        watermark, so an unstamped stream degrades to pass-through. Advances the
+        watermark and returns True on accept.
+        """
+        if seq and seq < self._last_seq_ns:
+            self._dropped_out_of_order += 1
+            return False
+        if seq:
+            self._last_seq_ns = seq
+        return True
+
+    # ── transport-guard introspection (read-only, panel-facing) ────────────
+
+    def seconds_since_stream(self) -> float:
+        """Monotonic age (s) of the last in-order result-stream datagram, or
+        ``inf`` before the first one. Used by the panel to show a 'stale' hint
+        without touching the Receive LED state machine."""
+        if not self._stream_seen:
+            return float("inf")
+        return time.monotonic() - self._last_stream_t
+
+    def is_stale(self) -> bool:
+        """True when the result stream has gone quiet for > STALE_AFTER_S after
+        having flowed at least once."""
+        return self._stream_seen and self.seconds_since_stream() > self.STALE_AFTER_S
+
+    def dropped_out_of_order(self) -> int:
+        """Count of result-stream datagrams dropped as reordered/stale."""
+        return self._dropped_out_of_order
 
     # ── helpers ───────────────────────────────────────────────────────────
 

@@ -479,11 +479,21 @@ class VLMSceneWidget(QWidget):
 
         det_payload = self._latest_vlm or {}
         gaze_payload = self._latest_gaze or {}
-        # frame_bgr is already an owned copy from _on_bundle_callback;
-        # tell the renderer to draw in-place to skip a redundant copy.
+        # Render onto a FRESH copy every paint (copy=True). _latest_frame_bgr
+        # is refreshed only when a new bundle arrives, but this timer fires at
+        # PAINT_HZ regardless — so an in-place (copy=False) blend would
+        # re-composite the *same* stored buffer on every stalled tick, and the
+        # mask addWeighted compounds 0.35 → 0.58 → 0.73 → … → opaque. That is
+        # the WS4 F2 "translucent shapes render opaque over Tailscale" bug:
+        # when the frame_relay stalls (network loss/latency) the paint timer
+        # keeps firing on a frozen buffer. Drawing on a fresh copy each tick
+        # leaves the stored buffer pristine, so a stalled frame is re-painted
+        # identically (single-layer alpha) instead of accumulating. Costs one
+        # full-frame copy per paint (~1 ms at 1600×1200), within the render
+        # budget. See ws4-improvement-spec.md §F2.
         canvas = self._renderer.render(
             frame_bgr,
-            copy=False,
+            copy=True,
             gaze_xy=gaze_xy,
             detections=det_payload.get("detections"),
             hit_det_id=(det_payload.get("hit") or {}).get("det_id")
@@ -507,9 +517,17 @@ class VLMSceneWidget(QWidget):
             self._fps_window_t = painted_t
             p50, p95, p99 = self.recent_paint_latency_ms()
             if p50 == p50:  # NaN check
+                # WS4 F2: surface a 'stale' hint when the VLM result stream has
+                # gone quiet (Tailscale loss). Informational only — the overlay
+                # itself is now re-painted correctly on a stalled frame (see the
+                # copy=True note above); this just tells the operator the
+                # detections they're seeing are frozen.
+                stale = ""
+                if self._vlm_subscriber is not None and self._vlm_subscriber.is_stale():
+                    stale = f"  [stream stale {self._vlm_subscriber.seconds_since_stream():.0f}s]"
                 self.lbl_status.setText(
                     f"Render path: json_local — {self._fps:5.1f} fps  "
-                    f"paint p50/p95/p99 = {p50:5.1f}/{p95:5.1f}/{p99:5.1f} ms"
+                    f"paint p50/p95/p99 = {p50:5.1f}/{p95:5.1f}/{p99:5.1f} ms{stale}"
                 )
 
     def _paint_canvas(self, canvas_bgr: np.ndarray) -> None:
