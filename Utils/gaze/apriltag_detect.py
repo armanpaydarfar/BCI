@@ -49,11 +49,26 @@ def camera_params(K: np.ndarray) -> Tuple[float, float, float, float]:
     return float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
 
 
-def detect_tags(detector, bgr: np.ndarray, K: np.ndarray,
-                tag_size_m: float) -> Dict[int, Dict]:
+def rescale_pose_t_mm(pose_t_m, true_size_m: float, ref_size_m: float) -> np.ndarray:
+    """Translation (mm) of a tag of physical edge ``true_size_m`` from a pose the
+    detector computed at ``ref_size_m``. A tag's recovered translation scales
+    **linearly** with its physical edge (the rotation is size-independent), so
+    detecting once at a reference size and rescaling per-tag lets the world and
+    EE tags be DIFFERENT sizes — e.g. a large world tag + a small EE tag."""
+    return np.asarray(pose_t_m, dtype=float).ravel() * (_M_TO_MM * true_size_m / ref_size_m)
+
+
+def detect_tags(detector, bgr: np.ndarray, K: np.ndarray, tag_size_m: float,
+                tag_sizes: Dict[int, float] = None) -> Dict[int, Dict]:
     """Detect tags → ``{tag_id: {T (4×4, mm), margin, hamming, center}}``. Pose
-    translation is metres→mm so it matches robot telemetry / the X column."""
+    translation is metres→mm so it matches robot telemetry / the X column.
+
+    ``tag_size_m`` is the default physical edge (m); ``tag_sizes`` optionally
+    overrides it per tag id (e.g. ``{ee_tag_id: 0.04}`` for a small EE tag while
+    the world tag stays large). Detection runs once at ``tag_size_m`` and each
+    tag's translation is rescaled to its true size (see ``rescale_pose_t_mm``)."""
     import cv2  # lazy: only the camera path needs it
+    sizes = tag_sizes or {}
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     results = detector.detect(
         gray, estimate_tag_pose=True,
@@ -63,8 +78,9 @@ def detect_tags(detector, bgr: np.ndarray, K: np.ndarray,
     for r in results:
         if r.pose_R is None or r.pose_t is None:
             continue
-        T = make_transform(np.asarray(r.pose_R, dtype=float),
-                           np.asarray(r.pose_t, dtype=float).ravel() * _M_TO_MM)
+        true_size = sizes.get(int(r.tag_id), tag_size_m)
+        t_mm = rescale_pose_t_mm(r.pose_t, true_size, tag_size_m)
+        T = make_transform(np.asarray(r.pose_R, dtype=float), t_mm)
         out[int(r.tag_id)] = {
             "T": T,
             "margin": float(r.decision_margin),

@@ -38,7 +38,7 @@ Examples:
     python tools/apriltag_calibrate.py --stage detect --world-tag-id 0 --tag-size 0.06
     python tools/apriltag_calibrate.py --stage gaze   --world-tag-id 0 --tag-size 0.06
     python tools/apriltag_calibrate.py --stage collect --with-robot \\
-        --world-tag-id 0 --ee-tag-id 1 --tag-size 0.06 --t-eetag-ee 0 0 50
+        --world-tag-id 0 --ee-tag-id 1 --tag-size 0.10 --ee-tag-size 0.04 --t-eetag-ee 0 0 50
     python tools/apriltag_calibrate.py --stage solve runs/apriltag_capture_<UTC>.npz
 """
 
@@ -209,6 +209,11 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
     detector = load_detector(args.families)
     K = consumer.camera_matrix
     offset_mm = np.asarray(args.t_eetag_ee, dtype=float)
+    # The EE tag may be smaller than the world tag (it has to fit the EE); pass
+    # its true size so its pose is scaled correctly. --tag-size is the world size.
+    ee_size = args.ee_tag_size or args.tag_size
+    tag_sizes = {args.ee_tag_id: ee_size}
+    _log(f"tag sizes: world {args.tag_size} m, EE {ee_size} m")
     link: Optional[HarmonyLink] = None
     if args.with_robot:
         link = HarmonyLink(args.robot_ip, args.robot_port, args.bind_ip,
@@ -274,7 +279,7 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
             if b is None or b.video is None or b.video.bgr is None:
                 _log("    no frame; relay up? (capture discarded)")
                 continue
-            tags = detect_tags(detector, b.video.bgr, K, args.tag_size)
+            tags = detect_tags(detector, b.video.bgr, K, args.tag_size, tag_sizes=tag_sizes)
             if args.world_tag_id not in tags or args.ee_tag_id not in tags:
                 _log(f"    need both tags; saw {sorted(tags.keys())}. (discarded)")
                 continue
@@ -308,6 +313,7 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
         "world_tag_id": args.world_tag_id,
         "ee_tag_id": args.ee_tag_id,
         "tag_size_m": args.tag_size,
+        "ee_tag_size_m": ee_size,
         "t_eetag_ee_mm": offset_mm.tolist(),
         "with_robot": bool(args.with_robot),
         "units": {"P_world": "mm", "X": "mm", "Q": "rad", "t_eetag_ee": "mm"},
@@ -406,7 +412,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="solve stage: path to an apriltag_capture_*.npz")
     p.add_argument("--families", default="tag36h11")
     p.add_argument("--tag-size", type=float, default=0.06,
-                   help="tag edge length in METRES (default 0.06)")
+                   help="WORLD tag edge length in METRES (default 0.06)")
+    p.add_argument("--ee-tag-size", type=float, default=None,
+                   help="EE tag edge length in METRES if it differs from the "
+                        "world tag (the EE tag is usually smaller; default: --tag-size)")
     p.add_argument("--world-tag-id", type=int, default=None)
     p.add_argument("--ee-tag-id", type=int, default=None)
     p.add_argument("--t-eetag-ee", type=float, nargs=3, default=[0.0, 0.0, 0.0],

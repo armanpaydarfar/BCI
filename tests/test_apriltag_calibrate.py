@@ -19,7 +19,7 @@ import numpy as np  # noqa: E402
 
 import tools.apriltag_calibrate as calib  # noqa: E402
 from Utils.gaze.apriltag_calib import make_transform  # noqa: E402
-from Utils.gaze.apriltag_detect import camera_params  # noqa: E402
+from Utils.gaze.apriltag_detect import camera_params, rescale_pose_t_mm  # noqa: E402
 
 
 def _rot_z(deg):
@@ -80,6 +80,14 @@ def test_solve_missing_file_returns_2():
 def test_camera_params_from_K():
     K = np.array([[1490.0, 0, 800.0], [0, 1480.0, 600.0], [0, 0, 1]])
     assert camera_params(K) == (1490.0, 1480.0, 800.0, 600.0)
+
+
+def test_rescale_pose_t_mm_per_tag_size():
+    # Detected at the world size → mm unchanged; a half-size (EE) tag → half the
+    # translation, so world and EE tags can differ in size.
+    pose_t_m = [0.0, 0.0, 0.5]
+    np.testing.assert_allclose(rescale_pose_t_mm(pose_t_m, 0.06, 0.06), [0, 0, 500.0])
+    np.testing.assert_allclose(rescale_pose_t_mm(pose_t_m, 0.03, 0.06), [0, 0, 250.0])
 
 
 def test_arg_defaults_come_from_config():
