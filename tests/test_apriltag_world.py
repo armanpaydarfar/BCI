@@ -17,9 +17,11 @@ sys.path.insert(0, str(ROOT))
 import numpy as np  # noqa: E402
 
 from Utils.gaze.apriltag_calib import make_transform  # noqa: E402
+from Utils.gaze.apriltag_calib import transform_point  # noqa: E402
 from Utils.gaze.apriltag_world import (  # noqa: E402
     average_pose,
     build_world_map,
+    fit_plane,
     recover_world_pose,
     world_map_from_arrays,
     world_map_to_arrays,
@@ -91,8 +93,58 @@ def test_average_pose_symmetric_pair():
 def test_world_map_arrays_roundtrip():
     _, _, cam_poses = _layout()
     wm = build_world_map(cam_poses)
-    ref, ids, rels = world_map_to_arrays(wm)
-    wm2 = world_map_from_arrays(ref, ids, rels)
+    ref, ids, rels, pp, pn = world_map_to_arrays(wm)
+    wm2 = world_map_from_arrays(ref, ids, rels, pp, pn)
     assert wm2["ref_id"] == wm["ref_id"] and wm2["ids"] == wm["ids"]
     for i in wm["ids"]:
         np.testing.assert_allclose(wm2["rel"][i], wm["rel"][i], atol=1e-12)
+    np.testing.assert_allclose(wm2["plane_point"], wm["plane_point"], atol=1e-12)
+    np.testing.assert_allclose(wm2["plane_normal"], wm["plane_normal"], atol=1e-12)
+
+
+def test_fit_plane_recovers_normal():
+    # Points on z=5 (xy-spread) → unit normal ±z, point on the plane.
+    pts = np.array([[0, 0, 5.0], [10, 0, 5.0], [0, 10, 5.0], [10, 10, 5.0]])
+    c, n = fit_plane(pts)
+    assert abs(abs(n[2]) - 1.0) < 1e-9          # normal is ±z
+    assert abs(c[2] - 5.0) < 1e-9               # centroid on the plane
+
+
+def test_plane_fit_robust_to_tilted_reference():
+    # Tags are TRULY coplanar, but the reference tag (id 0) is DETECTED with a
+    # 15° orientation error. The fitted world plane (from all tag origins) must
+    # recover the TRUE table plane in cam — not the noisy reference's tilted +Z.
+    T_cam_table = make_transform(_rot_x(10.0), [0.0, 0.0, 600.0])   # true table in cam
+    table_T = {0: [0, 0, 0], 1: [400, 0, 0], 2: [0, 300, 0], 3: [400, 300, 0]}  # flat (z=0)
+    cam_poses = {i: T_cam_table @ make_transform(np.eye(3), t) for i, t in table_T.items()}
+    cam_poses[0] = cam_poses[0] @ make_transform(_rot_x(15.0), [0, 0, 0])  # ref mis-detected
+    wm = build_world_map(cam_poses, ref_id=0)
+    T_cam_world = recover_world_pose(cam_poses, wm)
+    normal_cam = T_cam_world[:3, :3] @ wm["plane_normal"]
+    true_normal = T_cam_table[:3, 2]
+    # |cos| ≈ 1 → recovered plane normal is parallel to the true table normal.
+    assert abs(abs(float(normal_cam @ true_normal)) - 1.0) < 1e-6
+
+
+def test_world_frame_is_reference_frame_when_ref_not_at_origin():
+    # Reviewer gap #2: ref tag NOT at the construction origin. recover must return
+    # the REFERENCE tag's camera pose (the world frame == ref frame, by contract).
+    constr_T = {0: make_transform(_rot_z(25.0), [120.0, -40.0, 0.0]),
+                1: make_transform(np.eye(3), [400.0, 0.0, 0.0]),
+                2: make_transform(np.eye(3), [0.0, 300.0, 0.0])}
+    T_cam_constr = make_transform(_rot_x(15.0), [5.0, 5.0, 550.0])
+    cam_poses = {i: T_cam_constr @ constr_T[i] for i in constr_T}
+    wm = build_world_map(cam_poses, ref_id=0)
+    np.testing.assert_allclose(recover_world_pose(cam_poses, wm), cam_poses[0], atol=1e-9)
+
+
+def test_recover_fuses_disagreeing_estimates_stays_rigid():
+    # Reviewer gap #4: perturb one tag's runtime pose so the per-tag estimates
+    # disagree; the fused result must still be a proper rigid transform.
+    _, _, cam_poses = _layout()
+    wm = build_world_map(cam_poses)
+    noisy = dict(cam_poses)
+    noisy[1] = cam_poses[1] @ make_transform(_rot_z(3.0), [4.0, -2.0, 1.0])
+    T = recover_world_pose(noisy, wm)
+    np.testing.assert_allclose(T[:3, :3] @ T[:3, :3].T, np.eye(3), atol=1e-9)  # orthonormal
+    assert abs(np.linalg.det(T[:3, :3]) - 1.0) < 1e-9                          # proper rotation

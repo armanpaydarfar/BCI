@@ -361,7 +361,7 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
     from datetime import datetime, timezone
     stamp = args.utc_stamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_path = out_dir / f"apriltag_capture_{stamp}.npz"
-    wm_ref, wm_ids, wm_rels = world_map_to_arrays(world_map)
+    wm_ref, wm_ids, wm_rels, wm_pp, wm_pn = world_map_to_arrays(world_map)
     meta = {
         "version": 3,
         "scheme": "ee_mounted_tag_free_roam",
@@ -384,6 +384,8 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
         world_map_ref=np.array(wm_ref),
         world_map_ids=wm_ids,
         world_map_rels=wm_rels,
+        world_map_plane_point=wm_pp,
+        world_map_plane_normal=wm_pn,
         meta=np.array(meta, dtype=object),
     )
     _log(f"saved {len(p_world_rows)} captures → {out_path}")
@@ -449,7 +451,8 @@ def stage_solve(args) -> int:
     # Carry the world map through so the control tool recovers the SAME world
     # frame from whichever tags are visible (occlusion-robust).
     extra = {}
-    for k in ("world_map_ref", "world_map_ids", "world_map_rels"):
+    for k in ("world_map_ref", "world_map_ids", "world_map_rels",
+              "world_map_plane_point", "world_map_plane_normal"):
         if k in z.files:
             extra[k] = z[k]
     np.savez_compressed(

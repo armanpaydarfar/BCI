@@ -40,6 +40,17 @@ def average_pose(transforms: List[np.ndarray]) -> np.ndarray:
     return make_transform(R, t)
 
 
+def fit_plane(points: np.ndarray):
+    """Best-fit plane through ≥3 points → ``(centroid, unit_normal)``. The normal
+    is the least-significant right-singular vector of the centred points (its sign
+    is arbitrary, which is fine — ray-plane intersection is sign-invariant)."""
+    P = np.asarray(points, dtype=float)
+    c = P.mean(axis=0)
+    _U, _S, Vt = np.linalg.svd(P - c)
+    n = Vt[-1]
+    return c, n / np.linalg.norm(n)
+
+
 def build_world_map(cam_poses_by_id: Dict[int, np.ndarray],
                     ref_id: Optional[int] = None) -> Dict:
     """Build the rigid tag map from one registration observation.
@@ -50,9 +61,13 @@ def build_world_map(cam_poses_by_id: Dict[int, np.ndarray],
         ref_id: which tag defines the world frame; default = the lowest id present.
 
     Returns:
-        ``{"ref_id": int, "ids": [int...], "rel": {id: T_ref_id}}`` where
-        ``T_ref_id`` is tag ``id``'s pose in the world (reference-tag) frame.
-        ``rel[ref_id]`` is the identity by construction.
+        ``{"ref_id", "ids", "rel": {id: T_ref_id}, "plane_point", "plane_normal"}``.
+        ``T_ref_id`` is tag ``id``'s pose in the world (reference-tag) frame
+        (``rel[ref_id]`` = identity). ``plane_point``/``plane_normal`` are the
+        table plane in the world frame, **fit from all tag origins** when ≥3 tags
+        are present — so the depth plane's orientation is the consensus of all
+        coplanar tags, not one (possibly noisy/tilted) tag's normal. With <3 tags
+        it falls back to the reference tag's own plane (world z=0).
     """
     ids = sorted(int(i) for i in cam_poses_by_id)
     if not ids:
@@ -63,7 +78,12 @@ def build_world_map(cam_poses_by_id: Dict[int, np.ndarray],
     T_cam_ref = np.asarray(cam_poses_by_id[ref], dtype=float)
     T_ref_cam = invert_transform(T_cam_ref)
     rel = {int(i): T_ref_cam @ np.asarray(cam_poses_by_id[i], dtype=float) for i in ids}
-    return {"ref_id": ref, "ids": ids, "rel": rel}
+    if len(ids) >= 3:
+        plane_point, plane_normal = fit_plane(np.array([rel[i][:3, 3] for i in ids]))
+    else:
+        plane_point, plane_normal = np.zeros(3), np.array([0.0, 0.0, 1.0])
+    return {"ref_id": ref, "ids": ids, "rel": rel,
+            "plane_point": plane_point, "plane_normal": plane_normal}
 
 
 def recover_world_pose(tags_in_view: Dict[int, np.ndarray],
@@ -90,15 +110,20 @@ def recover_world_pose(tags_in_view: Dict[int, np.ndarray],
 
 
 def world_map_to_arrays(world_map: Dict):
-    """Flatten a map to npz-friendly arrays: (ref_id, ids[int], rels[N,4,4])."""
+    """Flatten a map to npz-friendly arrays:
+    ``(ref_id, ids[int], rels[N,4,4], plane_point[3], plane_normal[3])``."""
     ids = list(world_map["ids"])
     rels = np.stack([world_map["rel"][int(i)] for i in ids])
-    return int(world_map["ref_id"]), np.asarray(ids, dtype=int), rels
+    return (int(world_map["ref_id"]), np.asarray(ids, dtype=int), rels,
+            np.asarray(world_map["plane_point"], dtype=float),
+            np.asarray(world_map["plane_normal"], dtype=float))
 
 
-def world_map_from_arrays(ref_id, ids, rels) -> Dict:
+def world_map_from_arrays(ref_id, ids, rels, plane_point, plane_normal) -> Dict:
     """Inverse of ``world_map_to_arrays`` (rebuild after np.load)."""
     ids = [int(i) for i in np.asarray(ids).ravel()]
     rels = np.asarray(rels, dtype=float)
     return {"ref_id": int(ref_id), "ids": ids,
-            "rel": {ids[k]: rels[k] for k in range(len(ids))}}
+            "rel": {ids[k]: rels[k] for k in range(len(ids))},
+            "plane_point": np.asarray(plane_point, dtype=float).ravel(),
+            "plane_normal": np.asarray(plane_normal, dtype=float).ravel()}

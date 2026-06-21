@@ -74,7 +74,9 @@ def test_gaze_point_in_base_principal_point():
     K = np.array([[1490.0, 0, 800.0], [0, 1490.0, 600.0], [0, 0, 1]])
     T_cam_world = make_transform(np.eye(3), [0.0, 0.0, 500.0])
     T_base_world = make_transform(np.eye(3), [300.0, -120.0, 50.0])
-    p_base = gaze_point_in_base(800.0, 600.0, K, T_cam_world, T_base_world)
+    # world-frame table plane = z=0 (point origin, normal +z).
+    p_base = gaze_point_in_base(800.0, 600.0, K, T_cam_world, T_base_world,
+                                [0.0, 0.0, 0.0], [0.0, 0.0, 1.0])
     np.testing.assert_allclose(p_base, [300.0, -120.0, 50.0], atol=1e-6)
 
 
@@ -92,11 +94,13 @@ def test_gaze_point_in_base_tilted_offaxis():
     proj = K @ cam_pt
     px, py = proj[0] / proj[2], proj[1] / proj[2]   # the gaze pixel that sees it
     expected = transform_point(T_base_world, p_world_true)
-    got = gaze_point_in_base(px, py, K, T_cam_world, T_base_world)
+    got = gaze_point_in_base(px, py, K, T_cam_world, T_base_world,
+                             [0.0, 0.0, 0.0], [0.0, 0.0, 1.0])
     np.testing.assert_allclose(got, expected, atol=1e-6)
 
 
 def test_gaze_point_in_base_nan_gaze_returns_none():
     K = np.array([[1490.0, 0, 800.0], [0, 1490.0, 600.0], [0, 0, 1]])
     T = make_transform(np.eye(3), [0.0, 0.0, 500.0])
-    assert gaze_point_in_base(float("nan"), 600.0, K, T, T) is None
+    assert gaze_point_in_base(float("nan"), 600.0, K, T, T,
+                              [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]) is None

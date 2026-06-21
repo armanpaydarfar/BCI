@@ -48,7 +48,6 @@ from Utils.gaze.apriltag_calib import (  # noqa: E402
     gaze_ray_cam,
     invert_transform,
     ray_plane_intersection,
-    tag_plane_in_cam,
     transform_point,
 )
 from Utils.gaze.apriltag_detect import RelayConsumer, detect_tags, load_detector  # noqa: E402
@@ -91,14 +90,18 @@ def nearest_pose(X: np.ndarray, p_base: np.ndarray) -> Tuple[int, float]:
 
 
 def gaze_point_in_base(gaze_x: float, gaze_y: float, K: np.ndarray,
-                       T_cam_world: np.ndarray, T_base_world: np.ndarray
-                       ) -> Optional[np.ndarray]:
-    """Full §5 chain for one gaze sample: pixel → ray → world-tag-plane hit →
-    world frame → base frame. Returns P_base (mm) or None if the ray misses."""
+                       T_cam_world: np.ndarray, T_base_world: np.ndarray,
+                       plane_point_world, plane_normal_world) -> Optional[np.ndarray]:
+    """Full §5 chain for one gaze sample: pixel → ray → table-plane hit → world
+    frame → base frame. Returns P_base (mm) or None if the ray misses. The table
+    plane is the world-frame plane fitted across all world tags (robust to any
+    one tag's orientation noise), transformed into the camera frame via the fused
+    ``T_cam_world``."""
     ray = gaze_ray_cam(gaze_x, gaze_y, K)
     if ray is None:
         return None
-    point, normal = tag_plane_in_cam(T_cam_world)
+    point = transform_point(T_cam_world, plane_point_world)        # plane → cam
+    normal = T_cam_world[:3, :3] @ np.asarray(plane_normal_world, dtype=float)
     hit_cam = ray_plane_intersection(np.zeros(3), ray, point, normal)
     if hit_cam is None:
         return None
@@ -133,7 +136,8 @@ def _sample_p_base(consumer: RelayConsumer, detector, K, T_base_world,
         T_cam_world = recover_world_pose(world_view, world_map)
         if T_cam_world is None:
             continue
-        p_base = gaze_point_in_base(b.gaze.x, b.gaze.y, K, T_cam_world, T_base_world)
+        p_base = gaze_point_in_base(b.gaze.x, b.gaze.y, K, T_cam_world, T_base_world,
+                                    world_map["plane_point"], world_map["plane_normal"])
         if p_base is not None:
             pts.append(p_base)
     if not pts:
@@ -178,11 +182,15 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
     # The world map (registered during collect) lets any visible subset of world
     # tags recover the SAME world frame — occlusion-robust. Tag size defaults
     # from meta so the panel button needs only --calib.
-    if not all(k in z.files for k in ("world_map_ref", "world_map_ids", "world_map_rels")):
+    wm_keys = ("world_map_ref", "world_map_ids", "world_map_rels",
+               "world_map_plane_point", "world_map_plane_normal")
+    if not all(k in z.files for k in wm_keys):
         _log(f"{args.calib} has no world map — re-run the calibration (collect "
              "now registers a multi-tag world map)")
         return 2
-    world_map = world_map_from_arrays(z["world_map_ref"], z["world_map_ids"], z["world_map_rels"])
+    world_map = world_map_from_arrays(z["world_map_ref"], z["world_map_ids"],
+                                      z["world_map_rels"], z["world_map_plane_point"],
+                                      z["world_map_plane_normal"])
     meta = z["meta"].item() if "meta" in z.files else {}
     tag_size = (args.tag_size if args.tag_size is not None
                 else float(meta.get("tag_size_m", 0.06)))
