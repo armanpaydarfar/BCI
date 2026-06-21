@@ -175,7 +175,12 @@ class TestDriverHybridFailFast:
         msg = str(excinfo.value)
         # Message must name the NPZ path and the fit-script so the
         # operator knows which file is misconfigured and what to run.
-        assert str(npz) in msg, (
+        # The driver formats the path with !r (ExperimentDriver_Online_
+        # GazeTracking.py:746); on Windows repr doubles the backslashes, so
+        # collapse the escaping before the substring check to stay platform-
+        # neutral.
+        normalized = msg.replace("\\\\", "\\")
+        assert str(npz) in normalized, (
             f"RuntimeError must name the NPZ path; got: {msg!r}")
         assert "fit_vergence_affine.py" in msg, (
             f"RuntimeError must point the operator at the fit script; "
