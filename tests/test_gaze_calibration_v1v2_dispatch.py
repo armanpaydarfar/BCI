@@ -46,7 +46,7 @@ def _load_driver_helpers():
     dependencies.
     """
     src = Path(__file__).resolve().parent.parent / "ExperimentDriver_Online_GazeTracking.py"
-    text = src.read_text()
+    text = src.read_text(encoding="utf-8")
 
     # We exec the whole file inside a guarded ``__name__='not_main'``
     # namespace but skip the top-level setup by giving stubs for

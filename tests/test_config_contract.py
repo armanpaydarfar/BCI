@@ -75,7 +75,7 @@ _SAFE_DEFAULT_VALUES = {
 
 def _parse_config():
     """Return (config_keys, triggers_keys, robot_opcodes_keys, assignments)."""
-    src = CONFIG_PY.read_text()
+    src = CONFIG_PY.read_text(encoding="utf-8")
     tree = ast.parse(src)
 
     config_keys = set()
@@ -157,7 +157,7 @@ _PANEL_KEY_PATTERNS = [
 
 
 def _panel_key_references():
-    src = CONTROL_PANEL_PY.read_text()
+    src = CONTROL_PANEL_PY.read_text(encoding="utf-8")
     refs = set()
     for pat in _PANEL_KEY_PATTERNS:
         refs.update(pat.findall(src))
@@ -203,7 +203,7 @@ def _collect_keyed_references(pattern):
     for path in DRIVER_FILES:
         if not path.is_file():
             continue
-        refs.update(pattern.findall(path.read_text()))
+        refs.update(pattern.findall(path.read_text(encoding="utf-8")))
     return refs
 
 
@@ -244,7 +244,7 @@ def test_local_keys_list_matches_hook():
     hook_path = Path.home() / ".claude" / "hooks" / "config-py-guard.sh"
     if not hook_path.is_file():
         pytest.skip(f"{hook_path} not present on this machine")
-    src = hook_path.read_text()
+    src = hook_path.read_text(encoding="utf-8")
     # The hook embeds its key list as `LOCAL_KEYS = { ... }` inside a python
     # heredoc. Parse it with a forgiving regex rather than re-running bash.
     hook_keys = set(re.findall(r'"([A-Z_][A-Z0-9_]*)"', src))
