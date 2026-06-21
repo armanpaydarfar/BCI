@@ -21,8 +21,11 @@ import pytest  # noqa: E402
 
 from Utils.gaze.apriltag_calib import (  # noqa: E402
     angle_between_deg,
+    average_rotation,
     ee_point_in_world,
+    eetag_to_world_point,
     gaze_ray_cam,
+    geodesic_angle_deg,
     invert_transform,
     make_transform,
     per_point_errors,
@@ -76,15 +79,29 @@ def test_umeyama_recovers_known_rigid_transform():
     assert rms < 1e-9
 
 
-def test_umeyama_returns_proper_rotation_not_reflection():
-    # Near-planar points (a degenerate-ish config) must still yield det(R)=+1.
+def test_umeyama_returns_proper_rotation_on_true_reflection():
+    # A genuine mirror of src (det would be -1 without the sign correction).
+    # This actually exercises the d=-1 branch — verified to drive the correction,
+    # unlike a near-planar config where d stays +1.
     rng = np.random.default_rng(1)
-    src = rng.normal(size=(20, 3))
-    src[:, 2] *= 1e-3  # squash onto a plane
-    R_true = _rot_x(15.0)
-    dst = (R_true @ src.T).T + np.array([5.0, 5.0, 5.0])
+    src = rng.normal(size=(30, 3)) * 50.0
+    dst = src.copy()
+    dst[:, 2] *= -1.0  # reflection across the xy-plane
     T, _ = umeyama_rigid(src, dst)
+    # Must return a PROPER rotation (det=+1), not the reflecting fit.
     assert np.linalg.det(T[:3, :3]) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_umeyama_direction_inverse_roundtrip():
+    # Swapping src/dst must give the inverse transform — pins the src→dst
+    # orientation against a future xd/xs swap.
+    rng = np.random.default_rng(5)
+    src = rng.normal(size=(15, 3)) * 30.0
+    R_true = _rot_z(20.0) @ _rot_x(35.0)
+    dst = (R_true @ src.T).T + np.array([10.0, 20.0, 30.0])
+    T_fwd, _ = umeyama_rigid(src, dst)
+    T_inv, _ = umeyama_rigid(dst, src)
+    np.testing.assert_allclose(T_inv @ T_fwd, np.eye(4), atol=1e-9)
 
 
 def test_umeyama_residual_reports_noise():
@@ -167,6 +184,57 @@ def test_ee_point_in_world_rotates_offset():
     # offset +x (10mm) rotates to +y under a 90° z-rotation.
     p = ee_point_in_world(T, [10.0, 0.0, 0.0])
     np.testing.assert_allclose(p, [0.0, 10.0, 0.0], atol=1e-12)
+
+
+# ── frame-chain compose (the §4.2 collect heart, previously untested) ─────────
+
+
+def test_eetag_to_world_point_is_invariant_to_camera_pose():
+    # Known EE-tag pose in WORLD + a known mount offset → a known EE-in-world
+    # point. Recovering it through TWO different (arbitrary) camera poses must
+    # give the SAME answer — this is the §1 head-pose-cancels guarantee.
+    R_we = _rot_z(40.0) @ _rot_x(15.0)
+    t_we = np.array([300.0, -120.0, 50.0])
+    T_world_eetag = make_transform(R_we, t_we)
+    offset = np.array([0.0, 0.0, 40.0])  # mm, in the eetag frame
+    expected = t_we + R_we @ offset
+
+    for cam_pose in (
+        make_transform(_rot_x(25.0), [10.0, 0.0, 600.0]),
+        make_transform(_rot_z(-70.0) @ _rot_x(80.0), [-200.0, 90.0, 1100.0]),
+    ):
+        # cam sees both tags: T_cam_world and T_cam_eetag share this cam pose.
+        T_cam_world = cam_pose
+        T_cam_eetag = cam_pose @ T_world_eetag
+        p = eetag_to_world_point(T_cam_world, T_cam_eetag, offset)
+        np.testing.assert_allclose(p, expected, atol=1e-9)
+
+
+# ── rotation jitter helpers ──────────────────────────────────────────────────
+
+
+def test_average_rotation_of_symmetric_pair_is_identity():
+    R = average_rotation([_rot_z(12.0), _rot_z(-12.0)])
+    np.testing.assert_allclose(R, np.eye(3), atol=1e-9)
+    assert np.linalg.det(R) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_geodesic_angle_deg():
+    assert geodesic_angle_deg(np.eye(3), _rot_z(30.0)) == pytest.approx(30.0, abs=1e-9)
+    assert geodesic_angle_deg(_rot_x(50.0), _rot_x(50.0)) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_ray_plane_hits_tilted_plane_on_plane_and_ray():
+    # Non-axis-aligned plane (normal tilted), ray down +z. Hit must lie on the
+    # plane and on the ray.
+    normal = _rot_x(20.0) @ np.array([0.0, 0.0, 1.0])
+    plane_pt = np.array([0.0, 0.0, 500.0])
+    direction = np.array([0.1, 0.05, 1.0])
+    hit = ray_plane_intersection([0, 0, 0], direction, plane_pt, normal)
+    assert hit is not None
+    assert abs((hit - plane_pt) @ normal) < 1e-9          # on the plane
+    cross = np.cross(hit, direction)
+    np.testing.assert_allclose(cross, np.zeros(3), atol=1e-9)  # on the ray (through origin)
 
 
 # ── angle helper ─────────────────────────────────────────────────────────────

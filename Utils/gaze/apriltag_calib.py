@@ -166,6 +166,9 @@ def ray_plane_intersection(
         direction: ray direction (need not be unit).
         plane_point: any point on the plane (the world-tag origin in cam frame).
         plane_normal: plane normal (the world-tag +Z axis in cam frame).
+
+    **Runtime-only:** part of the deferred §5 runtime gaze pipeline; not called
+    by the spike stages. Wired in with the V3 mapping after the spike passes.
     """
     origin = np.asarray(origin, dtype=float).ravel()
     direction = np.asarray(direction, dtype=float).ravel()
@@ -183,8 +186,16 @@ def ray_plane_intersection(
 def tag_plane_in_cam(T_cam_tag: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """The tag's own plane expressed in the camera frame: ``(point, normal)``
     where point = the tag origin (T translation) and normal = the tag +Z axis
-    (third column of the rotation). Used to build the table plane for the
-    runtime ray-plane gaze hit (§5.2–5.3)."""
+    (third column of the rotation).
+
+    **Modeling assumption:** this equals the *table* plane only when the world
+    tag lies flat in the table plane with its +Z along the table normal (the
+    REV03 world-bundle mounting assumption, §5.2). It is not a general
+    table-plane fit.
+
+    **Runtime-only:** part of the deferred §5 runtime gaze pipeline; the spike
+    stages (detect/gaze/collect/solve) do not call it. Wired in with the V3
+    mapping after the spike passes (§9)."""
     T_cam_tag = np.asarray(T_cam_tag, dtype=float)
     return T_cam_tag[:3, 3].copy(), T_cam_tag[:3, 2].copy()
 
@@ -198,6 +209,42 @@ def ee_point_in_world(T_world_eetag: np.ndarray, t_eetag_ee: np.ndarray) -> np.n
     if t_eetag_ee.shape != (3,):
         raise ValueError(f"t_eetag_ee must be (3,); got {t_eetag_ee.shape}")
     return T_world_eetag[:3, 3] + T_world_eetag[:3, :3] @ t_eetag_ee
+
+
+def eetag_to_world_point(T_cam_world: np.ndarray, T_cam_eetag: np.ndarray,
+                         t_eetag_ee: np.ndarray) -> np.ndarray:
+    """The §4.2 capture compose as one tested unit: the EE origin in the world
+    frame from the two camera-frame tag poses + the hand-measured mount offset.
+
+    ``p_world = ee_point_in_world( (T_cam_world)⁻¹ · T_cam_eetag , t_eetag_ee )``
+
+    The head pose cancels in the composition (§1) — both tag poses are in the
+    same camera frame, so ``world_T_eetag = world_T_cam · cam_T_eetag``. Kept
+    as a single function so the inversion/compose convention is unit-testable
+    without a Neon or robot (the spike's collect stage just calls this)."""
+    T_world_eetag = invert_transform(T_cam_world) @ np.asarray(T_cam_eetag, dtype=float)
+    return ee_point_in_world(T_world_eetag, t_eetag_ee)
+
+
+def average_rotation(rotations: np.ndarray) -> np.ndarray:
+    """Chordal-L2 mean of a stack of 3×3 rotations via SVD projection of the
+    elementwise mean back onto SO(3) (with the determinant-sign correction).
+    Used as the reference for geodesic rotation-jitter (the proper metric vs
+    per-axis Rodrigues-component std, which suffers axis ambiguity at small
+    angles)."""
+    M = np.mean(np.asarray(rotations, dtype=float), axis=0)
+    U, _S, Vt = np.linalg.svd(M)
+    d = np.sign(np.linalg.det(U) * np.linalg.det(Vt))
+    return U @ np.diag([1.0, 1.0, d]) @ Vt
+
+
+def geodesic_angle_deg(Ra: np.ndarray, Rb: np.ndarray) -> float:
+    """Geodesic (rotation) angle between two 3×3 rotations, degrees:
+    ``arccos((trace(Raᵀ·Rb) − 1) / 2)``. Wraparound- and axis-ambiguity-free,
+    unlike the std of Rodrigues-vector components."""
+    R = np.asarray(Ra, dtype=float).T @ np.asarray(Rb, dtype=float)
+    cos = (np.trace(R) - 1.0) / 2.0
+    return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
 
 
 def angle_between_deg(u: np.ndarray, v: np.ndarray) -> float:

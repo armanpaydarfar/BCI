@@ -25,6 +25,11 @@ Four stages (`--stage`):
     solve    offline. Umeyama rigid fit of T_base_world from a saved npz, with
              leave-one-out cross-validation. No hardware.
 
+Single-tag-first: each anchor is ONE tag id (`--world-tag-id`/`--ee-tag-id`),
+per the §7.2 escalation. The locked production method (§0.1.2) uses tag BUNDLES
+to defeat the planar pose-flip ambiguity (§8); the `detect` stage measures the
+flip rate so a non-zero count tells you to escalate to a bundle.
+
 `pupil-apriltags` is imported lazily; detect/gaze/collect fail fast with a
 `pip install pupil-apriltags` remediation if it is absent (it is intentionally
 not yet in environment.yml — added only once the spike is adopted, §6.4). The
@@ -57,9 +62,10 @@ import numpy as np  # noqa: E402
 
 from Utils.gaze.apriltag_calib import (  # noqa: E402
     angle_between_deg,
-    ee_point_in_world,
+    average_rotation,
+    eetag_to_world_point,
     gaze_ray_cam,
-    invert_transform,
+    geodesic_angle_deg,
     make_transform,
     per_point_errors,
     umeyama_rigid,
@@ -163,6 +169,9 @@ class _RelayConsumer:
         try:
             self._reader.close()
         except Exception:
+            # Best-effort teardown: the reader/socket may already be torn down
+            # by the daemon thread's iterator exit; a failure here is benign on
+            # a Tier-3 bench tool already shutting down.
             pass
 
 
@@ -174,8 +183,14 @@ class RobotTelemetry:
     position (`eeR/eeL.pos_mm`, mm, base frame). It sends **no** motion opcode —
     by construction it cannot command the arm.
 
-    Binds the same control endpoint the recorder uses, so it must not run
-    alongside `harmony_free_arm_calibration.py` (one binder per port)."""
+    Binds the **same control endpoint the recorder uses** (config.UDP_CONTROL_BIND,
+    with SO_REUSEADDR), exactly mirroring `harmony_free_arm_calibration.RobotLink`
+    (:150-153). The robot replies to that fixed well-known port, so the bind must
+    match — an ephemeral source port would never receive the reply. Because only
+    one process may hold this UDP endpoint, running this **alongside the recorder
+    or the online gaze driver fails fast with EADDRINUSE** rather than silently
+    splitting the robot's telemetry — the intended guard (one robot binder per
+    host). Do not run this concurrently with a live realtime session."""
 
     def __init__(self, dial_ip: str, dial_port: int, bind_ip: str,
                  bind_port: int, side: str = "R", timeout_s: float = 0.5):
@@ -183,14 +198,15 @@ class RobotTelemetry:
         self._side = side.upper()
         self._seq = 0
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.bind((bind_ip, int(bind_port)))
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind((bind_ip, int(bind_port)))  # raises EADDRINUSE if a recorder holds it
         self._sock.settimeout(timeout_s)
 
     def query_ee_mm(self) -> Optional[np.ndarray]:
         """Return the active-side EE position (3,) mm, or None on timeout/parse
         failure. ``q;seq`` is a pure telemetry read — no side effects."""
         self._seq += 1
-        self._sock.sendto(f"q;seq={self._seq}".encode("ascii"), self._addr)
+        self._sock.sendto(f"q;seq={self._seq}".encode("utf-8"), self._addr)
         key_ee = "eeR" if self._side == "R" else "eeL"
         deadline = time.time() + 1.0
         while time.time() < deadline:
@@ -204,7 +220,10 @@ class RobotTelemetry:
                 continue
             if isinstance(pkt, dict) and key_ee in pkt \
                     and isinstance(pkt[key_ee], dict) and "pos_mm" in pkt[key_ee]:
-                return np.asarray(pkt[key_ee]["pos_mm"], dtype=float).ravel()[:3]
+                ee = np.asarray(pkt[key_ee]["pos_mm"], dtype=float).ravel()
+                if ee.size < 3:  # mirror the recorder's guard (harmony_free_arm_calibration:219)
+                    continue
+                return ee[:3]
         return None
 
     def close(self) -> None:
@@ -218,18 +237,22 @@ class RobotTelemetry:
 
 
 def stage_detect(args, consumer: _RelayConsumer) -> int:
-    import cv2  # for Rodrigues
     detector = _load_detector(args.families)
     K = consumer.camera_matrix
     tag_id = args.world_tag_id if args.world_tag_id is not None else args.ee_tag_id
     if tag_id is None:
         _log("detect needs --world-tag-id (or --ee-tag-id) to track")
         return 2
-    _log(f"detect: tracking tag {tag_id} for {args.duration:.0f}s "
+    _log(f"detect: SINGLE tag {tag_id} for {args.duration:.0f}s "
          f"(tag-size {args.tag_size} m). Hold the tag static in view.")
+    _log("NOTE: single-tag-first per methodology §7.2 escalation. The locked "
+         "production method (§0.1.2) uses a tag BUNDLE; pose-flip (§8, the "
+         "dominant failure mode) is UNMITIGATED here and is measured below — "
+         "a non-zero flip count means escalate to a bundle.")
 
     translations: List[np.ndarray] = []
-    rvecs: List[np.ndarray] = []
+    rmats: List[np.ndarray] = []
+    zaxes: List[np.ndarray] = []
     margins: List[float] = []
     hammings: List[int] = []
     total = 0
@@ -251,8 +274,8 @@ def stage_detect(args, consumer: _RelayConsumer) -> int:
             seen += 1
             T = tags[tag_id]["T"]
             translations.append(T[:3, 3].copy())
-            rvec, _ = cv2.Rodrigues(T[:3, :3])
-            rvecs.append(rvec.ravel())
+            rmats.append(T[:3, :3].copy())
+            zaxes.append(T[:3, 2].copy())
             margins.append(tags[tag_id]["margin"])
             hammings.append(tags[tag_id]["hamming"])
 
@@ -264,17 +287,28 @@ def stage_detect(args, consumer: _RelayConsumer) -> int:
     if seen >= 2:
         tr = np.vstack(translations)
         jit_mm = np.std(tr, axis=0)
-        rv = np.vstack(rvecs)
-        jit_deg = np.degrees(np.std(rv, axis=0))
+        # Geodesic rotation jitter (std of the per-frame angle to the mean
+        # rotation) — robust to the axis ambiguity / wraparound that makes
+        # per-axis Rodrigues-component std misleading near a static pose.
+        R_mean = average_rotation(rmats)
+        geo = np.array([geodesic_angle_deg(R_mean, R) for R in rmats])
+        rot_jit = float(np.std(geo))
+        # Pose-flip diagnostic (§8): the tag +Z axis should keep a consistent
+        # sign vs its mean direction; a sign reversal is a flip.
+        zmean = np.mean(np.vstack(zaxes), axis=0)
+        nrm = np.linalg.norm(zmean)
+        flips = int(np.sum([float(z @ zmean) < 0.0 for z in zaxes])) if nrm > 0 else 0
         _log(f"translation jitter (std) mm: x={jit_mm[0]:.2f} y={jit_mm[1]:.2f} "
              f"z={jit_mm[2]:.2f}  (norm {np.linalg.norm(jit_mm):.2f})")
-        _log(f"rotation jitter (std) deg:   {np.max(jit_deg):.2f} (max axis)")
+        _log(f"rotation jitter (geodesic std) deg: {rot_jit:.2f}")
+        _log(f"pose flips: {flips}/{seen} (tag +Z sign reversals — want 0)")
         _log(f"decision margin: median={np.median(margins):.1f} "
              f"min={np.min(margins):.1f}   hamming max={max(hammings)}")
-        # Pass/fail vs §7.1 starting thresholds.
-        ok = (rate >= 0.90 and np.linalg.norm(jit_mm) < 5.0 and np.max(jit_deg) < 2.0)
+        # Pass/fail vs §7.1 starting thresholds; any flip → REVIEW (escalate to bundle).
+        ok = (rate >= 0.90 and np.linalg.norm(jit_mm) < 5.0
+              and rot_jit < 2.0 and flips == 0)
         _log(f"VERDICT: {'PASS' if ok else 'REVIEW'} "
-             f"(targets: rate≥90%, |jitter|<5mm, rot<2°)")
+             f"(targets: rate≥90%, |trans jitter|<5mm, rot<2°, flips=0)")
     return 0
 
 
@@ -323,8 +357,10 @@ def stage_gaze(args, consumer: _RelayConsumer) -> int:
     _log(f"samples={arr.size} gaze-to-tag angular error deg: "
          f"median={np.median(arr):.2f} p90={np.percentile(arr, 90):.2f} "
          f"max={arr.max():.2f}")
-    ok = np.median(arr) <= 2.0  # Neon budget ≈1.3–1.8°, allow a little margin
-    _log(f"VERDICT: {'PASS' if ok else 'REVIEW'} (target median ≲1.5°)")
+    # Bar = the Neon gaze budget stated in §7.1 (≈1.3–1.8°); enforce its upper
+    # edge so the printed target and the pass test agree.
+    ok = np.median(arr) <= 1.8
+    _log(f"VERDICT: {'PASS' if ok else 'REVIEW'} (target median ≤1.8°, Neon budget §7.1)")
     return 0
 
 
@@ -347,54 +383,60 @@ def stage_collect(args, consumer: _RelayConsumer) -> int:
     else:
         _log("no --with-robot: P_base will be NaN (camera-side dry run)")
 
-    _log("collect: hand-guide the EE so BOTH tags are in view, fixate, then "
-         "press Enter to capture. Type 'q' + Enter to finish. NO ROBOT MOTION "
-         "is commanded.")
+    _log("collect: SINGLE world/EE tag per anchor (single-tag-first, §7.2; the "
+         "production method uses bundles, §0.1.2). Hand-guide the EE so BOTH "
+         "tags are in view, fixate, then press Enter to capture. Type 'q' + "
+         "Enter to finish. NO ROBOT MOTION is commanded.")
     p_world_rows: List[np.ndarray] = []
     p_base_rows: List[np.ndarray] = []
     tcw_rows: List[np.ndarray] = []
     tce_rows: List[np.ndarray] = []
 
-    while True:
-        cmd = input(f"[{len(p_world_rows)} captured] Enter=capture / q=finish > ").strip().lower()
-        if cmd == "q":
-            break
-        b = consumer.latest()
-        if b is None or b.video is None or b.video.bgr is None:
-            _log("  no frame available; relay up?")
-            continue
-        tags = _detect_tags(detector, b.video.bgr, K, args.tag_size)
-        if args.world_tag_id not in tags or args.ee_tag_id not in tags:
-            have = sorted(tags.keys())
-            _log(f"  need both tags; saw {have}. Reposition so both are visible.")
-            continue
-        T_cam_world = tags[args.world_tag_id]["T"]
-        T_cam_eetag = tags[args.ee_tag_id]["T"]
-        T_world_eetag = invert_transform(T_cam_world) @ T_cam_eetag
-        p_world = ee_point_in_world(T_world_eetag, offset_mm)
-        if robot is not None:
-            p_base = robot.query_ee_mm()
-            if p_base is None:
-                _log("  robot telemetry timed out; skipping this capture")
+    try:
+        while True:
+            cmd = input(f"[{len(p_world_rows)} captured] Enter=capture / q=finish > ").strip().lower()
+            if cmd == "q":
+                break
+            b = consumer.latest()
+            if b is None or b.video is None or b.video.bgr is None:
+                _log("  no frame available; relay up?")
                 continue
-        else:
-            p_base = np.full(3, np.nan)
-        p_world_rows.append(p_world)
-        p_base_rows.append(p_base)
-        tcw_rows.append(T_cam_world)
-        tce_rows.append(T_cam_eetag)
-        _log(f"  captured #{len(p_world_rows)}: "
-             f"P_world={np.round(p_world, 1)} mm  P_base={np.round(p_base, 1)} mm")
+            tags = _detect_tags(detector, b.video.bgr, K, args.tag_size)
+            if args.world_tag_id not in tags or args.ee_tag_id not in tags:
+                have = sorted(tags.keys())
+                _log(f"  need both tags; saw {have}. Reposition so both are visible.")
+                continue
+            T_cam_world = tags[args.world_tag_id]["T"]
+            T_cam_eetag = tags[args.ee_tag_id]["T"]
+            p_world = eetag_to_world_point(T_cam_world, T_cam_eetag, offset_mm)
+            if robot is not None:
+                p_base = robot.query_ee_mm()
+                if p_base is None:
+                    _log("  robot telemetry timed out; skipping this capture")
+                    continue
+            else:
+                p_base = np.full(3, np.nan)
+            p_world_rows.append(p_world)
+            p_base_rows.append(p_base)
+            tcw_rows.append(T_cam_world)
+            tce_rows.append(T_cam_eetag)
+            _log(f"  captured #{len(p_world_rows)}: "
+                 f"P_world={np.round(p_world, 1)} mm  P_base={np.round(p_base, 1)} mm")
+    finally:
+        # Always release the robot socket so a mid-loop error can't leave the
+        # control endpoint bound (it would block the next session / the recorder).
+        if robot is not None:
+            robot.close()
 
-    if robot is not None:
-        robot.close()
     if len(p_world_rows) < 3:
         _log(f"only {len(p_world_rows)} captures (<3) — not saving a solvable npz")
         return 1
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = args.utc_stamp or "unstamped"
+    # Stamp in-process so two captures never silently overwrite one file.
+    from datetime import datetime, timezone
+    stamp = args.utc_stamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_path = out_dir / f"apriltag_spike_{stamp}.npz"
     meta = {
         "version": 3,
@@ -464,7 +506,20 @@ def stage_solve(args) -> int:
              f"max={loo.max():.2f} mm (generalisation estimate)")
 
     ok = rms < 20.0  # §7.1 starting bar ~1–2 cm; refine vs REV01 accuracy
-    _log(f"VERDICT: {'PASS' if ok else 'REVIEW'} (target RMS ≲10–20 mm)")
+    _log(f"VERDICT: {'PASS' if ok else 'REVIEW'} (target RMS ≲10–20 mm; refine vs REV01)")
+
+    # Persist the solved transform so the result survives the terminal — §4.6
+    # lists T_base_world / umeyama_rms_mm as schema fields. Written beside the
+    # input as <stem>_solved.npz (do not overwrite the captures).
+    out_path = npz_path.with_name(npz_path.stem + "_solved.npz")
+    np.savez_compressed(
+        out_path,
+        T_base_world=T_base_world,
+        umeyama_rms_mm=np.array(rms),
+        per_point_errors_mm=errs,
+        n_points=np.array(n),
+    )
+    _log(f"solved transform → {out_path}")
     return 0
 
 
@@ -499,23 +554,25 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--robot-ip", default=None, help="default: config.UDP_ROBOT[IP]")
     p.add_argument("--robot-port", type=int, default=None,
                    help="default: config.UDP_ROBOT[PORT]")
-    p.add_argument("--bind-ip", default="0.0.0.0")
+    p.add_argument("--bind-ip", default=None,
+                   help="default: config.UDP_CONTROL_BIND[IP] (mirrors the recorder)")
     p.add_argument("--bind-port", type=int, default=None,
-                   help="default: config.UDP_ROBOT[PORT]")
+                   help="default: config.UDP_CONTROL_BIND[PORT]")
     p.add_argument("--out-dir", default="runs",
                    help="collect: directory for the saved npz")
     p.add_argument("--utc-stamp", default=None,
-                   help="collect: UTC stamp for the filename (Date.now is "
-                        "unavailable here; pass one for a stable name)")
+                   help="collect: override the auto UTC stamp in the npz filename")
     args = p.parse_args(argv)
 
     import os
     args.relay_host = args.relay_host or getattr(cfg, "FRAME_RELAY_DIAL_HOST", "127.0.0.1")
     args.relay_port = args.relay_port or int(getattr(cfg, "FRAME_RELAY_PORT", 5591))
     robot = getattr(cfg, "UDP_ROBOT", {"IP": "192.168.2.1", "PORT": 8080})
+    bind = getattr(cfg, "UDP_CONTROL_BIND", {"IP": "0.0.0.0", "PORT": 8080})
     args.robot_ip = args.robot_ip or robot["IP"]
     args.robot_port = args.robot_port or int(robot["PORT"])
-    args.bind_port = args.bind_port or int(robot["PORT"])
+    args.bind_ip = args.bind_ip or bind["IP"]
+    args.bind_port = args.bind_port or int(bind["PORT"])
     args.side = (args.side or os.environ.get("HARMONY_ACTIVE_SIDE", "R")).upper()
     return args
 
