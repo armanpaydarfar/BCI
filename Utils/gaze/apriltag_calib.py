@@ -17,9 +17,11 @@ All lengths are in **millimetres** to match robot telemetry (``eeR.pos_mm``)
 and the ``X`` calibration column; tag-detector translations (metres) must be
 scaled to mm before entering these functions. Rotations are dimensionless 3×3.
 
-Detection (``pupil-apriltags``), relay/robot I/O, and the CLI stages live in
-``tools/apriltag_calib_spike.py``; the runtime mapping (``V3`` NN over ``X``)
-lands after the de-risking spike passes (§9). This module is import-safe and
+Detection (``pupil-apriltags``) + the frame relay live in ``apriltag_detect.py``,
+the robot link in ``harmony_link.py``, and the CLI stages in
+``tools/apriltag_calibrate.py`` + ``tools/apriltag_control_test.py``. The
+experiment-driver integration (the ``V3`` NN over ``X``) lands after the
+calibration is validated on hardware (§9). This module is import-safe and
 depends only on numpy.
 """
 
@@ -167,8 +169,8 @@ def ray_plane_intersection(
         plane_point: any point on the plane (the world-tag origin in cam frame).
         plane_normal: plane normal (the world-tag +Z axis in cam frame).
 
-    **Runtime-only:** part of the deferred §5 runtime gaze pipeline; not called
-    by the spike stages. Wired in with the V3 mapping after the spike passes.
+    Used by the control tool's gaze→base chain (§5); the experiment-driver
+    integration with the V3 mapping lands later (§9).
     """
     origin = np.asarray(origin, dtype=float).ravel()
     direction = np.asarray(direction, dtype=float).ravel()
@@ -193,9 +195,8 @@ def tag_plane_in_cam(T_cam_tag: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     REV03 world-bundle mounting assumption, §5.2). It is not a general
     table-plane fit.
 
-    **Runtime-only:** part of the deferred §5 runtime gaze pipeline; the spike
-    stages (detect/gaze/collect/solve) do not call it. Wired in with the V3
-    mapping after the spike passes (§9)."""
+    Used by the control tool's gaze→base chain (§5.2) to build the table plane;
+    the experiment-driver integration with the V3 mapping lands later (§9)."""
     T_cam_tag = np.asarray(T_cam_tag, dtype=float)
     return T_cam_tag[:3, 3].copy(), T_cam_tag[:3, 2].copy()
 
@@ -221,7 +222,7 @@ def eetag_to_world_point(T_cam_world: np.ndarray, T_cam_eetag: np.ndarray,
     The head pose cancels in the composition (§1) — both tag poses are in the
     same camera frame, so ``world_T_eetag = world_T_cam · cam_T_eetag``. Kept
     as a single function so the inversion/compose convention is unit-testable
-    without a Neon or robot (the spike's collect stage just calls this)."""
+    without a Neon or robot (the calibration tool's collect stage just calls this)."""
     T_world_eetag = invert_transform(T_cam_world) @ np.asarray(T_cam_eetag, dtype=float)
     return ee_point_in_world(T_world_eetag, t_eetag_ee)
 

@@ -97,6 +97,9 @@ INIT_SH = os.path.join(ROOT, "initialize_devices.sh")
 # ---- Harmony scripts you want on tab 2 ----
 HARMONY_CALIBRATION_EXEC_PY = os.path.join(ROOT, "harmony_calibration_exec.py")
 HARMONY_ONLINE_CONTROL_PY   = os.path.join(ROOT, "harmony_online_control.py")
+# WS5 AprilTag gaze↔robot calibration + control test (rev03).
+APRILTAG_CALIBRATE_PY       = os.path.join(ROOT, "tools", "apriltag_calibrate.py")
+APRILTAG_CONTROL_TEST_PY    = os.path.join(ROOT, "tools", "apriltag_control_test.py")
 
 # ---- Gaze scripts (same folder as control_panel.py per your note) ----
 GAZE_RUNNER_PY = os.path.join(ROOT, "gaze_runner.py")
@@ -1225,6 +1228,22 @@ class ControlPanel(QMainWindow):
         hbtn_row.addWidget(self.btn_run_harmony_online)
         hbtn_row.addStretch(1)
         hb.addLayout(hbtn_row)
+
+        # WS5 AprilTag calibration + gaze→robot control test (rev03). The
+        # calibration button opens the tool at its detect stage (operator runs
+        # gaze/collect/solve in the same persistent terminal); the control-test
+        # button drives the robot from the selected *_calib.npz.
+        atag_row = QHBoxLayout()
+        self.btn_run_apriltag_calibrate = QPushButton("Run AprilTag calibration")
+        self.btn_run_apriltag_calibrate.setMaximumWidth(220)
+        self.btn_run_apriltag_calibrate.clicked.connect(self.on_run_apriltag_calibrate)
+        self.btn_run_apriltag_control = QPushButton("Run AprilTag control test")
+        self.btn_run_apriltag_control.setMaximumWidth(220)
+        self.btn_run_apriltag_control.clicked.connect(self.on_run_apriltag_control_test)
+        atag_row.addWidget(self.btn_run_apriltag_calibrate)
+        atag_row.addWidget(self.btn_run_apriltag_control)
+        atag_row.addStretch(1)
+        hb.addLayout(atag_row)
         rt.addWidget(harmony_box)
 
         train_box = QGroupBox("Model training (uses config.py DATA_DIR + subject below)")
@@ -3124,6 +3143,30 @@ class ControlPanel(QMainWindow):
         # If your script expects a flag instead (for example --calib_lib), change the line below accordingly.
         self._spawn_external(f'python -u "{HARMONY_ONLINE_CONTROL_PY}" "{calib_lib}"')
         self._append_log("Panel", f"[{self._ts()}] Opened harmony_online_control.py with calibration library:\n  {calib_lib}\n")
+
+    def on_run_apriltag_calibrate(self):
+        if not os.path.exists(APRILTAG_CALIBRATE_PY):
+            QMessageBox.warning(self, "Missing", f"Not found:\n{APRILTAG_CALIBRATE_PY}")
+            return
+        # Open at the detect stage; the persistent terminal lets the operator run
+        # gaze / collect --with-robot / solve with their own tag ids + offset.
+        self._spawn_external(
+            f'python -u "{APRILTAG_CALIBRATE_PY}" --stage detect --world-tag-id 0 --tag-size 0.06')
+        self._append_log("Panel", f"[{self._ts()}] Opened apriltag_calibrate.py (detect stage)\n")
+
+    def on_run_apriltag_control_test(self):
+        if not os.path.exists(APRILTAG_CONTROL_TEST_PY):
+            QMessageBox.warning(self, "Missing", f"Not found:\n{APRILTAG_CONTROL_TEST_PY}")
+            return
+        calib_lib = self._get_selected_calibration_library()
+        if not calib_lib or not os.path.exists(calib_lib):
+            QMessageBox.warning(self, "Calibration Library",
+                                "Select a valid AprilTag calibration (apriltag_*_calib.npz).")
+            return
+        # world-tag-id + tag-size default from the calibration's own meta.
+        self._spawn_external(
+            f'python -u "{APRILTAG_CONTROL_TEST_PY}" --calib "{calib_lib}"')
+        self._append_log("Panel", f"[{self._ts()}] Opened apriltag_control_test.py with calibration:\n  {calib_lib}\n")
 
     # ----- Driver -----
     def on_driver_start(self):
