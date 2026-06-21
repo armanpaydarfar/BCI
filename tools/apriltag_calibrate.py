@@ -29,16 +29,18 @@ Stages (`--stage`):
              leave-one-out cross-validation, and writes a consolidated
              <stem>_calib.npz (X, Q, T_base_world) the control tool consumes.
 
-Single-tag-first: each anchor is ONE tag id (`--world-tag-id`/`--ee-tag-id`).
-The production method uses tag BUNDLES to defeat the planar pose-flip ambiguity;
-the `detect` stage measures the flip rate so a non-zero count says escalate to a
-bundle.
+World tags: `--world-tag-ids` takes one or more (corner) tags. `collect` first
+**registers a rigid world map** over them (all visible once, arm clear), so at
+capture/runtime any visible subset recovers the SAME world frame — robust to the
+exoskeleton arm occluding individual tags, and more accurate (fusion) when
+several are visible. `detect`/`gaze` track the first id for the per-tag jitter /
+pose-flip diagnostic.
 
 Examples:
-    python tools/apriltag_calibrate.py --stage detect --world-tag-id 0 --tag-size 0.06
-    python tools/apriltag_calibrate.py --stage gaze   --world-tag-id 0 --tag-size 0.06
+    python tools/apriltag_calibrate.py --stage detect --world-tag-ids 0 --tag-size 0.10
+    python tools/apriltag_calibrate.py --stage gaze   --world-tag-ids 0 --tag-size 0.10
     python tools/apriltag_calibrate.py --stage collect --with-robot \\
-        --world-tag-id 0 --ee-tag-id 1 --tag-size 0.10 --ee-tag-size 0.04 --t-eetag-ee 0 0 50
+        --world-tag-ids 0 1 2 --ee-tag-id 9 --tag-size 0.10 --ee-tag-size 0.04 --t-eetag-ee 0 0 50
     python tools/apriltag_calibrate.py --stage solve runs/apriltag_capture_<UTC>.npz
 """
 
@@ -70,6 +72,12 @@ from Utils.gaze.apriltag_detect import (  # noqa: E402
     detect_tags,
     load_detector,
 )
+from Utils.gaze.apriltag_world import (  # noqa: E402
+    average_pose,
+    build_world_map,
+    recover_world_pose,
+    world_map_to_arrays,
+)
 from Utils.gaze.harmony_link import HarmonyLink  # noqa: E402
 
 
@@ -83,9 +91,9 @@ def _log(msg: str) -> None:
 def stage_detect(args, consumer: RelayConsumer) -> int:
     detector = load_detector(args.families)
     K = consumer.camera_matrix
-    tag_id = args.world_tag_id if args.world_tag_id is not None else args.ee_tag_id
+    tag_id = (args.world_tag_ids[0] if args.world_tag_ids else args.ee_tag_id)
     if tag_id is None:
-        _log("detect needs --world-tag-id (or --ee-tag-id) to track")
+        _log("detect needs --world-tag-ids (or --ee-tag-id) to track")
         return 2
     _log(f"detect: SINGLE tag {tag_id} for {args.duration:.0f}s "
          f"(tag-size {args.tag_size} m). Hold the tag static in view.")
@@ -155,9 +163,9 @@ def stage_detect(args, consumer: RelayConsumer) -> int:
 def stage_gaze(args, consumer: RelayConsumer) -> int:
     detector = load_detector(args.families)
     K = consumer.camera_matrix
-    tag_id = args.world_tag_id if args.world_tag_id is not None else args.ee_tag_id
+    tag_id = (args.world_tag_ids[0] if args.world_tag_ids else args.ee_tag_id)
     if tag_id is None:
-        _log("gaze needs --world-tag-id (or --ee-tag-id) to fixate")
+        _log("gaze needs --world-tag-ids (or --ee-tag-id) to fixate")
         return 2
     _log(f"gaze: fixate tag {tag_id} steadily for {args.duration:.0f}s.")
 
@@ -202,18 +210,64 @@ def stage_gaze(args, consumer: RelayConsumer) -> int:
 # ── stage: collect (free-arm m/c capture; records X + Q) ─────────────────────
 
 
+def _register_world_map(consumer, detector, K, world_ids, tag_size, tag_sizes,
+                        dur=2.0):
+    """Average each world tag's pose over a short window (all tags visible, arm
+    clear) and build the rigid world map. Returns ``(world_map, sorted_seen_ids)``
+    or ``(None, [])`` if no world tag was detected."""
+    _log(f"world-map registration: keep ALL world tags {world_ids} visible and "
+         f"the arm CLEAR for ~{dur:.0f}s …")
+    obs = {int(i): [] for i in world_ids}
+    last_idx = None
+    deadline = time.time() + dur
+    while time.time() < deadline:
+        b = consumer.latest()
+        if b is None or b.video is None or b.video.bgr is None or b.video.frame_idx == last_idx:
+            time.sleep(0.005)
+            continue
+        last_idx = b.video.frame_idx
+        tags = detect_tags(detector, b.video.bgr, K, tag_size, tag_sizes=tag_sizes)
+        for i in world_ids:
+            if int(i) in tags:
+                obs[int(i)].append(tags[int(i)]["T"])
+    seen = {i: average_pose(v) for i, v in obs.items() if v}
+    if not seen:
+        return None, []
+    return build_world_map(seen), sorted(seen)
+
+
 def stage_collect(args, consumer: RelayConsumer) -> int:
-    if args.world_tag_id is None or args.ee_tag_id is None:
-        _log("collect needs both --world-tag-id and --ee-tag-id")
+    if not args.world_tag_ids or args.ee_tag_id is None:
+        _log("collect needs --world-tag-ids (one or more) and --ee-tag-id")
         return 2
+    world_ids = [int(i) for i in args.world_tag_ids]
     detector = load_detector(args.families)
     K = consumer.camera_matrix
     offset_mm = np.asarray(args.t_eetag_ee, dtype=float)
-    # The EE tag may be smaller than the world tag (it has to fit the EE); pass
+    # The EE tag may be smaller than the world tags (it has to fit the EE); pass
     # its true size so its pose is scaled correctly. --tag-size is the world size.
     ee_size = args.ee_tag_size or args.tag_size
     tag_sizes = {args.ee_tag_id: ee_size}
-    _log(f"tag sizes: world {args.tag_size} m, EE {ee_size} m")
+    _log(f"tag sizes: world {args.tag_size} m, EE {ee_size} m; world tags {world_ids}")
+
+    # Register the multi-tag world map first (occlusion robustness): all world
+    # tags must be seen once, arm clear, so any visible subset later recovers the
+    # same world frame.
+    world_map = None
+    while True:
+        input("place ALL world tags visible + arm CLEAR, Enter to register the world map > ")
+        world_map, seen = _register_world_map(consumer, detector, K, world_ids, args.tag_size, tag_sizes)
+        if world_map is None:
+            _log("  no world tags detected — reposition and retry")
+            continue
+        missing = [i for i in world_ids if i not in seen]
+        if missing:
+            _log(f"  registered {seen}, MISSING {missing} — re-show all world tags "
+                 "(the map needs every tag so any subset works later), then retry")
+            continue
+        _log(f"  world map OK: ref={world_map['ref_id']}, tags={seen}")
+        break
+
     link: Optional[HarmonyLink] = None
     if args.with_robot:
         link = HarmonyLink(args.robot_ip, args.robot_port, args.bind_ip,
@@ -280,16 +334,17 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
                 _log("    no frame; relay up? (capture discarded)")
                 continue
             tags = detect_tags(detector, b.video.bgr, K, args.tag_size, tag_sizes=tag_sizes)
-            if args.world_tag_id not in tags or args.ee_tag_id not in tags:
-                _log(f"    need both tags; saw {sorted(tags.keys())}. (discarded)")
+            world_view = {i: tags[i]["T"] for i in world_ids if i in tags}
+            T_cam_world = recover_world_pose(world_view, world_map)
+            if T_cam_world is None or args.ee_tag_id not in tags:
+                _log(f"    need ≥1 world tag + the EE tag; saw {sorted(tags.keys())}. (discarded)")
                 continue
-            p_world = eetag_to_world_point(
-                tags[args.world_tag_id]["T"], tags[args.ee_tag_id]["T"], offset_mm)
+            p_world = eetag_to_world_point(T_cam_world, tags[args.ee_tag_id]["T"], offset_mm)
 
             p_world_rows.append(p_world)
             x_rows.append(x_ee)
             q_rows.append(q_joints)
-            tcw_rows.append(tags[args.world_tag_id]["T"])
+            tcw_rows.append(T_cam_world)
             tce_rows.append(tags[args.ee_tag_id]["T"])
             _log(f"    captured #{len(p_world_rows)}: P_world={np.round(p_world,1)} "
                  f"X={np.round(x_ee,1)} mm")
@@ -306,11 +361,12 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
     from datetime import datetime, timezone
     stamp = args.utc_stamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_path = out_dir / f"apriltag_capture_{stamp}.npz"
+    wm_ref, wm_ids, wm_rels = world_map_to_arrays(world_map)
     meta = {
         "version": 3,
         "scheme": "ee_mounted_tag_free_roam",
         "side": args.side,
-        "world_tag_id": args.world_tag_id,
+        "world_tag_ids": world_ids,
         "ee_tag_id": args.ee_tag_id,
         "tag_size_m": args.tag_size,
         "ee_tag_size_m": ee_size,
@@ -325,6 +381,9 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
         Q=np.vstack(q_rows),
         T_cam_world=np.stack(tcw_rows),
         T_cam_eetag=np.stack(tce_rows),
+        world_map_ref=np.array(wm_ref),
+        world_map_ids=wm_ids,
+        world_map_rels=wm_rels,
         meta=np.array(meta, dtype=object),
     )
     _log(f"saved {len(p_world_rows)} captures → {out_path}")
@@ -387,16 +446,22 @@ def stage_solve(args) -> int:
                        "source_capture": npz_path.name})
     out_path = npz_path.with_name(npz_path.stem.replace("apriltag_capture", "apriltag")
                                   + "_calib.npz")
+    # Carry the world map through so the control tool recovers the SAME world
+    # frame from whichever tags are visible (occlusion-robust).
+    extra = {}
+    for k in ("world_map_ref", "world_map_ids", "world_map_rels"):
+        if k in z.files:
+            extra[k] = z[k]
     np.savez_compressed(
         out_path,
         X=X, Q=Q, T_base_world=T_base_world,
         per_point_errors_mm=errs,
         meta=np.array(calib_meta, dtype=object),
+        **extra,
     )
     _log(f"calibration → {out_path}")
     _log("drive the robot: "
-         f"python tools/apriltag_control_test.py --calib {out_path} "
-         "--world-tag-id <id> --tag-size <m>")
+         f"python tools/apriltag_control_test.py --calib {out_path}")
     return 0
 
 
@@ -416,7 +481,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--ee-tag-size", type=float, default=None,
                    help="EE tag edge length in METRES if it differs from the "
                         "world tag (the EE tag is usually smaller; default: --tag-size)")
-    p.add_argument("--world-tag-id", type=int, default=None)
+    p.add_argument("--world-tag-ids", type=int, nargs="+", default=[0],
+                   help="one or more world tag ids; collect registers a map over "
+                        "them so any visible subset recovers the world frame "
+                        "(occlusion-robust). detect/gaze use the first.")
     p.add_argument("--ee-tag-id", type=int, default=None)
     p.add_argument("--t-eetag-ee", type=float, nargs=3, default=[0.0, 0.0, 0.0],
                    metavar=("X", "Y", "Z"),

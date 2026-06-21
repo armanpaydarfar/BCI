@@ -52,6 +52,7 @@ from Utils.gaze.apriltag_calib import (  # noqa: E402
     transform_point,
 )
 from Utils.gaze.apriltag_detect import RelayConsumer, detect_tags, load_detector  # noqa: E402
+from Utils.gaze.apriltag_world import recover_world_pose, world_map_from_arrays  # noqa: E402
 from Utils.gaze.calibration_mapping import WORKSPACE_BOUNDS_MARGIN  # noqa: E402
 from Utils.gaze.harmony_link import HarmonyLink  # noqa: E402
 
@@ -109,10 +110,11 @@ def gaze_point_in_base(gaze_x: float, gaze_y: float, K: np.ndarray,
 
 
 def _sample_p_base(consumer: RelayConsumer, detector, K, T_base_world,
-                   world_tag_id: int, tag_size: float, dur_s: float
+                   world_map: dict, tag_size: float, dur_s: float
                    ) -> Optional[np.ndarray]:
     """Average (median) the fixated base-frame point over a short window, using
-    only frames where gaze is valid and the world tag is seen."""
+    only frames where gaze is valid and ≥1 mapped world tag is seen. The world
+    pose is fused from whichever mapped tags are visible (occlusion-robust)."""
     pts: List[np.ndarray] = []
     last_idx = None
     deadline = time.time() + dur_s
@@ -127,10 +129,11 @@ def _sample_p_base(consumer: RelayConsumer, detector, K, T_base_world,
         if not getattr(b, "worn", True):
             continue
         tags = detect_tags(detector, b.video.bgr, K, tag_size)
-        if world_tag_id not in tags:
+        world_view = {i: tags[i]["T"] for i in world_map["ids"] if i in tags}
+        T_cam_world = recover_world_pose(world_view, world_map)
+        if T_cam_world is None:
             continue
-        p_base = gaze_point_in_base(b.gaze.x, b.gaze.y, K,
-                                    tags[world_tag_id]["T"], T_base_world)
+        p_base = gaze_point_in_base(b.gaze.x, b.gaze.y, K, T_cam_world, T_base_world)
         if p_base is not None:
             pts.append(p_base)
     if not pts:
@@ -172,11 +175,15 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
     X = np.asarray(z["X"], dtype=float)
     Q = np.asarray(z["Q"], dtype=float)
     T_base_world = np.asarray(z["T_base_world"], dtype=float)
-    # World-tag id + tag size default from the calibration's own meta, so the
-    # panel button needs only --calib.
+    # The world map (registered during collect) lets any visible subset of world
+    # tags recover the SAME world frame — occlusion-robust. Tag size defaults
+    # from meta so the panel button needs only --calib.
+    if not all(k in z.files for k in ("world_map_ref", "world_map_ids", "world_map_rels")):
+        _log(f"{args.calib} has no world map — re-run the calibration (collect "
+             "now registers a multi-tag world map)")
+        return 2
+    world_map = world_map_from_arrays(z["world_map_ref"], z["world_map_ids"], z["world_map_rels"])
     meta = z["meta"].item() if "meta" in z.files else {}
-    world_tag_id = (args.world_tag_id if args.world_tag_id is not None
-                    else int(meta.get("world_tag_id", 0)))
     tag_size = (args.tag_size if args.tag_size is not None
                 else float(meta.get("tag_size_m", 0.06)))
     q_lo, q_hi = workspace_bounds(Q)
@@ -217,7 +224,7 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
         # default (Enter / 'r'): resolve a fixation
         _log(f"resolving — fixate the target for {args.sample_s:.1f}s …")
         p_base = _sample_p_base(consumer, detector, K, T_base_world,
-                                world_tag_id, tag_size, args.sample_s)
+                                world_map, tag_size, args.sample_s)
         if p_base is None:
             _log("no valid gaze+world-tag samples — keep the world tag in view and fixate")
             pending, far_armed = None, False
@@ -240,10 +247,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     import config as cfg
     p = argparse.ArgumentParser(description="Drive the robot from gaze via an AprilTag calibration")
     p.add_argument("--calib", required=True, help="apriltag_*_calib.npz from the calibration tool")
-    p.add_argument("--world-tag-id", type=int, default=None,
-                   help="default: the world_tag_id stored in the calibration meta")
     p.add_argument("--tag-size", type=float, default=None,
-                   help="tag edge length in METRES (default: from the calibration meta)")
+                   help="world tag edge length in METRES (default: from the calibration meta)")
     p.add_argument("--families", default="tag36h11")
     p.add_argument("--dur", type=float, default=5.0, help="robot move duration (s)")
     p.add_argument("--sample-s", type=float, default=0.6, help="gaze-fixation sampling window (s)")
