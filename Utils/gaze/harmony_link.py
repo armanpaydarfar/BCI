@@ -185,16 +185,25 @@ class HarmonyLink:
         return self.send_and_wait_ack(f"h;dur={float(dur_s):.3f}",
                                       expect_prefix="h") is not None
 
-    def send_joint_command(self, q, dur_s: float) -> bool:
+    def send_joint_command(self, q, dur_s: float) -> str:
         """Command a joint pose: stage the 7-CSV trajectory (await
-        ``ACK:COORDS_STAGED_RAD``), then ``g`` to commit (await ``ACK:g``).
-        The caller MUST have clamped ``q`` to the calibrated workspace first —
-        the robot enforces no bounds. Returns True only if both ACKs arrive."""
+        ``ACK:COORDS_STAGED_RAD``), then ``g`` to commit (await ``ACK:g``). The
+        caller MUST have clamped ``q`` to the calibrated workspace first — the
+        robot enforces no bounds.
+
+        Returns a status so a lost go-ACK is never confused with a no-op:
+          - ``"ok"``            — both ACKs seen; move committed.
+          - ``"stage_failed"``  — coords not staged; the arm did NOT move.
+          - ``"go_unconfirmed"``— staged but no ``ACK:g`` (lost on the return
+            path or the robot is mid-move). The arm MAY be moving; the caller
+            must read back and verify rather than treat this as a clean failure."""
         coords = build_joint_command_str(q, dur_s)
         if self.send_and_wait_ack(coords, expect_prefix="COORDS_STAGED_RAD") is None:
-            return False
+            return "stage_failed"
         time.sleep(STAGE_TO_GO_DELAY_S)
-        return self.send_and_wait_ack("g", expect_prefix="g") is not None
+        if self.send_and_wait_ack("g", expect_prefix="g") is None:
+            return "go_unconfirmed"
+        return "ok"
 
     def close(self) -> None:
         try:

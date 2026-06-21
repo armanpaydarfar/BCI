@@ -141,6 +141,27 @@ def _sample_p_base(consumer: RelayConsumer, detector, K, T_base_world,
 # ── main control loop ─────────────────────────────────────────────────────────
 
 
+def _commit_move(link: HarmonyLink, q_cmd: np.ndarray, idx: int, dur_s: float) -> None:
+    """Command one move and ALWAYS read back the actual pose. ``send_joint_command``
+    distinguishes 'stage_failed' (arm did not move) from 'go_unconfirmed' (coords
+    staged but no ACK:g — the arm MAY be moving), so a lost go-ACK is never
+    reported as a clean failure (the fail-open hazard)."""
+    _log(f"GO → pose #{idx}")
+    status = link.send_joint_command(q_cmd, dur_s)
+    if status == "ok":
+        _log("move: committed (ACK:g)")
+    elif status == "stage_failed":
+        _log("move: NOT sent — coords not staged (no ACK:COORDS_STAGED_RAD); arm did NOT move")
+    else:  # go_unconfirmed
+        _log("move: WARNING — coords staged but no ACK:g; the arm MAY be moving. "
+             "Verify visually before the next command.")
+    st = link.query_state()
+    if st is not None:
+        _log(f"  readback: actual EE = {np.round(st['ee'], 1)} mm")
+    else:
+        _log("  readback: telemetry timed out — verify the arm visually")
+
+
 def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
     z = np.load(args.calib, allow_pickle=True)
     missing = [k for k in ("X", "Q", "T_base_world") if k not in z.files]
@@ -164,10 +185,11 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
     _log(f"calibration: {X.shape[0]} poses, RMS in meta. Workspace clamp from Q±"
          f"{WORKSPACE_BOUNDS_MARGIN:.0%}. Robot dur={args.dur:.1f}s.")
     _log("Per move: fixate a calibrated target, Enter to RESOLVE; review; then "
-         "'g' to GO, 'r' to re-resolve, 'h' to home, 'q' to quit. NO autonomous "
-         "motion.")
+         "'g' to GO ('g' again to confirm a far fixation), 'r' to re-resolve, "
+         "'h' to home, 'q' to quit. NO autonomous motion.")
 
     pending: Optional[Tuple[np.ndarray, int, float, bool]] = None  # (q_cmd, idx, dist, clamped)
+    far_armed = False  # a far fixation needs a SECOND 'g' to commit (review safety)
     while True:
         cmd = input("> ").strip().lower()
         if cmd == "q":
@@ -175,29 +197,21 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
         if cmd == "h":
             ok = link.home(args.dur)
             _log("home: " + ("ACK" if ok else "no ACK"))
-            pending = None
+            pending, far_armed = None, False
             continue
         if cmd == "g":
             if pending is None:
                 _log("nothing resolved yet — press Enter to resolve a fixation first")
                 continue
             q_cmd, idx, dist, clamped = pending
-            if dist > args.max_nn_dist_mm and cmd != "gg":
+            if dist > args.max_nn_dist_mm and not far_armed:
                 _log(f"nearest calibrated pose is {dist:.0f} mm away (> "
                      f"{args.max_nn_dist_mm}); fixation is outside the calibrated "
-                     "region. Type 'gg' to override, or re-resolve.")
+                     "region. Press 'g' AGAIN to override, or 'r' to re-resolve.")
+                far_armed = True
                 continue
-            _log(f"GO → pose #{idx} (clamped={clamped})")
-            ok = link.send_joint_command(q_cmd, args.dur)
-            _log("move: " + ("committed (ACK:g)" if ok else "FAILED (no ACK)"))
-            pending = None
-            continue
-        if cmd == "gg" and pending is not None:
-            q_cmd, idx, dist, clamped = pending
-            _log(f"GO (override) → pose #{idx}")
-            ok = link.send_joint_command(q_cmd, args.dur)
-            _log("move: " + ("committed (ACK:g)" if ok else "FAILED (no ACK)"))
-            pending = None
+            _commit_move(link, q_cmd, idx, args.dur)
+            pending, far_armed = None, False
             continue
 
         # default (Enter / 'r'): resolve a fixation
@@ -206,7 +220,7 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
                                 world_tag_id, tag_size, args.sample_s)
         if p_base is None:
             _log("no valid gaze+world-tag samples — keep the world tag in view and fixate")
-            pending = None
+            pending, far_armed = None, False
             continue
         idx, dist = nearest_pose(X, p_base)
         q_cmd, clamped = clamp_joints(Q[idx], q_lo, q_hi)
@@ -217,8 +231,8 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
         if dist > args.max_nn_dist_mm:
             _log(f"WARNING: {dist:.0f} mm from the nearest calibrated pose "
                  "(outside the calibrated region).")
-        _log("press 'g' to GO (or 'gg' to override a far fixation), 'r' to re-resolve")
-        pending = (q_cmd, idx, dist, clamped)
+        _log("press 'g' to GO, 'r' to re-resolve")
+        pending, far_armed = (q_cmd, idx, dist, clamped), False
     return 0
 
 
@@ -248,7 +262,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     args.relay_host = args.relay_host or getattr(cfg, "FRAME_RELAY_DIAL_HOST", "127.0.0.1")
     args.relay_port = args.relay_port or int(getattr(cfg, "FRAME_RELAY_PORT", 5591))
     robot = getattr(cfg, "UDP_ROBOT", {"IP": "192.168.2.1", "PORT": 8080})
-    bind = getattr(cfg, "UDP_CONTROL_BIND", {"IP": "0.0.0.0", "PORT": 8080})
+    # The robot sends command ACKs to a FIXED control address (192.168.2.2 per
+    # the C++ wire protocol), so the bind must be that address — not a wildcard.
+    bind = getattr(cfg, "UDP_CONTROL_BIND", {"IP": "192.168.2.2", "PORT": 8080})
     args.robot_ip = args.robot_ip or robot["IP"]
     args.robot_port = args.robot_port or int(robot["PORT"])
     args.bind_ip = args.bind_ip or bind["IP"]

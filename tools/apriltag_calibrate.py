@@ -10,8 +10,9 @@ Tier-3 operator tool. Camera frames + gaze + intrinsics come from the existing
 frame relay (`Utils.remote_frame_reader`), so it runs in the `lsl` env. The
 panel's embedded relay (or `python -m Utils.frame_relay`) must be up first — the
 sole Neon subscriber. The `collect` stage commands the free-arm opcodes
-(`m`/`c`, and `h` home) exactly like the existing free-arm recorder; the
-`detect`/`gaze` stages are camera-only; `solve` is offline.
+(`m` free / `c` capture-lock, plus `q` telemetry) exactly like the existing
+free-arm recorder — it sends no trajectory and cannot drive the arm to a pose;
+the `detect`/`gaze` stages are camera-only; `solve` is offline.
 
 Stages (`--stage`):
 
@@ -255,6 +256,17 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
                     _log("    capture failed (no ACK:CAPTURED_LOCKED); retry")
                     continue
                 x_ee, q_joints = cap["ee"], cap["q"]
+                # Torn-read detector (cpp.md §9.1.2): the `c` telemetry is 28
+                # non-atomic reads and can interleave joints sampled ms apart.
+                # The captured Q becomes a commanded pose later, so reject a
+                # capture that disagrees with the next steady-state read.
+                after = link.query_state()
+                if after is not None:
+                    qd = float(np.max(np.abs(q_joints - after["q"])))
+                    if qd > args.settle_eps_rad:
+                        _log(f"    captured pose disagrees with readback "
+                             f"(max|dq|={qd:.4f} rad); possible torn capture — retry")
+                        continue
             else:
                 x_ee, q_joints = np.full(3, np.nan), np.full(7, np.nan)
 
@@ -426,7 +438,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     args.relay_host = args.relay_host or getattr(cfg, "FRAME_RELAY_DIAL_HOST", "127.0.0.1")
     args.relay_port = args.relay_port or int(getattr(cfg, "FRAME_RELAY_PORT", 5591))
     robot = getattr(cfg, "UDP_ROBOT", {"IP": "192.168.2.1", "PORT": 8080})
-    bind = getattr(cfg, "UDP_CONTROL_BIND", {"IP": "0.0.0.0", "PORT": 8080})
+    # The robot sends command ACKs to a FIXED control address (192.168.2.2 per
+    # the C++ wire protocol), so the bind must be that address — not a wildcard.
+    bind = getattr(cfg, "UDP_CONTROL_BIND", {"IP": "192.168.2.2", "PORT": 8080})
     args.robot_ip = args.robot_ip or robot["IP"]
     args.robot_port = args.robot_port or int(robot["PORT"])
     args.bind_ip = args.bind_ip or bind["IP"]
