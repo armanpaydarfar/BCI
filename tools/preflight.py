@@ -98,9 +98,9 @@ Check = Callable[[Context], "CheckResult | Iterable[CheckResult]"]
 
 def run_checks(ctx: Context, checks: Iterable[Check]) -> list[CheckResult]:
     """Run each check, capturing exceptions as FAILs (a check that raises is a
-    bug in the check, not a pass). Honors strict-mode SKIP→FAIL promotion only
-    for checks that opt in by returning SKIP with a `remedy` of "" — see
-    `device_skip()` which tags device-tier skips."""
+    bug in the check, not a pass). This runner does NOT do strict-mode SKIP→FAIL
+    promotion — that happens at construction time in `device_skip()`; here we just
+    collect whatever each check returns."""
     out: list[CheckResult] = []
     for chk in checks:
         try:
@@ -236,18 +236,16 @@ def _installed_version(dist: str) -> Optional[str]:
 
 
 def check_env_drift(ctx: Context) -> Iterable[CheckResult]:
-    """Pin-operator-aware env-vs-spec check (P2). EXACT for `==`/conda-`=`
-    (numpy 1.26.4, pylsl 1.16.2, scipy/sklearn/pyriemann/python), RANGE for `<`
-    (pandas<3), IMPORT-ONLY for unpinned. Does NOT assert versions on the
-    intentionally-floating set, so Linux/Windows solves don't false-fail."""
+    """Pin-operator-aware env-vs-spec check (P2). EXACT for any `==`/conda-`=`
+    pin (numpy 1.26.4, pylsl 1.16.2, scipy/sklearn/pyriemann; python at
+    major.minor), RANGE for `<`/`<=` (pandas<3), IMPORT-ONLY for unpinned. The
+    operator from environment.yml drives it, so the intentionally-floating set is
+    never version-asserted and Linux/Windows solves don't false-fail."""
     env_yml = ROOT / "environment.yml"
     if not env_yml.is_file():
         yield CheckResult("env.environment_yml", FAIL, "environment.yml not found")
         return
     pins = parse_env_pins(env_yml)
-    # Only assert versions on the pinned/ranged numerical core; everything else
-    # is import-only by design.
-    EXACT_CORE = {"python", "numpy", "scipy", "scikit-learn", "pyriemann", "pylsl"}
     for pin in pins:
         dist = pin.name
         # python is the interpreter, not a distribution — handle separately.
@@ -264,14 +262,14 @@ def check_env_drift(ctx: Context) -> Iterable[CheckResult]:
             continue
         have = _installed_version(dist)
         if not have:
-            # Pinned but absent / version unreadable → FAIL (a real readiness
-            # problem). Unpinned absent is left to the import-only check.
-            if dist in EXACT_CORE:
+            # Exactly-pinned but absent / version unreadable → FAIL (a real
+            # readiness problem). Unpinned absent is left to the import-only check.
+            if pin.op == "==":
                 yield CheckResult(f"env.pin.{dist}", FAIL,
                                   "not installed / version unreadable",
                                   remedy="rebuild the env from environment.yml")
             continue
-        if pin.op == "==" and pin.version and dist in EXACT_CORE:
+        if pin.op == "==" and pin.version:
             want, got = _release_tuple(pin.version), _release_tuple(have)
             ok = got[:len(want)] == want
             yield CheckResult(f"env.pin.{dist}", PASS if ok else FAIL,
