@@ -507,5 +507,12 @@ except ImportError:
 # the per-machine WORKING_DIR / DATA_DIR. Defining these earlier would
 # bake the empty defaults into every consumer.
 # =============================================================================
-POSE_LIBRARY_PATH = os.path.join(WORKING_DIR, "poses_with_gaze_20251202_153040.npz")
+# Respect a machine-local POSE_LIBRARY_PATH from config_local (imported above);
+# only fall back to the WORKING_DIR-derived default if it wasn't set. The prior
+# unconditional assignment clobbered the config_local override AND its hardcoded
+# filename had gone stale, so the configured calibration NPZ was silently ignored
+# (the v2 gaze driver then fail-fasts on a missing file).
+POSE_LIBRARY_PATH = globals().get("POSE_LIBRARY_PATH") or os.path.join(
+    WORKING_DIR, "poses_with_gaze_20251202_153040.npz"
+)
 VLM_SESSION_ROOT  = os.path.join(DATA_DIR, "vlm_sessions")
