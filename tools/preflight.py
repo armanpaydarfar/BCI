@@ -46,6 +46,7 @@ import importlib.metadata as _md
 import json
 import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -167,6 +168,7 @@ _IMPORT_NAME = {
     "pyside6": "PySide6",
     "pyyaml": "yaml",
     "pillow": "PIL",
+    "pyserial": "serial",
 }
 
 
@@ -423,23 +425,153 @@ def run_server_checks(ctx: Context) -> list[CheckResult]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONTROL role checks  (STUB — owned by the control-host agent; fill against the
-# interface above. See SoftwareDocs .../preflight-and-env-drift-proposal.md
-# "Control-host response" for the agreed Tier-1/Tier-2 check set.)
+# CONTROL role checks  (owned by the control-host agent — linux-primary)
+# Implements the Tier-1/Tier-2 spec from the proposal's "Control-host response".
+# Control is Linux-only (CLAUDE.md realtime policy), so the device helpers use
+# Linux `ping`/`ip` — reached only on the control path.
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _ping(host: str, timeout_s: int = 2) -> bool:
+    if not host:
+        return False
+    try:
+        return subprocess.run(["ping", "-c", "1", "-W", str(timeout_s), host],
+                              capture_output=True).returncode == 0
+    except Exception:
+        return False
+
+
+def _host_has_addr(addr: str) -> bool:
+    try:
+        out = subprocess.run(["ip", "-4", "addr"], capture_output=True, text=True)
+        return addr in out.stdout
+    except Exception:
+        return False
+
+
+def _control_config(ctx: Context) -> Iterable[CheckResult]:
+    """Tier 1 — config_local *values* the control host must have set."""
+    cfg = ctx.config
+    if cfg is None:
+        yield CheckResult("config.import", FAIL, "could not import config/config_local")
+        return
+    dd = getattr(cfg, "DATA_DIR", "") or ""
+    dd_ok = bool(dd) and os.path.isdir(dd) and os.access(dd, os.W_OK)
+    yield CheckResult("config.DATA_DIR", PASS if dd_ok else FAIL, dd or "(unset)",
+                      remedy="" if dd_ok else "set DATA_DIR to an existing writable dir in config_local.py")
+    pl = getattr(cfg, "POSE_LIBRARY_PATH", "") or ""
+    pl_ok = bool(pl) and os.path.isfile(pl)
+    yield CheckResult("config.POSE_LIBRARY_PATH", PASS if pl_ok else FAIL, pl or "(unset)",
+                      remedy="" if pl_ok else "resolves to a missing file — config.py:510 re-assigns it AFTER `from config_local import *` (config_local override is clobbered; hardcoded filename is stale)")
+    for key in ("NEON_COMPANION_HOST", "VLM_SERVICE_HOST", "ARDUINO_PORT"):
+        v = getattr(cfg, key, "") or ""
+        ok = bool(str(v).strip())
+        yield CheckResult(f"config.{key}", PASS if ok else FAIL, f"{v or '(unset)'}",
+                          remedy="" if ok else f"set {key} in config_local.py")
+
+
+def _control_assets(ctx: Context) -> Iterable[CheckResult]:
+    """Tier 1 — assets / model-construct: the control analogue of the depth gap-catcher."""
+    # Gaze recognizer weight must be tracked at the repo root. gaze_system.py does
+    # YOLO("yolo26n.pt") (bare name → cwd); if the file is absent ultralytics
+    # silently auto-downloads a *different* weight — so assert FOUND, then load by
+    # absolute path (no download) to confirm it's a valid detector.
+    yolo = ROOT / "yolo26n.pt"
+    if not yolo.is_file():
+        yield CheckResult("asset.yolo26n", FAIL, str(yolo),
+                          remedy="yolo26n.pt missing from repo root (must be git-tracked; see !/yolo26n.pt)")
+    else:
+        try:
+            from ultralytics import YOLO
+            m = YOLO(str(yolo))
+            yield CheckResult("asset.yolo26n", PASS,
+                              f"repo-root weight loads (task={m.task}, {len(m.names)} classes)")
+        except Exception as e:
+            yield CheckResult("asset.yolo26n", FAIL, f"{type(e).__name__}: {e}")
+    # Active gaze pose library loads.
+    cfg = ctx.config
+    pl = (getattr(cfg, "POSE_LIBRARY_PATH", "") if cfg else "") or ""
+    if pl and os.path.isfile(pl):
+        try:
+            import numpy as np
+            d = np.load(pl, allow_pickle=True)
+            keys = list(getattr(d, "files", []) or [])
+            yield CheckResult("asset.pose_library", PASS if keys else FAIL,
+                              f"{os.path.basename(pl)}: {len(keys)} arrays")
+        except Exception as e:
+            yield CheckResult("asset.pose_library", FAIL, f"{type(e).__name__}: {e}")
+    else:
+        yield CheckResult("asset.pose_library", SKIP,
+                          "POSE_LIBRARY_PATH missing (see config.POSE_LIBRARY_PATH)")
+    # WS5 apriltag stack — pupil-apriltags is pip-installed (NOT in environment.yml),
+    # so env-drift can't see it; check it + the Tier-1 apriltag modules explicitly.
+    for dist, mod in (("pupil-apriltags", "pupil_apriltags"),
+                      ("apriltag_calib", "Utils.gaze.apriltag_calib"),
+                      ("apriltag_detect", "Utils.gaze.apriltag_detect"),
+                      ("apriltag_world", "Utils.gaze.apriltag_world"),
+                      ("harmony_link", "Utils.gaze.harmony_link")):
+        try:
+            importlib.import_module(mod)
+            yield CheckResult(f"asset.{dist}", PASS, f"import {mod} ok")
+        except Exception as e:
+            yield CheckResult(f"asset.{dist}", FAIL, f"import {mod} -> {type(e).__name__}: {e}",
+                              remedy=("conda run -n lsl pip install pupil-apriltags (machine-sync task 004)"
+                                      if dist == "pupil-apriltags" else ""))
+
+
+def _control_devices(ctx: Context) -> Iterable[CheckResult]:
+    """Tier 2 — device reachability. SKIP on a desk run; FAIL under --with-hardware."""
+    cfg = ctx.config
+    # EEG LSL stream (eegoSports) — every realtime driver needs it at startup.
+    try:
+        from pylsl import resolve_streams
+        streams = resolve_streams(2.0)
+        eeg = [s for s in streams if (s.type() or "").upper() == "EEG"]
+        if eeg:
+            yield CheckResult("device.eeg_lsl", PASS, f"{len(eeg)} EEG stream(s) (e.g. {eeg[0].name()})")
+        else:
+            yield device_skip("device.eeg_lsl", f"no EEG LSL stream ({len(streams)} total seen)", ctx)
+    except Exception as e:
+        yield CheckResult("device.eeg_lsl", FAIL, f"pylsl error: {type(e).__name__}: {e}")
+    # Neon Companion reachable.
+    neon = (getattr(cfg, "NEON_COMPANION_HOST", "") if cfg else "") or ""
+    if _ping(neon):
+        yield CheckResult("device.neon", PASS, f"{neon} reachable")
+    else:
+        yield device_skip("device.neon", f"Neon host {neon or '(unset)'} unreachable", ctx)
+    # Robot LAN (Part B): this host holds 192.168.2.2 + robot 192.168.2.1 pings.
+    holds, robot = _host_has_addr("192.168.2.2"), _ping("192.168.2.1")
+    if holds and robot:
+        yield CheckResult("device.robot_lan", PASS, "192.168.2.2 held; robot 192.168.2.1 pings")
+    else:
+        yield device_skip("device.robot_lan", f"192.168.2.2 held={holds}, robot ping={robot}", ctx)
+    # FES/Arduino serial port present.
+    ard = (getattr(cfg, "ARDUINO_PORT", "") if cfg else "") or ""
+    if ard and os.path.exists(ard):
+        yield CheckResult("device.arduino", PASS, ard)
+    else:
+        yield device_skip("device.arduino", f"ARDUINO_PORT {ard or '(unset)'} not present", ctx)
+    # Cross-host: vlm_service status round-trip (the perception server).
+    try:
+        from Utils.perception_clients import VLMClient
+        r = VLMClient(cfg).status(timeout_s=3.0)
+        if isinstance(r, dict) and r.get("ok"):
+            yield CheckResult("device.vlm_status", PASS,
+                              f"depth_enabled={r.get('depth_enabled')}, model={r.get('model')}")
+        else:
+            yield CheckResult("device.vlm_status", FAIL, f"unexpected reply: {str(r)[:80]}")
+    except Exception as e:
+        yield device_skip("device.vlm_status", f"vlm_service not answering ({type(e).__name__})", ctx)
+
+
 def run_control_checks(ctx: Context) -> list[CheckResult]:
+    deps = ["ultralytics", "pyserial", "pygame"]   # control realtime/gaze deps not in EXACT_CORE
     checks: list[Check] = [
-        check_env_drift,                       # shared check applies to both roles
-        # TODO(control agent): Tier 1 — config_local values (DATA_DIR writable,
-        #   POSE_LIBRARY_PATH, ARDUINO_PORT, GAZE_*/NEON/VLM endpoints non-default),
-        #   asset/model construct (YOLO("yolo26n.pt") resolves from repo root —
-        #   assert FOUND not auto-downloaded; pose-library .npz keys; apriltag
-        #   modules import). Tier 2 (device_skip unless --with-hardware) — EEG LSL
-        #   resolve, marker stream, Neon reachable, robot 192.168.2.1 ping +
-        #   control endpoint bind, ARDUINO_PORT open, VLMClient.status() round-trip.
-        lambda c: [CheckResult("control.checks", SKIP,
-                               "control-role checks not yet implemented (owned by control agent)")],
+        _control_config,
+        check_env_drift,                                   # shared (both roles)
+        lambda c: check_declared_imports(c, deps),
+        _control_assets,
+        _control_devices,
     ]
     return run_checks(ctx, checks)
 
