@@ -628,17 +628,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--neon-host", default="",
                    help="Companion phone IP; empty = mDNS auto-discovery")
     p.add_argument("--jpeg-quality", type=int, default=75, help="JPEG quality 1-100")
+    p.add_argument("--reader", choices=("matched", "scene_only"), default="matched",
+                   help="Neon reader. 'matched' = perception.neon.NeonLiveReader "
+                        "(matched-API, the standalone default). 'scene_only' = "
+                        "Utils.scene_only_neon_reader.SceneOnlyNeonReader (simple "
+                        "receive_scene_video_frame, less grain) — the panel spawns "
+                        "the relay with this so a separated relay decodes identically "
+                        "to the old in-process path.")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    # scene_only pre-constructs the simple-API reader and injects it; matched
+    # leaves reader=None so the server falls back to _open_reader (NeonLiveReader).
+    # Injecting here also keeps this process torch/pylsl-free (the perception.neon
+    # import is skipped), avoiding the libstdc++/CXXABI import-order hazard.
+    reader = None
+    if args.reader == "scene_only":
+        from Utils.scene_only_neon_reader import SceneOnlyNeonReader
+        reader = SceneOnlyNeonReader(host=args.neon_host or None)
     server = FrameRelayServer(
         bind_host=args.bind,
         bind_port=args.port,
         hz=args.hz,
         neon_host=args.neon_host,
         jpeg_quality=args.jpeg_quality,
+        reader=reader,
     )
     try:
         server.serve_forever()
