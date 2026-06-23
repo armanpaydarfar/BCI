@@ -124,6 +124,36 @@ def _pct(samples: Deque[float], qs: list) -> list:
     return out
 
 
+def detect_bottom_band_tear(bgr: np.ndarray, *, seam_ratio_thresh: float = 6.0) -> bool:
+    """Heuristic: does this BGR frame look like a bottom-band H.264 tear?
+
+    The tearing failure mode (clean top, stale macroblock band at the bottom)
+    leaves a sharp horizontal seam where the good region meets the corrupted
+    one. We compute per-row mean |vertical luma gradient|; a clean scene frame
+    is smooth so every interior row is low, while a torn frame spikes at the
+    seam. Flag when the strongest seam in the lower 60% of rows exceeds the
+    upper-40% baseline by `seam_ratio_thresh`. Pure-numpy, ~O(H*W) — cheap
+    enough to SAMPLE on the pump thread (~1/s), surfacing a regression the
+    `dropped=0` counter cannot see. A heuristic, not a decoder error count.
+    """
+    if bgr.ndim != 3 or bgr.shape[2] != 3:
+        raise ValueError(f"expected HxWx3 BGR frame, got shape {bgr.shape}")
+    y = (0.114 * bgr[..., 0].astype(np.float32)
+         + 0.587 * bgr[..., 1].astype(np.float32)
+         + 0.299 * bgr[..., 2].astype(np.float32))
+    h = y.shape[0]
+    if h < 16:
+        return False
+    row_grad = np.abs(np.diff(y, axis=0)).mean(axis=1)  # length h-1
+    upper_end = int(0.40 * (h - 1))
+    if upper_end < 1:
+        return False
+    # Floor the baseline so a perfectly flat upper region doesn't divide-by-~0.
+    upper_baseline = max(float(np.median(row_grad[:upper_end])), 0.5)
+    lower_peak = float(row_grad[upper_end:].max())
+    return (lower_peak / upper_baseline) >= seam_ratio_thresh
+
+
 def _fmt_addrs(addrs: list) -> str:
     """Compact addr summary for the stats line: '[10.0.0.5,10.0.0.6]'."""
     if not addrs:
@@ -484,6 +514,11 @@ class FrameRelayServer:
         period = 1.0 / max(self.hz, 1e-6)
         next_send = time.perf_counter()
         last_log_t = time.time()
+        # Sampled scene-integrity probe (~1/s): surfaces decode tearing that the
+        # transport counters (dropped=) sit upstream of and cannot see.
+        last_tear_check = 0.0
+        tear_checked = 0
+        tear_flagged = 0
         try:
             for bundle in self._reader:
                 if self._stop_event.is_set():
@@ -493,6 +528,20 @@ class FrameRelayServer:
                 # always see every bundle at native Neon frame rate. The
                 # relay-hz throttle below only applies to the TCP broadcast.
                 self._dispatch_local(bundle)
+
+                # Sample the tear heuristic ~1/s on the raw decoded frame.
+                # Guarded so the probe can never disturb the realtime pump.
+                now_t = time.time()
+                if now_t - last_tear_check >= 1.0:
+                    last_tear_check = now_t
+                    bgr = getattr(bundle.video, "bgr", None)
+                    if bgr is not None:
+                        try:
+                            tear_checked += 1
+                            if detect_bottom_band_tear(bgr):
+                                tear_flagged += 1
+                        except Exception:
+                            pass
 
                 now_pc = time.perf_counter()
                 if now_pc < next_send:
@@ -542,10 +591,13 @@ class FrameRelayServer:
                     _log(
                         f"published={self._frame_count_published} "
                         f"dropped={self._frame_count_dropped} "
+                        f"torn={tear_flagged}/{tear_checked} "
                         f"clients={n}{_fmt_addrs(client_addrs)} "
                         f"bundle_age p50/p99={bp50:.0f}/{bp99:.0f} ms "
                         f"send p50/p99={sp50:.1f}/{sp99:.1f} ms"
                     )
+                    tear_checked = 0
+                    tear_flagged = 0
         except Exception as e:
             _log(f"pump loop exited: {e}")
             self._stop_event.set()

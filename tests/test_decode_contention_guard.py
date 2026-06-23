@@ -42,6 +42,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+# Guard the PRODUCTION heuristic (now wired into the relay pump), not a copy.
+from Utils.frame_relay import detect_bottom_band_tear
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Corruption heuristic
@@ -63,51 +66,10 @@ import pytest
 # to run per-frame on the relay's pump thread.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _luma(bgr: np.ndarray) -> np.ndarray:
-    """Rec.601 luma of a uint8 BGR frame as float32 (H, W)."""
-    b = bgr[..., 0].astype(np.float32)
-    g = bgr[..., 1].astype(np.float32)
-    r = bgr[..., 2].astype(np.float32)
-    return 0.114 * b + 0.587 * g + 0.299 * r
-
-
-def detect_bottom_band_tear(bgr: np.ndarray, *, seam_ratio_thresh: float = 6.0) -> bool:
-    """Return True if `bgr` looks like a bottom-band H.264 tear.
-
-    Heuristic: compute per-row mean absolute vertical luma gradient. A clean
-    scene frame is smooth, so every interior row has a low value. A torn frame
-    has a sharp seam where the stale bottom band meets the good region above —
-    one row's gradient spikes far above the frame's baseline. We compare the
-    max seam strength found in the lower 60% of rows against the median seam
-    strength of the upper 40% (assumed clean); a ratio above `seam_ratio_thresh`
-    flags the frame.
-
-    Pure-numpy, no OpenCV/PyAV, ~O(H*W). Designed to be called per-frame on the
-    relay pump thread so a decode regression surfaces in logs/CI, not by eye.
-    """
-    if bgr.ndim != 3 or bgr.shape[2] != 3:
-        raise ValueError(f"expected HxWx3 BGR frame, got shape {bgr.shape}")
-    y = _luma(bgr)
-    h = y.shape[0]
-    if h < 16:
-        return False  # too small to have a meaningful band structure
-
-    # Per-row mean |vertical gradient|: row i vs row i-1. row_grad[i] is large
-    # when row i is uncorrelated with the row above it (a seam).
-    row_grad = np.abs(np.diff(y, axis=0)).mean(axis=1)  # length h-1
-
-    upper_end = int(0.40 * (h - 1))
-    if upper_end < 1:
-        return False
-    upper_baseline = float(np.median(row_grad[:upper_end]))
-    # Floor the baseline so a perfectly flat upper region (baseline≈0) doesn't
-    # make every frame divide-by-near-zero and flag as torn.
-    upper_baseline = max(upper_baseline, 0.5)
-
-    lower_start = int(0.40 * (h - 1))
-    lower_peak = float(row_grad[lower_start:].max())
-
-    return (lower_peak / upper_baseline) >= seam_ratio_thresh
+# `detect_bottom_band_tear` is imported from Utils.frame_relay (above) — the
+# relay samples it ~1/s on the pump thread and reports `torn=flagged/checked`
+# in its stats line. These tests pin its behaviour so a future edit can't
+# weaken the signal.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
