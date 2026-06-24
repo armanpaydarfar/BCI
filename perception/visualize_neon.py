@@ -46,8 +46,14 @@ EYE_STATE_DTYPE = np.dtype([
 
 def load_stream(rec: Path, name: str, dtype: np.dtype):
     """Load a .raw binary stream and its paired .time file (int64 ns)."""
-    raw_path  = next(rec.glob(f"{name} ps1.raw"))
-    time_path = next(rec.glob(f"{name} ps1.time"))
+    raw_path  = next(rec.glob(f"{name} ps1.raw"), None)
+    time_path = next(rec.glob(f"{name} ps1.time"), None)
+    if raw_path is None or time_path is None:
+        # Without this, a missing stream surfaces as an opaque StopIteration.
+        raise FileNotFoundError(
+            f"Neon stream '{name}' not found under {rec} "
+            f"(expected '{name} ps1.raw' and '{name} ps1.time')"
+        )
     data = np.frombuffer(raw_path.read_bytes(), dtype=dtype)
     ts   = np.frombuffer(time_path.read_bytes(), dtype="<i8")
     assert len(data) == len(ts), f"Length mismatch for {name}"

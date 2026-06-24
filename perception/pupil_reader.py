@@ -10,7 +10,7 @@ both ``utils.core.PupilCoreReader`` and ``utils.neon.NeonLiveReader``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -31,6 +31,7 @@ class IMUSample:
 
 @dataclass
 class GazeSample:
+    """A single gaze datum: scene-pixel (x, y) plus the paired eye-state row."""
     timestamp_ns: int
     x: float
     y: float
@@ -39,6 +40,7 @@ class GazeSample:
 
 @dataclass
 class VideoFrame:
+    """One scene-camera frame (BGR) with its capture timestamp and frame index."""
     timestamp_ns: int
     frame_idx: int
     bgr: np.ndarray
@@ -46,6 +48,7 @@ class VideoFrame:
 
 @dataclass
 class FrameBundle:
+    """A scene frame paired with the gaze/worn/IMU state sampled alongside it."""
     video: VideoFrame
     gaze: GazeSample
     worn: bool
