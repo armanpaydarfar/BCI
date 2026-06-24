@@ -3251,6 +3251,11 @@ class ControlPanel(QMainWindow):
         self._append_log("Panel", f"[{self._ts()}] AprilTag calibrations: {len(calibs)} "
                          f"(newest first → {os.path.basename(calibs[0])})\n")
 
+    def _get_selected_apriltag_calib(self) -> str:
+        if not hasattr(self, "cmb_apriltag_calib"):
+            return ""
+        return self.cmb_apriltag_calib.currentData() or ""
+
     def on_run_apriltag_calibrate(self):
         if not os.path.exists(APRILTAG_CALIBRATE_PY):
             QMessageBox.warning(self, "Missing", f"Not found:\n{APRILTAG_CALIBRATE_PY}")
@@ -3277,8 +3282,7 @@ class ControlPanel(QMainWindow):
         if not os.path.exists(APRILTAG_CONTROL_TEST_PY):
             QMessageBox.warning(self, "Missing", f"Not found:\n{APRILTAG_CONTROL_TEST_PY}")
             return
-        calib = (self.cmb_apriltag_calib.currentData()
-                 if hasattr(self, "cmb_apriltag_calib") else "")
+        calib = self._get_selected_apriltag_calib()
         if not calib or not os.path.exists(calib):
             QMessageBox.warning(self, "AprilTag calibration",
                                 "No AprilTag calibration selected. Run an AprilTag "
