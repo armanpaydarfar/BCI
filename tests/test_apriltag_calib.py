@@ -23,6 +23,7 @@ from Utils.gaze.apriltag_calib import (  # noqa: E402
     angle_between_deg,
     average_rotation,
     ee_point_in_world,
+    eetag_rayplane_point_world,
     eetag_to_world_point,
     gaze_ray_cam,
     geodesic_angle_deg,
@@ -250,6 +251,37 @@ def test_eetag_to_world_point_is_invariant_to_camera_pose():
         T_cam_eetag = cam_pose @ T_world_eetag
         p = eetag_to_world_point(T_cam_world, T_cam_eetag, offset)
         np.testing.assert_allclose(p, expected, atol=1e-9)
+
+
+def test_eetag_rayplane_ignores_tag_depth():
+    # The ray-cast EE point depends only on the tag-centre DIRECTION and the plane,
+    # not on the tag's reported range — so two poses with the same centre direction
+    # but different depths give the SAME world point (the depth-ambiguity immunity
+    # that motivates this method). Camera == world here for a closed-form check.
+    plane_point, plane_normal = np.array([0.0, 0.0, 500.0]), np.array([0.0, 0.0, 1.0])
+    far = make_transform(_rot_z(33.0), [100.0, 50.0, 800.0])   # centre dir (100,50,800)
+    near = make_transform(_rot_x(12.0), [50.0, 25.0, 400.0])   # SAME dir, half depth
+    p_far = eetag_rayplane_point_world(np.eye(4), far, plane_point, plane_normal)
+    p_near = eetag_rayplane_point_world(np.eye(4), near, plane_point, plane_normal)
+    np.testing.assert_allclose(p_far, [62.5, 31.25, 500.0], atol=1e-9)  # t=500/800
+    np.testing.assert_allclose(p_near, p_far, atol=1e-9)                # depth ignored
+
+
+def test_eetag_rayplane_on_plane_is_camera_invariant():
+    # When the EE tag lies ON the table plane, its line of sight hits the plane AT
+    # the tag, so the recovered world point equals the true tag origin regardless of
+    # camera pose (the head-invariance §1 guarantee, now via ray∩plane).
+    t_we = np.array([220.0, -90.0, 0.0])  # tag on the world z=0 plane
+    T_world_eetag = make_transform(_rot_z(25.0), t_we)
+    pp, pn = np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])
+    for cam_pose in (
+        make_transform(_rot_x(200.0), [10.0, 0.0, 600.0]),
+        make_transform(_rot_z(-70.0) @ _rot_x(160.0), [-200.0, 90.0, 1100.0]),
+    ):
+        T_cam_world = cam_pose
+        T_cam_eetag = cam_pose @ T_world_eetag
+        p = eetag_rayplane_point_world(T_cam_world, T_cam_eetag, pp, pn)
+        np.testing.assert_allclose(p, t_we, atol=1e-6)
 
 
 # ── rotation jitter helpers ──────────────────────────────────────────────────

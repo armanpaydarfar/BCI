@@ -75,6 +75,7 @@ import numpy as np  # noqa: E402
 from Utils.gaze.apriltag_calib import (  # noqa: E402
     angle_between_deg,
     average_rotation,
+    eetag_rayplane_point_world,
     eetag_to_world_point,
     gaze_ray_cam,
     geodesic_angle_deg,
@@ -584,16 +585,23 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
 
             cur_uv = None
             if ok:
-                p_world = eetag_to_world_point(T_cam_world, T_cam_eetag, offset_mm)
-                cur_uv = plane_coords(p_world, plane_point, plane_normal)
-                grid.add(cur_uv)
-                uv_rows.append(cur_uv)
-                q_rows.append(q_joints)
-                x_rows.append(x_ee)
-                tcw_rows.append(T_cam_world)
-                tce_rows.append(T_cam_eetag)
-                t_rows.append(t_robot)
-                accepted += 1
+                # Depth-ambiguity-free EE position: the tag-centre line of sight ∩
+                # the known table plane — the SAME ray∩plane runtime uses for gaze
+                # (rev04 §5 follow-up, 2026-06-24). The single small EE tag's 3-D
+                # pose range is too noisy (HIL repeatability 52 mm); its centre
+                # direction is not. None = ray parallel/behind → drop the sample.
+                p_world = eetag_rayplane_point_world(T_cam_world, T_cam_eetag,
+                                                     plane_point, plane_normal)
+                if p_world is not None:
+                    cur_uv = plane_coords(p_world, plane_point, plane_normal)
+                    grid.add(cur_uv)
+                    uv_rows.append(cur_uv)
+                    q_rows.append(q_joints)
+                    x_rows.append(x_ee)
+                    tcw_rows.append(T_cam_world)
+                    tce_rows.append(T_cam_eetag)
+                    t_rows.append(t_robot)
+                    accepted += 1
 
             target = grid.next_target()
             if ui is not None:
@@ -671,6 +679,10 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
         "tag_size_m": args.tag_size,
         "ee_tag_size_m": ee_size,
         "t_eetag_ee_mm": offset_mm.tolist(),
+        # EE (u,v) from the tag-centre line of sight ∩ table plane (ambiguity-free),
+        # not the tag's 3-D pose translation (rev04 §5 follow-up, 2026-06-24). The
+        # offset above is recorded for provenance but not applied in this mode.
+        "ee_point_method": "rayplane_center",
         "with_robot": bool(args.with_robot),
         "sample_hz": args.sample_hz,
         "coverage": {"cell_size_mm": args.cell_size_mm,

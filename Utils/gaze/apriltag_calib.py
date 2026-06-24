@@ -282,6 +282,36 @@ def eetag_to_world_point(T_cam_world: np.ndarray, T_cam_eetag: np.ndarray,
     return ee_point_in_world(T_world_eetag, t_eetag_ee)
 
 
+def eetag_rayplane_point_world(T_cam_world: np.ndarray, T_cam_eetag: np.ndarray,
+                               plane_point_world, plane_normal_world):
+    """Depth-ambiguity-free EE position for capture (rev04 §5 follow-up,
+    2026-06-24). Instead of the EE tag's full 3-D pose translation — whose range
+    along the line of sight is poorly constrained for a single small planar tag
+    (the ``more than one minima`` ambiguity that set the HIL repeatability floor) —
+    back-project the tag CENTRE's line of sight (its *direction* is the sub-pixel
+    detected centre, reliable even when the range is not) and intersect it with the
+    known world table plane. This is the **same ray∩plane** the runtime uses for
+    gaze (``apriltag_control_test.gaze_point_in_plane_uv``), so the calibration
+    point and the runtime point are produced by an identical operation.
+
+    The tag centre in the camera frame is ``T_cam_eetag[:,3]``; the camera origin is
+    the camera-frame origin, so the head pose cancels exactly as in §1. The plane is
+    given in WORLD coords and transformed into the camera frame via ``T_cam_world``.
+    Returns the world-frame hit point, or ``None`` if the ray is parallel to / behind
+    the plane. No EE-tag→EE offset is applied — this is a centroid (line-of-sight)
+    estimate by construction (operator 2026-06-24)."""
+    T_cam_world = np.asarray(T_cam_world, dtype=float)
+    T_cam_eetag = np.asarray(T_cam_eetag, dtype=float)
+    center_cam = T_cam_eetag[:3, 3]  # tag centre in cam = the line-of-sight direction
+    pp_world = np.append(np.asarray(plane_point_world, dtype=float), 1.0)
+    point_cam = (T_cam_world @ pp_world)[:3]
+    normal_cam = T_cam_world[:3, :3] @ np.asarray(plane_normal_world, dtype=float)
+    hit_cam = ray_plane_intersection(np.zeros(3), center_cam, point_cam, normal_cam)
+    if hit_cam is None:
+        return None
+    return (invert_transform(T_cam_world) @ np.append(hit_cam, 1.0))[:3]
+
+
 def average_rotation(rotations: np.ndarray) -> np.ndarray:
     """Chordal-L2 mean of a stack of 3×3 rotations via SVD projection of the
     elementwise mean back onto SO(3) (with the determinant-sign correction).
