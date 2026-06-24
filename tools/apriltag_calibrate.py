@@ -768,15 +768,16 @@ def _ee_point_world(method, T_cam_world, T_cam_eetag, plane_point, plane_normal,
     return eetag_to_world_point(T_cam_world, T_cam_eetag, offset_mm)
 
 
-def _recompute_planar_uv(z, method):
+def _recompute_planar_uv(z, method, offset):
     """Re-derive every sweep sample's table ``(u,v)`` from the stored per-sample
-    transforms (``T_cam_world`` / ``T_cam_eetag``) using ``method`` — AND recompute
-    the table plane from the stored world map's tag ORIENTATIONS
-    (`table_normal_from_rel`), correcting an old origin-fit plane (idempotent for an
-    orientation-built map). The green/sufficient mask is recomputed too (the cells
-    move with the points). Returns ``(UV, green, plane_point, plane_normal)`` — the
-    corrected plane is written into the calib so the runtime gaze uses the same one.
-    Lets a captured sweep be re-solved a different way, with the plane fix, no rig."""
+    transforms (``T_cam_world`` / ``T_cam_eetag``) using ``method`` and the EE-tag→
+    hand ``offset`` (tag frame, mm) — AND recompute the table plane from the stored
+    world map's tag ORIENTATIONS (`table_normal_from_rel`), correcting an old
+    origin-fit plane (idempotent for an orientation-built map). The green/sufficient
+    mask is recomputed too (the cells move with the points). Returns
+    ``(UV, green, plane_point, plane_normal)`` — the corrected plane is written into
+    the calib so the runtime gaze uses the same one. Lets a captured sweep be
+    re-solved a different way (EE method, plane fix, measured offset), no rig."""
     Tcw = np.asarray(z["T_cam_world"], dtype=float)
     Tce = np.asarray(z["T_cam_eetag"], dtype=float)
     rels = np.asarray(z["world_map_rels"], dtype=float)
@@ -788,11 +789,11 @@ def _recompute_planar_uv(z, method):
     else:
         pp = np.asarray(z["world_map_plane_point"], dtype=float)
         pn = np.asarray(z["world_map_plane_normal"], dtype=float)
-    meta = z["meta"].item() if "meta" in z.files else {}
-    offset = np.asarray(meta.get("t_eetag_ee_mm", [0.0, 0.0, 0.0]), dtype=float)
+    offset = np.asarray(offset, dtype=float)
     pts = [(_ee_point_world(method, Tcw[i], Tce[i], pp, pn, offset)) for i in range(len(Tcw))]
     pts = np.array([p if p is not None else np.full(3, np.nan) for p in pts])
     UV = plane_coords(pts, pp, pn)
+    meta = z["meta"].item() if "meta" in z.files else {}
     cov = meta.get("coverage", {})
     grid = CoverageGrid(cell_size_mm=cov.get("cell_size_mm", 50.0),
                         min_samples=cov.get("min_samples", 8),
@@ -924,10 +925,16 @@ def stage_solve_planar(args, z, npz_path) -> int:
     green_src = np.asarray(z["green"], dtype=bool) if "green" in z.files else None
     plane_fix = None  # (plane_point, plane_normal) to override in the calib, if recomputed
     if args.ee_point_method is not None and "T_cam_world" in z.files:
-        UV, green_src, _pp_fix, _pn_fix = _recompute_planar_uv(z, args.ee_point_method)
+        # EE-tag→hand offset (tag frame, mm): an explicit --t-eetag-ee overrides the
+        # zero the sweep stored, so a measured mount offset can be applied on re-solve.
+        meta0 = z["meta"].item() if "meta" in z.files else {}
+        offset = np.asarray(args.t_eetag_ee, dtype=float)
+        if not offset.any():
+            offset = np.asarray(meta0.get("t_eetag_ee_mm", [0.0, 0.0, 0.0]), dtype=float)
+        UV, green_src, _pp_fix, _pn_fix = _recompute_planar_uv(z, args.ee_point_method, offset)
         plane_fix = (_pp_fix, _pn_fix)
-        _log(f"recomputed (u,v) from stored transforms with "
-             f"ee-point-method={args.ee_point_method}; table normal from tag "
+        _log(f"recomputed (u,v): ee-point-method={args.ee_point_method}, "
+             f"t_eetag_ee={offset.tolist()} mm (tag frame); table normal from tag "
              f"orientations = {np.round(_pn_fix, 3).tolist()}")
 
     # Green-only (rev04 §3, operator 2026-06-24): build the library from samples in
