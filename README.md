@@ -36,7 +36,21 @@ The primary intended use cases are **assistive robotics and rehabilitation resea
 - **Gaze system**  
   - `gaze_runner.py` and `gaze_visualizer.py` orchestrate real-time gaze input and visualization.  
   - `Utils/gaze/` contains gaze tracking, math, UI, and rendering utilities.  
-  - Optional Neon / Pupil Labs integration may exist in the repository (if applicable to your setup).
+  - Pupil Labs **Neon** is the gaze/scene-camera device; Linux owns the device I/O
+    and ships frames to the perception host (see below).
+
+- **Perception subsystem (segmentation / depth / VLM reasoning)**  
+  - `perception/` holds the vision stack — class-agnostic segmentation (FastSAM),
+    metric depth (Depth Pro), gaze-fixation detection, and Gemini-backed VLM intent
+    reasoning. It is **vendored from Vivian Chen's `harmony_vlm`** (see
+    [`NOTICE.md`](NOTICE.md)) and runs as a **separate process**, never imported into
+    the realtime EEG/robot loops.
+  - `vlm_service.py` is the perception host service; `vlm_bridge.py` /
+    `Utils/perception_clients.py` are the UDP request/reply clients the drivers use;
+    `Utils/frame_relay.py` + `Utils/remote_frame_reader.py` ship Neon frames Linux→host
+    over TCP. The split is config-gated (`PERCEPTION_FRAME_SOURCE`,
+    `SERVICES_HOSTED_REMOTELY`); see
+    `Documents/SoftwareDocs/projects/harmony-bci/gpu-service/architecture-plan.md`.
 
 - **Robot control (UDP)**  
   - Robot opcodes and trigger mappings are defined in `config.py` (`ROBOT_OPCODES`, `TRIGGERS`).  
@@ -79,13 +93,19 @@ Key folders and scripts (non-exhaustive):
 - **`STM_interface/`**  
   - Rehamove/STM configuration (`RehamoveConfig.py`, JSON) and serial communication packages (`serialCommunication.py`, `rehamoveLibrary/`).
 
-- **`OBS/`** (**obsolete; pending removal**)  
-  - Neon / OBS streaming and overlay scripts:
-    - `Neon_Stream_PupilRealtime.py`, `Neon_Stream_LSL.py`, `Neon_YOLO_overlay.py`, and helpers.  
-  - This folder is currently the holding area for **obsolete / legacy scripts** prior to a future cleanup (the directory is not removed yet). It currently includes, for example:
-    - `OBS/Visualize_offline_data.py` (obsolete visualization script)
-    - `OBS/ExperimentDriver_Online_EG.py`, `OBS/ExperimentDriver_Offline_EG.py` (obsolete drivers)
-    - `OBS/Robot_Control_WBC.py` (obsolete robot-control script)
+- **`perception/`** (vision stack; vendored from `harmony_vlm` — see [`NOTICE.md`](NOTICE.md))  
+  - **Live** modules (wired into `vlm_service.py` / the frame relay, importable in the
+    unified env): `object_detector.py` (FastSAM segmentation), `depth_estimator.py`
+    (Depth Pro), `fixation_detector.py`, `intent_reasoner.py` (Gemini VLM),
+    `pupil_reader.py`, `visualize_neon.py`, `neon/`.  
+  - **Staged** modules are vendored for upcoming WS4/WS5 work and are deliberately
+    **not import-safe** in the current env (their deps are excluded): `apriltag_detector.py`,
+    `realsense_camera.py`, `gaze_grounder.py`, `overlay_renderer.py`, `exo_controller.py`,
+    `core/`. The authoritative live-vs-staged list is the docstring in
+    [`perception/__init__.py`](perception/__init__.py).
+  - The perception process talks to the drivers only over UDP/TCP (`vlm_service.py`,
+    `vlm_bridge.py`, `Utils/perception_clients.py`, `Utils/frame_relay.py`) — there is no
+    in-process coupling to the realtime EEG/robot loops.
 
 - **Robot / FES / markers (root-level scripts)**  
   - `UDPRobot.py`, `udp_send.py`, `UTIL_marker_stream.py`: robot and marker utilities.  
@@ -97,7 +117,6 @@ Key folders and scripts (non-exhaustive):
   - `Analyze_experiment_logs_cross_subject.py`, `Analyze_online_Decoder_performance.py`: log and performance analysis.  
   - Visualization utilities:
     - `Visualize_offline_data_MNE.py`, `visualize_online_data.py`
-    - **Obsolete (for now)**: `OBS/Visualize_offline_data.py`
 
 #### Artifact rejection (offline training vs QC plots)
 
@@ -161,7 +180,9 @@ Typical layout per subject (`sub-<SUBJECT_ID>`):
     - **mne-lsl** / `mne-lsl viewer` for inspecting/debugging available LSL streams — optional, not bundled in `environment.yml` (the runtime uses `pylsl` directly); install separately with `pip install mne-lsl` if you want the viewer.
   - **Gaze / video**:
     - Pupil Labs / Neon APIs (e.g., `pupil_labs.realtime_api`) if using Neon-based gaze tracking.  
-    - OBS Studio (only if you intentionally run legacy scripts under `OBS/`).  
+  - **Perception host (GPU)**:
+    - The perception stack (`perception/` via `vlm_service.py`) runs on a CUDA host;
+      a `GOOGLE_API_KEY` (in `config_local.py`) is needed for the Gemini VLM path.
   - **Robot control**:
     - Network connectivity to the robot controller at the IP/port specified in `config.UDP_ROBOT`.  
     - SSH access for helper commands in `control_panel.py` (e.g., `sshpass`, `gnome-terminal`).  
@@ -293,7 +314,7 @@ The drivers in this repo are “modular” in what they require:
     - See `.githooks/README.md` for details.
 
 - **Reuse utilities in `Utils/`**
-  - Before adding new helpers, check for existing functions in `Utils/`, `Utils/gaze/`, `STM_interface/`, and `OBS/`.  
+  - Before adding new helpers, check for existing functions in `Utils/`, `Utils/gaze/`, `STM_interface/`, and `perception/`.  
   - Extend or wrap existing utilities when possible instead of duplicating logic.
 
 - **Entry-point heavy design**
@@ -316,7 +337,7 @@ The drivers in this repo are “modular” in what they require:
 
 ## 9. Status / Notes
 
-- Some components, especially under `OBS/` and certain analysis/visualization scripts, may be **experimental or legacy** and not required for a minimal online BCI + robot pipeline.  
+- Some components, especially certain analysis/visualization scripts, may be **experimental or legacy** and not required for a minimal online BCI + robot pipeline.  
 - Hardware availability and local lab practices vary; some scripts may be used only in specific setups or studies.  
 - Before modifying behavior:
   - Trace how a script is launched (e.g., from `control_panel.py` or other drivers).  
