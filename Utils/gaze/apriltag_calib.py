@@ -124,6 +124,59 @@ def umeyama_rigid(src: np.ndarray, dst: np.ndarray) -> Tuple[np.ndarray, float]:
     return T, rms
 
 
+def umeyama_similarity_2d(src: np.ndarray, dst: np.ndarray
+                          ) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    """Best-fit 2-D **similarity** (rotation + uniform scale + translation) mapping
+    ``src`` onto ``dst`` — Umeyama (1991) *with* scale, in the plane. The REV04 A2
+    quality readout (rev04 §1): fit ``base(x,y) ← plane(u,v)`` from the swept
+    correspondences and report the in-plane RMS, the well-conditioned 2-D analogue
+    of the old 3-D Umeyama residual (no height ⇒ no non-coplanarity degeneracy).
+
+    This is a **diagnostic only** — the command path is the A1 nearest-neighbour
+    library, not this fit.
+
+    Args:
+        src: (N, 2) source points (table-plane ``(u,v)``, mm).
+        dst: (N, 2) destination points (base-frame ``(x,y)``, mm), row-aligned.
+
+    Returns:
+        ``(A, t, s, rms)`` — the 2×2 linear part ``A = s·R``, the 2-vector
+        translation ``t`` (so ``dst ≈ A·src + t``), the scalar scale ``s``, and the
+        RMS residual (mm).
+
+    Raises:
+        ValueError: fewer than 2 points, mismatched shapes, or non-finite input.
+    """
+    src = np.asarray(src, dtype=float)
+    dst = np.asarray(dst, dtype=float)
+    if src.shape != dst.shape or src.ndim != 2 or src.shape[1] != 2:
+        raise ValueError(f"src/dst must be matching (N,2); got {src.shape}, {dst.shape}")
+    n = src.shape[0]
+    if n < 2:
+        raise ValueError(f"need ≥2 correspondences for a 2-D similarity fit; got {n}")
+    if not (np.all(np.isfinite(src)) and np.all(np.isfinite(dst))):
+        raise ValueError("src/dst contain non-finite values")
+
+    mu_s = src.mean(axis=0)
+    mu_d = dst.mean(axis=0)
+    xs = src - mu_s
+    xd = dst - mu_d
+    cov = (xd.T @ xs) / n
+    U, S, Vt = np.linalg.svd(cov)
+    d = np.sign(np.linalg.det(U) * np.linalg.det(Vt))
+    D = np.diag([1.0, d])
+    R = U @ D @ Vt
+    var_s = float(np.mean(np.sum(xs ** 2, axis=1)))
+    # Degenerate src (all points coincident) → no scale is recoverable; fall back to
+    # unit scale so the fit is a pure rotation+translation rather than dividing by 0.
+    s = float(np.sum(S * np.array([1.0, d])) / var_s) if var_s > 0.0 else 1.0
+    A = s * R
+    t = mu_d - A @ mu_s
+    pred = (A @ src.T).T + t
+    rms = float(np.sqrt(np.mean(np.sum((pred - dst) ** 2, axis=1))))
+    return A, t, s, rms
+
+
 def per_point_errors(T: np.ndarray, src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     """Per-correspondence Euclidean residual ‖dst − T·src‖ (mm), length N —
     for the solve stage's outlier inspection."""

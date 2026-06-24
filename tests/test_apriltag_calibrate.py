@@ -77,6 +77,81 @@ def test_solve_missing_file_returns_2():
     assert calib.main(["--stage", "solve", "does_not_exist_42.npz"]) == 2
 
 
+# ── step 5: REV04 planar solve (sweep npz → (u,v)→Q library) ─────────────────
+
+
+def _write_sweep(path, UV, Q, X):
+    # Minimal world map carried through to the calib (single ref tag, z=0 plane).
+    np.savez_compressed(
+        path, UV=UV, Q=Q, X=X,
+        T_cam_world=np.zeros((UV.shape[0], 4, 4)),
+        T_cam_eetag=np.zeros((UV.shape[0], 4, 4)),
+        world_map_ref=np.array(0), world_map_ids=np.array([0]),
+        world_map_rels=np.eye(4)[None, :, :],
+        world_map_plane_point=np.zeros(3), world_map_plane_normal=np.array([0.0, 0.0, 1.0]),
+        meta=np.array({"version": 3, "scheme": "planar_sweep", "side": "R"}, dtype=object),
+    )
+
+
+def _sim2(uv, s, deg, t):
+    a = np.radians(deg)
+    R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+    return (s * R @ uv.T).T + np.asarray(t)
+
+
+def test_planar_solve_builds_library_and_residual(tmp_path, capsys):
+    # A grid of table (u,v); base xy is an exact in-plane similarity of it, so the
+    # A2 residual is ~0 (PASS) and the (u,v)→Q library is written for the control tool.
+    gx, gy = np.meshgrid(np.linspace(0, 200, 4), np.linspace(0, 150, 3))
+    UV = np.column_stack([gx.ravel(), gy.ravel()])
+    Q = np.linspace(0.1, 0.5, UV.shape[0])[:, None] * np.ones((1, 7))
+    XY = _sim2(UV, 1.3, 20.0, [300.0, -100.0])
+    X = np.column_stack([XY, np.full(UV.shape[0], 350.0)])  # base z constant
+    sweep = tmp_path / "apriltag_sweep_test.npz"
+    _write_sweep(sweep, UV, Q, X)
+
+    rc = calib.main(["--stage", "solve", str(sweep)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "planar library" in out and "PASS" in out
+
+    calib_path = tmp_path / "apriltag_test_calib.npz"
+    assert calib_path.is_file()
+    z = np.load(calib_path, allow_pickle=True)
+    assert z["UV"].shape == UV.shape and z["Q"].shape == Q.shape
+    meta = z["meta"].item()
+    assert meta["scheme"] == "planar_uv_nn"
+    assert meta["a2_inplane_rms_mm"] < 1e-6
+    # The world map is carried through so the control tool can recover the frame.
+    assert "world_map_plane_normal" in z.files
+
+    # And the written library drives the V3 mapping directly.
+    from Utils.gaze.calibration_mapping import GazeCalibrationMappingV3
+    m = GazeCalibrationMappingV3(z)
+    assert m.num_valid_samples == UV.shape[0]
+
+
+def test_planar_solve_writes_library_when_X_all_nan(tmp_path, capsys):
+    UV = np.array([[0.0, 0.0], [100.0, 0.0], [0.0, 100.0], [100.0, 100.0]])
+    Q = np.linspace(0.1, 0.4, 4)[:, None] * np.ones((1, 7))
+    X = np.full((4, 3), np.nan)  # camera-side dry run, no robot
+    sweep = tmp_path / "apriltag_sweep_dry.npz"
+    _write_sweep(sweep, UV, Q, X)
+    assert calib.main(["--stage", "solve", str(sweep)]) == 0
+    out = capsys.readouterr().out
+    assert "A2 residual skipped" in out
+    z = np.load(tmp_path / "apriltag_dry_calib.npz", allow_pickle=True)
+    assert z["UV"].shape == (4, 2)
+
+
+def test_planar_solve_too_few_rows_returns_1(tmp_path):
+    UV = np.array([[0.0, 0.0], [10.0, 0.0]])
+    Q = np.zeros((2, 7))
+    Q[1] = np.nan  # only 1 finite (UV,Q) row remains
+    _write_sweep(tmp_path / "apriltag_sweep_tiny.npz", UV, Q, np.zeros((2, 3)))
+    assert calib.main(["--stage", "solve", str(tmp_path / "apriltag_sweep_tiny.npz")]) == 1
+
+
 def test_camera_params_from_K():
     K = np.array([[1490.0, 0, 800.0], [0, 1480.0, 600.0], [0, 0, 1]])
     assert camera_params(K) == (1490.0, 1480.0, 800.0, 600.0)

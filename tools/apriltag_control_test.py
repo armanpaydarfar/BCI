@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
 apriltag_control_test.py — drive the Harmony robot from gaze using an AprilTag
-calibration (WS5 REV03). The experimental validation of the gaze↔robot mapping,
-standalone — NOT the EEG-gated experiment driver.
+calibration (WS5 REV04, planar). The experimental validation of the gaze↔robot
+mapping, standalone — NOT the EEG-gated experiment driver.
 
 Methodology: SoftwareDocs/projects/harmony-bci/gaze-calibration/
-rev03-apriltag-methodology.md §5. Per fixation:
+rev04-planar-coverage-methodology.md §6. Per fixation:
 
-    gaze pixel → ray (cam frame) → intersect the world-tag plane → P_world
-      → P_base = T_base_world · P_world → nearest calibrated EE pose X[idx]
-      → joint vector Q[idx] → workspace clamp → command the robot.
+    gaze pixel → ray (cam frame) → intersect the table plane → P_world → table
+      (u,v) → nearest calibrated (u,v) (GazeCalibrationMappingV3) → joint vector
+      Q[idx] → workspace clamp → command the robot.
+
+REV04 drops the REV03 3-D T_base_world step: the runtime gaze∩plane point is on
+the table, so mapping table (u,v)→Q directly removes the height mismatch that
+put every first-HIL fixation >500 mm from the library (verification report §5).
+A REV03 rigid calib (T_base_world) is rejected — re-solve a sweep npz.
 
 The robot accepts only joint angles (verified in reports/cpp.md), so the command
 is the calibrated, known-safe Q[idx] — no inverse kinematics. **Tier-1: this
@@ -51,8 +56,15 @@ from Utils.gaze.apriltag_calib import (  # noqa: E402
     transform_point,
 )
 from Utils.gaze.apriltag_detect import RelayConsumer, detect_tags, load_detector  # noqa: E402
-from Utils.gaze.apriltag_world import recover_world_pose, world_map_from_arrays  # noqa: E402
-from Utils.gaze.calibration_mapping import WORKSPACE_BOUNDS_MARGIN  # noqa: E402
+from Utils.gaze.apriltag_world import (  # noqa: E402
+    plane_coords,
+    recover_world_pose,
+    world_map_from_arrays,
+)
+from Utils.gaze.calibration_mapping import (  # noqa: E402
+    WORKSPACE_BOUNDS_MARGIN,
+    GazeCalibrationMappingV3,
+)
 from Utils.gaze.harmony_link import HarmonyLink  # noqa: E402
 
 
@@ -63,40 +75,17 @@ def _log(msg: str) -> None:
 # ── pure helpers (hardware-free, unit-tested) ────────────────────────────────
 
 
-def workspace_bounds(Q: np.ndarray, margin: float = WORKSPACE_BOUNDS_MARGIN
-                     ) -> Tuple[np.ndarray, np.ndarray]:
-    """Per-joint clamp envelope from the calibration library: [min-margin·span,
-    max+margin·span]. Mirrors GazeCalibrationMappingV2's clamp."""
-    q_min = Q.min(axis=0)
-    q_max = Q.max(axis=0)
-    span = q_max - q_min
-    return q_min - margin * span, q_max + margin * span
-
-
-def clamp_joints(q: np.ndarray, q_lo: np.ndarray, q_hi: np.ndarray
-                 ) -> Tuple[np.ndarray, bool]:
-    """Clip a joint vector into the workspace envelope. Returns (clipped,
-    was_clamped)."""
-    clipped = np.clip(q, q_lo, q_hi)
-    return clipped, bool(np.any(clipped != q))
-
-
-def nearest_pose(X: np.ndarray, p_base: np.ndarray) -> Tuple[int, float]:
-    """Index + Euclidean distance (mm) of the nearest calibrated EE position to
-    a fixated base-frame point."""
-    d = np.linalg.norm(X - p_base[None, :], axis=1)
-    idx = int(np.argmin(d))
-    return idx, float(d[idx])
-
-
-def gaze_point_in_base(gaze_x: float, gaze_y: float, K: np.ndarray,
-                       T_cam_world: np.ndarray, T_base_world: np.ndarray,
-                       plane_point_world, plane_normal_world) -> Optional[np.ndarray]:
-    """Full §5 chain for one gaze sample: pixel → ray → table-plane hit → world
-    frame → base frame. Returns P_base (mm) or None if the ray misses. The table
-    plane is the world-frame plane fitted across all world tags (robust to any
-    one tag's orientation noise), transformed into the camera frame via the fused
-    ``T_cam_world``."""
+def gaze_point_in_plane_uv(gaze_x: float, gaze_y: float, K: np.ndarray,
+                           T_cam_world: np.ndarray,
+                           plane_point_world, plane_normal_world) -> Optional[np.ndarray]:
+    """REV04 §6 runtime chain for one gaze sample: pixel → ray → table-plane hit →
+    world frame → table-plane ``(u,v)``. Returns ``(u,v)`` (mm) or None if the ray
+    misses. This is the REV03 ``gaze_point_in_base`` chain with the ``T_base_world``
+    step **removed** (rev04 §1) and a final projection into the deterministic
+    in-plane basis (``plane_coords``) — so the runtime point and the calibration
+    library point are the same kind of point (both on the table plane). The world
+    plane is fitted across all world tags (robust to any one tag's orientation
+    noise), transformed into the camera frame via the fused ``T_cam_world``."""
     ray = gaze_ray_cam(gaze_x, gaze_y, K)
     if ray is None:
         return None
@@ -106,18 +95,17 @@ def gaze_point_in_base(gaze_x: float, gaze_y: float, K: np.ndarray,
     if hit_cam is None:
         return None
     p_world = transform_point(invert_transform(T_cam_world), hit_cam)
-    return transform_point(T_base_world, p_world)
+    return plane_coords(p_world, plane_point_world, plane_normal_world)
 
 
 # ── gaze sampling (median over a short window) ───────────────────────────────
 
 
-def _sample_p_base(consumer: RelayConsumer, detector, K, T_base_world,
-                   world_map: dict, tag_size: float, dur_s: float
-                   ) -> Optional[np.ndarray]:
-    """Average (median) the fixated base-frame point over a short window, using
-    only frames where gaze is valid and ≥1 mapped world tag is seen. The world
-    pose is fused from whichever mapped tags are visible (occlusion-robust)."""
+def _sample_uv(consumer: RelayConsumer, detector, K, world_map: dict,
+               tag_size: float, dur_s: float) -> Optional[np.ndarray]:
+    """Median fixated table-plane ``(u,v)`` over a short window, using only frames
+    where gaze is valid and ≥1 mapped world tag is seen. The world pose is fused
+    from whichever mapped tags are visible (occlusion-robust)."""
     pts: List[np.ndarray] = []
     last_idx = None
     deadline = time.time() + dur_s
@@ -136,10 +124,10 @@ def _sample_p_base(consumer: RelayConsumer, detector, K, T_base_world,
         T_cam_world = recover_world_pose(world_view, world_map)
         if T_cam_world is None:
             continue
-        p_base = gaze_point_in_base(b.gaze.x, b.gaze.y, K, T_cam_world, T_base_world,
+        uv = gaze_point_in_plane_uv(b.gaze.x, b.gaze.y, K, T_cam_world,
                                     world_map["plane_point"], world_map["plane_normal"])
-        if p_base is not None:
-            pts.append(p_base)
+        if uv is not None:
+            pts.append(uv)
     if not pts:
         return None
     return np.median(np.vstack(pts), axis=0)
@@ -171,34 +159,42 @@ def _commit_move(link: HarmonyLink, q_cmd: np.ndarray, idx: int, dur_s: float) -
 
 def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
     z = np.load(args.calib, allow_pickle=True)
-    missing = [k for k in ("X", "Q", "T_base_world") if k not in z.files]
-    if missing:
-        _log(f"{args.calib} is not an AprilTag calibration (missing {missing}); "
-             "select an apriltag_*_calib.npz from the calibration tool's solve stage")
+    # REV04: the command path is the planar (u,v)→Q library. A REV03 rigid calib
+    # (T_base_world) is no longer accepted — its EE-hover poses and a table fixation
+    # live at different heights (verification report §5), the failure REV04 removes.
+    if "UV" not in z.files:
+        if "T_base_world" in z.files:
+            _log(f"{args.calib} is a REV03 RIGID calibration (T_base_world). The "
+                 "REV04 control test uses the planar (u,v) chain — re-solve a sweep "
+                 "npz so the solve writes scheme='planar_uv_nn' (UV/Q).")
+        else:
+            _log(f"{args.calib} is not a planar AprilTag calibration (missing UV); "
+                 "select an apriltag_*_calib.npz from the planar solve stage")
         return 2
-    X = np.asarray(z["X"], dtype=float)
-    Q = np.asarray(z["Q"], dtype=float)
-    T_base_world = np.asarray(z["T_base_world"], dtype=float)
-    # The world map (registered during collect) lets any visible subset of world
-    # tags recover the SAME world frame — occlusion-robust. Tag size defaults
-    # from meta so the panel button needs only --calib.
+    # The world map (registered during the sweep) lets any visible subset of world
+    # tags recover the SAME world frame — occlusion-robust. Tag size defaults from
+    # meta so the panel button needs only --calib.
     wm_keys = ("world_map_ref", "world_map_ids", "world_map_rels",
                "world_map_plane_point", "world_map_plane_normal")
     if not all(k in z.files for k in wm_keys):
-        _log(f"{args.calib} has no world map — re-run the calibration (collect "
-             "now registers a multi-tag world map)")
+        _log(f"{args.calib} has no world map — re-run the calibration (the sweep "
+             "registers a multi-tag world map)")
         return 2
     world_map = world_map_from_arrays(z["world_map_ref"], z["world_map_ids"],
                                       z["world_map_rels"], z["world_map_plane_point"],
                                       z["world_map_plane_normal"])
+    try:
+        mapping = GazeCalibrationMappingV3(z)
+    except (KeyError, ValueError) as exc:
+        _log(f"{args.calib} planar library is unusable: {exc}")
+        return 2
     meta = z["meta"].item() if "meta" in z.files else {}
     tag_size = (args.tag_size if args.tag_size is not None
                 else float(meta.get("tag_size_m", 0.06)))
-    q_lo, q_hi = workspace_bounds(Q)
     detector = load_detector(args.families)
     K = consumer.camera_matrix
-    _log(f"calibration: {X.shape[0]} poses, RMS in meta. Workspace clamp from Q±"
-         f"{WORKSPACE_BOUNDS_MARGIN:.0%}. Robot dur={args.dur:.1f}s.")
+    _log(f"calibration: {mapping.num_valid_samples} planar (u,v)→Q poses. Workspace "
+         f"clamp from Q±{WORKSPACE_BOUNDS_MARGIN:.0%}. Robot dur={args.dur:.1f}s.")
     _log("Per move: fixate a calibrated target, Enter to RESOLVE; review; then "
          "'g' to GO ('g' again to confirm a far fixation), 'r' to re-resolve, "
          "'h' to home, 'q' to quit. NO autonomous motion.")
@@ -231,17 +227,17 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
 
         # default (Enter / 'r'): resolve a fixation
         _log(f"resolving — fixate the target for {args.sample_s:.1f}s …")
-        p_base = _sample_p_base(consumer, detector, K, T_base_world,
-                                world_map, tag_size, args.sample_s)
-        if p_base is None:
+        uv = _sample_uv(consumer, detector, K, world_map, tag_size, args.sample_s)
+        if uv is None:
             _log("no valid gaze+world-tag samples — keep the world tag in view and fixate")
             pending, far_armed = None, False
             continue
-        idx, dist = nearest_pose(X, p_base)
-        q_cmd, clamped = clamp_joints(Q[idx], q_lo, q_hi)
-        _log(f"fixated P_base = {np.round(p_base,1)} mm")
-        _log(f"nearest calibrated pose #{idx}: X={np.round(X[idx],1)} mm, "
-             f"dist={dist:.1f} mm, clamped={clamped}")
+        result = mapping.query_uv(uv)
+        idx, dist = result.idx, result.dist
+        q_cmd, clamped = result.q_target, result.clamped
+        _log(f"fixated table (u,v) = {np.round(uv,1)} mm")
+        _log(f"nearest calibrated pose #{idx}: library (u,v)={np.round(result.x_target,1)} "
+             f"mm, dist={dist:.1f} mm, clamped={clamped}")
         _log(f"joint target (rad) = {np.round(q_cmd,4).tolist()}")
         if dist > args.max_nn_dist_mm:
             _log(f"WARNING: {dist:.0f} mm from the nearest calibrated pose "

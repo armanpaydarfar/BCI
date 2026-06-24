@@ -33,7 +33,49 @@ from Utils.gaze.apriltag_calib import (  # noqa: E402
     tag_plane_in_cam,
     transform_point,
     umeyama_rigid,
+    umeyama_similarity_2d,
 )
+
+
+def _rot2(deg):
+    a = np.radians(deg)
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s], [s, c]])
+
+
+def test_similarity_2d_recovers_known_transform():
+    rng = np.random.default_rng(3)
+    src = rng.standard_normal((8, 2)) * 50.0
+    s_true, R = 1.7, _rot2(35.0)
+    t_true = np.array([120.0, -45.0])
+    dst = (s_true * R @ src.T).T + t_true
+    A, t, s, rms = umeyama_similarity_2d(src, dst)
+    assert s == pytest.approx(s_true, abs=1e-9)
+    np.testing.assert_allclose(A, s_true * R, atol=1e-7)
+    np.testing.assert_allclose(t, t_true, atol=1e-6)
+    assert rms == pytest.approx(0.0, abs=1e-7)
+
+
+def test_similarity_2d_residual_reports_noise():
+    rng = np.random.default_rng(4)
+    src = rng.standard_normal((20, 2)) * 30.0
+    dst = (2.0 * _rot2(10.0) @ src.T).T + np.array([5.0, 5.0])
+    dst_noisy = dst + rng.standard_normal(dst.shape) * 1.5
+    _A, _t, _s, rms = umeyama_similarity_2d(src, dst_noisy)
+    assert 0.5 < rms < 4.0
+
+
+def test_similarity_2d_rejects_too_few_points():
+    with pytest.raises(ValueError):
+        umeyama_similarity_2d(np.zeros((1, 2)), np.zeros((1, 2)))
+
+
+def test_similarity_2d_rejects_nonfinite():
+    src = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]])
+    dst = src.copy()
+    dst[0, 0] = np.nan
+    with pytest.raises(ValueError):
+        umeyama_similarity_2d(src, dst)
 
 
 def _rot_z(deg):

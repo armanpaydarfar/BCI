@@ -30,9 +30,11 @@ Stages (`--stage`):
              fresh frame with telemetry, time-aligns + quality-gates it, derives
              the table-plane (u,v), and drives an adaptive coverage box UI. Stops
              on full coverage. Saves apriltag_sweep_<UTC>.npz (UV, Q, X, maps).
-    solve    offline. Umeyama rigid fit of T_base_world from {P_world ↔ X},
-             leave-one-out cross-validation, and writes a consolidated
-             <stem>_calib.npz (X, Q, T_base_world) the control tool consumes.
+    solve    offline, auto-detected from the npz: a REV04 sweep (UV) → the planar
+             (u,v)→Q library + A2 in-plane similarity residual/LOO
+             (scheme="planar_uv_nn"); a REV03 collect (P_world) → the rigid
+             Umeyama T_base_world fit. Writes a <stem>_calib.npz the control
+             tool consumes.
 
 World tags: `--world-tag-ids` takes one or more (corner) tags. `collect` first
 **registers a rigid world map** over them (all visible once, arm clear), so at
@@ -76,6 +78,7 @@ from Utils.gaze.apriltag_calib import (  # noqa: E402
     geodesic_angle_deg,
     per_point_errors,
     umeyama_rigid,
+    umeyama_similarity_2d,
 )
 from Utils.gaze.apriltag_detect import (  # noqa: E402
     RelayConsumer,
@@ -675,11 +678,24 @@ def _make_coverage_ui(args):
 
 
 def stage_solve(args) -> int:
+    """Dispatch the offline solve by capture type: a REV04 sweep npz (``UV``
+    present) → the planar ``(u,v)→Q`` solve; a REV03 collect npz (``P_world``) →
+    the rigid ``T_base_world`` Umeyama fit."""
     npz_path = Path(args.npz)
     if not npz_path.is_file():
         _log(f"npz not found: {npz_path}")
         return 2
     z = np.load(npz_path, allow_pickle=True)
+    if "UV" in z.files:
+        return stage_solve_planar(args, z, npz_path)
+    if "P_world" in z.files:
+        return stage_solve_rigid(args, z, npz_path)
+    _log(f"{npz_path.name} has neither UV (planar sweep) nor P_world (rigid "
+         "collect) — not a solvable capture")
+    return 2
+
+
+def stage_solve_rigid(args, z, npz_path) -> int:
     P_world = np.asarray(z["P_world"], dtype=float)
     X = np.asarray(z["X"], dtype=float)
     Q = np.asarray(z["Q"], dtype=float)
@@ -739,6 +755,79 @@ def stage_solve(args) -> int:
         **extra,
     )
     _log(f"calibration → {out_path}")
+    _log("drive the robot: "
+         f"python tools/apriltag_control_test.py --calib {out_path}")
+    return 0
+
+
+def stage_solve_planar(args, z, npz_path) -> int:
+    """REV04 planar solve (rev04 §1). Builds the ``(u,v)→Q`` nearest-neighbour
+    library (A1, the command path) from a sweep npz and reports the A2 2-D
+    similarity residual + leave-one-out as the quality readout — the well-conditioned
+    in-plane analogue of the old Umeyama RMS. Writes ``<stem>_calib.npz`` with
+    ``scheme="planar_uv_nn"`` (UV, Q, world map + plane) for the control tool."""
+    UV = np.asarray(z["UV"], dtype=float)
+    Q = np.asarray(z["Q"], dtype=float)
+    X = np.asarray(z["X"], dtype=float) if "X" in z.files else np.full((UV.shape[0], 3), np.nan)
+
+    # A1 library needs finite (UV, Q); a no-robot dry-run sweep has NaN Q.
+    lib_ok = np.all(np.isfinite(UV), axis=1) & np.all(np.isfinite(Q[:, :7]), axis=1)
+    UV, Q, X = UV[lib_ok], Q[lib_ok], X[lib_ok]
+    n = UV.shape[0]
+    if n < 3:
+        _log(f"only {n} finite (UV,Q) rows (<3) — cannot build a library. "
+             "Was --with-robot used during the sweep?")
+        return 1
+    _log(f"planar library: {n} (u,v)→Q rows; u∈[{UV[:,0].min():.0f},{UV[:,0].max():.0f}] "
+         f"v∈[{UV[:,1].min():.0f},{UV[:,1].max():.0f}] mm")
+
+    # A2 (diagnostic): in-plane similarity fit base(x,y) ← plane(u,v) where the
+    # base-frame EE position is finite. Reports residual + LOO, NOT the command path.
+    a2_ok = X is not None and np.all(np.isfinite(X), axis=1)
+    n2 = int(np.sum(a2_ok)) if X is not None else 0
+    rms2 = float("nan")
+    if n2 >= 2:
+        uv_f, xy_f = UV[a2_ok], X[a2_ok, :2]
+        _A, _t, _s, rms2 = umeyama_similarity_2d(uv_f, xy_f)
+        _log(f"A2 in-plane similarity residual (uv→base xy, {n2} pts): RMS={rms2:.2f} mm "
+             f"(scale {_s:.4f})")
+        if n2 >= 4:
+            loo = []
+            for i in range(n2):
+                mask = np.ones(n2, dtype=bool)
+                mask[i] = False
+                A_i, t_i, _si, _r = umeyama_similarity_2d(uv_f[mask], xy_f[mask])
+                pred = A_i @ uv_f[i] + t_i
+                loo.append(float(np.linalg.norm(pred - xy_f[i])))
+            loo = np.array(loo)
+            _log(f"A2 leave-one-out: median={np.median(loo):.2f} max={loo.max():.2f} mm")
+        ok = rms2 < 20.0
+        _log(f"VERDICT: {'PASS' if ok else 'REVIEW'} (A2 in-plane RMS target ≲10–20 mm)")
+    else:
+        _log("A2 residual skipped: <2 rows with a finite base-frame X (no-robot "
+             "dry run?). The A1 (u,v)→Q library is still written.")
+
+    src_meta = z["meta"].item() if "meta" in z.files else {}
+    calib_meta = dict(src_meta)
+    calib_meta.update({"scheme": "planar_uv_nn", "n_points": int(n),
+                       "a2_inplane_rms_mm": rms2, "a2_n_points": n2,
+                       "source_capture": npz_path.name})
+    out_path = npz_path.with_name(npz_path.stem.replace("apriltag_sweep", "apriltag")
+                                  + "_calib.npz")
+    # Carry the world map + plane through so the control tool recovers the SAME
+    # world frame and the SAME (u,v) basis used at capture.
+    extra = {}
+    for k in ("world_map_ref", "world_map_ids", "world_map_rels",
+              "world_map_plane_point", "world_map_plane_normal"):
+        if k in z.files:
+            extra[k] = z[k]
+    np.savez_compressed(
+        out_path,
+        UV=UV, Q=Q, X=X,
+        meta=np.array(calib_meta, dtype=object),
+        **extra,
+    )
+    _log(f"planar calibration → {out_path}")
     _log("drive the robot: "
          f"python tools/apriltag_control_test.py --calib {out_path}")
     return 0
