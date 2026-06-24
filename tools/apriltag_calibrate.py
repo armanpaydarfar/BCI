@@ -93,6 +93,7 @@ from Utils.gaze.apriltag_world import (  # noqa: E402
     build_world_map,
     plane_coords,
     recover_world_pose,
+    table_normal_from_rel,
     world_map_to_arrays,
 )
 from Utils.gaze.apriltag_sweep import (  # noqa: E402
@@ -769,14 +770,24 @@ def _ee_point_world(method, T_cam_world, T_cam_eetag, plane_point, plane_normal,
 
 def _recompute_planar_uv(z, method):
     """Re-derive every sweep sample's table ``(u,v)`` from the stored per-sample
-    transforms (``T_cam_world`` / ``T_cam_eetag`` + the world plane) using ``method``,
-    and recompute the green/sufficient mask for the new ``(u,v)`` with the sweep's
-    own coverage knobs (the cells move when the points do). Returns ``(UV, green)``.
-    Lets a captured sweep be re-solved with a different EE-point method — no rig."""
+    transforms (``T_cam_world`` / ``T_cam_eetag``) using ``method`` — AND recompute
+    the table plane from the stored world map's tag ORIENTATIONS
+    (`table_normal_from_rel`), correcting an old origin-fit plane (idempotent for an
+    orientation-built map). The green/sufficient mask is recomputed too (the cells
+    move with the points). Returns ``(UV, green, plane_point, plane_normal)`` — the
+    corrected plane is written into the calib so the runtime gaze uses the same one.
+    Lets a captured sweep be re-solved a different way, with the plane fix, no rig."""
     Tcw = np.asarray(z["T_cam_world"], dtype=float)
     Tce = np.asarray(z["T_cam_eetag"], dtype=float)
-    pp = np.asarray(z["world_map_plane_point"], dtype=float)
-    pn = np.asarray(z["world_map_plane_normal"], dtype=float)
+    rels = np.asarray(z["world_map_rels"], dtype=float)
+    ids = [int(i) for i in np.asarray(z["world_map_ids"]).ravel()]
+    rel = {ids[k]: rels[k] for k in range(len(ids))}
+    if len(ids) >= 3:
+        pp = np.mean([rel[i][:3, 3] for i in ids], axis=0)
+        pn = table_normal_from_rel(rel, ids)
+    else:
+        pp = np.asarray(z["world_map_plane_point"], dtype=float)
+        pn = np.asarray(z["world_map_plane_normal"], dtype=float)
     meta = z["meta"].item() if "meta" in z.files else {}
     offset = np.asarray(meta.get("t_eetag_ee_mm", [0.0, 0.0, 0.0]), dtype=float)
     pts = [(_ee_point_world(method, Tcw[i], Tce[i], pp, pn, offset)) for i in range(len(Tcw))]
@@ -791,7 +802,7 @@ def _recompute_planar_uv(z, method):
         grid.add(uv)
     green = np.zeros(len(UV), dtype=bool)
     green[finite] = grid.sufficient_mask(UV[finite])
-    return UV, green
+    return UV, green, pp, pn
 
 
 def _await_sweep_start(ui) -> bool:
@@ -911,10 +922,13 @@ def stage_solve_planar(args, z, npz_path) -> int:
     # another way (e.g. tag 'pose' once consensus stabilised the world frame) with no
     # re-sweep. The coverage/green mask is recomputed too, since the cells move.
     green_src = np.asarray(z["green"], dtype=bool) if "green" in z.files else None
+    plane_fix = None  # (plane_point, plane_normal) to override in the calib, if recomputed
     if args.ee_point_method is not None and "T_cam_world" in z.files:
-        UV, green_src = _recompute_planar_uv(z, args.ee_point_method)
+        UV, green_src, _pp_fix, _pn_fix = _recompute_planar_uv(z, args.ee_point_method)
+        plane_fix = (_pp_fix, _pn_fix)
         _log(f"recomputed (u,v) from stored transforms with "
-             f"ee-point-method={args.ee_point_method}")
+             f"ee-point-method={args.ee_point_method}; table normal from tag "
+             f"orientations = {np.round(_pn_fix, 3).tolist()}")
 
     # Green-only (rev04 §3, operator 2026-06-24): build the library from samples in
     # sufficient ("green") coverage cells only — the default, since transit /
@@ -984,6 +998,10 @@ def stage_solve_planar(args, z, npz_path) -> int:
               "world_map_plane_point", "world_map_plane_normal"):
         if k in z.files:
             extra[k] = z[k]
+    if plane_fix is not None:
+        # The (u,v) were rebuilt on the orientation-derived plane; the runtime gaze
+        # must use the SAME plane, so override the stored (possibly origin-fit) one.
+        extra["world_map_plane_point"], extra["world_map_plane_normal"] = plane_fix
     np.savez_compressed(
         out_path,
         UV=UV, Q=Q, X=X,

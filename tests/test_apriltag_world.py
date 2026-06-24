@@ -113,14 +113,19 @@ def test_fit_plane_recovers_normal():
     assert abs(c[2] - 5.0) < 1e-9               # centroid on the plane
 
 
-def test_plane_fit_robust_to_tilted_reference():
-    # Tags are TRULY coplanar, but the reference tag (id 0) is DETECTED with a
-    # 15° orientation error. The fitted world plane (from all tag origins) must
-    # recover the TRUE table plane in cam — not the noisy reference's tilted +Z.
+def test_plane_normal_from_orientation_survives_origin_height_noise():
+    # The world tags are taped coplanar on the flat table, so each tag's +Z is the
+    # true table normal — but their ESTIMATED origin heights are noisy (the single-
+    # tag depth ambiguity). The plane normal must come from the (reliable)
+    # orientations and recover the true table normal, where a fit through the noisy
+    # origins would tilt (the HIL 65° failure, 2026-06-24).
     T_cam_table = make_transform(_rot_x(10.0), [0.0, 0.0, 600.0])   # true table in cam
     table_T = {0: [0, 0, 0], 1: [400, 0, 0], 2: [0, 300, 0], 3: [400, 300, 0]}  # flat (z=0)
     cam_poses = {i: T_cam_table @ make_transform(np.eye(3), t) for i, t in table_T.items()}
-    cam_poses[0] = cam_poses[0] @ make_transform(_rot_x(15.0), [0, 0, 0])  # ref mis-detected
+    # Corrupt each tag's estimated origin ALONG the table normal (height noise),
+    # leaving the orientations — the reliable cue — intact.
+    for i, dz in zip([0, 1, 2, 3], [60.0, -50.0, 40.0, -70.0]):
+        cam_poses[i] = cam_poses[i] @ make_transform(np.eye(3), [0.0, 0.0, dz])
     wm = build_world_map(cam_poses, ref_id=0)
     T_cam_world = recover_world_pose(cam_poses, wm)
     normal_cam = T_cam_world[:3, :3] @ wm["plane_normal"]

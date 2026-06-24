@@ -96,6 +96,31 @@ def world_from_plane_coords(uv: np.ndarray, plane_point: np.ndarray,
     return P[0] if single else P
 
 
+def table_normal_from_rel(rel: Dict[int, np.ndarray], ids: List[int]) -> np.ndarray:
+    """Table-plane normal from the world tags' shared ORIENTATION — the mean of each
+    tag's +Z face normal in the world frame — not a plane fit through their origin
+    positions.
+
+    The world tags are taped coplanar on the flat table (operator 2026-06-24), so
+    every tag's +Z is the table normal. Their orientations are reliable (rev03
+    detect: sub-degree rotation jitter) while their estimated origin HEIGHTS are not
+    (the single-tag depth ambiguity). Fitting a plane through the noisy estimated
+    origins tilted the HIL table normal 65° from vertical even though the tags are
+    physically coplanar, which mis-projected the elevated EE tag relative to the gaze
+    ray into a large systematic control-test offset (2026-06-24). Averaging the
+    (reliable) orientations recovers the true near-vertical normal. Signs are aligned
+    to the first tag so a 180°-flipped detection does not cancel the mean."""
+    normals: List[np.ndarray] = []
+    ref_n: Optional[np.ndarray] = None
+    for i in ids:
+        n = np.asarray(rel[int(i)], dtype=float)[:3, 2]
+        if ref_n is None:
+            ref_n = n
+        normals.append(n if float(n @ ref_n) >= 0.0 else -n)
+    m = np.mean(normals, axis=0)
+    return m / np.linalg.norm(m)
+
+
 def build_world_map(cam_poses_by_id: Dict[int, np.ndarray],
                     ref_id: Optional[int] = None) -> Dict:
     """Build the rigid tag map from one registration observation.
@@ -108,11 +133,12 @@ def build_world_map(cam_poses_by_id: Dict[int, np.ndarray],
     Returns:
         ``{"ref_id", "ids", "rel": {id: T_ref_id}, "plane_point", "plane_normal"}``.
         ``T_ref_id`` is tag ``id``'s pose in the world (reference-tag) frame
-        (``rel[ref_id]`` = identity). ``plane_point``/``plane_normal`` are the
-        table plane in the world frame, **fit from all tag origins** when ≥3 tags
-        are present — so the depth plane's orientation is the consensus of all
-        coplanar tags, not one (possibly noisy/tilted) tag's normal. With <3 tags
-        it falls back to the reference tag's own plane (world z=0).
+        (``rel[ref_id]`` = identity). ``plane_point`` is the centroid of the tag
+        origins; ``plane_normal`` is the mean of the tags' +Z face normals
+        (`table_normal_from_rel`) when ≥3 tags are present — the tags are coplanar on
+        the flat table, and their orientations are reliable where their estimated
+        origin heights are not (origin-fit tilted the HIL plane 65°). With <3 tags it
+        falls back to the reference tag's own plane (world z=0).
     """
     ids = sorted(int(i) for i in cam_poses_by_id)
     if not ids:
@@ -124,7 +150,8 @@ def build_world_map(cam_poses_by_id: Dict[int, np.ndarray],
     T_ref_cam = invert_transform(T_cam_ref)
     rel = {int(i): T_ref_cam @ np.asarray(cam_poses_by_id[i], dtype=float) for i in ids}
     if len(ids) >= 3:
-        plane_point, plane_normal = fit_plane(np.array([rel[i][:3, 3] for i in ids]))
+        plane_point = np.mean([rel[i][:3, 3] for i in ids], axis=0)
+        plane_normal = table_normal_from_rel(rel, ids)
     else:
         plane_point, plane_normal = np.zeros(3), np.array([0.0, 0.0, 1.0])
     return {"ref_id": ref, "ids": ids, "rel": rel,
