@@ -25,6 +25,11 @@ Stages (`--stage`):
              fixate → `c` (capture+lock) records X (EE pos) + Q (joint angles)
              from one telemetry reply, plus the EE-tag/world-tag poses → P_world.
              Saves apriltag_capture_<UTC>.npz.
+    sweep    + robot (REV04). CONTINUOUS swept capture: free the arm and
+             hand-guide the EE across the table while a ~20 Hz loop pairs each
+             fresh frame with telemetry, time-aligns + quality-gates it, derives
+             the table-plane (u,v), and drives an adaptive coverage box UI. Stops
+             on full coverage. Saves apriltag_sweep_<UTC>.npz (UV, Q, X, maps).
     solve    offline. Umeyama rigid fit of T_base_world from {P_world ↔ X},
              leave-one-out cross-validation, and writes a consolidated
              <stem>_calib.npz (X, Q, T_base_world) the control tool consumes.
@@ -80,9 +85,15 @@ from Utils.gaze.apriltag_detect import (  # noqa: E402
 from Utils.gaze.apriltag_world import (  # noqa: E402
     average_pose,
     build_world_map,
+    plane_coords,
     recover_world_pose,
     world_map_to_arrays,
 )
+from Utils.gaze.apriltag_sweep import (  # noqa: E402
+    accept_sweep_sample,
+    frame_telemetry_dt,
+)
+from Utils.gaze.coverage import CoverageGrid  # noqa: E402
 from Utils.gaze.harmony_link import HarmonyLink  # noqa: E402
 
 
@@ -264,27 +275,28 @@ def _resolve_ee_ids(args) -> Optional[List[int]]:
     return None
 
 
-def _register_ee_map(consumer, detector, K, ee_ids, world_tag_size, tag_sizes):
-    """Prompt + register the EE-tag bundle map (rev04 §7). For a single EE tag
-    this is a trivial 1-entry map (``recover_world_pose`` returns that tag's pose
-    directly); for a bundle it gives the occlusion-robust, ambiguity-reducing EE
-    pose the HIL report (§5) identified as the accuracy floor. Returns the map or
-    None (operator aborted)."""
+def _register_map_interactive(consumer, detector, K, ids, world_tag_size,
+                              tag_sizes, label, body_hint):
+    """Prompt the operator to show all ``ids`` and register a rigid tag map over
+    them, retrying until every listed tag is captured. Shared by collect + sweep
+    for BOTH the world bundle and the EE bundle (a single EE id is a trivial
+    1-entry map — ``recover_world_pose`` returns that tag's pose directly). Returns
+    the map (every listed tag present)."""
     while True:
-        input(f"place ALL EE tags {ee_ids} visible + the EE STILL, Enter to "
-              "register the EE-tag map (q+Enter to abort) > ")
-        ee_map, seen = _register_tag_map(consumer, detector, K, ee_ids,
-                                         world_tag_size, tag_sizes, label="EE")
-        if ee_map is None:
-            _log("  no EE tags detected — reposition and retry")
+        input(f"place ALL {label} tags {ids} visible + {body_hint}, Enter to "
+              f"register the {label}-tag map > ")
+        tag_map, seen = _register_tag_map(consumer, detector, K, ids,
+                                          world_tag_size, tag_sizes, label=label)
+        if tag_map is None:
+            _log(f"  no {label} tags detected — reposition and retry")
             continue
-        missing = [i for i in ee_ids if i not in seen]
+        missing = [i for i in ids if i not in seen]
         if missing:
-            _log(f"  registered {seen}, MISSING {missing} — re-show all EE tags "
-                 "(the bundle needs every tag so any subset works later), then retry")
+            _log(f"  registered {seen}, MISSING {missing} — re-show all {label} tags "
+                 "(the map needs every tag so any subset works later), then retry")
             continue
-        _log(f"  EE map OK: ref={ee_map['ref_id']}, tags={seen}")
-        return ee_map
+        _log(f"  {label} map OK: ref={tag_map['ref_id']}, tags={seen}")
+        return tag_map
 
 
 def stage_collect(args, consumer: RelayConsumer) -> int:
@@ -306,28 +318,14 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
 
     # Register the multi-tag world map first (occlusion robustness): all world
     # tags must be seen once, arm clear, so any visible subset later recovers the
-    # same world frame.
-    world_map = None
-    while True:
-        input("place ALL world tags visible + arm CLEAR, Enter to register the world map > ")
-        world_map, seen = _register_tag_map(consumer, detector, K, world_ids,
-                                            args.tag_size, tag_sizes, label="world")
-        if world_map is None:
-            _log("  no world tags detected — reposition and retry")
-            continue
-        missing = [i for i in world_ids if i not in seen]
-        if missing:
-            _log(f"  registered {seen}, MISSING {missing} — re-show all world tags "
-                 "(the map needs every tag so any subset works later), then retry")
-            continue
-        _log(f"  world map OK: ref={world_map['ref_id']}, tags={seen}")
-        break
-
-    # Register the EE-tag bundle map (rev04 §7): a single tag is a 1-entry map; a
-    # bundle resolves the single-small-tag pose ambiguity that set the HIL
-    # accuracy floor (verification report §5). The offset is w.r.t. the EE-map
-    # reference tag.
-    ee_map = _register_ee_map(consumer, detector, K, ee_ids, args.tag_size, tag_sizes)
+    # same world frame. Then the EE-tag bundle map (rev04 §7) — a bundle resolves
+    # the single-small-tag pose ambiguity that set the HIL accuracy floor
+    # (verification report §5); a single id is a 1-entry map. The offset is w.r.t.
+    # the EE-map reference tag.
+    world_map = _register_map_interactive(consumer, detector, K, world_ids,
+                                          args.tag_size, tag_sizes, "world", "arm CLEAR")
+    ee_map = _register_map_interactive(consumer, detector, K, ee_ids,
+                                       args.tag_size, tag_sizes, "EE", "the EE STILL")
     ee_ref = ee_map["ref_id"]
 
     link: Optional[HarmonyLink] = None
@@ -466,6 +464,213 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
     return 0
 
 
+# ── stage: sweep (REV04 continuous swept capture) ────────────────────────────
+
+
+def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
+    """REV04 continuous swept capture (rev04 §2). The operator frees the arm and
+    hand-guides the EE **across the table surface** while a ~20 Hz loop pairs each
+    fresh relay frame with a robot-telemetry sample, time-aligns + quality-gates it
+    (`apriltag_sweep`), derives the table-plane ``(u,v)``, and feeds a
+    `CoverageGrid`. One slow sweep yields hundreds of correspondences instead of the
+    ~23 discrete collect poses. Stops when coverage is sufficient, the time budget
+    is hit, the UI requests quit, or Ctrl-C. Writes ``apriltag_sweep_<UTC>.npz``.
+
+    ``ui`` is an optional coverage view (step 4) exposing ``update(grid, cur_uv,
+    target_uv)`` / ``should_quit()`` / ``close()``; ``None`` runs headless with a
+    periodic text summary (the camera-side verification path)."""
+    ee_ids = _resolve_ee_ids(args)
+    if not args.world_tag_ids or ee_ids is None:
+        _log("sweep needs --world-tag-ids and --ee-tag-id/--ee-tag-ids")
+        return 2
+    world_ids = [int(i) for i in args.world_tag_ids]
+    detector = load_detector(args.families)
+    K = consumer.camera_matrix
+    offset_mm = np.asarray(args.t_eetag_ee, dtype=float)
+    ee_size = args.ee_tag_size or args.tag_size
+    tag_sizes = {int(i): ee_size for i in ee_ids}
+    _log(f"tag sizes: world {args.tag_size} m, EE {ee_size} m; world tags "
+         f"{world_ids}, EE tags {ee_ids}")
+
+    world_map = _register_map_interactive(consumer, detector, K, world_ids,
+                                          args.tag_size, tag_sizes, "world", "arm CLEAR")
+    ee_map = _register_map_interactive(consumer, detector, K, ee_ids,
+                                       args.tag_size, tag_sizes, "EE", "the EE STILL")
+    ee_ref = ee_map["ref_id"]
+    plane_point = world_map["plane_point"]
+    plane_normal = world_map["plane_normal"]
+
+    grid = CoverageGrid(cell_size_mm=args.cell_size_mm, min_samples=args.min_samples,
+                        min_spread_mm=args.min_spread_mm)
+
+    link: Optional[HarmonyLink] = None
+    if args.with_robot:
+        link = HarmonyLink(args.robot_ip, args.robot_port, args.bind_ip,
+                           args.bind_port, side=args.side)
+        if not link.free_arm():
+            _log("could not free the arm (ACK:MASTER_FREE not seen) — aborting sweep")
+            link.close()
+            return 1
+        _log("arm FREED — hand-guide the EE slowly across the table surface")
+    else:
+        _log("no --with-robot: Q/X will be NaN (camera-side dry run — verifies "
+             "(u,v) + coverage on a recorded stream, not a solvable library)")
+
+    uv_rows: List[np.ndarray] = []
+    q_rows: List[np.ndarray] = []
+    x_rows: List[np.ndarray] = []
+    tcw_rows: List[np.ndarray] = []
+    tce_rows: List[np.ndarray] = []
+    t_rows: List[float] = []
+
+    period = 1.0 / args.sample_hz
+    last_idx = None
+    accepted = 0
+    next_tick = time.monotonic()
+    last_report = time.monotonic()
+    deadline = time.monotonic() + args.max_sweep_s
+    _log(f"sweep: ≤{args.max_sweep_s:.0f}s, stop early on full coverage "
+         f"(cell {args.cell_size_mm:.0f}mm, ≥{args.min_samples} samples, spread "
+         f"≥{args.min_spread_mm:.0f}mm). Ctrl-C to stop + save.")
+    try:
+        while time.monotonic() < deadline:
+            next_tick += period
+            b, t_frame = consumer.latest_with_time()
+            if b is None or b.video is None or b.video.bgr is None or b.video.frame_idx == last_idx:
+                _sleep_until(next_tick)
+                continue
+            last_idx = b.video.frame_idx
+
+            if link is not None:
+                rstate = link.query_state()
+                if rstate is None:
+                    _sleep_until(next_tick)
+                    continue
+                q_joints, x_ee, t_robot = rstate["q"], rstate["ee"], rstate["_t"]
+            else:
+                q_joints, x_ee, t_robot = np.full(7, np.nan), np.full(3, np.nan), time.time()
+
+            tags = detect_tags(detector, b.video.bgr, K, args.tag_size, tag_sizes=tag_sizes)
+            world_view = {i: tags[i]["T"] for i in world_ids if i in tags}
+            ee_view = {i: tags[i]["T"] for i in ee_ids if i in tags}
+            T_cam_world = recover_world_pose(world_view, world_map)
+            T_cam_eetag = recover_world_pose(ee_view, ee_map)
+            margins = ([tags[i]["margin"] for i in world_view]
+                       + [tags[i]["margin"] for i in ee_view])
+            dt = frame_telemetry_dt(t_frame, t_robot)
+            ok, reason = accept_sweep_sample(
+                world_seen=T_cam_world is not None, ee_seen=T_cam_eetag is not None,
+                margins=margins, dt_s=dt,
+                min_margin=args.min_margin, max_align_dt_s=args.max_align_dt_s)
+
+            cur_uv = None
+            if ok:
+                p_world = eetag_to_world_point(T_cam_world, T_cam_eetag, offset_mm)
+                cur_uv = plane_coords(p_world, plane_point, plane_normal)
+                grid.add(cur_uv)
+                uv_rows.append(cur_uv)
+                q_rows.append(q_joints)
+                x_rows.append(x_ee)
+                tcw_rows.append(T_cam_world)
+                tce_rows.append(T_cam_eetag)
+                t_rows.append(t_robot)
+                accepted += 1
+
+            target = grid.next_target()
+            if ui is not None:
+                ui.update(grid, cur_uv, target)
+                if ui.should_quit():
+                    _log("sweep: quit requested from the coverage view")
+                    break
+
+            now = time.monotonic()
+            if now - last_report >= 1.0:
+                s = grid.summary()
+                tgt = "—" if target is None else np.round(target, 0).tolist()
+                _log(f"  accepted={accepted} cells={int(s['visited'])} "
+                     f"sufficient={int(s['sufficient'])} → go to {tgt}"
+                     + ("" if ok else f"  (last drop: {reason})"))
+                last_report = now
+
+            if grid.done():
+                _log("sweep: coverage COMPLETE — every visited cell is sufficient")
+                break
+            _sleep_until(next_tick)
+    except KeyboardInterrupt:
+        _log("sweep: Ctrl-C — stopping and saving what we have")
+    finally:
+        if link is not None:
+            link.close()
+        if ui is not None:
+            ui.close()
+
+    if len(uv_rows) < 3:
+        _log(f"only {len(uv_rows)} accepted samples (<3) — not saving a solvable npz")
+        return 1
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    from datetime import datetime, timezone
+    stamp = args.utc_stamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_path = out_dir / f"apriltag_sweep_{stamp}.npz"
+    wm_ref, wm_ids, wm_rels, wm_pp, wm_pn = world_map_to_arrays(world_map)
+    em_ref, em_ids, em_rels, em_pp, em_pn = world_map_to_arrays(ee_map)
+    meta = {
+        "version": 3,
+        "scheme": "planar_sweep",
+        "side": args.side,
+        "world_tag_ids": world_ids,
+        "ee_tag_ids": ee_ids,
+        "ee_tag_id": ee_ref,
+        "tag_size_m": args.tag_size,
+        "ee_tag_size_m": ee_size,
+        "t_eetag_ee_mm": offset_mm.tolist(),
+        "with_robot": bool(args.with_robot),
+        "sample_hz": args.sample_hz,
+        "coverage": {"cell_size_mm": args.cell_size_mm,
+                     "min_samples": args.min_samples,
+                     "min_spread_mm": args.min_spread_mm,
+                     "complete": bool(grid.done())},
+        "units": {"UV": "mm (table plane)", "X": "mm", "Q": "rad", "t_eetag_ee": "mm"},
+    }
+    np.savez_compressed(
+        out_path,
+        UV=np.vstack(uv_rows),
+        Q=np.vstack(q_rows),
+        X=np.vstack(x_rows),
+        T_cam_world=np.stack(tcw_rows),
+        T_cam_eetag=np.stack(tce_rows),
+        t=np.asarray(t_rows, dtype=float),
+        world_map_ref=np.array(wm_ref), world_map_ids=wm_ids, world_map_rels=wm_rels,
+        world_map_plane_point=wm_pp, world_map_plane_normal=wm_pn,
+        ee_map_ref=np.array(em_ref), ee_map_ids=em_ids, ee_map_rels=em_rels,
+        ee_map_plane_point=em_pp, ee_map_plane_normal=em_pn,
+        meta=np.array(meta, dtype=object),
+    )
+    _log(f"saved {len(uv_rows)} swept samples → {out_path}")
+    if args.with_robot:
+        _log("solve it: "
+             f"python tools/apriltag_calibrate.py --stage solve {out_path}")
+    return 0
+
+
+def _sleep_until(deadline: float) -> None:
+    """Monotonic-clock pacing for the sweep loop; falls straight through if behind
+    (detection can exceed one tick under load)."""
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        time.sleep(remaining)
+
+
+def _make_coverage_ui(args):
+    """The sweep's coverage view: the OpenCV box (rev04 §3) unless ``--no-ui``
+    (headless camera-side verification, where only the text summary runs)."""
+    if args.no_ui:
+        return None
+    from Utils.gaze.coverage_view import CoverageBoxUI
+    return CoverageBoxUI(args.cell_size_mm, audio=args.audio)
+
+
 # ── stage: solve (offline) — writes the consolidated calibration ─────────────
 
 
@@ -546,7 +751,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     import config as cfg
     p = argparse.ArgumentParser(description="AprilTag gaze↔robot calibration tool")
     p.add_argument("--stage", required=True,
-                   choices=["detect", "gaze", "collect", "solve"])
+                   choices=["detect", "gaze", "collect", "sweep", "solve"])
     p.add_argument("npz", nargs="?", default=None,
                    help="solve stage: path to an apriltag_capture_*.npz")
     p.add_argument("--families", default="tag36h11")
@@ -588,9 +793,30 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="default: config.UDP_CONTROL_BIND[IP] (mirrors the recorder)")
     p.add_argument("--bind-port", type=int, default=None,
                    help="default: config.UDP_CONTROL_BIND[PORT]")
-    p.add_argument("--out-dir", default="runs", help="collect: directory for the saved npz")
+    p.add_argument("--out-dir", default="runs", help="collect/sweep: directory for the saved npz")
     p.add_argument("--utc-stamp", default=None,
-                   help="collect: override the auto UTC stamp in the npz filename")
+                   help="collect/sweep: override the auto UTC stamp in the npz filename")
+    # sweep stage (REV04 continuous capture + coverage)
+    p.add_argument("--sample-hz", type=float, default=20.0,
+                   help="sweep: telemetry/frame sampling rate (REV01 transit rate)")
+    p.add_argument("--max-sweep-s", type=float, default=180.0,
+                   help="sweep: hard time budget; the sweep also stops on full coverage")
+    p.add_argument("--cell-size-mm", type=float, default=50.0,
+                   help="sweep: coverage cell size on the table plane (mm)")
+    p.add_argument("--min-samples", type=int, default=8,
+                   help="sweep: samples needed per cell for sufficiency")
+    p.add_argument("--min-spread-mm", type=float, default=15.0,
+                   help="sweep: required spatial spread within a cell (frozen-hand guard)")
+    p.add_argument("--min-margin", type=float, default=20.0,
+                   help="sweep: reject a sample whose weakest contributing tag's "
+                        "decision margin is below this (motion blur / glancing view)")
+    p.add_argument("--max-align-dt-ms", type=float, default=50.0,
+                   help="sweep: reject a sample whose frame↔telemetry offset exceeds "
+                        "this (stale frame); default = one 20 Hz tick")
+    p.add_argument("--no-ui", action="store_true",
+                   help="sweep: run headless with a text summary (no OpenCV coverage box)")
+    p.add_argument("--audio", action="store_true",
+                   help="sweep: speak coverage cues (solo-operator aid, rev04 §3)")
     args = p.parse_args(argv)
 
     import os
@@ -605,6 +831,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     args.bind_ip = args.bind_ip or bind["IP"]
     args.bind_port = args.bind_port or int(bind["PORT"])
     args.side = (args.side or os.environ.get("HARMONY_ACTIVE_SIDE", "R")).upper()
+    args.max_align_dt_s = args.max_align_dt_ms / 1000.0
     return args
 
 
@@ -628,6 +855,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return stage_gaze(args, consumer)
         if args.stage == "collect":
             return stage_collect(args, consumer)
+        if args.stage == "sweep":
+            return stage_sweep(args, consumer, ui=_make_coverage_ui(args))
     finally:
         consumer.close()
     return 0

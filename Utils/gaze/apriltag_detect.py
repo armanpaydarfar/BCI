@@ -96,10 +96,13 @@ class RelayConsumer:
     ``latest()`` and dedup on ``frame_idx``. Exposes the handshake ``camera_matrix``."""
 
     def __init__(self, host: str, port: int, handshake_s: float = 5.0):
+        import time
         from Utils.remote_frame_reader import RemoteFrameReader
+        self._time = time.time
         self._reader = RemoteFrameReader(
             host, port, wait_for_handshake_s=handshake_s, auto_reconnect=False)
         self._latest = None
+        self._latest_t = 0.0
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="relay-consumer",
@@ -111,14 +114,23 @@ class RelayConsumer:
             for bundle in self._reader:
                 if self._stop.is_set():
                     break
+                t_recv = self._time()
                 with self._lock:
                     self._latest = bundle
+                    self._latest_t = t_recv
         except Exception as exc:  # surface, don't swallow: the relay died
             _log(f"relay consumer stopped: {exc!r}")
 
     def latest(self):
         with self._lock:
             return self._latest
+
+    def latest_with_time(self):
+        """The latest bundle paired with its host-clock arrival time (``time.time()``
+        at the moment this consumer received it). The sweep stage time-aligns this
+        against the robot telemetry timestamp to reject stale frames (rev04 §2)."""
+        with self._lock:
+            return self._latest, self._latest_t
 
     @property
     def camera_matrix(self) -> np.ndarray:
