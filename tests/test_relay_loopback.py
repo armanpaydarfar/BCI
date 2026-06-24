@@ -15,23 +15,20 @@ envelopes (using the same private send helper) and then connects both
     4. Drop-oldest queueing keeps the wire reader alive when consumers
        are slow.
 
-Run from the BCI root with the harmony_vlm conda env (cv2 + numpy):
-
-    C:/Users/arman/miniconda3/envs/harmony_vlm/python.exe tests/test_relay_loopback.py
-
-Exit code 0 = all checks passed. Non-zero = one or more checks failed
-(stderr names the failing assertion).
+Marked ``slow``: these tests bind real TCP sockets on a background thread
+and sleep ~1.5 s for reconnect/backoff timing, so they are excluded from
+the fast gate (``-m "not slow"``) and run explicitly.
 """
 
 from __future__ import annotations
 
-import json
 import socket
-import struct
 import sys
 import threading
 import time
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -44,6 +41,8 @@ from Utils.remote_frame_reader import (  # noqa: E402
     RemoteFrameReader,
     RemoteNeonDevice,
 )
+
+pytestmark = pytest.mark.slow
 
 
 # ── tiny mock relay ────────────────────────────────────────────────────────
@@ -156,7 +155,7 @@ class MockRelay:
 # ── checks ─────────────────────────────────────────────────────────────────
 
 
-def check_remote_frame_reader() -> None:
+def test_remote_frame_reader() -> None:
     relay = MockRelay(port=0, n_frames=5, hz=200.0)
     relay.start()
     reader = RemoteFrameReader("127.0.0.1", relay.bound_port,
@@ -195,7 +194,7 @@ def check_remote_frame_reader() -> None:
         relay.stop()
 
 
-def check_remote_neon_device() -> None:
+def test_remote_neon_device() -> None:
     relay = MockRelay(port=0, n_frames=5, hz=200.0)
     relay.start()
     dev = RemoteNeonDevice("127.0.0.1", relay.bound_port,
@@ -222,7 +221,7 @@ def check_remote_neon_device() -> None:
         relay.stop()
 
 
-def check_drop_oldest_resilience() -> None:
+def test_drop_oldest_resilience() -> None:
     """Send 50 frames at 1000 Hz to a slow consumer (sleeps between reads).
     With a queue cap of 4 and drop-oldest semantics the producer must not
     block; the consumer must still see the *most recent* frames."""
@@ -248,7 +247,7 @@ def check_drop_oldest_resilience() -> None:
         relay.stop()
 
 
-def check_consumer_starts_before_relay() -> None:
+def test_consumer_starts_before_relay() -> None:
     """The user use case: Windows services start at home, then later the
     Linux relay comes up at the office. The consumer must wait patiently
     and connect once the relay arrives — no manual restart needed."""
@@ -287,7 +286,7 @@ def check_consumer_starts_before_relay() -> None:
         reader.close()
 
 
-def check_reconnect_after_relay_drop() -> None:
+def test_reconnect_after_relay_drop() -> None:
     """Relay drops mid-session (Wi-Fi blip / box restart). Consumer should
     reconnect on the next cycle and resume yielding."""
     relay1 = MockRelay(port=0, n_frames=5, hz=200.0)
@@ -326,32 +325,3 @@ def check_reconnect_after_relay_drop() -> None:
         reader.close()
 
 
-# ── runner ─────────────────────────────────────────────────────────────────
-
-
-def main() -> int:
-    checks = [
-        ("RemoteFrameReader", check_remote_frame_reader),
-        ("RemoteNeonDevice", check_remote_neon_device),
-        ("drop-oldest under load", check_drop_oldest_resilience),
-        ("consumer starts before relay", check_consumer_starts_before_relay),
-        ("reconnect after relay drop", check_reconnect_after_relay_drop),
-    ]
-    failures: list = []
-    for label, fn in checks:
-        t0 = time.time()
-        try:
-            fn()
-            dt = (time.time() - t0) * 1000
-            print(f"[OK  ] {label}  ({dt:.0f} ms)")
-        except AssertionError as e:
-            failures.append((label, str(e)))
-            print(f"[FAIL] {label}: {e}", file=sys.stderr)
-        except Exception as e:  # noqa: BLE001 — surface in CI/log
-            failures.append((label, repr(e)))
-            print(f"[ERR ] {label}: {e!r}", file=sys.stderr)
-    return 0 if not failures else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -16,8 +16,6 @@ table directly (mirroring serve_forever's flow), and verifies:
 
 Designed to run in any env with numpy installed — no harmony_vlm needed —
 since VLMService.__init__ doesn't touch the model handles, only stores them.
-
-Exit code 0 = pass. Non-zero = a check failed (stderr names the assertion).
 """
 
 from __future__ import annotations
@@ -110,54 +108,56 @@ def _make_service() -> VLMService:
     return svc
 
 
-def _check(cond: bool, msg: str) -> None:
-    if not cond:
-        sys.stderr.write(f"FAIL: {msg}\n")
-        sys.exit(1)
-
-
-def main() -> None:
+def test_subscribe_unsubscribe_lifecycle() -> None:
     svc = _make_service()
     addr = ("127.0.0.1", 65000)
 
     # 1. subscribe → get id + hz
     resp = svc._dispatch("subscribe", {"hz": 50.0}, addr)
-    _check(resp.get("ok") is True, "subscribe ok=True expected")
+    assert resp.get("ok") is True, "subscribe ok=True expected"
     sid = resp["subscriber_id"]
-    _check(isinstance(sid, str) and len(sid) >= 8, "subscriber_id missing/short")
-    _check(resp["hz"] == VLMService._RESULTS_TICK_HZ,
-           f"hz should clamp to tick rate, got {resp['hz']}")
+    assert isinstance(sid, str) and len(sid) >= 8, "subscriber_id missing/short"
+    assert resp["hz"] == VLMService._RESULTS_TICK_HZ, \
+        f"hz should clamp to tick rate, got {resp['hz']}"
 
     # Idempotent re-subscribe from same addr returns same id.
     resp2 = svc._dispatch("subscribe", {"hz": 5.0}, addr)
-    _check(resp2["subscriber_id"] == sid, "subscribe should be idempotent on (addr,port)")
+    assert resp2["subscriber_id"] == sid, "subscribe should be idempotent on (addr,port)"
 
     # 2. unsubscribe removes it.
     resp3 = svc._dispatch("unsubscribe", {"subscriber_id": sid}, addr)
-    _check(resp3.get("ok") is True and resp3.get("removed") is True,
-           "unsubscribe should report removed=True")
+    assert resp3.get("ok") is True and resp3.get("removed") is True, \
+        "unsubscribe should report removed=True"
     resp4 = svc._dispatch("unsubscribe", {"subscriber_id": sid}, addr)
-    _check(resp4.get("removed") is False, "second unsubscribe should report removed=False")
+    assert resp4.get("removed") is False, "second unsubscribe should report removed=False"
+
+
+def test_build_vlm_results_payload_schema() -> None:
+    svc = _make_service()
 
     # 3. payload schema sanity.
     payload = svc._build_vlm_results_payload()
-    blob = json.dumps(payload)  # must be JSON-serialisable end-to-end
-    _check(payload["type"] == "vlm_results", "type must be 'vlm_results'")
-    _check(payload["frame_idx"] == 42, "frame_idx mismatched")
-    _check(payload["frame_ts_ns"] == 1_700_000_000_000_000_000, "frame_ts_ns mismatched")
-    _check(payload["vlm_state"] == "DECIDED", "vlm_state mismatched")
-    _check(isinstance(payload["detections"], list) and len(payload["detections"]) == 1,
-           "expected one detection in payload")
+    json.dumps(payload)  # must be JSON-serialisable end-to-end
+    assert payload["type"] == "vlm_results", "type must be 'vlm_results'"
+    assert payload["frame_idx"] == 42, "frame_idx mismatched"
+    assert payload["frame_ts_ns"] == 1_700_000_000_000_000_000, "frame_ts_ns mismatched"
+    assert payload["vlm_state"] == "DECIDED", "vlm_state mismatched"
+    assert isinstance(payload["detections"], list) and len(payload["detections"]) == 1, \
+        "expected one detection in payload"
     det = payload["detections"][0]
-    _check(det["label"] == "cup" and "mask_polygon" in det, "detection schema wrong")
-    _check(payload["fixation"] is not None and payload["fixation"]["active"] is True,
-           "fixation should be active")
-    _check(payload["depth_at_gaze_m"] == 0.42, "depth_at_gaze_m not threaded through")
-    _check(payload["decision"] == {"text": "pick the cup", "elapsed_s": 1.2},
-           "decision should be trimmed to the renderer-relevant fields")
-    _check("waypoints" not in (payload.get("decision") or {}),
-           "decision should not carry waypoints (large + unused by renderer)")
-    _check(payload["gaze_px"] == [512.0, 384.0], "gaze_px mismatched")
+    assert det["label"] == "cup" and "mask_polygon" in det, "detection schema wrong"
+    assert payload["fixation"] is not None and payload["fixation"]["active"] is True, \
+        "fixation should be active"
+    assert payload["depth_at_gaze_m"] == 0.42, "depth_at_gaze_m not threaded through"
+    assert payload["decision"] == {"text": "pick the cup", "elapsed_s": 1.2}, \
+        "decision should be trimmed to the renderer-relevant fields"
+    assert "waypoints" not in (payload.get("decision") or {}), \
+        "decision should not carry waypoints (large + unused by renderer)"
+    assert payload["gaze_px"] == [512.0, 384.0], "gaze_px mismatched"
+
+
+def test_tick_send_results_emits_datagram_on_wire() -> None:
+    svc = _make_service()
 
     # 4. tick path: subscribe a real socket, run one tick, expect the datagram.
     rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -171,11 +171,24 @@ def main() -> None:
         svc._tick_send_results(tx, time.monotonic())
         data, _from = rx.recvfrom(65535)
         decoded = json.loads(data.decode("utf-8"))
-        _check(decoded["type"] == "vlm_results", "wire payload missing type")
-        _check(decoded["frame_idx"] == 42, "wire payload frame_idx mismatched")
+        assert decoded["type"] == "vlm_results", "wire payload missing type"
+        assert decoded["frame_idx"] == 42, "wire payload frame_idx mismatched"
     finally:
         tx.close()
         rx.close()
+
+
+def test_expired_subscriber_pruned() -> None:
+    svc = _make_service()
+
+    # A live subscriber (default TTL) must survive the prune that drops the
+    # expired one — the original test relied on a leftover live subscriber
+    # from the tick section; register one explicitly here so the surviving
+    # count assertion (n_left == 1) checks the same thing in isolation.
+    live_rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    live_rx.bind(("127.0.0.1", 0))
+    live_addr = ("127.0.0.1", live_rx.getsockname()[1])
+    svc._dispatch("subscribe", {"hz": 50.0}, live_addr)
 
     # 5. TTL prune: subscribe with a 0 TTL, immediately tick → subscriber gone.
     rx2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -191,17 +204,12 @@ def main() -> None:
     rx2.settimeout(0.1)
     try:
         rx2.recvfrom(65535)
-        _check(False, "expired subscriber should not have received a datagram")
+        assert False, "expired subscriber should not have received a datagram"
     except socket.timeout:
         pass
     finally:
         rx2.close()
+        live_rx.close()
     with svc._subscribers_lock:
         n_left = len(svc._subscribers)
-    _check(n_left == 1, f"expired subscriber should be pruned; got {n_left}")
-
-    print(f"OK ({len(blob)} B payload)")
-
-
-if __name__ == "__main__":
-    main()
+    assert n_left == 1, f"expired subscriber should be pruned; got {n_left}"

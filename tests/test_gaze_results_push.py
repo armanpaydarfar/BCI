@@ -12,8 +12,6 @@ table directly, and verifies:
        Render_Layer_Refactor.md §3 and is JSON-serialisable.
     4. _tick_send sends a UDP datagram to the subscribed addr.
     5. Subscribers past their TTL are pruned.
-
-Exit code 0 = pass. Non-zero = a failed assertion (named on stderr).
 """
 
 from __future__ import annotations
@@ -53,52 +51,56 @@ class _StubGazeSystem:
         }
 
 
-def _check(cond: bool, msg: str) -> None:
-    if not cond:
-        sys.stderr.write(f"FAIL: {msg}\n")
-        sys.exit(1)
-
-
-def main() -> None:
-    stop_event = threading.Event()
-    udp = GazeUDPServer(
-        host="127.0.0.1", port=0,
-        system=_StubGazeSystem(),
-        stop_event=stop_event,
-    )
+def _make_server() -> GazeUDPServer:
     # We never call udp.start() — that would bind the recv socket. Instead
     # exercise handle() directly.
+    return GazeUDPServer(
+        host="127.0.0.1", port=0,
+        system=_StubGazeSystem(),
+        stop_event=threading.Event(),
+    )
 
+
+def test_subscribe_unsubscribe_lifecycle() -> None:
+    udp = _make_server()
     addr = ("127.0.0.1", 65000)
 
     # 1. subscribe.
     resp = udp.handle({"cmd": "subscribe", "hz": 50.0}, addr)
-    _check(resp.get("ok") is True, "subscribe ok=True expected")
+    assert resp.get("ok") is True, "subscribe ok=True expected"
     sid = resp["subscriber_id"]
-    _check(isinstance(sid, str) and len(sid) >= 8, "bad subscriber_id")
-    _check(resp["hz"] == GazeUDPServer._TICK_HZ,
-           f"hz should clamp to tick rate, got {resp['hz']}")
+    assert isinstance(sid, str) and len(sid) >= 8, "bad subscriber_id"
+    assert resp["hz"] == GazeUDPServer._TICK_HZ, \
+        f"hz should clamp to tick rate, got {resp['hz']}"
 
     # Idempotent re-subscribe → same id.
     resp2 = udp.handle({"cmd": "subscribe", "hz": 5.0}, addr)
-    _check(resp2["subscriber_id"] == sid, "subscribe should be idempotent on (addr,port)")
+    assert resp2["subscriber_id"] == sid, "subscribe should be idempotent on (addr,port)"
 
     # 2. unsubscribe.
     resp3 = udp.handle({"cmd": "unsubscribe", "subscriber_id": sid}, addr)
-    _check(resp3.get("removed") is True, "expected removed=True")
+    assert resp3.get("removed") is True, "expected removed=True"
     resp4 = udp.handle({"cmd": "unsubscribe", "subscriber_id": sid}, addr)
-    _check(resp4.get("removed") is False, "expected removed=False")
+    assert resp4.get("removed") is False, "expected removed=False"
+
+
+def test_build_gaze_results_payload_schema() -> None:
+    udp = _make_server()
 
     # 3. payload schema.
     payload = udp._build_gaze_results_payload()
-    blob = json.dumps(payload)
-    _check(payload["type"] == "gaze_results", "type should be gaze_results")
-    _check(payload["worn"] is True, "worn missing")
-    _check(payload["gaze_px"] == [640.0, 480.0], "gaze_px mismatched")
-    _check(len(payload["tracks"]) == 1 and payload["tracks"][0]["id"] == 7,
-           "tracks shape wrong")
-    _check(payload["current_hit"]["track_id"] == 7, "current_hit wrong")
-    _check(payload["governor"]["cv_enabled"] is True, "governor.cv_enabled wrong")
+    json.dumps(payload)  # must be JSON-serialisable end-to-end
+    assert payload["type"] == "gaze_results", "type should be gaze_results"
+    assert payload["worn"] is True, "worn missing"
+    assert payload["gaze_px"] == [640.0, 480.0], "gaze_px mismatched"
+    assert len(payload["tracks"]) == 1 and payload["tracks"][0]["id"] == 7, \
+        "tracks shape wrong"
+    assert payload["current_hit"]["track_id"] == 7, "current_hit wrong"
+    assert payload["governor"]["cv_enabled"] is True, "governor.cv_enabled wrong"
+
+
+def test_tick_send_emits_datagram_on_wire() -> None:
+    udp = _make_server()
 
     # 4. tick → datagram on the wire.
     rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -111,11 +113,15 @@ def main() -> None:
         rx.settimeout(1.0)
         data, _from = rx.recvfrom(65535)
         decoded = json.loads(data.decode("utf-8"))
-        _check(decoded["type"] == "gaze_results", "wire payload type wrong")
-        _check(decoded["tracks"][0]["label"] == "cup", "wire payload track label wrong")
+        assert decoded["type"] == "gaze_results", "wire payload type wrong"
+        assert decoded["tracks"][0]["label"] == "cup", "wire payload track label wrong"
     finally:
         udp._push_sock.close()
         rx.close()
+
+
+def test_expired_subscriber_pruned() -> None:
+    udp = _make_server()
 
     # 5. TTL prune.
     rx2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -131,14 +137,8 @@ def main() -> None:
     rx2.settimeout(0.1)
     try:
         rx2.recvfrom(65535)
-        _check(False, "expired subscriber should not receive")
+        assert False, "expired subscriber should not receive"
     except socket.timeout:
         pass
     finally:
         rx2.close()
-
-    print(f"OK ({len(blob)} B payload)")
-
-
-if __name__ == "__main__":
-    main()
