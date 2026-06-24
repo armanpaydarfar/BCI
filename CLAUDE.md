@@ -413,6 +413,9 @@ Staged perception deps (`dt-apriltags`, `pyrealsense2`, `piper`, `msgpack`,
 `segment_anything`) are deliberately omitted — they belong to modules fenced as
 non-import-safe in `perception/__init__.py`.
 
-The perception source was folded in-tree in WS3 — there is **no** sibling
-`harmony_vlm` repo or env to clone/create (`VLM_REPO_DIR` / `VLM_CONDA_ENV`
-are retired).
+The perception source was folded in-tree in WS3 — the build needs **no** sibling
+`harmony_vlm` repo or env to clone/create (`VLM_REPO_DIR` / `VLM_CONDA_ENV` are
+retired). A read-only reference clone of the upstream does still exist on disk at
+`~/Projects/harmony_vlm` (kept only for provenance / diffing the vendored
+`perception/` against its origin commit `cfa01b6`); nothing in the build depends on
+it, and it must not be reintroduced as a runtime/env dependency.
