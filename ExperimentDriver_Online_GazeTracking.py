@@ -55,8 +55,6 @@ import Utils.runtime_common as _RC
 
 from Utils.stream_utils import require_marker_stream
 
-from vlm_bridge import VLMBridge
-
 # =========================================================
 # Logger setup
 # =========================================================
@@ -608,7 +606,7 @@ def run_gaze_selection_window(gaze_sock, eeg_state, duration_s=GAZE_SELECTION_WI
     }
 
 
-def repeat_until_valid_selection(gaze_sock, eeg_state, vlm_bridge=None):
+def repeat_until_valid_selection(gaze_sock, eeg_state, vlm_client=None):
     attempt = 0
     while True:
         attempt += 1
@@ -620,11 +618,18 @@ def repeat_until_valid_selection(gaze_sock, eeg_state, vlm_bridge=None):
         # legacy path but with identity already pinned.
         vlm_decision = None
         if GAZE_OR_BACKEND == "vlm":
-            if vlm_bridge is None:
-                logger.log_event("❌ GAZE_OR_BACKEND=vlm but no VLMBridge provided.")
+            if vlm_client is None:
+                logger.log_event("❌ GAZE_OR_BACKEND=vlm but no VLMClient provided.")
                 return None
             logger.log_event("Calling vlm_service.decide() for this selection attempt…")
-            vlm_decision = vlm_bridge.decide()
+            try:
+                vlm_decision = vlm_client.decide()
+            except (OSError, json.JSONDecodeError):
+                # VLMClient raises on transport failure; the selection loop
+                # treats an unreachable/garbled service as "no decision" and
+                # retries — same behaviour the former VLMBridge gave via its
+                # None return.
+                vlm_decision = None
             if vlm_decision is None:
                 logger.log_event("⚠️ VLM decide() returned no response — retrying selection.")
                 continue
@@ -1108,13 +1113,17 @@ def main():
     # driver does NOT spawn the service — that is the control panel's job, same
     # ownership model as the legacy gaze_runner service (see control_panel.py
     # L555-576 for the gaze side).
-    vlm_bridge = None
+    vlm_client = None
     if GAZE_OR_BACKEND == "vlm":
-        vlm_bridge = VLMBridge(
-            host=config.VLM_SERVICE_HOST,
-            port=config.VLM_SERVICE_PORT,
-        )
-        status = vlm_bridge.status()
+        from Utils.perception_clients import VLMClient
+        vlm_client = VLMClient(config)
+        try:
+            # timeout_s=0.3 matches the former VLMBridge.status() default.
+            status = vlm_client.status(timeout_s=0.3)
+        except (OSError, json.JSONDecodeError):
+            # Preserve the former None-on-failure so the not-responding
+            # branch below fires instead of crashing on an unreachable service.
+            status = None
         if status is None or not status.get("ok"):
             logger.log_event(
                 f"❌ GAZE_OR_BACKEND=vlm but vlm_service is not responding at "
@@ -1179,7 +1188,7 @@ def main():
         # ---------------------------------
         # 1. Gaze selection phase
         # ---------------------------------
-        selection_result = repeat_until_valid_selection(gaze_sock, eeg_state, vlm_bridge=vlm_bridge)
+        selection_result = repeat_until_valid_selection(gaze_sock, eeg_state, vlm_client=vlm_client)
         if selection_result is None:
             logger.log_event("Experiment terminated during selection phase.")
             running = False
@@ -1501,9 +1510,9 @@ def main():
     except Exception:
         pass
 
-    if vlm_bridge is not None:
+    if vlm_client is not None:
         try:
-            vlm_bridge.close()
+            vlm_client.close()
         except Exception:
             pass
 

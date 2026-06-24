@@ -147,6 +147,13 @@ class VLMClient:
         self.port = int(getattr(cfg, "VLM_SERVICE_PORT", 5589))
         self.default_timeout_s = float(getattr(cfg, "VLM_SERVICE_TIMEOUT", 2.0) or 2.0)
 
+    def close(self) -> None:
+        """No-op: each request opens and closes its own socket (see
+        ``udp_request``), so there is no persistent resource to release.
+        Provided for API symmetry with callers that manage a client
+        lifecycle (e.g. the gaze driver's teardown)."""
+        return None
+
     def status(self, *, timeout_s: Optional[float] = None) -> Dict[str, Any]:
         return _udp_request(self.host, self.port, {"cmd": "status"}, timeout_s or self.default_timeout_s)
 
