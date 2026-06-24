@@ -601,8 +601,15 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                      + ("" if ok else f"  (last drop: {reason})"))
                 last_report = now
 
-            if grid.done():
-                _log("sweep: coverage COMPLETE — every visited cell is sufficient")
+            # Auto-stop needs ≥ min_cells covered, not just "every visited cell
+            # sufficient" — otherwise an operator who dwells in ONE cell at the
+            # start (filling min_samples with a small wiggle that clears the
+            # frozen-hand spread guard) would end the sweep with a single cell
+            # (critic I1). The operator can still stop early manually (UI 'q' /
+            # Ctrl-C); this only gates the AUTOMATIC stop.
+            if grid.done() and len(grid.visited_cells()) >= args.min_cells:
+                _log(f"sweep: coverage COMPLETE — {len(grid.visited_cells())} cells, "
+                     "every visited cell sufficient")
                 break
             _sleep_until(next_tick)
     except KeyboardInterrupt:
@@ -913,6 +920,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="sweep: hard time budget; the sweep also stops on full coverage")
     p.add_argument("--cell-size-mm", type=float, default=50.0,
                    help="sweep: coverage cell size on the table plane (mm)")
+    p.add_argument("--min-cells", type=int, default=4,
+                   help="sweep: minimum covered cells before the AUTOMATIC stop may "
+                        "fire (guards against ending after a single dwelt cell)")
     p.add_argument("--min-samples", type=int, default=8,
                    help="sweep: samples needed per cell for sufficiency")
     p.add_argument("--min-spread-mm", type=float, default=15.0,

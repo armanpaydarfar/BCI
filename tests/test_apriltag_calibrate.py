@@ -176,6 +176,15 @@ def test_arg_defaults_come_from_config():
 # ── step 2: EE-tag bundle map generalisation ─────────────────────────────────
 
 
+def test_sweep_coverage_defaults():
+    # The sweep's auto-stop floor (critic I1) and coverage knobs must be present.
+    a = calib.parse_args(["--stage", "sweep", "--world-tag-ids", "0",
+                          "--ee-tag-id", "9"])
+    assert a.min_cells == 4          # > 1 so one dwelt cell cannot end the sweep
+    assert a.min_samples == 8 and a.cell_size_mm == 50.0
+    assert a.max_align_dt_s == 0.05  # one 20 Hz tick, ms→s converted
+
+
 def test_resolve_ee_ids_plural_overrides_singular_else_none():
     plural = calib.parse_args(["--stage", "collect", "--ee-tag-ids", "5", "6", "7"])
     assert calib._resolve_ee_ids(plural) == [5, 6, 7]

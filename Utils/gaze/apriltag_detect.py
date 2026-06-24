@@ -16,6 +16,7 @@ and the X calibration column.
 from __future__ import annotations
 
 import threading
+import time
 from typing import Dict, Tuple
 
 import numpy as np
@@ -96,9 +97,7 @@ class RelayConsumer:
     ``latest()`` and dedup on ``frame_idx``. Exposes the handshake ``camera_matrix``."""
 
     def __init__(self, host: str, port: int, handshake_s: float = 5.0):
-        import time
         from Utils.remote_frame_reader import RemoteFrameReader
-        self._time = time.time
         self._reader = RemoteFrameReader(
             host, port, wait_for_handshake_s=handshake_s, auto_reconnect=False)
         self._latest = None
@@ -114,7 +113,7 @@ class RelayConsumer:
             for bundle in self._reader:
                 if self._stop.is_set():
                     break
-                t_recv = self._time()
+                t_recv = time.time()
                 with self._lock:
                     self._latest = bundle
                     self._latest_t = t_recv
