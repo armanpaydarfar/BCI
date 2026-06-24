@@ -129,7 +129,7 @@ def speak(text: str) -> None:
 
 class CoverageBoxUI:
     """OpenCV coverage box (rev04 §3). Thin display wrapper over the pure layout
-    helpers; ``update`` redraws, ``should_quit`` polls the window for 'q', ``close``
+    helpers; ``update`` redraws, ``should_quit`` polls the window for SPACE/'q', ``close``
     tears the window down. Optional audio announces the target direction (throttled
     to target-cell changes) and completion."""
 
@@ -212,12 +212,15 @@ class CoverageBoxUI:
 
         # On-screen operator instructions (rev04 §3, operator 2026-06-24): the
         # operator wears the Neon and cannot watch the terminal during the sweep.
-        footer = "hand-guide slowly  |  move toward the RED cell  |  [q] stop & save"
+        footer = "hand-guide slowly  |  cover the area  |  [SPACE] stop & save"
         cv2.putText(canvas, footer, (12, self.height - 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, _COLOR_EE, 1, cv2.LINE_AA)
 
         cv2.imshow(self.window, canvas)
-        if (cv2.waitKey(1) & 0xFF) == ord("q"):
+        # The operator ends the sweep with SPACE (they judge coverage; there is no
+        # automatic stop by default, operator 2026-06-24). 'q' also stops, for parity
+        # with the registration/start prompts.
+        if (cv2.waitKey(1) & 0xFF) in (ord(" "), ord("q")):
             self._quit = True
 
         if self.audio:

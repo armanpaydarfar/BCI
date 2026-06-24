@@ -484,7 +484,7 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
 
 # Auto-home move duration after a sweep ends — matches the REV01 free-arm
 # teardown budget (harmony_free_arm_calibration AUTO_HOME_DURATION_S).
-_SWEEP_AUTO_HOME_DUR_S = 4.0
+_SWEEP_AUTO_HOME_DUR_S = 5.0
 
 
 def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
@@ -639,13 +639,14 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                      + ("" if ok else f"  (last drop: {reason})"))
                 last_report = now
 
-            # Auto-stop needs ≥ min_cells covered, not just "every visited cell
-            # sufficient" — otherwise an operator who dwells in ONE cell at the
-            # start (filling min_samples with a small wiggle that clears the
-            # frozen-hand spread guard) would end the sweep with a single cell
-            # (critic I1). The operator can still stop early manually (UI 'q' /
-            # Ctrl-C); this only gates the AUTOMATIC stop.
-            if grid.done() and len(grid.visited_cells()) >= args.min_cells:
+            # Stopping is operator-driven by default (SPACE in the coverage window /
+            # Ctrl-C): the coverage extent the operator wants is theirs to judge, and
+            # the automatic "every visited cell sufficient" stop fired far too early
+            # (5 cells, a small patch — operator 2026-06-24). Opt back into the
+            # automatic stop with --auto-stop; it still needs ≥ min_cells covered so
+            # one dwelt cell cannot end it (critic I1).
+            if (args.auto_stop and grid.done()
+                    and len(grid.visited_cells()) >= args.min_cells):
                 _log(f"sweep: coverage COMPLETE — {len(grid.visited_cells())} cells, "
                      "every visited cell sufficient")
                 break
@@ -997,13 +998,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # sweep stage (REV04 continuous capture + coverage)
     p.add_argument("--sample-hz", type=float, default=20.0,
                    help="sweep: telemetry/frame sampling rate (REV01 transit rate)")
-    p.add_argument("--max-sweep-s", type=float, default=180.0,
-                   help="sweep: hard time budget; the sweep also stops on full coverage")
+    p.add_argument("--max-sweep-s", type=float, default=600.0,
+                   help="sweep: hard time budget (safety backstop); the operator "
+                        "normally ends the sweep with SPACE in the coverage window")
+    p.add_argument("--auto-stop", action="store_true",
+                   help="sweep: also stop AUTOMATICALLY once every visited cell is "
+                        "sufficient (≥ --min-cells). Off by default — the operator "
+                        "judges coverage and ends with SPACE (operator 2026-06-24)")
     p.add_argument("--cell-size-mm", type=float, default=50.0,
                    help="sweep: coverage cell size on the table plane (mm)")
     p.add_argument("--min-cells", type=int, default=4,
-                   help="sweep: minimum covered cells before the AUTOMATIC stop may "
-                        "fire (guards against ending after a single dwelt cell)")
+                   help="sweep: with --auto-stop, the minimum covered cells before the "
+                        "automatic stop may fire (guards against ending after one cell)")
     p.add_argument("--min-samples", type=int, default=8,
                    help="sweep: samples needed per cell for sufficiency")
     p.add_argument("--min-spread-mm", type=float, default=15.0,
