@@ -51,6 +51,51 @@ def fit_plane(points: np.ndarray):
     return c, n / np.linalg.norm(n)
 
 
+def plane_basis(plane_normal: np.ndarray):
+    """Right-handed orthonormal in-plane basis ``(e1, e2)`` spanning the plane with
+    the given normal. Deterministic (REV04 §6): seed e1 from the world axis *least*
+    aligned with the normal so the projection never degenerates, then
+    ``e2 = n × e1``. A stable normal → a stable basis, so the same physical table
+    point always maps to the same ``(u,v)`` across captures."""
+    n = np.asarray(plane_normal, dtype=float)
+    n = n / np.linalg.norm(n)
+    seed = np.eye(3)[int(np.argmin(np.abs(n)))]
+    e1 = seed - np.dot(seed, n) * n
+    e1 = e1 / np.linalg.norm(e1)
+    e2 = np.cross(n, e1)
+    return e1, e2
+
+
+def plane_coords(points: np.ndarray, plane_point: np.ndarray,
+                 plane_normal: np.ndarray) -> np.ndarray:
+    """Project world-frame point(s) onto the plane's 2-D ``(u,v)`` basis with origin
+    at ``plane_point`` (REV04 §1, the planar calibration coordinate). Accepts a
+    single point ``(3,)`` → ``(2,)`` or a stack ``(N,3)`` → ``(N,2)``. Any
+    out-of-plane component is dropped (orthogonal projection)."""
+    P = np.asarray(points, dtype=float)
+    single = P.ndim == 1
+    P = np.atleast_2d(P)
+    c = np.asarray(plane_point, dtype=float)
+    e1, e2 = plane_basis(plane_normal)
+    d = P - c
+    uv = np.stack([d @ e1, d @ e2], axis=1)
+    return uv[0] if single else uv
+
+
+def world_from_plane_coords(uv: np.ndarray, plane_point: np.ndarray,
+                            plane_normal: np.ndarray) -> np.ndarray:
+    """Inverse of `plane_coords` for in-plane points: ``(u,v)`` → world-frame point
+    on the plane. Used by the coverage UI (draw cell centres back in the scene) and
+    for round-trip tests. ``(2,)`` → ``(3,)`` or ``(N,2)`` → ``(N,3)``."""
+    uv = np.asarray(uv, dtype=float)
+    single = uv.ndim == 1
+    uv = np.atleast_2d(uv)
+    c = np.asarray(plane_point, dtype=float)
+    e1, e2 = plane_basis(plane_normal)
+    P = c + uv[:, [0]] * e1 + uv[:, [1]] * e2
+    return P[0] if single else P
+
+
 def build_world_map(cam_poses_by_id: Dict[int, np.ndarray],
                     ref_id: Optional[int] = None) -> Dict:
     """Build the rigid tag map from one registration observation.

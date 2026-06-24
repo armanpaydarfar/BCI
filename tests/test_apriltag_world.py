@@ -22,7 +22,10 @@ from Utils.gaze.apriltag_world import (  # noqa: E402
     average_pose,
     build_world_map,
     fit_plane,
+    plane_basis,
+    plane_coords,
     recover_world_pose,
+    world_from_plane_coords,
     world_map_from_arrays,
     world_map_to_arrays,
 )
@@ -148,3 +151,48 @@ def test_recover_fuses_disagreeing_estimates_stays_rigid():
     T = recover_world_pose(noisy, wm)
     np.testing.assert_allclose(T[:3, :3] @ T[:3, :3].T, np.eye(3), atol=1e-9)  # orthonormal
     assert abs(np.linalg.det(T[:3, :3]) - 1.0) < 1e-9                          # proper rotation
+
+
+# ── REV04 planar coordinates (plane_basis / plane_coords / round-trip) ──────────
+
+def test_plane_basis_orthonormal_right_handed():
+    for n in (np.array([0.0, 0.0, 1.0]), np.array([1.0, 2.0, 3.0]),
+              np.array([0.0, 1.0, 0.0])):
+        e1, e2 = plane_basis(n)
+        nn = n / np.linalg.norm(n)
+        assert abs(np.dot(e1, e2)) < 1e-12
+        assert abs(np.linalg.norm(e1) - 1.0) < 1e-12
+        assert abs(np.linalg.norm(e2) - 1.0) < 1e-12
+        assert abs(np.dot(e1, nn)) < 1e-12 and abs(np.dot(e2, nn)) < 1e-12
+        np.testing.assert_allclose(np.cross(e1, e2), nn, atol=1e-12)  # right-handed
+
+
+def test_plane_coords_origin_and_offplane_drop():
+    c = np.array([10.0, -5.0, 100.0])
+    n = np.array([0.0, 0.0, 1.0])
+    np.testing.assert_allclose(plane_coords(c, c, n), [0.0, 0.0], atol=1e-12)
+    # adding any out-of-plane component must not move (u,v)
+    p = np.array([42.0, 7.0, 100.0])
+    np.testing.assert_allclose(plane_coords(p, c, n),
+                               plane_coords(p + 33.0 * n, c, n), atol=1e-12)
+
+
+def test_plane_coords_isometry_and_roundtrip():
+    # tilted plane; in-plane distances are preserved and the map round-trips
+    c, n = np.array([1.0, 2.0, 3.0]), np.array([0.3, -0.4, 1.0])
+    e1, e2 = plane_basis(n)
+    pts = np.array([c + a * e1 + b * e2
+                    for a, b in [(0, 0), (50, 0), (0, 70), (-20, 35), (120, -90)]])
+    uv = plane_coords(pts, c, n)
+    back = world_from_plane_coords(uv, c, n)
+    np.testing.assert_allclose(back, pts, atol=1e-9)
+    # distance preservation (rigid in-plane embedding)
+    d3 = np.linalg.norm(pts[1] - pts[3])
+    d2 = np.linalg.norm(uv[1] - uv[3])
+    assert abs(d3 - d2) < 1e-9
+
+
+def test_plane_coords_single_vs_batch_shapes():
+    c, n = np.zeros(3), np.array([0.0, 0.0, 1.0])
+    assert plane_coords(np.array([1.0, 2.0, 9.0]), c, n).shape == (2,)
+    assert plane_coords(np.zeros((4, 3)), c, n).shape == (4, 2)
