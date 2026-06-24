@@ -148,19 +148,16 @@ class CoverageBoxUI:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window, width, height)
 
-    def wait_for_start(self) -> bool:
-        """Start gate (rev04 §3, operator 2026-06-24): block — drawing an on-screen
-        prompt so the operator can position the freed arm — until they press SPACE
-        to begin (returns True) or 'q' / close the window to abort (returns False).
-        No sample is recorded until this returns True, so the transit into the start
-        pose never enters the library."""
+    def prompt(self, title: str, sublines) -> bool:
+        """Show a centered on-window prompt and block until the operator presses
+        SPACE (returns True) or 'q' / closes the window (returns False). Used for the
+        map-registration steps AND the sweep start gate so EVERY interaction is on
+        the visual interface, not the terminal (operator 2026-06-24)."""
         cv2 = self._cv2
-        lines = [("POSITION THE ARM", 0.95, 2),
-                 ("press SPACE to START the sweep", 0.6, 1),
-                 ("q aborts (arm re-locks + homes)", 0.55, 1)]
+        rows = [(title, 0.95, 2)] + [(s, 0.6, 1) for s in sublines]
         while True:
             canvas = np.full((self.height, self.width, 3), _COLOR_BG, dtype=np.uint8)
-            for k, (text, scale, thick) in enumerate(lines):
+            for k, (text, scale, thick) in enumerate(rows):
                 y = self.height // 2 - 28 + k * 36
                 cv2.putText(canvas, text, (40, y), cv2.FONT_HERSHEY_SIMPLEX, scale,
                             _COLOR_EE, thick, cv2.LINE_AA)
@@ -175,6 +172,14 @@ class CoverageBoxUI:
             if cv2.getWindowProperty(self.window, cv2.WND_PROP_VISIBLE) < 1:
                 self._quit = True
                 return False
+
+    def wait_for_start(self) -> bool:
+        """Start gate (rev04 §3): block until the operator has positioned the freed
+        arm and presses SPACE. No sample is recorded until this returns True, so the
+        transit into the start pose never enters the library."""
+        return self.prompt("POSITION THE ARM",
+                            ["press SPACE to START the sweep",
+                             "q aborts (arm re-locks + homes)"])
 
     def update(self, grid: CoverageGrid, cur_uv, target_uv) -> None:
         cv2 = self._cv2

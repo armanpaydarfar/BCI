@@ -282,15 +282,25 @@ def _resolve_ee_ids(args) -> Optional[List[int]]:
 
 
 def _register_map_interactive(consumer, detector, K, ids, world_tag_size,
-                              tag_sizes, label, body_hint):
+                              tag_sizes, label, body_hint, ui=None):
     """Prompt the operator to show all ``ids`` and register a rigid tag map over
     them, retrying until every listed tag is captured. Shared by collect + sweep
     for BOTH the world bundle and the EE bundle (a single EE id is a trivial
-    1-entry map — ``recover_world_pose`` returns that tag's pose directly). Returns
-    the map (every listed tag present)."""
+    1-entry map — ``recover_world_pose`` returns that tag's pose directly).
+
+    With a coverage ``ui`` the prompt is on the visual interface (SPACE to register,
+    q to abort) so the operator never switches to the terminal (operator
+    2026-06-24); headless it is a terminal Enter. Returns the map, or ``None`` if the
+    operator aborted from the window."""
     while True:
-        input(f"place ALL {label} tags {ids} visible + {body_hint}, Enter to "
-              f"register the {label}-tag map > ")
+        if ui is not None:
+            if not ui.prompt(f"Show {label} tags {ids}",
+                             [body_hint, "press SPACE to register, q to abort"]):
+                _log(f"  {label}-map registration aborted from the coverage window")
+                return None
+        else:
+            input(f"place ALL {label} tags {ids} visible + {body_hint}, Enter to "
+                  f"register the {label}-tag map > ")
         tag_map, seen = _register_tag_map(consumer, detector, K, ids,
                                           world_tag_size, tag_sizes, label=label)
         if tag_map is None:
@@ -503,9 +513,19 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
          f"{world_ids}, EE tags {ee_ids}")
 
     world_map = _register_map_interactive(consumer, detector, K, world_ids,
-                                          args.tag_size, tag_sizes, "world", "arm CLEAR")
+                                          args.tag_size, tag_sizes, "world", "arm CLEAR",
+                                          ui=ui)
+    if world_map is None:
+        if ui is not None:
+            ui.close()
+        return 1
     ee_map = _register_map_interactive(consumer, detector, K, ee_ids,
-                                       args.tag_size, tag_sizes, "EE", "the EE STILL")
+                                       args.tag_size, tag_sizes, "EE", "the EE STILL",
+                                       ui=ui)
+    if ee_map is None:
+        if ui is not None:
+            ui.close()
+        return 1
     ee_ref = ee_map["ref_id"]
     plane_point = world_map["plane_point"]
     plane_normal = world_map["plane_normal"]
