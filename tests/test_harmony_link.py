@@ -19,7 +19,11 @@ import json  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
-from Utils.gaze.harmony_link import build_joint_command_str, parse_telemetry  # noqa: E402
+from Utils.gaze.harmony_link import (  # noqa: E402
+    HarmonyLink,
+    build_joint_command_str,
+    parse_telemetry,
+)
 
 
 def test_build_joint_command_str_format():
@@ -73,3 +77,19 @@ def test_parse_telemetry_rejects_missing_keys():
 def test_parse_telemetry_rejects_short_vectors():
     bad = json.dumps({"qR": [0, 0, 0], "eeR": {"pos_mm": [1, 2, 3]}})
     assert parse_telemetry(bad, "R") is None
+
+
+def test_query_state_stamps_arrival_time():
+    """The REV04 sweep unpacks ``rstate["_t"]`` for its frame↔telemetry staleness
+    gate (`stage_sweep`); ``query_state`` MUST return that host-clock arrival time
+    alongside q/ee. Pins the contract so the sweep can't regress to a KeyError —
+    the live sweep path needs a robot and is not otherwise covered."""
+    link = HarmonyLink.__new__(HarmonyLink)  # bypass the socket bind in __init__
+    link._seq = 0
+    link._side = "R"
+    link.send = lambda msg: None
+    link.recv = lambda timeout_s: _telemetry()
+    out = link.query_state()
+    assert out is not None
+    assert "_t" in out and out["_t"] > 0.0
+    np.testing.assert_allclose(out["q"], [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])

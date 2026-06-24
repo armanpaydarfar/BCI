@@ -137,7 +137,12 @@ class HarmonyLink:
 
     # ── telemetry (read-only) ─────────────────────────────────────────────────
     def query_state(self) -> Optional[Dict[str, np.ndarray]]:
-        """One ``q;seq`` round-trip → ``{q (7,), ee (3,)}`` or None. Read-only."""
+        """One ``q;seq`` round-trip → ``{q (7,), ee (3,), _t}`` or None. Read-only.
+
+        ``_t`` is the control-host ``time.time()`` at which the telemetry reply was
+        received — the SAME clock the relay consumer stamps a frame's arrival with
+        (`RelayConsumer.latest_with_time`), so the sweep's frame↔telemetry Δt gate
+        (rev04 §2) is a pure host-clock staleness measure, not a cross-clock skew."""
         self._seq = (self._seq + 1) & 0xFFFFFFFF
         self.send(f"q;seq={self._seq}")
         t0 = time.time()
@@ -147,6 +152,7 @@ class HarmonyLink:
                 continue
             parsed = parse_telemetry(r, self._side)
             if parsed is not None:
+                parsed["_t"] = time.time()
                 return parsed
         return None
 

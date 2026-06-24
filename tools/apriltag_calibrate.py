@@ -469,6 +469,10 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
 
 # ── stage: sweep (REV04 continuous swept capture) ────────────────────────────
 
+# Auto-home move duration after a sweep ends — matches the REV01 free-arm
+# teardown budget (harmony_free_arm_calibration AUTO_HOME_DURATION_S).
+_SWEEP_AUTO_HOME_DUR_S = 4.0
+
 
 def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     """REV04 continuous swept capture (rev04 §2). The operator frees the arm and
@@ -507,6 +511,7 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                         min_spread_mm=args.min_spread_mm)
 
     link: Optional[HarmonyLink] = None
+    arm_is_free = False
     if args.with_robot:
         link = HarmonyLink(args.robot_ip, args.robot_port, args.bind_ip,
                            args.bind_port, side=args.side)
@@ -514,6 +519,7 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
             _log("could not free the arm (ACK:MASTER_FREE not seen) — aborting sweep")
             link.close()
             return 1
+        arm_is_free = True
         _log("arm FREED — hand-guide the EE slowly across the table surface")
     else:
         _log("no --with-robot: Q/X will be NaN (camera-side dry run — verifies "
@@ -603,6 +609,21 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
         _log("sweep: Ctrl-C — stopping and saving what we have")
     finally:
         if link is not None:
+            # The sweep leaves the arm in zero-stiffness master_free; on ANY exit
+            # path (coverage done, Ctrl-C, UI quit, error) re-lock it with `c` and
+            # auto-home before releasing the socket — otherwise the operator lets go
+            # of a LIMP arm and it drops under gravity. Mirrors the REV01 free-arm
+            # teardown (harmony_free_arm_calibration.py:1311-1328), the pattern this
+            # sweep ports (rev04 §2). The safety-lock pose is discarded.
+            if arm_is_free:
+                _log("re-locking the arm (`c`) before auto-home — keep clear")
+                try:
+                    link.capture_pose()
+                except Exception as exc:  # best-effort safety lock; still try home
+                    _log(f"  WARNING: safety lock raised {exc!r}; homing anyway")
+                _log("auto-homing the arm — STAND CLEAR of the workspace")
+                if not link.home(_SWEEP_AUTO_HOME_DUR_S):
+                    _log("  WARNING: no home ACK — verify the arm is safe visually")
             link.close()
         if ui is not None:
             ui.close()
