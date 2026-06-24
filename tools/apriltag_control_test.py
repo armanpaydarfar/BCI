@@ -102,12 +102,18 @@ def gaze_point_in_plane_uv(gaze_x: float, gaze_y: float, K: np.ndarray,
 
 
 def _sample_uv(consumer: RelayConsumer, detector, K, world_map: dict,
-               tag_size: float, dur_s: float) -> Optional[np.ndarray]:
+               tag_size: float, dur_s: float) -> Tuple[Optional[np.ndarray], dict]:
     """Median fixated table-plane ``(u,v)`` over a short window, using only frames
     where gaze is valid and ≥1 mapped world tag is seen. The world pose is fused
-    from whichever mapped tags are visible (occlusion-robust)."""
+    from whichever mapped tags are visible (occlusion-robust). Returns
+    ``(uv_or_None, diag)`` where ``diag`` reports world-tag visibility — how many of
+    the mapped world tags were detected per frame and which — so the operator can see
+    the head-invariant anchor is solid (more tags → a more stable, flip-proof pose)."""
     pts: List[np.ndarray] = []
     last_idx = None
+    gaze_frames = 0
+    per_frame_counts: List[int] = []
+    ids_seen: dict = {}
     deadline = time.time() + dur_s
     while time.time() < deadline:
         b = consumer.latest()
@@ -119,8 +125,12 @@ def _sample_uv(consumer: RelayConsumer, detector, K, world_map: dict,
             continue
         if not getattr(b, "worn", True):
             continue
+        gaze_frames += 1
         tags = detect_tags(detector, b.video.bgr, K, tag_size)
         world_view = {i: tags[i]["T"] for i in world_map["ids"] if i in tags}
+        per_frame_counts.append(len(world_view))
+        for i in world_view:
+            ids_seen[int(i)] = ids_seen.get(int(i), 0) + 1
         T_cam_world = recover_world_pose(world_view, world_map)
         if T_cam_world is None:
             continue
@@ -128,9 +138,16 @@ def _sample_uv(consumer: RelayConsumer, detector, K, world_map: dict,
                                     world_map["plane_point"], world_map["plane_normal"])
         if uv is not None:
             pts.append(uv)
+    diag = {
+        "frames": len(pts),
+        "gaze_frames": gaze_frames,
+        "median_world_tags": float(np.median(per_frame_counts)) if per_frame_counts else 0.0,
+        "tags_seen": sorted(ids_seen),
+        "mapped_tags": sorted(int(i) for i in world_map["ids"]),
+    }
     if not pts:
-        return None
-    return np.median(np.vstack(pts), axis=0)
+        return None, diag
+    return np.median(np.vstack(pts), axis=0), diag
 
 
 # ── main control loop ─────────────────────────────────────────────────────────
@@ -227,14 +244,19 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
 
         # default (Enter / 'r'): resolve a fixation
         _log(f"resolving — fixate the target for {args.sample_s:.1f}s …")
-        uv = _sample_uv(consumer, detector, K, world_map, tag_size, args.sample_s)
+        uv, diag = _sample_uv(consumer, detector, K, world_map, tag_size, args.sample_s)
         if uv is None:
-            _log("no valid gaze+world-tag samples — keep the world tag in view and fixate")
+            _log(f"no valid gaze+world-tag samples (gaze frames={diag['gaze_frames']}, "
+                 f"world tags seen={diag['tags_seen']} of {diag['mapped_tags']}) — "
+                 "keep ≥1 world tag in view and fixate")
             pending, far_armed = None, False
             continue
         result = mapping.query_uv(uv)
         idx, dist = result.idx, result.dist
         q_cmd, clamped = result.q_target, result.clamped
+        _log(f"world anchor: {diag['frames']} frames, median "
+             f"{diag['median_world_tags']:.0f}/{len(diag['mapped_tags'])} world tags/frame, "
+             f"saw {diag['tags_seen']}")
         _log(f"fixated table (u,v) = {np.round(uv,1)} mm")
         _log(f"nearest calibrated pose #{idx}: library (u,v)={np.round(result.x_target,1)} "
              f"mm, dist={dist:.1f} mm, clamped={clamped}")
