@@ -63,6 +63,20 @@ def test_sufficient_when_count_and_spread_met():
     assert g.done()  # the only visited cell is sufficient
 
 
+def test_sufficient_mask_marks_only_green_cell_samples():
+    # One green cell (0,0) and one still-partial cell (2,0); the mask over the exact
+    # sample sequence is True only for the samples that fell in the green cell.
+    g = CoverageGrid(cell_size_mm=50.0, min_samples=8, min_spread_mm=15.0)
+    green_pts = [list(np.array([20.0, 20.0]) + [k * 3.0, k * 3.0]) for k in range(10)]
+    partial_pts = [[120.0, 20.0], [123.0, 22.0], [126.0, 24.0]]  # (2,0), only 3
+    for p in green_pts + partial_pts:
+        g.add(p)
+    mask = g.sufficient_mask(green_pts + partial_pts)
+    assert mask.dtype == bool and mask.shape == (13,)
+    assert mask[:10].all() and not mask[10:].any()
+    assert g.sufficient_mask([]).shape == (0,)
+
+
 def test_next_target_points_at_weakest_then_none():
     g = CoverageGrid(cell_size_mm=50.0, min_samples=8, min_spread_mm=15.0)
     _fill_cell(g, [20, 20], n=10, spread_mm=30.0)   # (0,0) sufficient

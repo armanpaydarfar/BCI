@@ -80,8 +80,9 @@ def test_solve_missing_file_returns_2():
 # ── step 5: REV04 planar solve (sweep npz → (u,v)→Q library) ─────────────────
 
 
-def _write_sweep(path, UV, Q, X):
+def _write_sweep(path, UV, Q, X, green=None):
     # Minimal world map carried through to the calib (single ref tag, z=0 plane).
+    extra = {} if green is None else {"green": np.asarray(green, dtype=bool)}
     np.savez_compressed(
         path, UV=UV, Q=Q, X=X,
         T_cam_world=np.zeros((UV.shape[0], 4, 4)),
@@ -90,6 +91,7 @@ def _write_sweep(path, UV, Q, X):
         world_map_rels=np.eye(4)[None, :, :],
         world_map_plane_point=np.zeros(3), world_map_plane_normal=np.array([0.0, 0.0, 1.0]),
         meta=np.array({"version": 3, "scheme": "planar_sweep", "side": "R"}, dtype=object),
+        **extra,
     )
 
 
@@ -150,6 +152,46 @@ def test_planar_solve_too_few_rows_returns_1(tmp_path):
     Q[1] = np.nan  # only 1 finite (UV,Q) row remains
     _write_sweep(tmp_path / "apriltag_sweep_tiny.npz", UV, Q, np.zeros((2, 3)))
     assert calib.main(["--stage", "solve", str(tmp_path / "apriltag_sweep_tiny.npz")]) == 1
+
+
+def test_planar_solve_green_only_filters_partial_cells(tmp_path, capsys):
+    # 4 green-cell rows + 2 partial-cell rows (flagged False); the default green-only
+    # solve must build the library from the 4 green rows only.
+    UV = np.array([[0.0, 0.0], [100.0, 0.0], [0.0, 100.0], [100.0, 100.0],
+                   [900.0, 900.0], [950.0, 950.0]])
+    Q = np.linspace(0.1, 0.6, 6)[:, None] * np.ones((1, 7))
+    X = np.column_stack([_sim2(UV, 1.0, 0.0, [0.0, 0.0]), np.full(6, 350.0)])
+    green = np.array([True, True, True, True, False, False])
+    sweep = tmp_path / "apriltag_sweep_green.npz"
+    _write_sweep(sweep, UV, Q, X, green=green)
+
+    assert calib.main(["--stage", "solve", str(sweep)]) == 0
+    out = capsys.readouterr().out
+    assert "green-only: 4/6" in out
+    z = np.load(tmp_path / "apriltag_green_calib.npz", allow_pickle=True)
+    assert z["UV"].shape == (4, 2)  # the 2 partial-cell rows are dropped
+
+    # --include-partial keeps all 6.
+    assert calib.main(["--stage", "solve", "--include-partial", str(sweep)]) == 0
+    z2 = np.load(tmp_path / "apriltag_green_calib.npz", allow_pickle=True)
+    assert z2["UV"].shape == (6, 2)
+
+
+def test_planar_solve_green_only_noop_without_mask(tmp_path, capsys):
+    # A pre-fix sweep npz (no 'green') cannot be filtered — keep all, with a note.
+    UV = np.array([[0.0, 0.0], [100.0, 0.0], [0.0, 100.0], [100.0, 100.0]])
+    Q = np.linspace(0.1, 0.4, 4)[:, None] * np.ones((1, 7))
+    X = np.column_stack([UV, np.full(4, 350.0)])
+    _write_sweep(tmp_path / "apriltag_sweep_nomask.npz", UV, Q, X)  # green=None
+    assert calib.main(["--stage", "solve", str(tmp_path / "apriltag_sweep_nomask.npz")]) == 0
+    assert "has no 'green' mask" in capsys.readouterr().out
+
+
+def test_green_only_default_and_include_partial_flag():
+    a = calib.parse_args(["--stage", "solve", "x.npz"])
+    assert a.green_only is True
+    b = calib.parse_args(["--stage", "solve", "--include-partial", "x.npz"])
+    assert b.green_only is False
 
 
 def test_camera_params_from_K():

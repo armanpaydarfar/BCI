@@ -537,14 +537,22 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     period = 1.0 / args.sample_hz
     last_idx = None
     accepted = 0
-    next_tick = time.monotonic()
-    last_report = time.monotonic()
-    deadline = time.monotonic() + args.max_sweep_s
-    _log(f"sweep: ≤{args.max_sweep_s:.0f}s, stop early on full coverage "
-         f"(cell {args.cell_size_mm:.0f}mm, ≥{args.min_samples} samples, spread "
-         f"≥{args.min_spread_mm:.0f}mm). Ctrl-C to stop + save.")
     try:
-        while time.monotonic() < deadline:
+        # Start gate (rev04 §3, operator 2026-06-24): with the arm freed, let the
+        # operator position it before any sample is recorded, so the transit into
+        # the start pose never enters the library. The deadline starts AFTER the
+        # gate so positioning time is not charged against the sweep budget.
+        started = _await_sweep_start(ui)
+        if not started:
+            _log("sweep: start aborted before any capture")
+        else:
+            _log(f"sweep: ≤{args.max_sweep_s:.0f}s, stop early on full coverage "
+                 f"(cell {args.cell_size_mm:.0f}mm, ≥{args.min_samples} samples, spread "
+                 f"≥{args.min_spread_mm:.0f}mm). Ctrl-C to stop + save.")
+        next_tick = time.monotonic()
+        last_report = time.monotonic()
+        deadline = time.monotonic() + args.max_sweep_s
+        while started and time.monotonic() < deadline:
             next_tick += period
             b, t_frame = consumer.latest_with_time()
             if b is None or b.video is None or b.video.bgr is None or b.video.frame_idx == last_idx:
@@ -646,6 +654,11 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     from datetime import datetime, timezone
     stamp = args.utc_stamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_path = out_dir / f"apriltag_sweep_{stamp}.npz"
+    # Tag each saved sample green/amber by its cell's FINAL sufficiency so the solve
+    # can build the library from green-cell samples only (rev04 §3, operator
+    # 2026-06-24): extraneous transit samples land in still-partial cells and would
+    # otherwise pollute the (u,v)→Q nearest-neighbour lookup.
+    green = grid.sufficient_mask(uv_rows)
     wm_ref, wm_ids, wm_rels, wm_pp, wm_pn = world_map_to_arrays(world_map)
     em_ref, em_ids, em_rels, em_pp, em_pn = world_map_to_arrays(ee_map)
     meta = {
@@ -671,6 +684,7 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
         UV=np.vstack(uv_rows),
         Q=np.vstack(q_rows),
         X=np.vstack(x_rows),
+        green=green,
         T_cam_world=np.stack(tcw_rows),
         T_cam_eetag=np.stack(tce_rows),
         t=np.asarray(t_rows, dtype=float),
@@ -680,7 +694,8 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
         ee_map_plane_point=em_pp, ee_map_plane_normal=em_pn,
         meta=np.array(meta, dtype=object),
     )
-    _log(f"saved {len(uv_rows)} swept samples → {out_path}")
+    _log(f"saved {len(uv_rows)} swept samples ({int(green.sum())} in green/sufficient "
+         f"cells) → {out_path}")
     if args.with_robot:
         _log("solve it: "
              f"python tools/apriltag_calibrate.py --stage solve {out_path}")
@@ -702,6 +717,21 @@ def _make_coverage_ui(args):
         return None
     from Utils.gaze.coverage_view import CoverageBoxUI
     return CoverageBoxUI(args.cell_size_mm, audio=args.audio)
+
+
+def _await_sweep_start(ui) -> bool:
+    """Gate between freeing the arm and recording the first sample (rev04 §3,
+    operator 2026-06-24). With the coverage window up the prompt is on-screen
+    (SPACE to start / q to abort); headless (``--no-ui``) it is a terminal Enter.
+    Returns True to begin sampling, False to abort with nothing captured."""
+    if ui is not None:
+        return ui.wait_for_start()
+    try:
+        input("position the freed arm, then press Enter to START sampling "
+              "(Ctrl-C aborts) > ")
+        return True
+    except EOFError:
+        return False
 
 
 # ── stage: solve (offline) — writes the consolidated calibration ─────────────
@@ -799,6 +829,23 @@ def stage_solve_planar(args, z, npz_path) -> int:
     UV = np.asarray(z["UV"], dtype=float)
     Q = np.asarray(z["Q"], dtype=float)
     X = np.asarray(z["X"], dtype=float) if "X" in z.files else np.full((UV.shape[0], 3), np.nan)
+
+    # Green-only (rev04 §3, operator 2026-06-24): build the library from samples in
+    # sufficient ("green") coverage cells only — the default, since transit /
+    # extraneous samples in still-partial cells pollute the NN lookup. ``green`` is
+    # the per-sample sufficiency mask the sweep stored; a pre-fix npz lacks it
+    # (then we cannot filter and keep all). ``--include-partial`` keeps every sample.
+    if args.green_only and "green" in z.files:
+        gmask = np.asarray(z["green"], dtype=bool)
+        kept = int(gmask.sum())
+        _log(f"green-only: {kept}/{len(gmask)} samples in sufficient cells "
+             f"(dropped {len(gmask) - kept} partial-cell; --include-partial keeps all)")
+        UV, Q, X = UV[gmask], Q[gmask], X[gmask]
+    elif args.green_only:
+        _log("green-only requested but this npz has no 'green' mask (pre-fix sweep) "
+             "— using all accepted samples")
+    else:
+        _log("--include-partial: using all accepted samples (green + amber cells)")
 
     # A1 library needs finite (UV, Q); a no-robot dry-run sweep has NaN Q.
     lib_ok = np.all(np.isfinite(UV), axis=1) & np.all(np.isfinite(Q[:, :7]), axis=1)
@@ -939,6 +986,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="sweep: run headless with a text summary (no OpenCV coverage box)")
     p.add_argument("--audio", action="store_true",
                    help="sweep: speak coverage cues (solo-operator aid, rev04 §3)")
+    p.add_argument("--include-partial", dest="green_only", action="store_false",
+                   help="solve: build the library from ALL accepted samples, not just "
+                        "those in sufficient ('green') coverage cells. Default is "
+                        "green-only — partial-cell transit samples pollute the NN "
+                        "lookup (rev04 §3).")
+    p.set_defaults(green_only=True)
     args = p.parse_args(argv)
 
     import os

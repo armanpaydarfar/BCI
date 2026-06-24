@@ -148,6 +148,34 @@ class CoverageBoxUI:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window, width, height)
 
+    def wait_for_start(self) -> bool:
+        """Start gate (rev04 §3, operator 2026-06-24): block — drawing an on-screen
+        prompt so the operator can position the freed arm — until they press SPACE
+        to begin (returns True) or 'q' / close the window to abort (returns False).
+        No sample is recorded until this returns True, so the transit into the start
+        pose never enters the library."""
+        cv2 = self._cv2
+        lines = [("POSITION THE ARM", 0.95, 2),
+                 ("press SPACE to START the sweep", 0.6, 1),
+                 ("q aborts (arm re-locks + homes)", 0.55, 1)]
+        while True:
+            canvas = np.full((self.height, self.width, 3), _COLOR_BG, dtype=np.uint8)
+            for k, (text, scale, thick) in enumerate(lines):
+                y = self.height // 2 - 28 + k * 36
+                cv2.putText(canvas, text, (40, y), cv2.FONT_HERSHEY_SIMPLEX, scale,
+                            _COLOR_EE, thick, cv2.LINE_AA)
+            cv2.imshow(self.window, canvas)
+            key = cv2.waitKey(30) & 0xFF
+            if key == ord(" "):
+                return True
+            if key == ord("q"):
+                self._quit = True
+                return False
+            # Window closed via the title-bar X → abort rather than spin forever.
+            if cv2.getWindowProperty(self.window, cv2.WND_PROP_VISIBLE) < 1:
+                self._quit = True
+                return False
+
     def update(self, grid: CoverageGrid, cur_uv, target_uv) -> None:
         cv2 = self._cv2
         canvas = np.full((self.height, self.width, 3), _COLOR_BG, dtype=np.uint8)
@@ -176,6 +204,12 @@ class CoverageBoxUI:
                   + ("COMPLETE" if grid.done() else "sweeping…"))
         cv2.putText(canvas, header, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                     _COLOR_EE, 1, cv2.LINE_AA)
+
+        # On-screen operator instructions (rev04 §3, operator 2026-06-24): the
+        # operator wears the Neon and cannot watch the terminal during the sweep.
+        footer = "hand-guide slowly  |  move toward the RED cell  |  [q] stop & save"
+        cv2.putText(canvas, footer, (12, self.height - 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, _COLOR_EE, 1, cv2.LINE_AA)
 
         cv2.imshow(self.window, canvas)
         if (cv2.waitKey(1) & 0xFF) == ord("q"):

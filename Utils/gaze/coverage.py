@@ -97,6 +97,16 @@ class CoverageGrid:
         return {c: ("sufficient" if self.is_sufficient(c) else "partial")
                 for c in self._cells}
 
+    def sufficient_mask(self, uvs) -> np.ndarray:
+        """Boolean mask over a sequence of ``(u,v)`` samples: True where the
+        sample's cell is sufficient ("green"). Computed once at sweep end so the
+        solve can build the calibration library from green-cell samples only —
+        excluding the transit / extraneous samples that land in still-partial
+        ("amber") cells and would otherwise pollute the nearest-neighbour lookup
+        (rev04 §3, operator 2026-06-24). Empty input → empty mask."""
+        return np.array([self.is_sufficient(self.cell_of(uv)) for uv in uvs],
+                        dtype=bool)
+
     # ── guidance + stopping ───────────────────────────────────────────────────
     def next_target(self) -> Optional[np.ndarray]:
         """Centre ``(u,v)`` of the visited cell most in need of more samples — the
