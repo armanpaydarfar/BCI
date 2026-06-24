@@ -727,6 +727,13 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     )
     _log(f"saved {len(uv_rows)} swept samples ({int(green.sum())} in green/sufficient "
          f"cells) → {out_path}")
+    if args.with_robot and args.then_solve:
+        # Wrap solve into calibration (the control-panel "calibration" button): the
+        # sweep already baked the EE method, plane (orientation normal), and offset
+        # into the stored (u,v), so solve from those — no recompute.
+        _log("--then-solve: building the planar calibration from this sweep …")
+        args.npz, args.ee_point_method = str(out_path), None
+        return stage_solve(args)
     if args.with_robot:
         _log("solve it: "
              f"python tools/apriltag_calibrate.py --stage solve {out_path}")
@@ -1102,6 +1109,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="sweep: run headless with a text summary (no OpenCV coverage box)")
     p.add_argument("--audio", action="store_true",
                    help="sweep: speak coverage cues (solo-operator aid, rev04 §3)")
+    p.add_argument("--then-solve", action="store_true",
+                   help="sweep: immediately run the planar solve on the npz just saved "
+                        "(wraps calibration → solve in one terminal; the control panel "
+                        "uses this). No-op without --with-robot (a dry run has NaN Q).")
     p.add_argument("--ee-point-method", choices=["pose", "rayplane"], default=None,
                    help="how each sample's EE table-(u,v) is derived. sweep: default "
                         "'pose' (the EE tag's 3-D origin projected onto the table — "

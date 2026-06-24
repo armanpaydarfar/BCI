@@ -224,6 +224,14 @@ def test_solve_recompute_uv_with_ee_point_method(tmp_path):
     np.testing.assert_allclose(z["UV"], expected, atol=1e-6)  # recomputed, not the stored zeros
 
 
+def test_then_solve_flag_defaults_false():
+    a = calib.parse_args(["--stage", "sweep", "--world-tag-ids", "0", "--ee-tag-ids", "5"])
+    assert a.then_solve is False
+    b = calib.parse_args(["--stage", "sweep", "--world-tag-ids", "0", "--ee-tag-ids", "5",
+                          "--then-solve"])
+    assert b.then_solve is True
+
+
 def test_ee_point_method_default_none_choices():
     a = calib.parse_args(["--stage", "sweep", "--world-tag-ids", "0", "--ee-tag-ids", "5"])
     assert a.ee_point_method is None  # sweep resolves None -> 'pose'

@@ -1245,10 +1245,21 @@ class ControlPanel(QMainWindow):
         hbtn_row.addStretch(1)
         hb.addLayout(hbtn_row)
 
-        # WS5 AprilTag calibration + gaze→robot control test (rev03). The
-        # calibration button opens the tool at its detect stage (operator runs
-        # gaze/collect/solve in the same persistent terminal); the control-test
-        # button drives the robot from the selected *_calib.npz.
+        # WS5 REV04 AprilTag gaze→robot calibration (HIL PASS 2026-06-24). The
+        # calibration button runs the swept capture + planar solve in one terminal
+        # using the verified rig config (config.APRILTAG_*); the control-test button
+        # drives the robot from the AprilTag calibration selected below (the dropdown
+        # lists runs/apriltag_*_calib.npz newest-first, so it defaults to the latest).
+        atag_lib_row = QHBoxLayout()
+        atag_lib_row.addWidget(QLabel("AprilTag calib:"))
+        self.cmb_apriltag_calib = QComboBox()
+        atag_lib_row.addWidget(self.cmb_apriltag_calib, 1)
+        self.btn_refresh_apriltag_calibs = QPushButton("Refresh")
+        self.btn_refresh_apriltag_calibs.setMaximumWidth(90)
+        self.btn_refresh_apriltag_calibs.clicked.connect(self.on_refresh_apriltag_calibs)
+        atag_lib_row.addWidget(self.btn_refresh_apriltag_calibs)
+        hb.addLayout(atag_lib_row)
+
         atag_row = QHBoxLayout()
         self.btn_run_apriltag_calibrate = QPushButton("Run AprilTag calibration")
         self.btn_run_apriltag_calibrate.setMaximumWidth(220)
@@ -1306,6 +1317,7 @@ class ControlPanel(QMainWindow):
         # Initial serial refresh
         self.on_serial_refresh()
         self.on_refresh_calibration_libs()
+        self.on_refresh_apriltag_calibs()
         self.on_refresh_training_data_list()
 
         self._building_ui = False
@@ -3215,29 +3227,66 @@ class ControlPanel(QMainWindow):
         self._spawn_external(f'python -u "{HARMONY_ONLINE_CONTROL_PY}" "{calib_lib}"')
         self._append_log("Panel", f"[{self._ts()}] Opened harmony_online_control.py with calibration library:\n  {calib_lib}\n")
 
+    def on_refresh_apriltag_calibs(self):
+        """List runs/apriltag_*_calib.npz newest-first so the dropdown defaults to the
+        latest calibration (the operator does not need to know the filename)."""
+        if not hasattr(self, "cmb_apriltag_calib"):
+            return
+        current = self.cmb_apriltag_calib.currentData()
+        self.cmb_apriltag_calib.clear()
+        calibs = sorted(glob.glob(os.path.join(ROOT, "runs", "apriltag_*_calib.npz")),
+                        key=os.path.getmtime, reverse=True)
+        if not calibs:
+            self.cmb_apriltag_calib.addItem("No AprilTag calibrations in runs/", "")
+            self._append_log("Panel", f"[{self._ts()}] No AprilTag calibrations "
+                             f"(runs/apriltag_*_calib.npz) yet — run a calibration first\n")
+            return
+        for c in calibs:
+            self.cmb_apriltag_calib.addItem(os.path.basename(c), c)
+        # Keep the prior selection if still present; otherwise index 0 (= newest).
+        if current:
+            idx = self.cmb_apriltag_calib.findData(current)
+            if idx >= 0:
+                self.cmb_apriltag_calib.setCurrentIndex(idx)
+        self._append_log("Panel", f"[{self._ts()}] AprilTag calibrations: {len(calibs)} "
+                         f"(newest first → {os.path.basename(calibs[0])})\n")
+
     def on_run_apriltag_calibrate(self):
         if not os.path.exists(APRILTAG_CALIBRATE_PY):
             QMessageBox.warning(self, "Missing", f"Not found:\n{APRILTAG_CALIBRATE_PY}")
             return
-        # Open at the detect stage; the persistent terminal lets the operator run
-        # gaze / collect --with-robot / solve with their own tag ids + offset.
-        self._spawn_external(
-            f'python -u "{APRILTAG_CALIBRATE_PY}" --stage detect --world-tag-id 0 --tag-size 0.06')
-        self._append_log("Panel", f"[{self._ts()}] Opened apriltag_calibrate.py (detect stage)\n")
+        # REV04 swept calibration + planar solve in one terminal, from the verified
+        # rig config (config.APRILTAG_*). --then-solve writes the *_calib.npz; the
+        # operator hits Refresh afterwards and the control-test button picks it up.
+        world = " ".join(str(int(i)) for i in getattr(_HCFG, "APRILTAG_WORLD_TAG_IDS", [0, 1, 2, 3, 4]))
+        ee = " ".join(str(int(i)) for i in getattr(_HCFG, "APRILTAG_EE_TAG_IDS", [5]))
+        tag = float(getattr(_HCFG, "APRILTAG_TAG_SIZE_M", 0.08))
+        ee_tag = float(getattr(_HCFG, "APRILTAG_EE_TAG_SIZE_M", 0.04))
+        off = list(getattr(_HCFG, "APRILTAG_T_EETAG_EE_MM", [150.0, -200.0, 0.0]))
+        # --side defaults to env HARMONY_ACTIVE_SIDE or 'R' in the tool itself.
+        cmd = (f'python -u "{APRILTAG_CALIBRATE_PY}" --stage sweep --with-robot '
+               f'--world-tag-ids {world} --ee-tag-ids {ee} '
+               f'--tag-size {tag} --ee-tag-size {ee_tag} '
+               f'--t-eetag-ee {off[0]} {off[1]} {off[2]} '
+               f'--out-dir runs --then-solve')
+        self._spawn_external(cmd)
+        self._append_log("Panel", f"[{self._ts()}] Launched AprilTag calibration "
+                         f"(sweep → solve): world {world}, EE {ee}, offset {off}\n")
 
     def on_run_apriltag_control_test(self):
         if not os.path.exists(APRILTAG_CONTROL_TEST_PY):
             QMessageBox.warning(self, "Missing", f"Not found:\n{APRILTAG_CONTROL_TEST_PY}")
             return
-        calib_lib = self._get_selected_calibration_library()
-        if not calib_lib or not os.path.exists(calib_lib):
-            QMessageBox.warning(self, "Calibration Library",
-                                "Select a valid AprilTag calibration (apriltag_*_calib.npz).")
+        calib = (self.cmb_apriltag_calib.currentData()
+                 if hasattr(self, "cmb_apriltag_calib") else "")
+        if not calib or not os.path.exists(calib):
+            QMessageBox.warning(self, "AprilTag calibration",
+                                "No AprilTag calibration selected. Run an AprilTag "
+                                "calibration first, then click Refresh.")
             return
-        # world-tag-id + tag-size default from the calibration's own meta.
-        self._spawn_external(
-            f'python -u "{APRILTAG_CONTROL_TEST_PY}" --calib "{calib_lib}"')
-        self._append_log("Panel", f"[{self._ts()}] Opened apriltag_control_test.py with calibration:\n  {calib_lib}\n")
+        # tag ids / sizes / plane default from the calibration's own meta + world map.
+        self._spawn_external(f'python -u "{APRILTAG_CONTROL_TEST_PY}" --calib "{calib}"')
+        self._append_log("Panel", f"[{self._ts()}] Launched AprilTag control test with:\n  {calib}\n")
 
     # ----- Driver -----
     def on_driver_start(self):

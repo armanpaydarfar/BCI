@@ -189,6 +189,21 @@ GAZE_CALIBRATION_USE_IMU = False
 # reachable and Depth Pro is loaded.
 GAZE_CALIBRATION_DEPTH_SOURCE = "vergence"
 
+# REV04 AprilTag gaze↔robot calibration — verified rig defaults (HIL PASS
+# 2026-06-24; verification report §7). The control panel builds the swept-
+# calibration + control-test commands from these so the operator never retypes
+# tag ids / sizes / the EE-tag→hand offset. These are algorithm/protocol
+# settings (not machine-local paths or IPs), so they live in committed config.py;
+# override per rig here when the physical tag layout changes.
+#   WORLD tags are taped coplanar on the flat table (≥3 → robust consensus pose);
+#   EE tag(s) ride on the end-effector; the offset is the measured EE-tag→hand
+#   vector in the TAG frame (mm), applied per-sample as R_world_eetag·offset.
+APRILTAG_WORLD_TAG_IDS = [0, 1, 2, 3, 4]
+APRILTAG_EE_TAG_IDS = [5]
+APRILTAG_TAG_SIZE_M = 0.08
+APRILTAG_EE_TAG_SIZE_M = 0.04
+APRILTAG_T_EETAG_EE_MM = [150.0, -200.0, 0.0]
+
 # =============================================================================
 # Pupil Labs Neon — device connection
 # =============================================================================
