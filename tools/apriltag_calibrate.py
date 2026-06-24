@@ -40,8 +40,13 @@ Examples:
     python tools/apriltag_calibrate.py --stage detect --world-tag-ids 0 --tag-size 0.10
     python tools/apriltag_calibrate.py --stage gaze   --world-tag-ids 0 --tag-size 0.10
     python tools/apriltag_calibrate.py --stage collect --with-robot \\
-        --world-tag-ids 0 1 2 --ee-tag-id 9 --tag-size 0.10 --ee-tag-size 0.04 --t-eetag-ee 0 0 50
+        --world-tag-ids 0 1 2 --ee-tag-ids 8 9 --tag-size 0.10 --ee-tag-size 0.04 --t-eetag-ee 0 0 50
     python tools/apriltag_calibrate.py --stage solve runs/apriltag_capture_<UTC>.npz
+
+The EE side mirrors the world side: ``--ee-tag-ids`` registers a rigid EE
+**bundle** (occlusion-robust, ambiguity-reducing — the HIL accuracy floor of a
+single small EE tag, verification report §5); the back-compat singular
+``--ee-tag-id`` is just a 1-entry bundle.
 """
 
 from __future__ import annotations
@@ -91,9 +96,11 @@ def _log(msg: str) -> None:
 def stage_detect(args, consumer: RelayConsumer) -> int:
     detector = load_detector(args.families)
     K = consumer.camera_matrix
-    tag_id = (args.world_tag_ids[0] if args.world_tag_ids else args.ee_tag_id)
+    ee_ids = _resolve_ee_ids(args)
+    tag_id = (args.world_tag_ids[0] if args.world_tag_ids
+              else (ee_ids[0] if ee_ids else None))
     if tag_id is None:
-        _log("detect needs --world-tag-ids (or --ee-tag-id) to track")
+        _log("detect needs --world-tag-ids (or --ee-tag-id/--ee-tag-ids) to track")
         return 2
     _log(f"detect: SINGLE tag {tag_id} for {args.duration:.0f}s "
          f"(tag-size {args.tag_size} m). Hold the tag static in view.")
@@ -163,9 +170,11 @@ def stage_detect(args, consumer: RelayConsumer) -> int:
 def stage_gaze(args, consumer: RelayConsumer) -> int:
     detector = load_detector(args.families)
     K = consumer.camera_matrix
-    tag_id = (args.world_tag_ids[0] if args.world_tag_ids else args.ee_tag_id)
+    ee_ids = _resolve_ee_ids(args)
+    tag_id = (args.world_tag_ids[0] if args.world_tag_ids
+              else (ee_ids[0] if ee_ids else None))
     if tag_id is None:
-        _log("gaze needs --world-tag-ids (or --ee-tag-id) to fixate")
+        _log("gaze needs --world-tag-ids (or --ee-tag-id/--ee-tag-ids) to fixate")
         return 2
     _log(f"gaze: fixate tag {tag_id} steadily for {args.duration:.0f}s.")
 
@@ -210,14 +219,21 @@ def stage_gaze(args, consumer: RelayConsumer) -> int:
 # ── stage: collect (free-arm m/c capture; records X + Q) ─────────────────────
 
 
-def _register_world_map(consumer, detector, K, world_ids, tag_size, tag_sizes,
-                        dur=2.0):
-    """Average each world tag's pose over a short window (all tags visible, arm
-    clear) and build the rigid world map. Returns ``(world_map, sorted_seen_ids)``
-    or ``(None, [])`` if no world tag was detected."""
-    _log(f"world-map registration: keep ALL world tags {world_ids} visible and "
-         f"the arm CLEAR for ~{dur:.0f}s …")
-    obs = {int(i): [] for i in world_ids}
+def _register_tag_map(consumer, detector, K, ids, tag_size, tag_sizes,
+                      label="tag", dur=2.0):
+    """Average each tag's pose over a short window (all tags visible, the body
+    they sit on held still) and build a rigid map over them via
+    ``build_world_map``. Returns ``(map, sorted_seen_ids)`` or ``(None, [])`` if
+    no listed tag was detected.
+
+    Used for BOTH the static world-tag map and the EE-tag bundle map (rev04 §7):
+    ``build_world_map``/``recover_world_pose`` are frame-agnostic, so the EE
+    bundle is registered exactly like the world bundle — its "world" frame is the
+    EE reference tag's frame, and the hand-measured offset is taken w.r.t. that
+    reference tag."""
+    _log(f"{label}-map registration: keep ALL {label} tags {ids} visible and the "
+         f"body they sit on STILL for ~{dur:.0f}s …")
+    obs = {int(i): [] for i in ids}
     last_idx = None
     deadline = time.time() + dur
     while time.time() < deadline:
@@ -227,7 +243,7 @@ def _register_world_map(consumer, detector, K, world_ids, tag_size, tag_sizes,
             continue
         last_idx = b.video.frame_idx
         tags = detect_tags(detector, b.video.bgr, K, tag_size, tag_sizes=tag_sizes)
-        for i in world_ids:
+        for i in ids:
             if int(i) in tags:
                 obs[int(i)].append(tags[int(i)]["T"])
     seen = {i: average_pose(v) for i, v in obs.items() if v}
@@ -236,19 +252,57 @@ def _register_world_map(consumer, detector, K, world_ids, tag_size, tag_sizes,
     return build_world_map(seen), sorted(seen)
 
 
+def _resolve_ee_ids(args) -> Optional[List[int]]:
+    """The EE tag id list from either ``--ee-tag-ids`` (plural, a bundle) or the
+    back-compat singular ``--ee-tag-id`` (a 1-entry map). Returns None if neither
+    was given. A single id still flows through the map machinery as a 1-tag map,
+    so the capture/runtime code has exactly one EE-pose path."""
+    if args.ee_tag_ids:
+        return [int(i) for i in args.ee_tag_ids]
+    if args.ee_tag_id is not None:
+        return [int(args.ee_tag_id)]
+    return None
+
+
+def _register_ee_map(consumer, detector, K, ee_ids, world_tag_size, tag_sizes):
+    """Prompt + register the EE-tag bundle map (rev04 §7). For a single EE tag
+    this is a trivial 1-entry map (``recover_world_pose`` returns that tag's pose
+    directly); for a bundle it gives the occlusion-robust, ambiguity-reducing EE
+    pose the HIL report (§5) identified as the accuracy floor. Returns the map or
+    None (operator aborted)."""
+    while True:
+        input(f"place ALL EE tags {ee_ids} visible + the EE STILL, Enter to "
+              "register the EE-tag map (q+Enter to abort) > ")
+        ee_map, seen = _register_tag_map(consumer, detector, K, ee_ids,
+                                         world_tag_size, tag_sizes, label="EE")
+        if ee_map is None:
+            _log("  no EE tags detected — reposition and retry")
+            continue
+        missing = [i for i in ee_ids if i not in seen]
+        if missing:
+            _log(f"  registered {seen}, MISSING {missing} — re-show all EE tags "
+                 "(the bundle needs every tag so any subset works later), then retry")
+            continue
+        _log(f"  EE map OK: ref={ee_map['ref_id']}, tags={seen}")
+        return ee_map
+
+
 def stage_collect(args, consumer: RelayConsumer) -> int:
-    if not args.world_tag_ids or args.ee_tag_id is None:
-        _log("collect needs --world-tag-ids (one or more) and --ee-tag-id")
+    ee_ids = _resolve_ee_ids(args)
+    if not args.world_tag_ids or ee_ids is None:
+        _log("collect needs --world-tag-ids (one or more) and --ee-tag-id / --ee-tag-ids")
         return 2
     world_ids = [int(i) for i in args.world_tag_ids]
     detector = load_detector(args.families)
     K = consumer.camera_matrix
     offset_mm = np.asarray(args.t_eetag_ee, dtype=float)
-    # The EE tag may be smaller than the world tags (it has to fit the EE); pass
-    # its true size so its pose is scaled correctly. --tag-size is the world size.
+    # The EE tags may be smaller than the world tags (they have to fit the EE);
+    # pass their true size so their poses are scaled correctly. --tag-size is the
+    # world size.
     ee_size = args.ee_tag_size or args.tag_size
-    tag_sizes = {args.ee_tag_id: ee_size}
-    _log(f"tag sizes: world {args.tag_size} m, EE {ee_size} m; world tags {world_ids}")
+    tag_sizes = {int(i): ee_size for i in ee_ids}
+    _log(f"tag sizes: world {args.tag_size} m, EE {ee_size} m; world tags "
+         f"{world_ids}, EE tags {ee_ids}")
 
     # Register the multi-tag world map first (occlusion robustness): all world
     # tags must be seen once, arm clear, so any visible subset later recovers the
@@ -256,7 +310,8 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
     world_map = None
     while True:
         input("place ALL world tags visible + arm CLEAR, Enter to register the world map > ")
-        world_map, seen = _register_world_map(consumer, detector, K, world_ids, args.tag_size, tag_sizes)
+        world_map, seen = _register_tag_map(consumer, detector, K, world_ids,
+                                            args.tag_size, tag_sizes, label="world")
         if world_map is None:
             _log("  no world tags detected — reposition and retry")
             continue
@@ -267,6 +322,13 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
             continue
         _log(f"  world map OK: ref={world_map['ref_id']}, tags={seen}")
         break
+
+    # Register the EE-tag bundle map (rev04 §7): a single tag is a 1-entry map; a
+    # bundle resolves the single-small-tag pose ambiguity that set the HIL
+    # accuracy floor (verification report §5). The offset is w.r.t. the EE-map
+    # reference tag.
+    ee_map = _register_ee_map(consumer, detector, K, ee_ids, args.tag_size, tag_sizes)
+    ee_ref = ee_map["ref_id"]
 
     link: Optional[HarmonyLink] = None
     if args.with_robot:
@@ -335,17 +397,19 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
                 continue
             tags = detect_tags(detector, b.video.bgr, K, args.tag_size, tag_sizes=tag_sizes)
             world_view = {i: tags[i]["T"] for i in world_ids if i in tags}
+            ee_view = {i: tags[i]["T"] for i in ee_ids if i in tags}
             T_cam_world = recover_world_pose(world_view, world_map)
-            if T_cam_world is None or args.ee_tag_id not in tags:
-                _log(f"    need ≥1 world tag + the EE tag; saw {sorted(tags.keys())}. (discarded)")
+            T_cam_eetag = recover_world_pose(ee_view, ee_map)
+            if T_cam_world is None or T_cam_eetag is None:
+                _log(f"    need ≥1 world tag + ≥1 EE tag; saw {sorted(tags.keys())}. (discarded)")
                 continue
-            p_world = eetag_to_world_point(T_cam_world, tags[args.ee_tag_id]["T"], offset_mm)
+            p_world = eetag_to_world_point(T_cam_world, T_cam_eetag, offset_mm)
 
             p_world_rows.append(p_world)
             x_rows.append(x_ee)
             q_rows.append(q_joints)
             tcw_rows.append(T_cam_world)
-            tce_rows.append(tags[args.ee_tag_id]["T"])
+            tce_rows.append(T_cam_eetag)
             _log(f"    captured #{len(p_world_rows)}: P_world={np.round(p_world,1)} "
                  f"X={np.round(x_ee,1)} mm")
     finally:
@@ -362,12 +426,14 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
     stamp = args.utc_stamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_path = out_dir / f"apriltag_capture_{stamp}.npz"
     wm_ref, wm_ids, wm_rels, wm_pp, wm_pn = world_map_to_arrays(world_map)
+    em_ref, em_ids, em_rels, em_pp, em_pn = world_map_to_arrays(ee_map)
     meta = {
         "version": 3,
         "scheme": "ee_mounted_tag_free_roam",
         "side": args.side,
         "world_tag_ids": world_ids,
-        "ee_tag_id": args.ee_tag_id,
+        "ee_tag_ids": ee_ids,
+        "ee_tag_id": ee_ref,  # back-compat scalar = the EE-map reference tag
         "tag_size_m": args.tag_size,
         "ee_tag_size_m": ee_size,
         "t_eetag_ee_mm": offset_mm.tolist(),
@@ -386,6 +452,11 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
         world_map_rels=wm_rels,
         world_map_plane_point=wm_pp,
         world_map_plane_normal=wm_pn,
+        ee_map_ref=np.array(em_ref),
+        ee_map_ids=em_ids,
+        ee_map_rels=em_rels,
+        ee_map_plane_point=em_pp,
+        ee_map_plane_normal=em_pn,
         meta=np.array(meta, dtype=object),
     )
     _log(f"saved {len(p_world_rows)} captures → {out_path}")
@@ -488,7 +559,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="one or more world tag ids; collect registers a map over "
                         "them so any visible subset recovers the world frame "
                         "(occlusion-robust). detect/gaze use the first.")
-    p.add_argument("--ee-tag-id", type=int, default=None)
+    p.add_argument("--ee-tag-id", type=int, default=None,
+                   help="single EE tag id (back-compat: a 1-entry EE map)")
+    p.add_argument("--ee-tag-ids", type=int, nargs="+", default=None,
+                   help="one or more EE tag ids forming a rigid EE BUNDLE; "
+                        "collect/sweep register a map over them so any visible "
+                        "subset recovers the EE pose (resolves the single-small-tag "
+                        "ambiguity that set the HIL accuracy floor). The offset "
+                        "--t-eetag-ee is measured w.r.t. the bundle's reference "
+                        "(lowest) tag. Overrides --ee-tag-id when given.")
     p.add_argument("--t-eetag-ee", type=float, nargs=3, default=[0.0, 0.0, 0.0],
                    metavar=("X", "Y", "Z"),
                    help="hand-measured EE-tag→EE offset vector in MM")

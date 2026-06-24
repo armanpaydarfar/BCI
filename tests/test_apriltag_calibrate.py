@@ -96,3 +96,64 @@ def test_arg_defaults_come_from_config():
     assert args.relay_host == getattr(cfg, "FRAME_RELAY_DIAL_HOST")
     assert args.bind_ip == cfg.UDP_CONTROL_BIND["IP"]
     assert args.side in ("R", "L")
+
+
+# ── step 2: EE-tag bundle map generalisation ─────────────────────────────────
+
+
+def test_resolve_ee_ids_plural_overrides_singular_else_none():
+    plural = calib.parse_args(["--stage", "collect", "--ee-tag-ids", "5", "6", "7"])
+    assert calib._resolve_ee_ids(plural) == [5, 6, 7]
+    # --ee-tag-ids wins when both are given
+    both = calib.parse_args(["--stage", "collect", "--ee-tag-id", "2",
+                             "--ee-tag-ids", "5", "6"])
+    assert calib._resolve_ee_ids(both) == [5, 6]
+    singular = calib.parse_args(["--stage", "collect", "--ee-tag-id", "9"])
+    assert calib._resolve_ee_ids(singular) == [9]
+    neither = calib.parse_args(["--stage", "collect", "--world-tag-ids", "0"])
+    assert calib._resolve_ee_ids(neither) is None
+
+
+def test_ee_single_tag_map_equals_direct_tag_pose():
+    """Back-compat: a 1-entry EE map reproduces the old single-tag P_world path
+    exactly (recover_world_pose returns the tag pose itself, so eetag_to_world_point
+    composes identically)."""
+    from Utils.gaze.apriltag_world import build_world_map, recover_world_pose
+    from Utils.gaze.apriltag_calib import eetag_to_world_point
+
+    T_cam_world = make_transform(_rot_z(15.0), [40.0, -10.0, 600.0])
+    T_cam_eetag = make_transform(_rot_z(-25.0), [120.0, 30.0, 550.0])
+    offset = np.array([0.0, 0.0, 35.0])
+
+    ee_map = build_world_map({9: T_cam_eetag})
+    recovered = recover_world_pose({9: T_cam_eetag}, ee_map)
+    np.testing.assert_allclose(recovered, T_cam_eetag, atol=1e-9)
+
+    via_map = eetag_to_world_point(T_cam_world, recovered, offset)
+    via_direct = eetag_to_world_point(T_cam_world, T_cam_eetag, offset)
+    np.testing.assert_allclose(via_map, via_direct, atol=1e-9)
+
+
+def test_ee_bundle_recovers_consistent_world_point_under_occlusion():
+    """An EE bundle (≥2 rigid tags) recovers the SAME EE world point from any
+    visible subset — the occlusion-robustness the HIL accuracy floor needed
+    (verification report §5). Built on the analytically-known EE-reference frame."""
+    from Utils.gaze.apriltag_world import build_world_map, recover_world_pose
+    from Utils.gaze.apriltag_calib import eetag_to_world_point, ee_point_in_world, invert_transform
+
+    T_cam_world = make_transform(_rot_z(10.0), [0.0, 0.0, 700.0])
+    # EE reference-tag frame in the camera; second tag rigidly offset on the EE body.
+    T_cam_eeref = make_transform(_rot_z(-30.0), [150.0, -40.0, 520.0])
+    rel_2 = make_transform(_rot_z(90.0), [25.0, 0.0, 0.0])  # tag 2 in ee-ref frame
+    T_cam_ee2 = T_cam_eeref @ rel_2
+    offset = np.array([10.0, 0.0, 20.0])
+
+    ee_map = build_world_map({3: T_cam_eeref, 4: T_cam_ee2}, ref_id=3)
+
+    # Analytic expectation: EE point in world from the true EE-ref pose.
+    expected = ee_point_in_world(invert_transform(T_cam_world) @ T_cam_eeref, offset)
+
+    for view in ({3: T_cam_eeref, 4: T_cam_ee2}, {3: T_cam_eeref}, {4: T_cam_ee2}):
+        T_cam_eetag = recover_world_pose(view, ee_map)
+        p_world = eetag_to_world_point(T_cam_world, T_cam_eetag, offset)
+        np.testing.assert_allclose(p_world, expected, atol=1e-6)
