@@ -6,6 +6,28 @@ The format is **lightweight** (this repo is not strictly semver-tagged). Add bul
 
 ## [Unreleased]
 
+### Cleanup (collaborator-onboarding prep)
+
+- **Consolidated the two VLM UDP clients into one (behaviour-preserving).**
+  `vlm_bridge.VLMBridge` (one consumer — the gaze driver) is folded into
+  `Utils.perception_clients.VLMClient` (config-driven, the other 3 consumers,
+  owns the results-push channel); `vlm_bridge.py` deleted. The gaze driver's
+  migrated `status()`/`decide()` calls wrap `VLMClient` (which *raises* on
+  transport failure) in `except (OSError, json.JSONDecodeError): None` to keep
+  the former `None`-on-failure retry semantics; timeouts preserved (0.3s status,
+  30/40s decide). `VLMClient` gained a no-op `close()`. Dead `reason()` +
+  `top_intent`/`hit_waypoint_xyz` helpers dropped with the module.
+- **Test suite reshaped (no behaviour change).** Pruned 63 dead
+  `@pytest.mark.skip("pending rewrite")` tests that cited removed APIs;
+  converted 4 `__main__`/`_check`-style files that collected zero tests into
+  real pytest (`test_relay_loopback.py` is now `@pytest.mark.slow`); added a
+  `VLMClient` wire-contract characterization suite. Fast gate 396→420 passed,
+  63→0 skipped. `tests/README.md` refreshed with a current per-subsystem
+  catalog (the only test doc in the public repo).
+- **Perception item-5 tidy.** Unused `field` imports removed; dataclass
+  docstrings added; `visualize_neon.load_stream()` raises a clear
+  `FileNotFoundError` instead of an opaque `StopIteration`.
+
 ### Tooling
 
 - **Re-track `yolo26n.pt` at the repo root (corrects the `6054e07` cleanup).** That cleanup untracked it together with the genuinely-unused `yolo11n.pt`/`yolov8n.pt`, but `yolo26n.pt` is the in-use gaze recognizer — `Utils/gaze/gaze_system.py:78`/`:779` loads it by bare name (`YOLO("yolo26n.pt")` → cwd/repo root), so it must travel with the repo; otherwise a fresh clone has no weight and silently relies on an ultralytics auto-download. Restored as a tracked file via a `!/yolo26n.pt` exception to the `*.pt` ignore. This **supersedes** the "in-use `yolo26n.pt` … untracked-but-kept and now gitignored" clause in the env bullet below. Large weights (`FastSAM-s.pt`, `depth_pro.pt`) are unchanged — uncommitted, resolved from `PERCEPTION_MODELS_DIR`; the WS4 `--recognizer-model` path still resolves under `PERCEPTION_MODELS_DIR` or an absolute path, so a GPU host can point at this repo copy directly.
