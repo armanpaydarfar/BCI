@@ -347,6 +347,96 @@ class GazeCalibrationMappingV2:
         return clipped, violations
 
 
+class GazeCalibrationMappingV3:
+    """REV04 planar mapping: nearest-neighbour over the table-plane ``(u,v)``
+    calibration library → the recorded joint vector ``Q``, workspace-clamped.
+
+    The REV03 ``v3`` design (rev03 §6.2) was a 3-D ``p_base`` NN; the first HIL
+    showed the 3-D rigid solve manufactured its own failure (the calibrated EE
+    hovered while runtime gaze hits the table — verification report §5), so REV04
+    drops the base frame and maps the table plane directly (rev04 §1). The library
+    point and the runtime point are then the same kind of point (both on the
+    plane), so the lookup is a plain 2-D NN — ``scheme="planar_uv_nn"``.
+
+    The caller (``tools/apriltag_control_test.py`` now, the gaze experiment driver
+    at §9) computes the query ``(u,v)`` from the gaze→ray→∩plane chain and passes it
+    to ``query_uv``. The workspace clamp is the same envelope as v2 (``Q`` min/max
+    with ``WORKSPACE_BOUNDS_MARGIN``) — the only joint-safety guard, since the robot
+    enforces none.
+    """
+
+    def __init__(self, npz_data: Dict[str, np.ndarray]) -> None:
+        """Build the index from a planar calibration npz (``UV``/``Q``). Accepts an
+        ``np.load(...)`` object or a dict; rows with a non-finite ``UV`` or ``Q``
+        are dropped (a no-robot dry-run sweep leaves ``Q`` NaN)."""
+        keys = npz_data.files if hasattr(npz_data, "files") else npz_data
+        for key in ("UV", "Q"):
+            if key not in keys:
+                raise KeyError(
+                    f"v3 planar mapping requires NPZ key {key!r}; this looks like a "
+                    "non-planar calibration (run the REV04 planar solve)."
+                )
+        UV = np.asarray(npz_data["UV"], dtype=float)
+        Q = np.asarray(npz_data["Q"], dtype=float)
+        if UV.ndim != 2 or UV.shape[1] != 2:
+            raise ValueError(f"UV must be (N, 2); got shape={UV.shape}")
+        if Q.ndim != 2 or Q.shape[1] < 7:
+            raise ValueError(f"Q must be (N, 7); got shape={Q.shape}")
+        if UV.shape[0] != Q.shape[0]:
+            raise ValueError(f"UV length {UV.shape[0]} != Q length {Q.shape[0]}")
+
+        valid = np.all(np.isfinite(UV), axis=1) & np.all(np.isfinite(Q[:, :7]), axis=1)
+        if not np.any(valid):
+            raise ValueError("v3 planar NPZ has zero rows with finite (UV, Q).")
+        self._valid_indices = np.flatnonzero(valid)
+        self._UV = UV[valid]
+        self._Q = Q[valid, :7]
+
+        q_min = np.min(self._Q, axis=0)
+        q_max = np.max(self._Q, axis=0)
+        span = q_max - q_min
+        self._q_lo = q_min - WORKSPACE_BOUNDS_MARGIN * span
+        self._q_hi = q_max + WORKSPACE_BOUNDS_MARGIN * span
+
+    def query_uv(self, uv) -> GazeMappingResult:
+        """Nearest calibrated table point to ``uv`` (mm) → its clamped joint vector.
+
+        ``dist`` is the Euclidean in-plane distance (mm) — the caller's far-fixation
+        gate uses it. ``x_target`` is the matched library ``(u,v)`` (where that
+        pose's hand sat on the table), ``features`` the query ``(u,v)``."""
+        uv = np.asarray(uv, dtype=float).reshape(2)
+        if not np.all(np.isfinite(uv)):
+            raise ValueError(f"query uv must be finite; got {uv!r}")
+        d = np.linalg.norm(self._UV - uv[None, :], axis=1)
+        best_local = int(np.argmin(d))
+        q_clipped, clamp_violations = self._apply_workspace_bounds(self._Q[best_local])
+        return GazeMappingResult(
+            idx=int(self._valid_indices[best_local]),
+            dist=float(d[best_local]),
+            q_target=q_clipped,
+            x_target=self._UV[best_local].copy(),
+            features=uv,
+            clamped=bool(np.any(clamp_violations)),
+            clamp_violations=clamp_violations,
+        )
+
+    @property
+    def num_valid_samples(self) -> int:
+        return int(self._UV.shape[0])
+
+    @property
+    def workspace_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
+        """(q_lo, q_hi) — the clamp envelope, for diagnostic logs."""
+        return self._q_lo.copy(), self._q_hi.copy()
+
+    def _apply_workspace_bounds(self, q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Clamp each joint to ``[_q_lo, _q_hi]`` (same rule as v2). Returns the
+        clipped vector and a per-joint violation indicator."""
+        clipped = np.clip(q, self._q_lo, self._q_hi)
+        violations = (q != clipped).astype(np.int64)
+        return clipped, violations
+
+
 # --------------------------------------------------------------------
 # Module-level helpers
 # --------------------------------------------------------------------

@@ -97,6 +97,9 @@ INIT_SH = os.path.join(ROOT, "initialize_devices.sh")
 # ---- Harmony scripts you want on tab 2 ----
 HARMONY_CALIBRATION_EXEC_PY = os.path.join(ROOT, "harmony_calibration_exec.py")
 HARMONY_ONLINE_CONTROL_PY   = os.path.join(ROOT, "harmony_online_control.py")
+# WS5 AprilTag gaze↔robot calibration + control test (rev03).
+APRILTAG_CALIBRATE_PY       = os.path.join(ROOT, "tools", "apriltag_calibrate.py")
+APRILTAG_CONTROL_TEST_PY    = os.path.join(ROOT, "tools", "apriltag_control_test.py")
 
 # ---- Gaze scripts (same folder as control_panel.py per your note) ----
 GAZE_RUNNER_PY = os.path.join(ROOT, "gaze_runner.py")
@@ -144,9 +147,15 @@ FRAME_RELAY_BIND_HOST = str(getattr(_HCFG, "FRAME_RELAY_HOST", "0.0.0.0")) if _H
 FRAME_RELAY_HZ        = float(getattr(_HCFG, "FRAME_RELAY_HZ", 15.0)) if _HCFG else 15.0
 # When True, the panel hosts FrameRelayServer in-process so its
 # scene-tab widget can consume bundles via add_local_subscriber (raw
-# BGR, no JPEG encode/decode). Windows clients still connect to the
-# same TCP port. False → widget falls back to RemoteFrameReader and
-# the user is expected to run `python -m Utils.frame_relay` separately.
+# BGR, no JPEG encode/decode). This runs the Neon H.264 decode in the
+# panel's own process, where the Qt paint + JPEG-encode load contends
+# for the GIL with the SDK's RTP-receive thread and corrupts the lower
+# image slices under motion ("tearing" — rootcause record 2026-06-22).
+# False → the panel spawns `python -m Utils.frame_relay` as a managed
+# child process (see _start_relay_subprocess) and the widget consumes it
+# via RemoteFrameReader; the decode then runs in its own GIL, isolated
+# from the panel load. False is the validated fix for the tearing.
+# Windows/remote clients connect to the same TCP port either way.
 FRAME_RELAY_EMBEDDED  = bool(getattr(_HCFG, "FRAME_RELAY_EMBEDDED", True)) if _HCFG else True
 
 
@@ -651,6 +660,16 @@ class ControlPanel(QMainWindow):
         # ---- VLM service proc ----
         self.vlm_service = Proc("VLM Service", None, ROOT)
         self._vlm_last_snapshot_id: Optional[str] = None
+
+        # ---- Frame relay proc (separated-decode mode) ----
+        # When FRAME_RELAY_EMBEDDED is False the panel does NOT host the relay
+        # in-process; it spawns Utils.frame_relay as a child process so the
+        # Neon H.264 decode runs in its own GIL, isolated from the panel's
+        # Qt paint + JPEG-encode load. In-process contention starves the SDK's
+        # RTP-receive thread and corrupts the lower image slices ("tearing");
+        # process isolation is the validated fix (rootcause record 2026-06-22).
+        # cmd is built lazily on connect from the live config.
+        self.frame_relay_proc = Proc("Frame Relay", None, ROOT)
 
         # Robot terminal
         self.robot_term: Optional[QProcess] = None
@@ -1225,6 +1244,33 @@ class ControlPanel(QMainWindow):
         hbtn_row.addWidget(self.btn_run_harmony_online)
         hbtn_row.addStretch(1)
         hb.addLayout(hbtn_row)
+
+        # WS5 REV04 AprilTag gaze→robot calibration (HIL PASS 2026-06-24). The
+        # calibration button runs the swept capture + planar solve in one terminal
+        # using the verified rig config (config.APRILTAG_*); the control-test button
+        # drives the robot from the AprilTag calibration selected below (the dropdown
+        # lists runs/apriltag_*_calib.npz newest-first, so it defaults to the latest).
+        atag_lib_row = QHBoxLayout()
+        atag_lib_row.addWidget(QLabel("AprilTag calib:"))
+        self.cmb_apriltag_calib = QComboBox()
+        atag_lib_row.addWidget(self.cmb_apriltag_calib, 1)
+        self.btn_refresh_apriltag_calibs = QPushButton("Refresh")
+        self.btn_refresh_apriltag_calibs.setMaximumWidth(90)
+        self.btn_refresh_apriltag_calibs.clicked.connect(self.on_refresh_apriltag_calibs)
+        atag_lib_row.addWidget(self.btn_refresh_apriltag_calibs)
+        hb.addLayout(atag_lib_row)
+
+        atag_row = QHBoxLayout()
+        self.btn_run_apriltag_calibrate = QPushButton("Run AprilTag calibration")
+        self.btn_run_apriltag_calibrate.setMaximumWidth(220)
+        self.btn_run_apriltag_calibrate.clicked.connect(self.on_run_apriltag_calibrate)
+        self.btn_run_apriltag_control = QPushButton("Run AprilTag control test")
+        self.btn_run_apriltag_control.setMaximumWidth(220)
+        self.btn_run_apriltag_control.clicked.connect(self.on_run_apriltag_control_test)
+        atag_row.addWidget(self.btn_run_apriltag_calibrate)
+        atag_row.addWidget(self.btn_run_apriltag_control)
+        atag_row.addStretch(1)
+        hb.addLayout(atag_row)
         rt.addWidget(harmony_box)
 
         train_box = QGroupBox("Model training (uses config.py DATA_DIR + subject below)")
@@ -1271,6 +1317,7 @@ class ControlPanel(QMainWindow):
         # Initial serial refresh
         self.on_serial_refresh()
         self.on_refresh_calibration_libs()
+        self.on_refresh_apriltag_calibs()
         self.on_refresh_training_data_list()
 
         self._building_ui = False
@@ -1304,9 +1351,13 @@ class ControlPanel(QMainWindow):
         Windows TCP clients still dial the embedded relay's listening
         socket — the wire is unchanged.
 
-        When FRAME_RELAY_EMBEDDED is True (the default), the user must
-        NOT also run `python -m Utils.frame_relay` separately on this
-        machine: two NeonLiveReaders conflict at the SDK level.
+        When FRAME_RELAY_EMBEDDED is True, the user must NOT also run
+        `python -m Utils.frame_relay` separately on this machine: two
+        Neon readers conflict at the SDK level. When False, the panel
+        spawns + owns that relay process itself on Connect
+        (_start_relay_subprocess) and tears it down on Disconnect, so the
+        operator never launches it by hand — and the decode runs isolated
+        from the panel's paint/encode load (the tearing fix).
         """
         vvt = QWidget()
         tabs.addTab(vvt, "VLM Video")
@@ -1416,6 +1467,11 @@ class ControlPanel(QMainWindow):
             "VLM",
             f"[{self._ts()}] chain: connect armed token={self._connect_token}\n",
         )
+        # Separated-decode mode: bring the relay child process up first so its
+        # listening socket is ready; the widget's RemoteFrameReader auto-reconnects
+        # regardless of ordering. No-op when FRAME_RELAY_EMBEDDED (widget hosts it).
+        if not FRAME_RELAY_EMBEDDED:
+            self._start_relay_subprocess()
         if hasattr(self, "vlm_scene_widget"):
             self.vlm_scene_widget.start()
         if getattr(self, "_relay_status_timer", None) is not None:
@@ -1428,6 +1484,10 @@ class ControlPanel(QMainWindow):
         self._append_log("VLM", f"[{self._ts()}] chain: disconnect token={token}\n")
         if hasattr(self, "vlm_scene_widget"):
             self.vlm_scene_widget.stop()
+        # Tear down the separated relay child process (if any) so its Neon
+        # subscription + :5591 bind are released for the next Connect.
+        if not FRAME_RELAY_EMBEDDED:
+            self._stop_relay_subprocess()
         # Tear down state-machine state so a subsequent Connect starts
         # fresh. _connect_token=None disqualifies any late-arriving
         # chain_verify push from the prior session even if it slips
@@ -1452,6 +1512,48 @@ class ControlPanel(QMainWindow):
         self.lbl_compute_led.setToolTip("compute: idle")
         self._set_led(self.lbl_receive_led, "stopped")
         self.lbl_receive_led.setToolTip("receive: idle")
+
+    def _start_relay_subprocess(self) -> None:
+        """Spawn ``Utils.frame_relay`` as a child process (separated-decode mode,
+        FRAME_RELAY_EMBEDDED=False). The relay opens Neon and runs the H.264 decode
+        in its OWN process/GIL; the VLM Video widget consumes it over TCP via
+        RemoteFrameReader. This isolates the decode from the panel's paint+encode
+        load, which is what prevents the in-process-contention frame tearing
+        (rootcause record 2026-06-22). ``--reader scene_only`` keeps the decode
+        identical to the old in-process path (simple receive_scene_video_frame).
+
+        Only spawns when the dial host is local: a remote FRAME_RELAY_DIAL_HOST
+        means the relay lives on another machine (GPU-host split) and the panel is
+        consume-only."""
+        dial = str(FRAME_RELAY_DIAL_HOST or "127.0.0.1")
+        if dial not in ("127.0.0.1", "localhost", "0.0.0.0"):
+            self._append_log(
+                "Relay",
+                f"[{self._ts()}] dial host {dial} is remote — not spawning a "
+                f"local relay (consume-only).\n",
+            )
+            return
+        q = self.frame_relay_proc.q
+        if q is not None and q.state() != QProcess.NotRunning:
+            return  # already running
+        py = sys.executable
+        self.frame_relay_proc.cmd = (
+            f'"{py}" -u -m Utils.frame_relay '
+            f'--bind {FRAME_RELAY_BIND_HOST} --port {int(FRAME_RELAY_PORT)} '
+            f'--hz {FRAME_RELAY_HZ} --neon-host "{NEON_COMPANION_HOST}" '
+            f'--reader scene_only'
+        )
+        self._append_log(
+            "Relay",
+            f"[{self._ts()}] starting separated relay (decode isolated): "
+            f"{self.frame_relay_proc.cmd}\n",
+        )
+        self._start_proc(self.frame_relay_proc, None, "Relay")
+
+    def _stop_relay_subprocess(self) -> None:
+        """Terminate the separated relay child process if running."""
+        if self.frame_relay_proc.q is not None:
+            self._stop_proc(self.frame_relay_proc, None, "Relay")
 
     def _on_handshake_observed(self, addr) -> None:
         """Slot for VLMSceneWidget.handshake_observed. The relay has
@@ -3124,6 +3226,71 @@ class ControlPanel(QMainWindow):
         # If your script expects a flag instead (for example --calib_lib), change the line below accordingly.
         self._spawn_external(f'python -u "{HARMONY_ONLINE_CONTROL_PY}" "{calib_lib}"')
         self._append_log("Panel", f"[{self._ts()}] Opened harmony_online_control.py with calibration library:\n  {calib_lib}\n")
+
+    def on_refresh_apriltag_calibs(self):
+        """List runs/apriltag_*_calib.npz newest-first so the dropdown defaults to the
+        latest calibration (the operator does not need to know the filename)."""
+        if not hasattr(self, "cmb_apriltag_calib"):
+            return
+        current = self.cmb_apriltag_calib.currentData()
+        self.cmb_apriltag_calib.clear()
+        calibs = sorted(glob.glob(os.path.join(ROOT, "runs", "apriltag_*_calib.npz")),
+                        key=os.path.getmtime, reverse=True)
+        if not calibs:
+            self.cmb_apriltag_calib.addItem("No AprilTag calibrations in runs/", "")
+            self._append_log("Panel", f"[{self._ts()}] No AprilTag calibrations "
+                             f"(runs/apriltag_*_calib.npz) yet — run a calibration first\n")
+            return
+        for c in calibs:
+            self.cmb_apriltag_calib.addItem(os.path.basename(c), c)
+        # Keep the prior selection if still present; otherwise index 0 (= newest).
+        if current:
+            idx = self.cmb_apriltag_calib.findData(current)
+            if idx >= 0:
+                self.cmb_apriltag_calib.setCurrentIndex(idx)
+        self._append_log("Panel", f"[{self._ts()}] AprilTag calibrations: {len(calibs)} "
+                         f"(newest first → {os.path.basename(calibs[0])})\n")
+
+    def _get_selected_apriltag_calib(self) -> str:
+        if not hasattr(self, "cmb_apriltag_calib"):
+            return ""
+        return self.cmb_apriltag_calib.currentData() or ""
+
+    def on_run_apriltag_calibrate(self):
+        if not os.path.exists(APRILTAG_CALIBRATE_PY):
+            QMessageBox.warning(self, "Missing", f"Not found:\n{APRILTAG_CALIBRATE_PY}")
+            return
+        # REV04 swept calibration + planar solve in one terminal, from the verified
+        # rig config (config.APRILTAG_*). --then-solve writes the *_calib.npz; the
+        # operator hits Refresh afterwards and the control-test button picks it up.
+        world = " ".join(str(int(i)) for i in getattr(_HCFG, "APRILTAG_WORLD_TAG_IDS", [0, 1, 2, 3, 4]))
+        ee = " ".join(str(int(i)) for i in getattr(_HCFG, "APRILTAG_EE_TAG_IDS", [5]))
+        tag = float(getattr(_HCFG, "APRILTAG_TAG_SIZE_M", 0.08))
+        ee_tag = float(getattr(_HCFG, "APRILTAG_EE_TAG_SIZE_M", 0.04))
+        off = list(getattr(_HCFG, "APRILTAG_T_EETAG_EE_MM", [150.0, -200.0, 0.0]))
+        # --side defaults to env HARMONY_ACTIVE_SIDE or 'R' in the tool itself.
+        cmd = (f'python -u "{APRILTAG_CALIBRATE_PY}" --stage sweep --with-robot '
+               f'--world-tag-ids {world} --ee-tag-ids {ee} '
+               f'--tag-size {tag} --ee-tag-size {ee_tag} '
+               f'--t-eetag-ee {off[0]} {off[1]} {off[2]} '
+               f'--out-dir runs --then-solve')
+        self._spawn_external(cmd)
+        self._append_log("Panel", f"[{self._ts()}] Launched AprilTag calibration "
+                         f"(sweep → solve): world {world}, EE {ee}, offset {off}\n")
+
+    def on_run_apriltag_control_test(self):
+        if not os.path.exists(APRILTAG_CONTROL_TEST_PY):
+            QMessageBox.warning(self, "Missing", f"Not found:\n{APRILTAG_CONTROL_TEST_PY}")
+            return
+        calib = self._get_selected_apriltag_calib()
+        if not calib or not os.path.exists(calib):
+            QMessageBox.warning(self, "AprilTag calibration",
+                                "No AprilTag calibration selected. Run an AprilTag "
+                                "calibration first, then click Refresh.")
+            return
+        # tag ids / sizes / plane default from the calibration's own meta + world map.
+        self._spawn_external(f'python -u "{APRILTAG_CONTROL_TEST_PY}" --calib "{calib}"')
+        self._append_log("Panel", f"[{self._ts()}] Launched AprilTag control test with:\n  {calib}\n")
 
     # ----- Driver -----
     def on_driver_start(self):

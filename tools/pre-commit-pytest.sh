@@ -11,13 +11,32 @@
 
 set -u
 
-# Pick the lsl conda env's pytest if available; otherwise PATH.
-PYTEST_BIN="/home/arman-admin/opt/miniconda/envs/lsl/bin/pytest"
-if [ ! -x "$PYTEST_BIN" ]; then
-  PYTEST_BIN="$(command -v pytest || true)"
+# Resolve a pytest runner for the `lsl` env. Order:
+#   1. the env's pytest binary directly — fast path on the Linux primary host.
+#   2. pytest already on PATH — env activated in the calling shell.
+#   3. `conda run -n lsl pytest` — covers any host where the env exists but is
+#      not activated. This is the native-Windows case: under Git Bash `conda`
+#      is on PATH but the env's pytest lives at Scripts/pytest.exe and is not,
+#      so without this branch the gate silently no-ops on Windows.
+# If none resolve, the hook is a no-op (machines without the env).
+PYTEST_CMD=()
+linux_pytest="/home/arman-admin/opt/miniconda/envs/lsl/bin/pytest"
+if [ -x "$linux_pytest" ]; then
+  PYTEST_CMD=("$linux_pytest")
+elif command -v pytest >/dev/null 2>&1; then
+  PYTEST_CMD=("$(command -v pytest)")
+else
+  conda_bin="${CONDA_EXE:-$(command -v conda || true)}"
+  # Confirm the env actually has pytest before committing to it, so a missing
+  # env stays a skip (don't block the commit) rather than a hard conda error.
+  if [ -n "$conda_bin" ] && "$conda_bin" run -n lsl python -c "import pytest" >/dev/null 2>&1; then
+    # --no-capture-output so pytest's progress/failures stream to the terminal.
+    PYTEST_CMD=("$conda_bin" run -n lsl --no-capture-output pytest)
+  fi
 fi
-if [ -z "${PYTEST_BIN:-}" ]; then
-  echo "pre-commit-pytest: pytest not on PATH and lsl env missing — skipping." >&2
+
+if [ "${#PYTEST_CMD[@]}" -eq 0 ]; then
+  echo "pre-commit-pytest: pytest not on PATH and no usable 'lsl' env — skipping." >&2
   exit 0
 fi
 
@@ -33,7 +52,7 @@ if [ ! -d "tests" ]; then
 fi
 
 echo "pre-commit-pytest: running fast suite (-m 'not slow') ..." >&2
-"$PYTEST_BIN" tests/ -m "not slow" -q --tb=line
+"${PYTEST_CMD[@]}" tests/ -m "not slow" -q --tb=line
 rc=$?
 
 if [ "$rc" -ne 0 ]; then

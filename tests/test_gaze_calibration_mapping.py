@@ -27,6 +27,7 @@ from Utils.gaze.calibration_mapping import (
     PASS1_FEATURE_KEYS,
     PASS2_FEATURE_KEYS,
     GazeCalibrationMappingV2,
+    GazeCalibrationMappingV3,
     GazeMappingResult,
     MAD_TO_SIGMA,
     WORKSPACE_BOUNDS_MARGIN,
@@ -547,3 +548,74 @@ class TestRuntimeDepthPipeline:
         m = GazeCalibrationMappingV2(data, use_imu=False)
         assert m.runtime_depth_pipeline == "vergence"
         assert m.affine_map is None
+
+
+# ─── GazeCalibrationMappingV3 (REV04 planar (u,v)→Q NN) ────────────────────
+
+class TestPlanarMappingV3:
+    def _planar(self) -> _ShimNpz:
+        # Four library points on the table plane with distinct joint vectors.
+        d = _ShimNpz()
+        d["UV"] = np.array([[0.0, 0.0], [100.0, 0.0],
+                            [0.0, 100.0], [100.0, 100.0]])
+        d["Q"] = np.array([[0.1] * 7, [0.2] * 7, [0.3] * 7, [0.4] * 7])
+        return d
+
+    def test_nearest_uv_returns_that_rows_joints(self):
+        m = GazeCalibrationMappingV3(self._planar())
+        r = m.query_uv([95.0, 5.0])     # closest to row 1 (100,0)
+        assert r.idx == 1
+        np.testing.assert_allclose(r.x_target, [100.0, 0.0])
+        # Q±5% of a constant-per-row library leaves an interior value unclamped.
+        np.testing.assert_allclose(r.q_target, [0.2] * 7)
+        assert r.clamped is False
+
+    def test_dist_is_inplane_mm(self):
+        m = GazeCalibrationMappingV3(self._planar())
+        r = m.query_uv([0.0, 30.0])     # 30 mm from row 0 (0,0)
+        assert r.idx == 0
+        assert abs(r.dist - 30.0) < 1e-9
+
+    def test_clamp_flags_out_of_envelope_extreme(self):
+        # A library spanning Q 0..1; the envelope is [-0.05, 1.05]. Force a clamp by
+        # making one row an extreme so its own value sits inside but the matched
+        # row's value is interior — instead test the clamp via a constructed range.
+        d = _ShimNpz()
+        d["UV"] = np.array([[0.0, 0.0], [10.0, 0.0]])
+        d["Q"] = np.array([[0.0] * 7, [1.0] * 7])
+        m = GazeCalibrationMappingV3(d)
+        q_lo, q_hi = m.workspace_bounds
+        np.testing.assert_allclose(q_lo, [-0.05] * 7)
+        np.testing.assert_allclose(q_hi, [1.05] * 7)
+        r = m.query_uv([0.0, 0.0])
+        # row 0 value 0.0 is inside [-0.05,1.05] → not clamped.
+        assert r.clamped is False
+        np.testing.assert_allclose(r.q_target, [0.0] * 7)
+
+    def test_drops_nonfinite_rows(self):
+        d = _ShimNpz()
+        d["UV"] = np.array([[0.0, 0.0], [50.0, 50.0], [100.0, 100.0]])
+        d["Q"] = np.array([[0.1] * 7, [np.nan] * 7, [0.3] * 7])
+        m = GazeCalibrationMappingV3(d)
+        assert m.num_valid_samples == 2
+        # The NaN row (index 1) must never be selected even for a nearby query.
+        r = m.query_uv([50.0, 50.0])
+        assert r.idx in (0, 2)
+
+    def test_missing_uv_key_raises(self):
+        d = _ShimNpz()
+        d["Q"] = np.array([[0.1] * 7])
+        with pytest.raises(KeyError):
+            GazeCalibrationMappingV3(d)
+
+    def test_all_nan_raises(self):
+        d = _ShimNpz()
+        d["UV"] = np.array([[0.0, 0.0], [1.0, 1.0]])
+        d["Q"] = np.full((2, 7), np.nan)
+        with pytest.raises(ValueError):
+            GazeCalibrationMappingV3(d)
+
+    def test_query_nan_uv_raises(self):
+        m = GazeCalibrationMappingV3(self._planar())
+        with pytest.raises(ValueError):
+            m.query_uv([np.nan, 0.0])

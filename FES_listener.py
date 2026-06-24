@@ -54,16 +54,42 @@ def _setup():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
 
+def select_fes_params(fes_config, channel_name, mode):
+    """Resolve (current_mA, duration_sec, pulse_width) for a channel and mode.
+
+    Pure: no device, no socket — just config lookups, so it is unit-testable
+    without hardware (mirrors `UTIL_marker_stream.parse_marker_message`).
+    Returns None if the channel is unconfigured.
+
+    The mode is matched exactly. An unrecognized mode raises rather than
+    falling through to motor parameters: this selection drives the
+    stimulation *current* delivered to a subject, and a silent fall-through
+    would deliver MOTOR current for any typo'd mode. The only callers pass
+    the literals 'SENSORY' / 'MOTOR' (see main()), so a bad mode can only be
+    a code bug — fail-fast per CLAUDE.md Tier 1 policy.
+    """
+    channel_config = fes_config["channels"].get(channel_name)
+    if not channel_config:
+        return None
+
+    if mode == 'SENSORY':
+        return (channel_config["Sensory_current_mA"],
+                channel_config["duration_sense"],
+                int(channel_config["pulse_width"]))
+    if mode == 'MOTOR':
+        return (channel_config["Motor_current_mA"],
+                channel_config["duration_Motor"],
+                int(channel_config["pulse_width"]))
+    raise ValueError(f"Unknown FES mode: {mode!r} (expected 'SENSORY' or 'MOTOR')")
+
+
 def trigger_fes(channel_name, mode = 'SENSORY'):
     """Trigger FES for a specific channel and duration."""
-    channel_config = fes_config["channels"].get(channel_name, {})
-    if not channel_config:
+    params = select_fes_params(fes_config, channel_name, mode)
+    if params is None:
         print(f"No configuration found for channel: {channel_name}")
         return
-
-    current = channel_config["Sensory_current_mA"] if mode == 'SENSORY' else channel_config["Motor_current_mA"] #utilize sensory threshold or motor threshold depending on mode
-    duration = channel_config["duration_sense"] if mode == 'SENSORY' else channel_config["duration_Motor"] # utilize MI/rest duration or robot movement duration
-    pulse_width = int(channel_config["pulse_width"])  # Ensure pulse_width is an integer
+    current, duration, pulse_width = params
 
     print(f"Triggering FES on {channel_name} for {duration} seconds.")
     start_time = time.time()

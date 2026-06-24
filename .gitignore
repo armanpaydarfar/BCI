@@ -53,10 +53,14 @@ config_local.py
 perception/models/
 perception/output/
 
-# Model weights are never committed: FastSAM/depth_pro resolve from
-# PERCEPTION_MODELS_DIR; the gaze YOLO weight (yolo26n.pt) auto-downloads via
-# ultralytics or sits in the repo root locally.
+# Model weights: large weights (FastSAM-s.pt, depth_pro.pt) are never committed
+# and resolve from PERCEPTION_MODELS_DIR. The gaze YOLO weight yolo26n.pt IS
+# committed at the repo root — gaze_system.py loads it by bare name
+# (YOLO("yolo26n.pt") → cwd), so it must travel with the repo. Only the older,
+# genuinely-unused yolo11n/yolov8n were meant to be removed in 6054e07;
+# yolo26n.pt's untrack there was unintended and is restored via the !/ exception.
 *.pt
+!/yolo26n.pt
 
 # Calibration pose libraries are machine-local runtime data. The active one
 # resolves via config.POSE_LIBRARY_PATH; harmony_calibration_exec.py writes a

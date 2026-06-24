@@ -39,7 +39,7 @@ _EXPECTED = {
 
 
 def _config_literal_values():
-    tree = ast.parse(CONFIG_PY.read_text())
+    tree = ast.parse(CONFIG_PY.read_text(encoding="utf-8"))
     out = {}
     for node in tree.body:
         if not isinstance(node, ast.Assign):

@@ -53,7 +53,7 @@ RUNTIME_COMMON = REPO_ROOT / "Utils" / "runtime_common.py"
 # ─── helpers ──────────────────────────────────────────────────────────────
 
 def _parse(path: Path) -> ast.AST:
-    return ast.parse(path.read_text())
+    return ast.parse(path.read_text(encoding="utf-8"))
 
 
 def _is_trigger_ref(node: ast.AST, key: str) -> bool:

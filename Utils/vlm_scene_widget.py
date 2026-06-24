@@ -57,11 +57,20 @@ class _BundleSourceThread(threading.Thread):
     just forward). Used when the panel is not hosting a FrameRelayServer
     in-process."""
 
-    def __init__(self, host: str, port: int, on_bundle, *, name: str = "panel-bundle-rx") -> None:
+    def __init__(self, host: str, port: int, on_bundle, *,
+                 on_handshake=None, on_first_publish=None,
+                 name: str = "panel-bundle-rx") -> None:
         super().__init__(daemon=True, name=name)
         self._host = host
         self._port = int(port)
         self._on_bundle = on_bundle
+        # Fired once on the first received bundle so the panel's Send/Receive
+        # verification LEDs advance on the separated-relay path. The embedded
+        # path gets the equivalent from FrameRelayServer's on_handshake_sent /
+        # on_first_publish; RemoteFrameReader has no such hook, so a bundle
+        # arriving (which proves handshake + frames are flowing) stands in.
+        self._on_handshake = on_handshake
+        self._on_first_publish = on_first_publish
         self._stop = threading.Event()
         self._reader = None
 
@@ -81,10 +90,22 @@ class _BundleSourceThread(threading.Thread):
             self._reader = RemoteFrameReader(self._host, self._port)
         except Exception:
             return
+        addr = (self._host, self._port)
+        first = True
         try:
             for bundle in self._reader:
                 if self._stop.is_set():
                     break
+                if first:
+                    first = False
+                    # Order matters: handshake (Send) before first_publish
+                    # (Receive/verify_chain), matching the embedded path.
+                    for cb in (self._on_handshake, self._on_first_publish):
+                        if cb is not None:
+                            try:
+                                cb(addr)
+                            except Exception:
+                                pass
                 try:
                     self._on_bundle(bundle)
                 except Exception:
@@ -255,6 +276,8 @@ class VLMSceneWidget(QWidget):
                 self._relay_dial_host,
                 self._relay_dial_port,
                 self._on_bundle_callback,
+                on_handshake=self._emit_handshake,
+                on_first_publish=self._emit_first_publish,
             )
             self._bundle_thread.start()
 

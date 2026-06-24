@@ -131,6 +131,12 @@ realtime but not in the critical path.
 
 - If unsure, prefer no change over a potentially unsafe change.
 
+- **A health counter only proves what it measures.** Before trusting
+  `dropped=0` / `errors=0`, confirm it sits downstream of the failure
+  mode; for media/I/O, surface an output-quality signal, not just
+  transport success. (The relay's `dropped=0` was upstream of the decode
+  corruption — it read green through every torn frame.)
+
 ---
 
 ## config.py and config_local.py
@@ -234,6 +240,11 @@ note the reference in the commit message and relevant docstrings.
   not noise to override. A plausible behavioural claim written from
   assumption is as wrong as fabricated code.
 
+- **Trace the live path before claiming equivalence.** A "reorg /
+  no-behaviour-change" claim must verify which module the runtime actually
+  executes — byte-diffing the wrong module proves nothing. (WS3 audited the
+  matched-API reader; the panel ran the simple-API one.)
+
 ---
 
 ## Proposing Changes
@@ -305,6 +316,13 @@ note the reference in the commit message and relevant docstrings.
   full float32 precision. Justify any precision tradeoff explicitly
   before introducing it.
 
+- **Removing an isolation/safety property needs a guard in the same
+  change.** Collapsing a process/thread boundary, dropping a defensive
+  copy, or sharing a buffer for speed must ship a regression test that
+  fails if it silently regresses, and name the property in the commit.
+  "Works today" misses latent threshold crossings under future load. (The
+  embedded relay removed the decode's process isolation with no guard.)
+
 ---
 
 ## Commit Hygiene
@@ -370,6 +388,13 @@ dependency set.
   `pylsl==1.16.2` (the realtime drivers + Tier-1 stream files call the
   deprecated `resolve_stream(...)`, which pylsl 1.17+ **removed**; the native
   `liblsl` it loads comes from conda-forge since the wheel doesn't bundle it).
+- **Pin load-bearing realtime/decode deps too, not just the numerical core.**
+  The Neon SDK + codec stack (`pupil-labs-realtime-api`, `pupil-labs-video`,
+  `av`) and `opencv-python` change device-I/O / media-decode behaviour on a
+  silent bump; pin or floor them, and on any env rebuild diff the resolved
+  versions (incl. `libavcodec`) — treat a change as behaviour to validate, not
+  noise. (An unpinned PyAV floated libavcodec 62.11→62.28, narrowing a
+  contention margin and surfacing the scene-tearing regression.)
 - Do not introduce dependencies that cannot be satisfied on Linux. Windows-only
   packages (e.g. `triton-windows`) must never appear in `environment.yml`.
 - **torch needs no role knob.** The default PyPI torch wheel is already a CUDA
