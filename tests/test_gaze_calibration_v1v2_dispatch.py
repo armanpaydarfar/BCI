@@ -176,16 +176,6 @@ class TestVersionDispatch:
     config flag is what gates v2 construction.
     """
 
-    @pytest.mark.skip(
-        reason="Test reads the effective config including config_local.py "
-               "overrides, so it fails on any machine that flips "
-               "GAZE_CALIBRATION_VERSION to 2 for testing. Re-write to "
-               "inspect the committed default in config.py directly."
-    )
-    def test_v1_default_no_v2_mapping_constructed(self, monkeypatch):
-        import config as _config
-        assert int(getattr(_config, "GAZE_CALIBRATION_VERSION", 1)) == 1
-
     def test_v2_flag_can_be_set_at_runtime(self, monkeypatch):
         import config as _config
         monkeypatch.setattr(_config, "GAZE_CALIBRATION_VERSION", 2)
