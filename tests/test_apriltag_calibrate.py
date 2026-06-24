@@ -194,6 +194,43 @@ def test_green_only_default_and_include_partial_flag():
     assert b.green_only is False
 
 
+def test_solve_recompute_uv_with_ee_point_method(tmp_path):
+    # --ee-point-method on solve re-derives (u,v) from the stored per-sample
+    # transforms, overriding the stored UV (re-solve a sweep a different way, no
+    # re-sweep). Stored UV is deliberately wrong (zeros); the recompute must produce
+    # the tag-pose projection of the EE-tag origins.
+    from Utils.gaze.apriltag_calib import make_transform, eetag_to_world_point
+    from Utils.gaze.apriltag_world import plane_coords
+    Nn = 10
+    Tcw = np.broadcast_to(np.eye(4), (Nn, 4, 4)).copy()
+    Tce = np.stack([make_transform(np.eye(3), [12.0 * i, 6.0 * i, 200.0]) for i in range(Nn)])
+    pp, pn = np.zeros(3), np.array([0.0, 0.0, 1.0])
+    Q = np.linspace(0.1, 0.5, Nn)[:, None] * np.ones((1, 7))
+    X = np.stack([eetag_to_world_point(Tcw[i], Tce[i], np.zeros(3)) for i in range(Nn)])
+    sweep = tmp_path / "apriltag_sweep_recompute.npz"
+    np.savez_compressed(
+        sweep, UV=np.zeros((Nn, 2)), Q=Q, X=X, T_cam_world=Tcw, T_cam_eetag=Tce,
+        world_map_ref=np.array(0), world_map_ids=np.array([0]),
+        world_map_rels=np.eye(4)[None, :, :],
+        world_map_plane_point=pp, world_map_plane_normal=pn,
+        meta=np.array({"version": 3, "scheme": "planar_sweep", "side": "R"}, dtype=object))
+
+    rc = calib.main(["--stage", "solve", str(sweep), "--ee-point-method", "pose",
+                     "--include-partial"])
+    assert rc == 0
+    z = np.load(tmp_path / "apriltag_recompute_calib.npz", allow_pickle=True)
+    expected = plane_coords(
+        np.stack([eetag_to_world_point(Tcw[i], Tce[i], np.zeros(3)) for i in range(Nn)]), pp, pn)
+    np.testing.assert_allclose(z["UV"], expected, atol=1e-6)  # recomputed, not the stored zeros
+
+
+def test_ee_point_method_default_none_choices():
+    a = calib.parse_args(["--stage", "sweep", "--world-tag-ids", "0", "--ee-tag-ids", "5"])
+    assert a.ee_point_method is None  # sweep resolves None -> 'pose'
+    b = calib.parse_args(["--stage", "solve", "x.npz", "--ee-point-method", "rayplane"])
+    assert b.ee_point_method == "rayplane"
+
+
 def test_camera_params_from_K():
     K = np.array([[1490.0, 0, 800.0], [0, 1480.0, 600.0], [0, 0, 1]])
     assert camera_params(K) == (1490.0, 1480.0, 800.0, 600.0)

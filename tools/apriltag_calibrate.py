@@ -509,8 +509,9 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     offset_mm = np.asarray(args.t_eetag_ee, dtype=float)
     ee_size = args.ee_tag_size or args.tag_size
     tag_sizes = {int(i): ee_size for i in ee_ids}
+    ee_point_method = args.ee_point_method or "pose"
     _log(f"tag sizes: world {args.tag_size} m, EE {ee_size} m; world tags "
-         f"{world_ids}, EE tags {ee_ids}")
+         f"{world_ids}, EE tags {ee_ids}; EE point method: {ee_point_method}")
 
     world_map = _register_map_interactive(consumer, detector, K, world_ids,
                                           args.tag_size, tag_sizes, "world", "arm CLEAR",
@@ -605,13 +606,8 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
 
             cur_uv = None
             if ok:
-                # Depth-ambiguity-free EE position: the tag-centre line of sight ∩
-                # the known table plane — the SAME ray∩plane runtime uses for gaze
-                # (rev04 §5 follow-up, 2026-06-24). The single small EE tag's 3-D
-                # pose range is too noisy (HIL repeatability 52 mm); its centre
-                # direction is not. None = ray parallel/behind → drop the sample.
-                p_world = eetag_rayplane_point_world(T_cam_world, T_cam_eetag,
-                                                     plane_point, plane_normal)
+                p_world = _ee_point_world(ee_point_method, T_cam_world, T_cam_eetag,
+                                          plane_point, plane_normal, offset_mm)
                 if p_world is not None:
                     cur_uv = plane_coords(p_world, plane_point, plane_normal)
                     grid.add(cur_uv)
@@ -700,10 +696,11 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
         "tag_size_m": args.tag_size,
         "ee_tag_size_m": ee_size,
         "t_eetag_ee_mm": offset_mm.tolist(),
-        # EE (u,v) from the tag-centre line of sight ∩ table plane (ambiguity-free),
-        # not the tag's 3-D pose translation (rev04 §5 follow-up, 2026-06-24). The
-        # offset above is recorded for provenance but not applied in this mode.
-        "ee_point_method": "rayplane_center",
+        # How each sample's EE (u,v) was derived (rev04, 2026-06-24): 'pose' = the EE
+        # tag's 3-D pose origin + offset, orthogonally projected (default, most head-
+        # invariant once the world frame is consensus-stable); 'rayplane' = tag-centre
+        # line of sight ∩ plane (depth-ambiguity-free but parallax-prone).
+        "ee_point_method": ee_point_method,
         "with_robot": bool(args.with_robot),
         "sample_hz": args.sample_hz,
         "coverage": {"cell_size_mm": args.cell_size_mm,
@@ -750,6 +747,51 @@ def _make_coverage_ui(args):
         return None
     from Utils.gaze.coverage_view import CoverageBoxUI
     return CoverageBoxUI(args.cell_size_mm, audio=args.audio)
+
+
+def _ee_point_world(method, T_cam_world, T_cam_eetag, plane_point, plane_normal, offset_mm):
+    """The EE point in the world frame by the selected method (rev04, 2026-06-24).
+
+    'pose' (default): the EE tag's 3-D pose origin + the measured offset, which
+    `plane_coords` then projects orthogonally onto the table — the EE's true table
+    position. This is correct (runtime gaze gives the true table target) and the
+    most head-invariant choice once the world frame is stabilised by the consensus
+    fusion (HIL repeatability 12 mm).
+
+    'rayplane': the tag-centre line of sight ∩ table plane (depth-ambiguity-free).
+    Robust to the single-tag flip but adds a head-angle-dependent parallax; it only
+    wins when the EE/world pose is still flip-prone. Returns None when the ray
+    misses the plane (drop the sample); 'pose' never returns None."""
+    if method == "rayplane":
+        return eetag_rayplane_point_world(T_cam_world, T_cam_eetag, plane_point, plane_normal)
+    return eetag_to_world_point(T_cam_world, T_cam_eetag, offset_mm)
+
+
+def _recompute_planar_uv(z, method):
+    """Re-derive every sweep sample's table ``(u,v)`` from the stored per-sample
+    transforms (``T_cam_world`` / ``T_cam_eetag`` + the world plane) using ``method``,
+    and recompute the green/sufficient mask for the new ``(u,v)`` with the sweep's
+    own coverage knobs (the cells move when the points do). Returns ``(UV, green)``.
+    Lets a captured sweep be re-solved with a different EE-point method — no rig."""
+    Tcw = np.asarray(z["T_cam_world"], dtype=float)
+    Tce = np.asarray(z["T_cam_eetag"], dtype=float)
+    pp = np.asarray(z["world_map_plane_point"], dtype=float)
+    pn = np.asarray(z["world_map_plane_normal"], dtype=float)
+    meta = z["meta"].item() if "meta" in z.files else {}
+    offset = np.asarray(meta.get("t_eetag_ee_mm", [0.0, 0.0, 0.0]), dtype=float)
+    pts = [(_ee_point_world(method, Tcw[i], Tce[i], pp, pn, offset)) for i in range(len(Tcw))]
+    pts = np.array([p if p is not None else np.full(3, np.nan) for p in pts])
+    UV = plane_coords(pts, pp, pn)
+    cov = meta.get("coverage", {})
+    grid = CoverageGrid(cell_size_mm=cov.get("cell_size_mm", 50.0),
+                        min_samples=cov.get("min_samples", 8),
+                        min_spread_mm=cov.get("min_spread_mm", 15.0))
+    finite = np.all(np.isfinite(UV), axis=1)
+    for uv in UV[finite]:
+        grid.add(uv)
+    green = np.zeros(len(UV), dtype=bool)
+    green[finite] = grid.sufficient_mask(UV[finite])
+    return UV, green
 
 
 def _await_sweep_start(ui) -> bool:
@@ -863,13 +905,24 @@ def stage_solve_planar(args, z, npz_path) -> int:
     Q = np.asarray(z["Q"], dtype=float)
     X = np.asarray(z["X"], dtype=float) if "X" in z.files else np.full((UV.shape[0], 3), np.nan)
 
+    # Optionally re-derive (u,v) with a different EE-point method from the stored
+    # per-sample transforms (rev04, 2026-06-24): the npz carries T_cam_world /
+    # T_cam_eetag + the world plane, so a sweep captured one way can be re-solved
+    # another way (e.g. tag 'pose' once consensus stabilised the world frame) with no
+    # re-sweep. The coverage/green mask is recomputed too, since the cells move.
+    green_src = np.asarray(z["green"], dtype=bool) if "green" in z.files else None
+    if args.ee_point_method is not None and "T_cam_world" in z.files:
+        UV, green_src = _recompute_planar_uv(z, args.ee_point_method)
+        _log(f"recomputed (u,v) from stored transforms with "
+             f"ee-point-method={args.ee_point_method}")
+
     # Green-only (rev04 §3, operator 2026-06-24): build the library from samples in
     # sufficient ("green") coverage cells only — the default, since transit /
-    # extraneous samples in still-partial cells pollute the NN lookup. ``green`` is
-    # the per-sample sufficiency mask the sweep stored; a pre-fix npz lacks it
-    # (then we cannot filter and keep all). ``--include-partial`` keeps every sample.
-    if args.green_only and "green" in z.files:
-        gmask = np.asarray(z["green"], dtype=bool)
+    # extraneous samples in still-partial cells pollute the NN lookup. A pre-fix npz
+    # lacks the mask (then we cannot filter and keep all). ``--include-partial``
+    # keeps every sample.
+    if args.green_only and green_src is not None:
+        gmask = green_src
         kept = int(gmask.sum())
         _log(f"green-only: {kept}/{len(gmask)} samples in sufficient cells "
              f"(dropped {len(gmask) - kept} partial-cell; --include-partial keeps all)")
@@ -1024,6 +1077,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="sweep: run headless with a text summary (no OpenCV coverage box)")
     p.add_argument("--audio", action="store_true",
                    help="sweep: speak coverage cues (solo-operator aid, rev04 §3)")
+    p.add_argument("--ee-point-method", choices=["pose", "rayplane"], default=None,
+                   help="how each sample's EE table-(u,v) is derived. sweep: default "
+                        "'pose' (the EE tag's 3-D origin projected onto the table — "
+                        "most head-invariant once the world frame is consensus-stable); "
+                        "'rayplane' = tag-centre line of sight ∩ plane (ambiguity-free "
+                        "but parallax-prone). solve: when given, RE-derives (u,v) from "
+                        "the stored transforms with this method (re-solve a sweep a "
+                        "different way, no re-sweep); omit to use the stored (u,v).")
     p.add_argument("--include-partial", dest="green_only", action="store_false",
                    help="solve: build the library from ALL accepted samples, not just "
                         "those in sufficient ('green') coverage cells. Default is "
