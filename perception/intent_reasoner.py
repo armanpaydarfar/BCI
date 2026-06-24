@@ -254,12 +254,12 @@ class IntentReasoner:
         gaze: GazeSample,
         fixation: FixationState,
         frame_bgr: np.ndarray,
-        detections: list = [],
+        detections: list | None = None,
         gaze_hit_info: str = "",
     ) -> Future:
         """Single-object reasoning: annotated frame with gaze marker + segments."""
         return self._executor.submit(
-            self._reason_single, gaze, fixation, frame_bgr, detections,
+            self._reason_single, gaze, fixation, frame_bgr, list(detections or []),
             gaze_hit_info,
         )
 
@@ -271,14 +271,15 @@ class IntentReasoner:
         second_fix: FixationState,
         first_frame_bgr: np.ndarray,
         second_frame_bgr: np.ndarray,
-        first_detections: list = [],
-        second_detections: list = [],
+        first_detections: list | None = None,
+        second_detections: list | None = None,
         gaze_hit_info: str = "",
     ) -> Future:
         """Two-object reasoning: two frames with segments + gaze markers."""
         return self._executor.submit(
             self._reason_pair, first_gaze, second_gaze, first_fix, second_fix,
-            first_frame_bgr, second_frame_bgr, first_detections, second_detections,
+            first_frame_bgr, second_frame_bgr,
+            list(first_detections or []), list(second_detections or []),
             gaze_hit_info,
         )
 
@@ -480,8 +481,11 @@ class IntentReasoner:
                             log_lines.append(f"\n### Image (detail={detail}, ~{size_kb}KB)")
                             log_lines.append(f"![prompt image]({img_name})")
                             img_idx += 1
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            # Best-effort DEBUG prompt-image dump; never let a disk/
+                            # decode failure here break the VLM call below.
+                            print(f"[VLM] WARN: prompt-image save failed: {exc!r}",
+                                  file=sys.stderr)
 
         print(f"{'='*60}", file=sys.stderr, flush=True)
 
@@ -503,8 +507,9 @@ class IntentReasoner:
             log_path = out_dir / f"prompt_{ts}.md"
             log_path.write_text("\n".join(log_lines))
             print(f"[VLM] Saved prompt log: {log_path}", file=sys.stderr, flush=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Best-effort prompt/response log; a write failure must not fail the call.
+            print(f"[VLM] WARN: prompt-log write failed: {exc!r}", file=sys.stderr)
 
         # Append to session log (combined markdown)
         # All images and session.md are in the same directory, so bare filenames work
@@ -515,8 +520,9 @@ class IntentReasoner:
                 header = f"# VLM Call #{self._vlm_call_count}\n"
                 with open(self._session_vlm_log, "a") as f:
                     f.write(separator + header + "\n".join(log_lines) + "\n")
-            except Exception:
-                pass
+            except Exception as exc:
+                # Best-effort combined session log; a write failure must not fail the call.
+                print(f"[VLM] WARN: session-log append failed: {exc!r}", file=sys.stderr)
 
         try:
             return json.loads(raw)
