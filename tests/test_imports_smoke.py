@@ -140,6 +140,16 @@ _SAFE_IMPORT_MODULES = [
     "Utils.gaze.gaze_ui",
     # STM_interface (non-vendor)
     "STM_interface.RehamoveConfig",
+    # perception/ LIVE modules (import-safe per perception/__init__.py). The
+    # data contract + VLM logic + Neon readers — fast to import (~0.2s). The two
+    # heavy torch/ultralytics modules (object_detector, depth_estimator) are left
+    # to the compile tier so the pre-commit gate stays fast; their import cost is
+    # third-party deps, not the vendored code.
+    "perception.pupil_reader",
+    "perception.fixation_detector",
+    "perception.intent_reasoner",
+    "perception.visualize_neon",
+    "perception.neon.reader",
 ]
 
 # Library modules excluded from the import tier with reasons. Compile tier

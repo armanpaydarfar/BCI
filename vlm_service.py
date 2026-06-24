@@ -2,14 +2,24 @@
 """
 vlm_service.py — UDP request-reply service wrapping harmony_vlm's capabilities.
 
-Runs in the `harmony_vlm` conda env and imports the in-tree `perception`
-package. Loads the Neon live reader, FastSAM, Depth Pro (optional), Gemini,
-and the I-VT fixation detector once at startup; then exposes each capability
-as a distinct UDP command so the control panel and experiment drivers can
-consume them independently.
+Runs in the unified `lsl` conda env (the separate `harmony_vlm` env is retired)
+and imports the in-tree `perception` package. Loads the Neon live reader, FastSAM,
+Depth Pro (optional), Gemini, and the I-VT fixation detector once at startup; then
+exposes each capability as a distinct UDP command so the control panel and
+experiment drivers can consume them independently.
 
 Mirrors the request-reply idiom of gaze_runner.py:GazeUDPServer (L43-204) —
 single-threaded dispatch, JSON in / JSON out, single datagram round-trip.
+
+Internal structure (this is a large module — the map a newcomer needs):
+    VLMService is the single hub class. It owns (1) the blocking UDP server loop +
+    a dict-based command dispatch (`cmd` → `_cmd_*` handler), (2) a background
+    thread that ingests the latest Neon frame+gaze from the frame relay, (3) the
+    model handles loaded once at startup (segmenter / depth / reasoner / fixation),
+    (4) the per-command handlers (`_cmd_status/segment/depth/reason/decide/...`),
+    and (5) caches for the latest snapshot, segmentation, and rendered overlay plus
+    the subscription push channel. The `decide` and `decide_pair` handlers compose
+    segment→depth→reason into the waypoint dict the drivers consume.
 
 Supported commands (JSON `cmd` field, all lower-case):
     status         — service + Neon + models health (cheap, always ok)
@@ -58,16 +68,20 @@ import numpy as np
 
 
 # Pull argparse defaults from BCI/config.py (which layers config_local.py over
-# committed defaults). vlm_service.py runs in the `harmony_vlm` conda env with
-# cwd=<harmony_vlm repo>, so config.py is not on sys.path by default — insert
-# the BCI dir explicitly. Falls back to hardcoded safe defaults if the import
-# fails, so a stripped-down deployment without config_local still works.
+# committed defaults). The service may be launched from a different cwd, so
+# config.py is not guaranteed on sys.path — insert the BCI dir explicitly. Falls
+# back to hardcoded safe defaults if the import fails, so a stripped-down
+# deployment without config_local still works.
 _BCI_DIR = Path(__file__).resolve().parent
 if str(_BCI_DIR) not in sys.path:
     sys.path.insert(0, str(_BCI_DIR))
 try:
     import config as _bci_config
-except Exception:
+except Exception as _cfg_exc:  # noqa: BLE001 — documented degradation (see above)
+    # Safe, intentional fallback to hardcoded defaults; surface a breadcrumb so a
+    # config that was *expected* but failed to import isn't silently ignored.
+    print(f"[vlm_service] WARN: BCI config import failed ({_cfg_exc!r}); using "
+          "hardcoded argparse defaults", file=sys.stderr)
     _bci_config = None
 
 
