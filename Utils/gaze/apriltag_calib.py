@@ -2,8 +2,10 @@
 apriltag_calib.py — pure-geometry core for the REV03 AprilTag gaze↔robot
 calibration (WS5).
 
-Methodology: SoftwareDocs/projects/harmony-bci/gaze-calibration/
-rev03-apriltag-methodology.md. This module holds ONLY the hardware-free math so
+Methodology: SoftwareDocs/_archive/harmony-bci/gaze-calibration/
+rev03-apriltag-methodology.md (archived; the § citations below are its sections —
+the current model is the active rev04-planar-coverage-methodology.md). This module
+holds ONLY the hardware-free math so
 it is unit-testable without a Neon, a robot, or `pupil-apriltags`:
 
   - rigid 4×4 transform helpers (build / invert / apply),

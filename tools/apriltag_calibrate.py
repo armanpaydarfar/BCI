@@ -2,9 +2,11 @@
 """
 apriltag_calibrate.py — AprilTag gaze↔robot calibration tool (WS5 REV03).
 
-Methodology: SoftwareDocs/projects/harmony-bci/gaze-calibration/
-rev03-apriltag-methodology.md. Produces the calibration the control tool
-(`tools/apriltag_control_test.py`) uses to drive the robot from gaze.
+Methodology: the REV03 origin is archived at SoftwareDocs/_archive/harmony-bci/
+gaze-calibration/rev03-apriltag-methodology.md (its § citations below); the REV04
+sweep + planar solve added here follow the active SoftwareDocs/projects/harmony-bci/
+gaze-calibration/rev04-planar-coverage-methodology.md. Produces the calibration the
+control tool (`tools/apriltag_control_test.py`) uses to drive the robot from gaze.
 
 Tier-3 operator tool. Camera frames + gaze + intrinsics come from the existing
 frame relay (`Utils.remote_frame_reader`), so it runs in the `lsl` env. The

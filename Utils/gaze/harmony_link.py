@@ -7,8 +7,9 @@ Mirrors the proven wire contract of
 path in ``Utils/networking.py`` (the coords→``g`` staged-trajectory sequence),
 without importing those Tier-1/2 modules (which drag pygame / experiment-loop
 deps). Methodology + verified robot contract:
-SoftwareDocs/projects/harmony-bci/gaze-calibration/rev03-apriltag-methodology.md
-and reports/cpp.md (the C++ ``Gaze_Tracking.cpp`` / ``wire_protocol.md`` side).
+SoftwareDocs/_archive/harmony-bci/gaze-calibration/rev03-apriltag-methodology.md
+(archived; current model in the active rev04-planar-coverage-methodology.md) and
+reports/cpp.md (the C++ ``Gaze_Tracking.cpp`` / ``wire_protocol.md`` side).
 
 Verified robot facts this honours (reports/cpp.md):
   - Position is commanded ONLY as 7 comma-separated joint angles (radians) with

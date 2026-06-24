@@ -40,7 +40,8 @@ def load_detector(families: str = "tag36h11"):
             "pupil-apriltags is required for AprilTag detection but is not installed.\n"
             "  pip install pupil-apriltags\n"
             "(It is deliberately not in environment.yml until the AprilTag "
-            "calibration is adopted — see rev03-apriltag-methodology.md §6.4.)"
+            "calibration is adopted — see _archive/harmony-bci/gaze-calibration/"
+            "rev03-apriltag-methodology.md §6.4.)"
         ) from exc
     return Detector(families=families)
 
