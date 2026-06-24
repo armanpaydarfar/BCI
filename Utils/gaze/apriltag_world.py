@@ -131,14 +131,28 @@ def build_world_map(cam_poses_by_id: Dict[int, np.ndarray],
             "plane_point": plane_point, "plane_normal": plane_normal}
 
 
+_CONSENSUS_TOL_MM = 60.0
+
+
 def recover_world_pose(tags_in_view: Dict[int, np.ndarray],
-                       world_map: Dict) -> Optional[np.ndarray]:
+                       world_map: Dict, *,
+                       consensus_tol_mm: float = _CONSENSUS_TOL_MM) -> Optional[np.ndarray]:
     """Fuse a world-frame pose ``T_cam_world`` from whichever mapped tags are
     currently visible. Returns None if no mapped tag is in view.
 
     For each visible mapped tag ``i``: ``T_cam_world = T_cam_i · (T_ref_i)⁻¹``
-    (the world = reference frame, seen via tag ``i``). Estimates from all visible
-    mapped tags are averaged (`average_pose`)."""
+    (the world = reference frame, seen via tag ``i``).
+
+    **Robust consensus (2026-06-24).** A single planar tag's pose can flip to its
+    alternate solution (the ``more than one minima`` ambiguity, worst under
+    head-worn motion); its world-frame estimate then lands far from the others, and
+    a plain mean would jump the whole frame — the operator-observed flit between
+    distant cells. With ≥3 estimates, keep the LARGEST cluster whose world origins
+    (each estimate's translation, mm) agree within ``consensus_tol_mm`` and fuse
+    only those, so one flipped tag among several is out-voted (a 5-tag world map is
+    hard to flip). Small per-tag noise stays inside the tolerance, so the fused
+    result is unchanged when no tag has flipped. With 1–2 estimates there is no
+    majority to appeal to, so they are fused directly (`average_pose`)."""
     rel = world_map.get("rel", {})
     ests: List[np.ndarray] = []
     for tag_id, T_cam_i in tags_in_view.items():
@@ -149,9 +163,16 @@ def recover_world_pose(tags_in_view: Dict[int, np.ndarray],
         ests.append(T_cam_i @ invert_transform(np.asarray(rel[key], dtype=float)))
     if not ests:
         return None
-    if len(ests) == 1:
-        return ests[0]
-    return average_pose(ests)
+    if len(ests) <= 2:
+        return ests[0] if len(ests) == 1 else average_pose(ests)
+    origins = np.array([T[:3, 3] for T in ests])
+    best: List[int] = []
+    for i in range(len(ests)):
+        inliers = [j for j in range(len(ests))
+                   if np.linalg.norm(origins[j] - origins[i]) <= consensus_tol_mm]
+        if len(inliers) > len(best):
+            best = inliers
+    return average_pose([ests[k] for k in best]) if len(best) > 1 else ests[best[0]]
 
 
 def world_map_to_arrays(world_map: Dict):

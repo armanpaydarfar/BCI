@@ -153,6 +153,31 @@ def test_recover_fuses_disagreeing_estimates_stays_rigid():
     assert abs(np.linalg.det(T[:3, :3]) - 1.0) < 1e-9                          # proper rotation
 
 
+def test_recover_rejects_a_flipped_tag_by_consensus():
+    # One world tag's pose has FLIPPED to a grossly wrong solution (decimetre-scale
+    # error); the other three agree. The consensus must out-vote the flipped tag and
+    # return the clean world pose, not a polluted average. This is the head-motion
+    # flit fix (2026-06-24).
+    _, T_cam_world, cam_poses = _layout()
+    wm = build_world_map(cam_poses)
+    flipped = dict(cam_poses)
+    flipped[3] = cam_poses[3] @ make_transform(_rot_x(120.0), [200.0, 150.0, 300.0])
+    # 3 clean tags agree exactly → their cluster wins; the flip is dropped.
+    np.testing.assert_allclose(recover_world_pose(flipped, wm), T_cam_world, atol=1e-6)
+
+
+def test_recover_small_noise_not_rejected_matches_plain_mean():
+    # Sub-tolerance noise on one tag must NOT trip the consensus (all estimates stay
+    # in one cluster) — the fused result equals the plain average of all four, so the
+    # robust path is a no-op when nothing has flipped.
+    _, _, cam_poses = _layout()
+    wm = build_world_map(cam_poses)
+    noisy = dict(cam_poses)
+    noisy[1] = cam_poses[1] @ make_transform(_rot_z(1.0), [3.0, -1.0, 2.0])
+    ests = [noisy[i] @ np.linalg.inv(wm["rel"][i]) for i in noisy]
+    np.testing.assert_allclose(recover_world_pose(noisy, wm), average_pose(ests), atol=1e-9)
+
+
 # ── REV04 planar coordinates (plane_basis / plane_coords / round-trip) ──────────
 
 def test_plane_basis_orthonormal_right_handed():
