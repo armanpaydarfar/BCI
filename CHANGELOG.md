@@ -27,9 +27,15 @@ The format is **lightweight** (this repo is not strictly semver-tagged). Add bul
   machine, remote-services, and the VLM commands). **`control_panel.py`: 3828 → 774
   lines (−80%)**. Left in the panel: mode/subject/driver central session state and
   the logging/LED sink.
-  `vlm_service.py` (our GPU-host service, not the vendored `perception/`) had its
-  pure helpers extracted into a new `vlm/` package (`seg_ops`, `snapshot_cache`,
-  `wire`), keeping the `VLMService` hub. **`vlm_service.py`: 2093 → 1836 lines.**
+  `vlm_service.py` (our GPU-host service, not the vendored `perception/`) was
+  decomposed into a new `vlm/` package: the pure helpers (`seg_ops`,
+  `snapshot_cache`, `wire`) plus two composition collaborators that hold a
+  back-reference to the service hub — `results_pusher` (the subscriber/UDP-push
+  subsystem + its tick thread) and `segment_stream` (continuous segmentation + its
+  thread/tracker). `_dispatch` stays on the hub and routes to them.
+  **`vlm_service.py`: 2093 → 1308 lines (−38%).** What remains on the `VLMService`
+  hub is the UDP/dispatch loop, frame-ingest, the command handlers, and the
+  decide pipeline (below).
   **Deferred to a hardware-in-the-loop session:** the extracted verify-chain state
   machine is construction-guarded but its live transitions are NOT exercised by the
   headless tests — it needs a live Connect smoke before being trusted; and the
