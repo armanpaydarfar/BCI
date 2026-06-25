@@ -105,7 +105,7 @@ Key folders and scripts (non-exhaustive):
     `core/`. The authoritative live-vs-staged list is the docstring in
     [`perception/__init__.py`](perception/__init__.py).
   - The perception process talks to the drivers only over UDP/TCP (`vlm_service.py`,
-    `vlm_bridge.py`, `Utils/perception_clients.py`, `Utils/frame_relay.py`) — there is no
+    `Utils/perception_clients.py`, `Utils/frame_relay.py`) — there is no
     in-process coupling to the realtime EEG/robot loops.
 
 - **Robot / FES / markers (root-level scripts)**  

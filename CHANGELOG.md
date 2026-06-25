@@ -24,7 +24,7 @@ The format is **lightweight** (this repo is not strictly semver-tagged). Add bul
   (Harmony + AprilTag), `gaze_controller`, `runtime_config_controller`
   (runtime/ErrP config tabs + training), `log_file_controller`, and `vlm_controller`
   (the whole VLM/perception subsystem: video tab, frame-relay/verify-chain state
-  machine, remote-services, and the VLM commands). **`control_panel.py`: 3828 → 774
+  machine, remote-services, and the VLM commands). **`control_panel.py`: 3828 → 773
   lines (−80%)**. Left in the panel: mode/subject/driver central session state and
   the logging/LED sink.
   `vlm_service.py` (our GPU-host service, not the vendored `perception/`) was
@@ -33,7 +33,7 @@ The format is **lightweight** (this repo is not strictly semver-tagged). Add bul
   back-reference to the service hub — `results_pusher` (the subscriber/UDP-push
   subsystem + its tick thread) and `segment_stream` (continuous segmentation + its
   thread/tracker). `_dispatch` stays on the hub and routes to them.
-  **`vlm_service.py`: 2093 → 1308 lines (−38%).** What remains on the `VLMService`
+  **`vlm_service.py`: 2093 → 1303 lines (−38%).** What remains on the `VLMService`
   hub is the UDP/dispatch loop, frame-ingest, the command handlers, and the
   decide pipeline (below).
   The `vlm_service` decide/process-frame duplication was also resolved
@@ -56,8 +56,8 @@ The format is **lightweight** (this repo is not strictly semver-tagged). Add bul
   `@pytest.mark.skip("pending rewrite")` tests that cited removed APIs;
   converted 4 `__main__`/`_check`-style files that collected zero tests into
   real pytest (`test_relay_loopback.py` is now `@pytest.mark.slow`); added a
-  `VLMClient` wire-contract characterization suite. Fast gate 396→420 passed,
-  63→0 skipped. `tests/README.md` refreshed with a current per-subsystem
+  `VLMClient` wire-contract characterization suite. Fast gate 396→436 passed,
+  63→0 skipped (456 incl. the slow-marked set). `tests/README.md` refreshed with a current per-subsystem
   catalog (the only test doc in the public repo).
 - **Perception item-5 tidy.** Unused `field` imports removed; dataclass
   docstrings added; `visualize_neon.load_stream()` raises a clear

@@ -6,8 +6,9 @@ eegoSports, no Rehamove, no robot, no network peers — every test uses
 synthetic fixtures or loopback sockets, so the whole thing runs on a
 laptop with the `lsl` conda env and nothing else.
 
-As of this writing: **~360 test functions across 40 files** (the fast
-subset reports ~407 passed; the difference is parametrised cases). The
+As of this writing: **~400 test functions across 48 files** (the fast
+subset reports ~436 passed, 456 incl. the slow-marked set; the difference
+between functions and passes is parametrised cases). The
 detailed design rationale and per-test plan live in the team's internal
 docs (`SoftwareDocs/projects/harmony-bci/test-suite/{plan,report}.md`)
 for maintainers who have access; this README is the self-contained
