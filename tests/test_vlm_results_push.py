@@ -196,10 +196,14 @@ def test_expired_subscriber_pruned() -> None:
     rx2.bind(("127.0.0.1", 0))
     addr2 = ("127.0.0.1", rx2.getsockname()[1])
     svc._dispatch("subscribe", {"hz": 50.0, "ttl_s": 0.0}, addr2)
-    time.sleep(0.01)
     tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        svc.results_pusher._tick_send_results(tx, time.monotonic())
+        # ttl_s=0.0 => expires_at == subscribe time. Drive the prune with a clock
+        # value past it (now + 1 s, well under the live subscriber's 30 s TTL so it
+        # survives) rather than a real sleep: time.monotonic() resolution on Windows
+        # is ~15.6 ms, so a 10 ms sleep often leaves now == expires_at and the strict
+        # '<' prune does not fire (~34% flake). Injecting the clock is deterministic.
+        svc.results_pusher._tick_send_results(tx, time.monotonic() + 1.0)
     finally:
         tx.close()
     rx2.settimeout(0.1)

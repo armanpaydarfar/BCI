@@ -128,10 +128,14 @@ def test_expired_subscriber_pruned() -> None:
     rx2.bind(("127.0.0.1", 0))
     addr2 = ("127.0.0.1", rx2.getsockname()[1])
     udp.handle({"cmd": "subscribe", "hz": 50.0, "ttl_s": 0.0}, addr2)
-    time.sleep(0.01)
     udp._push_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        udp._tick_send(time.monotonic())
+        # ttl_s=0.0 => expires_at == subscribe time. Drive the prune with a clock
+        # value unambiguously past it (now + 1 s) rather than a real sleep:
+        # time.monotonic() resolution on Windows is ~15.6 ms, so a 10 ms sleep
+        # often leaves now == expires_at and the strict '<' prune in _tick_send
+        # does not fire (~34% flake). Injecting the clock makes it deterministic.
+        udp._tick_send(time.monotonic() + 1.0)
     finally:
         udp._push_sock.close()
     rx2.settimeout(0.1)
