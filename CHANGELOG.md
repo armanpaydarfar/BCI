@@ -36,11 +36,13 @@ The format is **lightweight** (this repo is not strictly semver-tagged). Add bul
   **`vlm_service.py`: 2093 → 1308 lines (−38%).** What remains on the `VLMService`
   hub is the UDP/dispatch loop, frame-ingest, the command handlers, and the
   decide pipeline (below).
-  **Deferred to a hardware-in-the-loop session:** the extracted verify-chain state
+  The `vlm_service` decide/process-frame duplication was also resolved
+  (characterize-first): the shared segment→depth→waypoints→hit pipeline is now one
+  `_segment_depth_waypoints(apply_constraints=…)` helper, with the seg-constraint
+  divergence an explicit flag (commit pinned by `tests/test_decide_pipeline_dedup.py`).
+  **The only remaining hardware-in-the-loop gate:** the extracted verify-chain state
   machine is construction-guarded but its live transitions are NOT exercised by the
-  headless tests — it needs a live Connect smoke before being trusted; and the
-  `vlm_service` decide-pipeline de-dup (`_cmd_decide` vs `_process_frame_and_gaze`)
-  remains, as the two paths differ in seg-constraint application.
+  headless tests — it needs a live Connect smoke before being trusted in a session.
 - **Consolidated the two VLM UDP clients into one (behaviour-preserving).**
   `vlm_bridge.VLMBridge` (one consumer — the gaze driver) is folded into
   `Utils.perception_clients.VLMClient` (config-driven, the other 3 consumers,
