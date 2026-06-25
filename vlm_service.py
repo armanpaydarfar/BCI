@@ -108,6 +108,14 @@ from vlm.seg_ops import (
 )
 from vlm.snapshot_cache import SnapshotCache
 
+# Subsystems extracted from the VLMService god class (behaviour-preserving): each
+# is a plain collaborator holding a back-reference to the service, constructed in
+# __init__ after the state it reads exists. ResultsPusher owns the subscribe-mode
+# JSON push (subscribers + tick thread); SegmentStream owns the continuous
+# segmentation stream (worker thread + tracker + stats).
+from vlm.results_pusher import ResultsPusher
+from vlm.segment_stream import SegmentStream
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="harmony_vlm UDP service")
@@ -337,7 +345,6 @@ class VLMService:
         # stub-args test path (and any minimal Namespace) on today's behaviour:
         # constraints inactive, overlay knobs at the module defaults.
         self._seg_constraints = SegConstraints.from_args(args)
-        self._seg_track = bool(getattr(args, "seg_track", False))
         self._overlay_top_k = int(getattr(args, "overlay_top_k", _OVERLAY_TOP_K))
         self._overlay_contain_ratio = float(
             getattr(args, "overlay_contain_ratio", _OVERLAY_CONTAIN_RATIO))
@@ -371,38 +378,15 @@ class VLMService:
         self._last_decision: Optional[dict] = None
         self._first_snap_det = None          # first-fixation Detection for AWAITING_SECOND badge
 
-        # Continuous segmentation stream (toggle from the panel). When on,
-        # _segment_stream_loop calls detector.detect at seg_stream_hz and
-        # writes into _cached_dets so the overlay stays fresh without manual
-        # "Segment Now" clicks.
-        self._seg_stream_thread: Optional[threading.Thread] = None
-        self._seg_stream_stop = threading.Event()
-        self._seg_stream_hz: float = 10.0
-        # Telemetry for the seg-stream loop. Updated under no lock from the
-        # loop thread and read read-only from _cmd_status; consumers tolerate
-        # a slightly stale snapshot. Each window covers _SEG_STREAM_STATS_S
-        # seconds; periodic stats lines log to stdout, the latest snapshot is
-        # included in status replies so the panel can surface it.
-        self._seg_stream_stats: Dict[str, Any] = {
-            "active": False,
-            "hz_target": 0.0,
-            "hz_achieved": 0.0,
-            "mean_dets": 0.0,
-            "mean_infer_ms": 0.0,
-            "errors": 0,
-            "window_s": 0.0,
-            "last_emit_t": 0.0,
-        }
-
-        # Subscribe-mode push: panel/clients send `cmd=subscribe` and we
-        # broadcast `vlm_results` JSON datagrams from a tick thread. The
-        # render-on-Linux refactor (Render_Layer_Refactor.md §3) replaces
-        # the JPEG overlay round-trip with this JSON channel.
-        self._subscribers_lock = threading.Lock()
-        # subscriber_id (uuid hex) → {addr, hz, last_sent_t, expires_at}
-        self._subscribers: Dict[str, Dict[str, Any]] = {}
-        self._results_tick_thread: Optional[threading.Thread] = None
-        self._results_tick_stop = threading.Event()
+        # Subsystems extracted from this hub (each holds a back-ref to self and
+        # owns its own thread + state). Constructed last so the shared state they
+        # read through the back-ref (_frame_lock/_latest, _render_lock/_cached_*,
+        # detector, _seg_constraints, the overlay knobs, _stop_event) already
+        # exists. SegmentStream owns the continuous-segmentation worker thread +
+        # tracker + stats; ResultsPusher owns the subscribe-mode JSON push
+        # (subscribers + tick thread, Render_Layer_Refactor.md §3).
+        self.segment_stream = SegmentStream(self)
+        self.results_pusher = ResultsPusher(self)
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -518,6 +502,12 @@ class VLMService:
 
     def stop(self) -> None:
         self._stop_event.set()
+        # Stop the subsystem threads. Both loops also gate on _stop_event (set
+        # above), so this is belt-and-suspenders for the results push and a
+        # join for the seg-stream worker; ordering matches the pre-refactor
+        # teardown (seg-stream first via _cmd_stop, push loop on _stop_event).
+        self.segment_stream.stop()
+        self.results_pusher.stop()
         try:
             if self._sock is not None:
                 self._sock.close()
@@ -567,7 +557,7 @@ class VLMService:
             "status": lambda: self._cmd_status(),
             "snapshot": lambda: self._cmd_snapshot(),
             "segment": lambda: self._cmd_segment(req),
-            "segment_stream": lambda: self._cmd_segment_stream(req),
+            "segment_stream": lambda: self.segment_stream.cmd_segment_stream(req),
             "recognize": lambda: self._cmd_recognize(req),
             "depth": lambda: self._cmd_depth(req),
             "reason": lambda: self._cmd_reason(req),
@@ -575,9 +565,9 @@ class VLMService:
             "capture_first": lambda: self._cmd_capture_first(req),
             "decide_pair": lambda: self._cmd_decide_pair(req),
             "camera_matrix": lambda: self._cmd_camera_matrix(),
-            "subscribe": lambda: self._cmd_subscribe(req, addr),
-            "unsubscribe": lambda: self._cmd_unsubscribe(req),
-            "verify_chain": lambda: self._cmd_verify_chain(req),
+            "subscribe": lambda: self.results_pusher.cmd_subscribe(req, addr),
+            "unsubscribe": lambda: self.results_pusher.cmd_unsubscribe(req),
+            "verify_chain": lambda: self.results_pusher.cmd_verify_chain(req),
             "stop": lambda: self._cmd_stop(addr),
         }
         handler = handlers.get(cmd)
@@ -615,7 +605,7 @@ class VLMService:
             # while the loop is running. Stays present (active=False) so
             # clients can render a single status panel regardless of
             # whether streaming is on.
-            "seg_stream": dict(self._seg_stream_stats),
+            "seg_stream": dict(self.segment_stream._seg_stream_stats),
         }
 
     def _cmd_snapshot(self) -> dict:
@@ -712,233 +702,6 @@ class VLMService:
             "n": len(out),
             "elapsed_s": elapsed,
         }
-
-    def _cmd_segment_stream(self, req: dict) -> dict:
-        enabled = bool(req.get("enabled", False))
-        hz = float(req.get("hz", self._seg_stream_hz))
-        if hz <= 0.0:
-            return {"ok": False, "error": "hz must be > 0"}
-        if enabled:
-            self._start_segment_stream(hz)
-        else:
-            self._stop_segment_stream()
-        return {"ok": True, "enabled": enabled, "hz": hz}
-
-    def _start_segment_stream(self, hz: float) -> None:
-        # Idempotent: if already running at a different rate, swap the rate
-        # without restarting the thread.
-        self._seg_stream_hz = hz
-        if self._seg_stream_thread is not None and self._seg_stream_thread.is_alive():
-            return
-        self._seg_stream_stop.clear()
-        self._seg_stream_thread = threading.Thread(
-            target=self._segment_stream_loop, daemon=True, name="vlm-seg-stream",
-        )
-        self._seg_stream_thread.start()
-        _log(f"segment stream started at {hz:.1f} Hz")
-
-    def _stop_segment_stream(self) -> None:
-        self._seg_stream_stop.set()
-        t = self._seg_stream_thread
-        if t is not None and t.is_alive():
-            t.join(timeout=2.0)
-        self._seg_stream_thread = None
-        # Clear cached detections so the overlay doesn't keep drawing the last
-        # mask set after the stream is turned off.
-        self._cache_dets([])
-        _log("segment stream stopped")
-
-    # Window size for seg-stream stats accumulation. 5 s is short enough
-    # to feel live in the panel readout but long enough that a single slow
-    # inference doesn't dominate the average.
-    _SEG_STREAM_STATS_S: float = 5.0
-
-    def _segment_stream_loop(self) -> None:
-        next_run = time.perf_counter()
-        last_hz = self._seg_stream_hz
-        period = 1.0 / max(last_hz, 1e-6)
-        # WS4 F3: optional temporal tracker. Fresh per stream session so a
-        # restart doesn't inherit stale tracks. Read-only import of the Tier-1
-        # gaze tracker (pure numpy, no I/O — do NOT modify it). None when the
-        # --seg-track gate is off, in which case the stateless path below is
-        # unchanged.
-        tracker = None
-        if self._seg_track:
-            from Utils.gaze.gaze_tracking import SimpleSORTTracker
-            tracker = SimpleSORTTracker()
-        # Stats accumulators for the current window. Reset after each
-        # periodic emit so each line summarises fresh activity.
-        win_start = time.perf_counter()
-        win_ticks = 0
-        win_dets = 0
-        win_infer_s = 0.0
-        win_errors = 0
-        self._seg_stream_stats.update({
-            "active": True, "hz_target": last_hz, "last_emit_t": time.time(),
-        })
-        try:
-            while not self._seg_stream_stop.is_set() and not self._stop_event.is_set():
-                # Re-read the rate each iteration so live changes take effect.
-                if self._seg_stream_hz != last_hz:
-                    last_hz = self._seg_stream_hz
-                    period = 1.0 / max(last_hz, 1e-6)
-                    self._seg_stream_stats["hz_target"] = last_hz
-
-                now_pc = time.perf_counter()
-                if now_pc < next_run:
-                    time.sleep(min(0.005, next_run - now_pc))
-                    continue
-
-                bundle, _, _ = self._latest()
-                if bundle is None:
-                    next_run = now_pc + period
-                    time.sleep(0.020)
-                    continue
-
-                try:
-                    t0 = time.perf_counter()
-                    dets = self.detector.detect(bundle.video.bgr)
-                    # F1 constraints first (geometry + gaze-ROI only — per-tick
-                    # Depth Pro is too costly for the stream, so depth-band is
-                    # decide-only; see SegConstraints.depth_band). Then the
-                    # overlay top-K / containment reduction with the configured
-                    # (E2) knobs.
-                    dets = _apply_seg_constraints(
-                        dets, bundle.video.bgr.shape, self._seg_constraints,
-                        gaze_xy=(float(bundle.gaze.x), float(bundle.gaze.y)),
-                    )
-                    dets = _filter_overlay_dets(
-                        dets, top_k=self._overlay_top_k,
-                        contain_ratio=self._overlay_contain_ratio,
-                        area_ratio=self._overlay_area_ratio,
-                    )
-                    # F3: temporal tracking/smoothing (opt-in). Replaces the
-                    # raw stateless set with confirmed tracks (min_hits to
-                    # appear, max_age to disappear) carrying stable track_ids.
-                    if tracker is not None:
-                        dets = self._apply_seg_tracking(dets, tracker, time.monotonic())
-                    self._cache_dets(dets)
-                    win_ticks += 1
-                    win_dets += len(dets)
-                    win_infer_s += (time.perf_counter() - t0)
-                except Exception as e:
-                    # Errors always log — silent failure here used to hide
-                    # detector misconfiguration (wrong device, missing
-                    # weights) until the operator wondered why the overlay
-                    # was empty.
-                    win_errors += 1
-                    _log(f"segment stream error: {e}")
-
-                # Periodic stats emit. Logs one line and refreshes the
-                # status-reply snapshot so the panel readout stays current.
-                window_s = time.perf_counter() - win_start
-                if window_s >= self._SEG_STREAM_STATS_S:
-                    achieved = win_ticks / max(window_s, 1e-6)
-                    mean_dets = (win_dets / win_ticks) if win_ticks else 0.0
-                    mean_infer_ms = (win_infer_s / win_ticks * 1000.0) if win_ticks else 0.0
-                    _log(
-                        f"seg-stream: target={last_hz:.1f}Hz achieved={achieved:.1f}Hz "
-                        f"ticks={win_ticks} mean_dets={mean_dets:.1f} "
-                        f"mean_infer={mean_infer_ms:.0f}ms errors={win_errors}"
-                    )
-                    self._seg_stream_stats.update({
-                        "active": True,
-                        "hz_target": last_hz,
-                        "hz_achieved": achieved,
-                        "mean_dets": mean_dets,
-                        "mean_infer_ms": mean_infer_ms,
-                        "errors": win_errors,
-                        "window_s": window_s,
-                        "last_emit_t": time.time(),
-                    })
-                    win_start = time.perf_counter()
-                    win_ticks = 0
-                    win_dets = 0
-                    win_infer_s = 0.0
-                    win_errors = 0
-
-                # Schedule next tick relative to the original cadence, but if we're
-                # falling behind by more than 2 periods just resync — avoids a
-                # runaway catch-up burst after a slow inference.
-                next_run += period
-                now_pc2 = time.perf_counter()
-                if next_run < now_pc2 - 2.0 * period:
-                    next_run = now_pc2
-        finally:
-            # Mark the loop dead so a stale snapshot doesn't make the panel
-            # claim the stream is still healthy after a stop.
-            self._seg_stream_stats["active"] = False
-
-    def _apply_seg_tracking(self, dets, tracker, t_now: float):
-        """F3: run the SORT tracker over this tick's detections and return the
-        confirmed-track view.
-
-        FastSAM labels (``segment_N``) are index-based and **not** stable across
-        frames, so feeding them as the tracker's class would break IoU
-        association (SimpleSORTTracker only matches within the same class). We
-        sidestep that *without editing the Tier-1 tracker* by giving every
-        detection the same class (0) — the class-consistency check then always
-        passes and association is pure IoU/geometry. The track_id becomes the
-        stable identity.
-
-        Output preserves masks for objects present this frame (matched to a
-        confirmed track by IoU) and emits box-only detections for confirmed
-        tracks that are *coasting* (no detection this frame but still within
-        max_age) — that pairing is what turns frame-to-frame flicker into
-        min_hits-to-appear / max_age-to-disappear behaviour. Every returned
-        Detection carries a ``track_id`` attribute and a ``#<id>`` label.
-        """
-        from perception.object_detector import Detection
-        from Utils.gaze.gaze_tracking import iou_xyxy
-
-        tracker.predict(t_now)
-        tracker.update_with_dets(
-            [{"xyxy": tuple(d.box_xyxy), "cls": 0, "conf": float(d.confidence),
-              "name": str(d.label)} for d in dets],
-            t_now=t_now,
-        )
-        tracks = tracker.get_tracks_as_dets(t_now)  # confirmed, unexpired
-
-        # Greedy 1:1 match each confirmed track to the best-IoU current det.
-        det_for_track: dict = {}
-        claimed: set = set()
-        for tr in tracks:
-            best_d = None
-            best_iou = 0.10  # floor: below this it isn't really the same object
-            for k, d in enumerate(dets):
-                if k in claimed:
-                    continue
-                score = iou_xyxy(tr["xyxy"], tuple(d.box_xyxy))
-                if score >= best_iou:
-                    best_iou = score
-                    best_d = (k, d)
-            if best_d is not None:
-                claimed.add(best_d[0])
-                det_for_track[tr["track_id"]] = best_d[1]
-
-        out = []
-        for tr in tracks:
-            tid = tr["track_id"]
-            d = det_for_track.get(tid)
-            if d is not None:
-                # Present this frame — keep its mask, tag with the stable id.
-                d.track_id = tid
-                d.label = f"#{tid}"
-                out.append(d)
-            else:
-                # Coasting (Kalman-predicted, no det this frame): emit a
-                # box-only detection so it persists through max_age.
-                x1, y1, x2, y2 = tr["xyxy"]
-                cd = Detection(
-                    label=f"#{tid}",
-                    confidence=float(tr.get("conf", 0.0)),
-                    box_xyxy=(float(x1), float(y1), float(x2), float(y2)),
-                    box_center=((x1 + x2) / 2.0, (y1 + y2) / 2.0),
-                    mask_polygon=None,
-                )
-                cd.track_id = tid
-                out.append(cd)
-        return out
 
     def _cmd_depth(self, req: dict) -> dict:
         at_gaze = bool(req.get("at_gaze", True))
@@ -1325,306 +1088,15 @@ class VLMService:
                 "hint": "stop the service locally with Ctrl-C, "
                         "or restart with --allow-remote-stop to allow this",
             }
-        self._stop_segment_stream()
+        self.segment_stream.stop()
         self._stop_event.set()
         return {"ok": True}
 
-    # ── subscribe-mode JSON push (Render_Layer_Refactor.md §3) ────────────
-
-    # Internal tick rate caps the per-subscriber rate. Subscribers may
-    # request lower hz; higher requests are clamped at this ceiling.
-    _RESULTS_TICK_HZ: float = 20.0
-    # Subscribers expire after this long without a refresh. The panel is
-    # expected to re-subscribe every ~10 s as a heartbeat — drops dead
-    # subscribers automatically when a client crashes.
-    _SUBSCRIBER_TTL_S: float = 30.0
-
-    def start_results_push(self) -> None:
-        """Spawn the tick thread that broadcasts vlm_results JSON to subscribers."""
-        if self._results_tick_thread is not None and self._results_tick_thread.is_alive():
-            return
-        self._results_tick_stop.clear()
-        self._results_tick_thread = threading.Thread(
-            target=self._results_tick_loop, daemon=True, name="vlm-results-push",
-        )
-        self._results_tick_thread.start()
-        _log("results push thread started")
-
-    def _cmd_subscribe(self, req: dict, addr: tuple) -> dict:
-        """Add (or refresh) a subscriber. Idempotent on (addr, port) so a
-        client re-subscribing as a heartbeat doesn't accumulate ghosts."""
-        try:
-            hz = float(req.get("hz", self._RESULTS_TICK_HZ))
-        except (TypeError, ValueError):
-            return {"ok": False, "error": "bad_hz"}
-        hz = max(0.5, min(hz, self._RESULTS_TICK_HZ))
-        ttl_s = float(req.get("ttl_s", self._SUBSCRIBER_TTL_S))
-        now = time.monotonic()
-        with self._subscribers_lock:
-            # Reuse existing id when the same (addr, port) re-subscribes;
-            # this keeps the subscriber set stable across heartbeats and
-            # lets the client treat subscribe as idempotent.
-            existing_id: Optional[str] = None
-            for sid, info in self._subscribers.items():
-                if info.get("addr") == addr:
-                    existing_id = sid
-                    break
-            sid = existing_id or uuid.uuid4().hex[:12]
-            self._subscribers[sid] = {
-                "addr": tuple(addr),
-                "hz": hz,
-                "last_sent_t": 0.0,
-                "expires_at": now + ttl_s,
-            }
-        return {"ok": True, "stream": "results", "subscriber_id": sid, "hz": hz}
-
-    def _cmd_unsubscribe(self, req: dict) -> dict:
-        sid = req.get("subscriber_id")
-        if not sid:
-            return {"ok": False, "error": "missing_subscriber_id"}
-        with self._subscribers_lock:
-            removed = self._subscribers.pop(str(sid), None)
-        return {"ok": True, "removed": bool(removed)}
-
-    def _cmd_verify_chain(self, req: dict) -> dict:
-        """End-to-end chain verification, used by the operator panel
-        immediately after Connect to flip the Receive LED green
-        without firing a real segment that would leave detections on
-        the panel's overlay.
-
-        Confirms (a) we have a frame from the upstream relay (proves
-        Send + ingest), (b) the detector is loaded (proves the GPU
-        side can compute), and (c) we can push to subscribers (proves
-        the return path). Pushes one synthetic payload with
-        ``type="chain_verify"`` to all current subscribers. The panel's
-        ``_on_vlm_payload`` only paints overlays for ``type="vlm_results"``
-        (Utils/vlm_scene_widget.py:413-415), so this push lights
-        Receive without any visible artifact on the video tab.
-
-        Echoes any ``token`` field from the request into the pushed
-        payload so the panel can match the response to the specific
-        Connect cycle that issued it. Without the token a stale push
-        from a prior session's GPU cache would be indistinguishable
-        from a fresh one and could trip the Receive LED prematurely.
-
-        No state is mutated — ``_cached_dets`` is left untouched, the
-        VLM state machine is not bumped, and the regular results-tick
-        loop is unaffected.
-        """
-        bundle, _, _ = self._latest()
-        if bundle is None:
-            return {"ok": False, "error": "no_frame"}
-        if self.detector is None:
-            return {"ok": False, "error": "detector_not_loaded"}
-
-        payload_dict = {
-            "type": "chain_verify",
-            "ok": True,
-            "ts_send_ns": int(time.time_ns()),
-        }
-        token = req.get("token") if isinstance(req, dict) else None
-        if token is not None:
-            payload_dict["token"] = token
-        payload = json.dumps(payload_dict).encode("utf-8")
-
-        with self._subscribers_lock:
-            addrs = [info["addr"] for info in self._subscribers.values()]
-        sent = 0
-        if addrs:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                for sub_addr in addrs:
-                    try:
-                        sock.sendto(payload, sub_addr)
-                        sent += 1
-                    except OSError:
-                        pass
-            finally:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-        return {"ok": True, "subscribers_notified": sent}
-
-    def _results_tick_loop(self) -> None:
-        """Build one payload per tick, send to each due subscriber. Reads
-        cached state under the existing _render_lock — no model calls in
-        this thread."""
-        push_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        period = 1.0 / max(self._RESULTS_TICK_HZ, 1e-6)
-        # Periodic stats — emitted every _RESULTS_LOG_PERIOD_S so the
-        # operator can see whether subscribers exist + whether sends are
-        # actually happening. Counts reset after each emit.
-        stats_period_s = 30.0
-        last_emit = time.monotonic()
-        ticks_run = 0
-        sends_done = 0
-        try:
-            while not self._stop_event.is_set() and not self._results_tick_stop.is_set():
-                t0 = time.monotonic()
-                sent_this_tick = self._tick_send_results(push_sock, t0)
-                ticks_run += 1
-                sends_done += sent_this_tick
-                if (t0 - last_emit) >= stats_period_s:
-                    with self._subscribers_lock:
-                        n_subs = len(self._subscribers)
-                    _log(
-                        f"results push: subs={n_subs} ticks={ticks_run} "
-                        f"sends={sends_done} window={t0 - last_emit:.0f}s"
-                    )
-                    last_emit = t0
-                    ticks_run = 0
-                    sends_done = 0
-                slept = time.monotonic() - t0
-                remaining = period - slept
-                if remaining > 0:
-                    time.sleep(remaining)
-        finally:
-            try:
-                push_sock.close()
-            except OSError:
-                pass
-
-    def _tick_send_results(self, push_sock: socket.socket, now: float) -> int:
-        """One pass: prune expired, build payload if any subscriber is due,
-        send. Returns the number of datagrams successfully transmitted on
-        this tick so _results_tick_loop can roll them up into the
-        periodic stats line."""
-        # Drop expired subscribers up front so we don't serialise for nobody.
-        with self._subscribers_lock:
-            for sid, info in list(self._subscribers.items()):
-                if info["expires_at"] < now:
-                    self._subscribers.pop(sid, None)
-            due = []
-            for sid, info in self._subscribers.items():
-                period = 1.0 / max(info["hz"], 1e-6)
-                if (now - info["last_sent_t"]) >= period:
-                    due.append((sid, info["addr"]))
-                    info["last_sent_t"] = now
-        if not due:
-            return 0
-        try:
-            payload_dict = self._build_vlm_results_payload()
-        except Exception as e:
-            # Always log payload build failures — silent failure here used
-            # to mask broken cached_dets contents and the panel just kept
-            # reporting "intake: connected" with no detections drawn.
-            _log(f"results push: payload build failed: {e}")
-            return 0
-        if payload_dict is None:
-            # No frame received from the relay yet. Pushing an empty
-            # placeholder (frame_idx=0, detections=[], …) would light
-            # the panel's Receive LED green before any real data has
-            # flowed end-to-end, breaking the chain-of-causation
-            # semantic the operator panel relies on. Skip until we
-            # have a real bundle.
-            return 0
-        payload = json.dumps(payload_dict, default=_json_default).encode("utf-8")
-        if len(payload) > 60 * 1024:
-            # UDP datagrams >~64 KB get IP-fragmented. Keep payloads small;
-            # the panel will fall back to the next tick.
-            _log(f"results push: payload {len(payload)} B exceeds 60 KB; skipping tick")
-            return 0
-        sent = 0
-        for _sid, addr in due:
-            try:
-                push_sock.sendto(payload, addr)
-                sent += 1
-            except OSError:
-                pass
-        return sent
-
-    def _build_vlm_results_payload(self) -> Optional[dict]:
-        """Snapshot the current detection / hit / fixation / decision state
-        as the JSON push payload defined in Render_Layer_Refactor.md §3.
-
-        Returns ``None`` when no frame has been received yet from the
-        upstream relay (``bundle is None``). The tick-send loop skips
-        the broadcast in that case so subscribers never see a placeholder
-        payload before real data is flowing — the panel's "Receive" LED
-        is gated on actual content under the chain-of-causation semantic.
-        """
-        bundle, fix, _ = self._latest()
-        if bundle is None:
-            return None
-        with self._render_lock:
-            dets = list(self._cached_dets)
-            hit_det = self._cached_hit_det
-            hit_wp = self._cached_hit_wp
-            state = self._vlm_state
-            decision = self._last_decision
-            first_det = self._first_snap_det
-
-        # Skip the push when nothing has happened yet on the GPU side
-        # (no detections cached, no hit, no fixation, no decision, no
-        # first-snap object, and we're still in IDLE). Without this,
-        # the very first frame after Connect would trigger a fully-
-        # default "vlm_results" datagram that lights the panel's
-        # Receive LED before any real compute has run — breaking the
-        # operator's chain-of-causation expectation. The chain_verify
-        # command provides the affirmative verification path; idle
-        # ticks stay silent.
-        fix_active = fix is not None and getattr(fix, "active", False)
-        if (not dets and hit_det is None and not fix_active
-                and decision is None and first_det is None
-                and state == "IDLE"):
-            return None
-
-        detections_out = [_serialize_detection_for_push(d) for d in dets]
-        hit_payload = None
-        if hit_det is not None:
-            hit_id = next((i for i, d in enumerate(dets) if d is hit_det), -1)
-            wp_pixel = (hit_wp or {}).get("pixel_center") if isinstance(hit_wp, dict) else None
-            hit_payload = {
-                "det_id": hit_id,
-                "waypoint": list(wp_pixel) if wp_pixel is not None else None,
-                "label": getattr(hit_det, "label", None),
-            }
-
-        fixation_payload = None
-        if fix is not None and getattr(fix, "active", False):
-            duration_ns = int(getattr(fix, "duration_ns", 0))
-            fx = float(bundle.gaze.x) if bundle is not None else None
-            fy = float(bundle.gaze.y) if bundle is not None else None
-            fixation_payload = {
-                "active": True,
-                "duration_ms": duration_ns / 1_000_000.0,
-                "x": fx,
-                "y": fy,
-                "stable": bool(getattr(fix, "is_stable", False)),
-            }
-
-        depth_at_gaze_m = None
-        if isinstance(decision, dict):
-            depth_at_gaze_m = decision.get("depth_at_gaze_m")
-
-        first_object_payload = None
-        if first_det is not None:
-            first_object_payload = _serialize_detection_for_push(first_det)
-
-        return {
-            "type": "vlm_results",
-            "frame_idx": int(getattr(getattr(bundle, "video", None), "frame_idx", 0)) if bundle is not None else 0,
-            "frame_ts_ns": int(getattr(getattr(bundle, "video", None), "timestamp_ns", 0)) if bundle is not None else 0,
-            "ts_send_ns": int(time.time_ns()),
-            "detections": detections_out,
-            "hit": hit_payload,
-            "fixation": fixation_payload,
-            "decision": _serialize_decision_for_push(decision) if isinstance(decision, dict) else None,
-            "depth_at_gaze_m": depth_at_gaze_m,
-            "vlm_state": state,
-            "first_object": first_object_payload,
-            "gaze_px": [float(bundle.gaze.x), float(bundle.gaze.y)] if bundle is not None else None,
-        }
-
-# Wire-protocol JSON serialization helpers extracted into vlm/wire.py
-# (behaviour-preserving — re-imported so _cmd_segment / results-push callers
-# reference them as bare names exactly as before).
-from vlm.wire import (
-    _json_default,
-    _serialize_detection_for_push,
-    _serialize_decision_for_push,
-)
+# Wire-protocol JSON serialization helper extracted into vlm/wire.py
+# (behaviour-preserving — re-imported so _send references it as a bare name
+# exactly as before). The detection/decision serializers also live there but are
+# now imported directly by vlm/results_pusher.py, the only remaining caller.
+from vlm.wire import _json_default
 
 
 def _open_service_log_file(arg_value):
@@ -1797,7 +1269,7 @@ def main() -> None:
     service.start_frame_thread()
     # Always run the JSON push loop. Subscribers self-register; if none ever
     # subscribe the loop is essentially idle (one prune pass per tick).
-    service.start_results_push()
+    service.results_pusher.start()
 
     # Keep Windows awake while the service runs (no-op on POSIX). Without
     # this an unattended GPU host can sleep mid-session and the operator

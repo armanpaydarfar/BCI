@@ -1,7 +1,7 @@
 """
 test_seg_tracking.py — WS4 F3 temporal tracking/smoothing wiring.
 
-Exercises VLMService._apply_seg_tracking against the real (Tier-1, read-only)
+Exercises SegmentStream._apply_seg_tracking against the real (Tier-1, read-only)
 SimpleSORTTracker with synthetic detections — no FastSAM/Neon. Verifies the
 anti-flicker contract: min_hits-to-appear, stable track_id, mask preserved when
 present, box-only coasting through max_age, then expiry. Also pins the
@@ -21,12 +21,13 @@ import numpy as np  # noqa: E402
 
 from perception.object_detector import Detection  # noqa: E402
 from Utils.gaze.gaze_tracking import SimpleSORTTracker  # noqa: E402
-from vlm_service import VLMService  # noqa: E402
+from vlm.segment_stream import SegmentStream  # noqa: E402
 
 
 def _svc():
-    # The method reads no instance state, so skip __init__.
-    return VLMService.__new__(VLMService)
+    # _apply_seg_tracking now lives on the SegmentStream collaborator and reads
+    # no instance state, so skip __init__ (which would need a service back-ref).
+    return SegmentStream.__new__(SegmentStream)
 
 
 def _det(box=(10, 10, 50, 50), label="segment_0", conf=0.9):

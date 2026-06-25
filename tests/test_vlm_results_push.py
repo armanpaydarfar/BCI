@@ -8,9 +8,9 @@ table directly (mirroring serve_forever's flow), and verifies:
 
     1. cmd=subscribe registers a subscriber, returns subscriber_id + hz.
     2. cmd=unsubscribe with that id removes it.
-    3. _build_vlm_results_payload emits the schema documented in
+    3. results_pusher._build_vlm_results_payload emits the schema documented in
        Render_Layer_Refactor.md §3 and is JSON-serialisable.
-    4. _tick_send_results sends a UDP datagram to the subscribed addr at the
+    4. results_pusher._tick_send_results sends a UDP datagram to the subscribed addr at the
        requested hz and not faster (tick rate cap is honoured).
     5. Subscribers past their TTL are pruned without an explicit unsubscribe.
 
@@ -33,6 +33,7 @@ sys.path.insert(0, str(ROOT))
 import numpy as np  # noqa: E402
 
 from vlm_service import VLMService  # noqa: E402
+from vlm.results_pusher import ResultsPusher  # noqa: E402
 
 
 def _stub_args() -> types.SimpleNamespace:
@@ -117,7 +118,7 @@ def test_subscribe_unsubscribe_lifecycle() -> None:
     assert resp.get("ok") is True, "subscribe ok=True expected"
     sid = resp["subscriber_id"]
     assert isinstance(sid, str) and len(sid) >= 8, "subscriber_id missing/short"
-    assert resp["hz"] == VLMService._RESULTS_TICK_HZ, \
+    assert resp["hz"] == ResultsPusher._RESULTS_TICK_HZ, \
         f"hz should clamp to tick rate, got {resp['hz']}"
 
     # Idempotent re-subscribe from same addr returns same id.
@@ -136,7 +137,7 @@ def test_build_vlm_results_payload_schema() -> None:
     svc = _make_service()
 
     # 3. payload schema sanity.
-    payload = svc._build_vlm_results_payload()
+    payload = svc.results_pusher._build_vlm_results_payload()
     json.dumps(payload)  # must be JSON-serialisable end-to-end
     assert payload["type"] == "vlm_results", "type must be 'vlm_results'"
     assert payload["frame_idx"] == 42, "frame_idx mismatched"
@@ -168,7 +169,7 @@ def test_tick_send_results_emits_datagram_on_wire() -> None:
 
     tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        svc._tick_send_results(tx, time.monotonic())
+        svc.results_pusher._tick_send_results(tx, time.monotonic())
         data, _from = rx.recvfrom(65535)
         decoded = json.loads(data.decode("utf-8"))
         assert decoded["type"] == "vlm_results", "wire payload missing type"
@@ -198,7 +199,7 @@ def test_expired_subscriber_pruned() -> None:
     time.sleep(0.01)
     tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        svc._tick_send_results(tx, time.monotonic())
+        svc.results_pusher._tick_send_results(tx, time.monotonic())
     finally:
         tx.close()
     rx2.settimeout(0.1)
@@ -210,6 +211,6 @@ def test_expired_subscriber_pruned() -> None:
     finally:
         rx2.close()
         live_rx.close()
-    with svc._subscribers_lock:
-        n_left = len(svc._subscribers)
+    with svc.results_pusher._subscribers_lock:
+        n_left = len(svc.results_pusher._subscribers)
     assert n_left == 1, f"expired subscriber should be pruned; got {n_left}"
