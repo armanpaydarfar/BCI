@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import glob
 import os
-from typing import Callable, Optional
+from typing import Callable
 
 from PySide6.QtCore import QObject
 from PySide6.QtWidgets import (

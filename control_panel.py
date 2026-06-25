@@ -37,15 +37,15 @@ IMPORTANT:
 - NO --telemetry flag is passed (that caused argparse errors).
 """
 
-import os, sys, time, subprocess, json, threading
+import os, sys, time, subprocess
 
-from typing import Optional, Dict
+from typing import Dict
 
-from PySide6.QtCore import Qt, QTimer, QProcess, QByteArray, QSize, QThread
-from PySide6.QtGui import QAction, QClipboard, QTextCursor, QPixmap
+from PySide6.QtCore import QTimer, QProcess, QSize
+from PySide6.QtGui import QAction, QClipboard, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QComboBox, QCheckBox, QGridLayout, QLineEdit,
+    QLabel, QPushButton, QComboBox, QCheckBox, QGridLayout,
     QTextEdit, QGroupBox, QMessageBox, QSplitter, QToolBar, QStyle,
 )
 
@@ -65,7 +65,6 @@ from panel.gaze_controller import GazeController
 from panel.vlm_controller import VlmController
 from panel.runtime_config_controller import RuntimeConfigController
 from panel.log_file_controller import LogFileController
-from panel.ui_utils import _fixed_v
 from panel.constants import *  # noqa: F401,F403 — module-level paths + config-derived globals (see panel/constants.py __all__)
 # netutils' import-time block runs the LAN / Tailscale IP discovery + report
 # prints, exactly as they did at the top of this module before the extraction.
