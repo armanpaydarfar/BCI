@@ -96,11 +96,23 @@ class CalibrationController(QObject):
         hbtn_row.addStretch(1)
         hb.addLayout(hbtn_row)
 
-        # WS5 REV04 AprilTag gaze→robot calibration (HIL PASS 2026-06-24). The
-        # calibration button runs the swept capture + planar solve in one terminal
-        # using the verified rig config (config.APRILTAG_*); the control-test button
-        # drives the robot from the AprilTag calibration selected below (the dropdown
-        # lists runs/apriltag_*_calib.npz newest-first, so it defaults to the latest).
+        # WS5 REV05 AprilTag gaze→robot calibration (canonical 2026-06-25). Two-step
+        # flow (rev05 §3): (1) register the static world tags ONCE from a TOP-DOWN view
+        # (the geometry is accurate there; per-tag pose is oblique-biased from the
+        # seat), then (2) run the seated swept calibration against that saved map (board
+        # PnP recovers the seated pose). The control-test button drives the robot from
+        # the calibration selected below. Both dropdowns list runs/ newest-first, so
+        # they default to the latest after a Refresh.
+        wm_row = QHBoxLayout()
+        wm_row.addWidget(QLabel("World map:"))
+        self.cmb_world_map = QComboBox()
+        wm_row.addWidget(self.cmb_world_map, 1)
+        self.btn_refresh_world_maps = QPushButton("Refresh")
+        self.btn_refresh_world_maps.setMaximumWidth(90)
+        self.btn_refresh_world_maps.clicked.connect(self.on_refresh_world_maps)
+        wm_row.addWidget(self.btn_refresh_world_maps)
+        hb.addLayout(wm_row)
+
         atag_lib_row = QHBoxLayout()
         atag_lib_row.addWidget(QLabel("AprilTag calib:"))
         self.cmb_apriltag_calib = QComboBox()
@@ -112,17 +124,22 @@ class CalibrationController(QObject):
         hb.addLayout(atag_lib_row)
 
         atag_row = QHBoxLayout()
-        self.btn_run_apriltag_calibrate = QPushButton("Run AprilTag calibration")
+        self.btn_register_world = QPushButton("1. Register world map (top-down)")
+        self.btn_register_world.setMaximumWidth(240)
+        self.btn_register_world.clicked.connect(self.on_register_world_map)
+        self.btn_run_apriltag_calibrate = QPushButton("2. Run AprilTag calibration")
         self.btn_run_apriltag_calibrate.setMaximumWidth(220)
         self.btn_run_apriltag_calibrate.clicked.connect(self.on_run_apriltag_calibrate)
-        self.btn_run_apriltag_control = QPushButton("Run AprilTag control test")
+        self.btn_run_apriltag_control = QPushButton("3. Run AprilTag control test")
         self.btn_run_apriltag_control.setMaximumWidth(220)
         self.btn_run_apriltag_control.clicked.connect(self.on_run_apriltag_control_test)
+        atag_row.addWidget(self.btn_register_world)
         atag_row.addWidget(self.btn_run_apriltag_calibrate)
         atag_row.addWidget(self.btn_run_apriltag_control)
         atag_row.addStretch(1)
         hb.addLayout(atag_row)
         parent_layout.addWidget(harmony_box)
+        self.on_refresh_world_maps()      # populate from existing runs/ at startup
 
     # ----- Harmony calibration / online control -----
     def on_refresh_calibration_libs(self):
@@ -208,32 +225,85 @@ class CalibrationController(QObject):
             return ""
         return self.cmb_apriltag_calib.currentData() or ""
 
-    def on_run_apriltag_calibrate(self):
+    def on_refresh_world_maps(self):
+        """List runs/world_map_*.npz newest-first so the dropdown defaults to the most
+        recent top-down registration (rev05 §2A). The world tags are static, so a map
+        is reused across seated sessions until a tag is physically bumped."""
+        if not hasattr(self, "cmb_world_map"):
+            return
+        current = self.cmb_world_map.currentData()
+        self.cmb_world_map.clear()
+        maps = sorted(glob.glob(os.path.join(self._root, "runs", "world_map_*.npz")),
+                      key=os.path.getmtime, reverse=True)
+        if not maps:
+            self.cmb_world_map.addItem("No world maps — register one first", "")
+            self._log("Panel", f"[{self._ts()}] No world maps (runs/world_map_*.npz) "
+                      "yet — click 'Register world map (top-down)' first\n")
+            return
+        for m in maps:
+            self.cmb_world_map.addItem(os.path.basename(m), m)
+        if current:
+            idx = self.cmb_world_map.findData(current)
+            if idx >= 0:
+                self.cmb_world_map.setCurrentIndex(idx)
+        self._log("Panel", f"[{self._ts()}] World maps: {len(maps)} "
+                  f"(newest first → {os.path.basename(maps[0])})\n")
+
+    def _get_selected_world_map(self) -> str:
+        if not hasattr(self, "cmb_world_map"):
+            return ""
+        return self.cmb_world_map.currentData() or ""
+
+    def on_register_world_map(self):
+        """Step 1: register the static world tags from a TOP-DOWN view (camera only, no
+        robot) and save runs/world_map_<UTC>.npz (rev05 §2A). The geometry is accurate
+        near top-down; the seated sweep then recovers its pose against this map by board
+        PnP. Refresh the 'World map' dropdown when it finishes."""
         if not os.path.exists(self._apriltag_calibrate_py):
             QMessageBox.warning(self._parent, "Missing", f"Not found:\n{self._apriltag_calibrate_py}")
             return
-        # REV04 swept calibration + planar solve in one terminal, from the verified
-        # rig config (config.APRILTAG_*). The EE-point method + offset come from config
-        # so the operator switches recipes without retyping: the verified-good recipe is
-        # APRILTAG_EE_POINT_METHOD='rayplane' with a zero offset (re-confirmed on the rig
-        # 2026-06-25; 'pose'+offset regressed via single-EE-tag flips). --then-solve
-        # writes the *_calib.npz; the operator hits Refresh and the control-test button
-        # picks it up.
+        world = " ".join(str(int(i)) for i in getattr(self._hcfg, "APRILTAG_WORLD_TAG_IDS", [0, 1, 2, 3, 4]))
+        tag = float(getattr(self._hcfg, "APRILTAG_TAG_SIZE_M", 0.08))
+        cmd = (f'python -u "{self._apriltag_calibrate_py}" --stage register-world '
+               f'--world-tag-ids {world} --tag-size {tag} --out-dir runs')
+        self._spawn_external(cmd)
+        self._log("Panel", f"[{self._ts()}] Launched world-map registration — stand "
+                  "TOP-DOWN over the table (no robot needed). Watch the corner read "
+                  "~90° → GOOD, then click Refresh next to 'World map'.\n")
+
+    def on_run_apriltag_calibrate(self):
+        """Step 2 (rev05 §3): seated swept calibration against the selected top-down
+        world map. Board PnP recovers the seated pose from that map; coverage/display
+        are telemetry-anchored; --then-solve writes the *_calib.npz the control-test
+        button picks up. The EE recipe comes from config (verified: pose + measured
+        offset, APRILTAG_EE_POINT_METHOD / APRILTAG_T_EETAG_EE_MM)."""
+        if not os.path.exists(self._apriltag_calibrate_py):
+            QMessageBox.warning(self._parent, "Missing", f"Not found:\n{self._apriltag_calibrate_py}")
+            return
+        world_map = self._get_selected_world_map()
+        if not world_map or not os.path.exists(world_map):
+            QMessageBox.warning(self._parent, "World map",
+                                "No world map selected. Click '1. Register world map "
+                                "(top-down)' first (stand over the table), then Refresh "
+                                "the 'World map' dropdown and select it.")
+            return
         world = " ".join(str(int(i)) for i in getattr(self._hcfg, "APRILTAG_WORLD_TAG_IDS", [0, 1, 2, 3, 4]))
         ee = " ".join(str(int(i)) for i in getattr(self._hcfg, "APRILTAG_EE_TAG_IDS", [5]))
         tag = float(getattr(self._hcfg, "APRILTAG_TAG_SIZE_M", 0.08))
         ee_tag = float(getattr(self._hcfg, "APRILTAG_EE_TAG_SIZE_M", 0.04))
-        method = getattr(self._hcfg, "APRILTAG_EE_POINT_METHOD", "rayplane")
-        off = list(getattr(self._hcfg, "APRILTAG_T_EETAG_EE_MM", [0.0, 0.0, 0.0]))
-        # --side defaults to env HARMONY_ACTIVE_SIDE or 'R' in the tool itself.
+        method = getattr(self._hcfg, "APRILTAG_EE_POINT_METHOD", "pose")
+        off = list(getattr(self._hcfg, "APRILTAG_T_EETAG_EE_MM", [150.0, -200.0, 0.0]))
+        # --world-tag-ids still satisfies the sweep's arg check; the loaded map's ids
+        # take over for recovery. --side defaults to env HARMONY_ACTIVE_SIDE / 'R'.
         cmd = (f'python -u "{self._apriltag_calibrate_py}" --stage sweep --with-robot '
-               f'--world-tag-ids {world} --ee-tag-ids {ee} '
+               f'--world-map "{world_map}" --world-tag-ids {world} --ee-tag-ids {ee} '
                f'--tag-size {tag} --ee-tag-size {ee_tag} '
                f'--ee-point-method {method} --t-eetag-ee {off[0]} {off[1]} {off[2]} '
                f'--out-dir runs --then-solve')
         self._spawn_external(cmd)
-        self._log("Panel", f"[{self._ts()}] Launched AprilTag calibration "
-                  f"(sweep → solve): world {world}, EE {ee}, method {method}, offset {off}\n")
+        self._log("Panel", f"[{self._ts()}] Launched AprilTag calibration (sweep → "
+                  f"solve) on {os.path.basename(world_map)}: EE {ee}, method {method}, "
+                  f"offset {off}. Refresh 'AprilTag calib' when done.\n")
 
     def on_run_apriltag_control_test(self):
         if not os.path.exists(self._apriltag_control_test_py):
