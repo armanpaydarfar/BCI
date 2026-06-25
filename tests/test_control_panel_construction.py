@@ -55,9 +55,9 @@ _EXPECTED_METHODS = [
     # (asserted by test_device_launchers_controller_wired below)
     # robot controls now live in panel.robot_controller.RobotController
     # (asserted by test_robot_controller_wired below)
-    # training / calibration
-    "on_run_harmony_calibration", "on_run_apriltag_control_test",
-    "_get_selected_apriltag_calib",
+    # harmony / AprilTag calibration now live in
+    # panel.calibration_controller.CalibrationController
+    # (asserted by test_calibration_controller_wired below)
     # external tools now live in panel.external_tools.ExternalToolsController
     # (asserted by test_external_tools_controller_wired below)
     # config read/write
@@ -167,3 +167,19 @@ def test_robot_controller_wired(panel):
     for m in ("on_init_robot", "on_robot_start", "on_robot_remove_overrides",
               "_on_robot_term_finished", "_update_robot_buttons_for_mode"):
         assert callable(getattr(panel.robot, m, None)), m
+
+
+def test_calibration_controller_wired(panel):
+    """The Harmony / AprilTag calibration QGroupBox + handlers were extracted into
+    a CalibrationController that owns its dropdowns; the panel holds it and the
+    controller built its widgets into the Robot Test tab during construction."""
+    from panel.calibration_controller import CalibrationController
+    assert isinstance(panel.calibration, CalibrationController)
+    for w in ("cmb_calibration_lib", "cmb_apriltag_calib",
+              "btn_run_harmony_calibration", "btn_run_apriltag_calibrate"):
+        assert getattr(panel.calibration, w, None) is not None, w
+    for m in ("on_refresh_calibration_libs", "_get_selected_calibration_library",
+              "on_run_harmony_calibration", "on_run_harmony_online_control",
+              "on_refresh_apriltag_calibs", "_get_selected_apriltag_calib",
+              "on_run_apriltag_calibrate", "on_run_apriltag_control_test"):
+        assert callable(getattr(panel.calibration, m, None)), m
