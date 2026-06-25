@@ -60,8 +60,9 @@ _EXPECTED_METHODS = [
     # (asserted by test_calibration_controller_wired below)
     # external tools now live in panel.external_tools.ExternalToolsController
     # (asserted by test_external_tools_controller_wired below)
-    # config read/write
-    "on_runtime_apply_config", "on_runtime_reload_config", "on_errp_config_apply",
+    # runtime-config / ErrP-config / model-training now live in
+    # panel.runtime_config_controller.RuntimeConfigController
+    # (asserted by test_runtime_config_controller_wired below)
     # mode / driver / subject
     "on_mode_changed", "on_save_subject", "_set_cmds_for_mode_and_driver",
     # vlm frame-relay state machine
@@ -187,6 +188,25 @@ def test_gaze_controller_wired(panel):
               "_start_gaze_service", "_gaze_udp_request",
               "_format_gaze_telemetry_line", "_ensure_gaze_paths"):
         assert callable(getattr(panel.gaze, m, None)), m
+
+
+def test_runtime_config_controller_wired(panel):
+    """The Runtime-config / ErrP-config editor tabs + the Model-training box (and
+    their config read/write + training-launch handlers) were extracted into a
+    RuntimeConfigController that owns those widgets; the panel holds it and the
+    controller built its widgets during construction."""
+    from panel.runtime_config_controller import RuntimeConfigController
+    assert isinstance(panel.runtime_config, RuntimeConfigController)
+    # build_tabs() + build_training_box() ran during _build_ui → the controller
+    # owns its widgets.
+    for w in ("rc_decoder", "rc_arduino_baud", "errp_backend",
+              "cmb_train_script", "lst_training_files", "btn_launch_training"):
+        assert getattr(panel.runtime_config, w, None) is not None, w
+    for m in ("on_runtime_reload_config", "on_runtime_apply_config",
+              "on_errp_config_reload", "on_errp_config_apply",
+              "on_refresh_training_data_list", "on_launch_model_training",
+              "_populate_training_script_combo", "_update_train_cmd_preview"):
+        assert callable(getattr(panel.runtime_config, m, None)), m
 
 
 def test_calibration_controller_wired(panel):
