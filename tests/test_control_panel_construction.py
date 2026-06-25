@@ -45,8 +45,8 @@ _EXPECTED_METHODS = [
     "_append_log", "_set_led", "_refresh_log_view",
     # process management now lives in panel.process_manager.ProcessManager
     # (asserted by test_process_manager_collaborator_wired below)
-    # log files
-    "_open_vlm_log_file", "_open_relay_log_file", "_relay_log_callback",
+    # log files now live in panel.log_file_controller.LogFileController
+    # (asserted by test_log_file_controller_wired below)
     # arduino / serial now lives in panel.serial_controller.SerialController
     # (asserted by test_serial_controller_wired below)
     # gaze controls now live in panel.gaze_controller.GazeController
@@ -188,6 +188,22 @@ def test_gaze_controller_wired(panel):
               "_start_gaze_service", "_gaze_udp_request",
               "_format_gaze_telemetry_line", "_ensure_gaze_paths"):
         assert callable(getattr(panel.gaze, m, None)), m
+
+
+def test_log_file_controller_wired(panel):
+    """The subject-tied VLM-panel + frame-relay log files (their open/close/rotate
+    logic + the relay log callback) were extracted into a LogFileController that
+    owns the file handles; the panel holds it and tees its log buffers through the
+    controller's handles. The files opened during __init__."""
+    from panel.log_file_controller import LogFileController
+    assert isinstance(panel.log_files, LogFileController)
+    # The handle attributes the panel's _append_log tees to must exist (open or
+    # None depending on whether DATA_DIR resolved under the test config).
+    assert hasattr(panel.log_files, "vlm_log_fh")
+    assert hasattr(panel.log_files, "relay_log_fh")
+    for m in ("open_vlm", "close_vlm", "open_relay", "close_relay",
+              "relay_callback"):
+        assert callable(getattr(panel.log_files, m, None)), m
 
 
 def test_runtime_config_controller_wired(panel):
