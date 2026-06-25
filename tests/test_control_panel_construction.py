@@ -43,8 +43,8 @@ pytestmark = pytest.mark.slow
 _EXPECTED_METHODS = [
     # logging / status
     "_append_log", "_set_led", "_refresh_log_view",
-    # process management
-    "_start_proc", "_stop_proc", "_on_finished",
+    # process management now lives in panel.process_manager.ProcessManager
+    # (asserted by test_process_manager_collaborator_wired below)
     # log files
     "_open_vlm_log_file", "_open_relay_log_file", "_relay_log_callback",
     # arduino / serial
@@ -104,3 +104,11 @@ def test_constructs_headless(panel):
 def test_all_grouped_methods_resolve(panel):
     missing = [m for m in _EXPECTED_METHODS if not callable(getattr(panel, m, None))]
     assert not missing, f"methods missing after extraction: {missing}"
+
+
+def test_process_manager_collaborator_wired(panel):
+    """Subprocess lifecycle was extracted into a ProcessManager collaborator;
+    the panel must hold it and delegate through it."""
+    from panel.process_manager import ProcessManager
+    assert isinstance(panel.procs, ProcessManager)
+    assert callable(panel.procs.start) and callable(panel.procs.stop)

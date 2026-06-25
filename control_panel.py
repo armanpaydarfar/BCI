@@ -37,7 +37,7 @@ IMPORTANT:
 - NO --telemetry flag is passed (that caused argparse errors).
 """
 
-import os, sys, shlex, time, re, tempfile, socket, subprocess, json, threading, glob
+import os, sys, time, re, tempfile, socket, subprocess, json, threading, glob
 import serial
 import serial.tools.list_ports
 
@@ -47,7 +47,6 @@ try:
 except ImportError:
     ARDUINO_PORT = ""
 
-from dataclasses import dataclass, field
 from typing import Optional, Dict
 
 from PySide6.QtCore import Qt, QTimer, QProcess, QByteArray, QSize, QThread, Signal
@@ -59,6 +58,8 @@ from PySide6.QtWidgets import (
     QScrollArea, QFormLayout, QDoubleSpinBox, QSpinBox,
     QListWidget, QSizePolicy,
 )
+
+from panel.process_manager import Proc, ProcessManager
 
 
 def _fixed_v(widget: QWidget) -> QWidget:
@@ -578,18 +579,6 @@ def _is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
         return True
 
 # ----------------- Process model -----------------
-@dataclass
-class Proc:
-    name: str
-    cmd: Optional[str]
-    cwd: str
-    env: Dict[str, str] = field(default_factory=dict)
-    q: Optional[QProcess] = None
-    status: str = "stopped"  # stopped|starting|running|error
-    pid: Optional[int] = None
-    out: bytearray = field(default_factory=bytearray)
-    err: bytearray = field(default_factory=bytearray)
-
 # ----------------- Main Window -----------------
 class ControlPanel(QMainWindow):
     # Emitted by the off-thread remote-status worker. Marshals the UDP
@@ -648,7 +637,15 @@ class ControlPanel(QMainWindow):
         except Exception:
             self.serial_baudrate = "9600"
 
-        # Procs (QProcess-managed)
+        # Procs (QProcess-managed). ProcessManager owns their QProcess lifecycle
+        # and reports status back through the panel's log/LED callbacks.
+        self.procs = ProcessManager(
+            self,
+            log=self._append_log,
+            set_led=self._set_led,
+            render_combined=self._render_combined_log,
+            timestamp=self._ts,
+        )
         self.marker = Proc("Marker Stream", f'python -u "{MARKER_PY}"', ROOT)
         self.driver = Proc("Experiment Driver", None, ROOT)
         self.fes    = Proc("FES Listener", f'python -u "{FES_PY}"', ROOT)
@@ -1548,12 +1545,12 @@ class ControlPanel(QMainWindow):
             f"[{self._ts()}] starting separated relay (decode isolated): "
             f"{self.frame_relay_proc.cmd}\n",
         )
-        self._start_proc(self.frame_relay_proc, None, "Relay")
+        self.procs.start(self.frame_relay_proc, None, "Relay")
 
     def _stop_relay_subprocess(self) -> None:
         """Terminate the separated relay child process if running."""
         if self.frame_relay_proc.q is not None:
-            self._stop_proc(self.frame_relay_proc, None, "Relay")
+            self.procs.stop(self.frame_relay_proc, None, "Relay")
 
     def _on_handshake_observed(self, addr) -> None:
         """Slot for VLMSceneWidget.handshake_observed. The relay has
@@ -2287,9 +2284,9 @@ class ControlPanel(QMainWindow):
 
     # ----- Marker -----
     def on_marker_start(self):
-        self._start_proc(self.marker, self.lbl_marker, "Marker")
+        self.procs.start(self.marker, self.lbl_marker, "Marker")
     def on_marker_stop(self):
-        self._stop_proc(self.marker, self.lbl_marker, "Marker")
+        self.procs.stop(self.marker, self.lbl_marker, "Marker")
     def on_marker_refresh(self):
         self.on_marker_stop()
         time.sleep(0.1)
@@ -2301,9 +2298,9 @@ class ControlPanel(QMainWindow):
         if not os.path.exists(FES_PY):
             QMessageBox.warning(self, "Missing", f"Not found:\n{FES_PY}")
             return
-        self._start_proc(self.fes, self.lbl_fes, "FES")
+        self.procs.start(self.fes, self.lbl_fes, "FES")
     def on_fes_stop(self):
-        self._stop_proc(self.fes, self.lbl_fes, "FES")
+        self.procs.stop(self.fes, self.lbl_fes, "FES")
     def on_fes_refresh(self):
         self.on_fes_stop()
         time.sleep(0.1)
@@ -2324,11 +2321,11 @@ class ControlPanel(QMainWindow):
         # Runner: UI + prints for testing, but logs are captured into View: Gaze.
         neon_arg = f'--neon-device-host "{NEON_COMPANION_HOST}"' if NEON_COMPANION_HOST else ""
         self.gaze_runner.cmd = f'python -u "{GAZE_RUNNER_PY}" --mode runner --display 1 --prints 1 {neon_arg}'
-        self._start_proc(self.gaze_runner, None, "Gaze")
+        self.procs.start(self.gaze_runner, None, "Gaze")
         self._append_log("Gaze", f"[{self._ts()}] Runner start requested\n")
 
     def on_gaze_runner_stop(self):
-        self._stop_proc(self.gaze_runner, None, "Gaze")
+        self.procs.stop(self.gaze_runner, None, "Gaze")
 
     def on_gaze_service_start_headless(self):
         self._start_gaze_service(display=0)
@@ -2370,11 +2367,11 @@ class ControlPanel(QMainWindow):
             f'--host {GAZE_BIND_HOST} --port {int(GAZE_SERVICE_PORT)} '
             f'--udp_log 1 --udp_log_hz 50 {neon_arg} {remote_arg}'
         )
-        self._start_proc(self.gaze_service, self.lbl_gaze_service, "Gaze")
+        self.procs.start(self.gaze_service, self.lbl_gaze_service, "Gaze")
         self._append_log("Gaze", f"[{self._ts()}] Service start requested (display={display})\n")
 
     def on_gaze_service_stop(self):
-        self._stop_proc(self.gaze_service, self.lbl_gaze_service, "Gaze")
+        self.procs.stop(self.gaze_service, self.lbl_gaze_service, "Gaze")
 
     def on_gaze_service_query(self):
         import threading
@@ -2728,7 +2725,7 @@ class ControlPanel(QMainWindow):
             f'--model {VLM_MODEL} {device_flag} '
             f'{depth_flag} {session_arg} {remote_arg}'
         )
-        self._start_proc(self.vlm_service, self.lbl_compute_led, "VLM")
+        self.procs.start(self.vlm_service, self.lbl_compute_led, "VLM")
         self._append_log(
             "VLM",
             f"[{self._ts()}] Service start requested "
@@ -2757,7 +2754,7 @@ class ControlPanel(QMainWindow):
             self._vlm_udp_request({"cmd": "stop"}, timeout_s=0.5)
         except Exception:
             pass
-        self._stop_proc(self.vlm_service, self.lbl_compute_led, "VLM")
+        self.procs.stop(self.vlm_service, self.lbl_compute_led, "VLM")
         # Belt-and-suspenders: reap any surviving orphan regardless.
         _kill_orphan_vlm_service()
         self._on_vlm_video_disconnect()
@@ -3301,10 +3298,10 @@ class ControlPanel(QMainWindow):
             if not (self.fes.q and self.fes.q.state() != QProcess.NotRunning):
                 QMessageBox.warning(self, "Gating", "FES is enabled but not running. Start FES first.")
                 return
-        self._start_proc(self.driver, self.lbl_driver, "Driver")
+        self.procs.start(self.driver, self.lbl_driver, "Driver")
 
     def on_driver_stop(self):
-        self._stop_proc(self.driver, self.lbl_driver, "Driver")
+        self.procs.stop(self.driver, self.lbl_driver, "Driver")
 
     # ----- Robot (no polling) -----
     def on_init_robot(self):
@@ -3415,142 +3412,6 @@ class ControlPanel(QMainWindow):
         self.eego_term.setArguments(["--wait", "--", "bash", "-lc", "eegoSports"])
         self.eego_term.start()
 
-    def _on_gaze_ready_read(self, p: Proc):
-        # MergedChannels → readAll() gets stdout + stderr in order
-        data: QByteArray = p.q.readAll()
-        if not data:
-            return
-        try:
-            txt = bytes(data).decode("utf-8", errors="replace")
-        except Exception:
-            txt = "<binary>\n"
-        self._append_log("Gaze", txt)
-    # ---------- Process helpers ----------
-    def _start_proc(self, p: Proc, led: Optional[QLabel], title: str):
-        if p.cmd is None:
-            QMessageBox.information(self, "Disabled", f"{p.name} is disabled for this mode.")
-            return
-        if p.q and p.q.state() != QProcess.NotRunning:
-            return
-
-        q = QProcess(self)
-
-        # ✅ Gaze: merge stdout+stderr and stream like a terminal
-        is_gaze = (title == "Gaze")
-        if is_gaze:
-            q.setProcessChannelMode(QProcess.MergedChannels)
-
-        parts = shlex.split(p.cmd)
-        q.setProgram(parts[0])
-        q.setArguments(parts[1:])
-        q.setWorkingDirectory(p.cwd)
-
-        env = os.environ.copy()
-        env.update(p.env)
-        from PySide6.QtCore import QProcessEnvironment
-        qenv = QProcessEnvironment()
-        for k, v in env.items():
-            qenv.insert(k, v)
-        q.setProcessEnvironment(qenv)
-
-        q.started.connect(lambda: self._on_started(p, led, title))
-        q.finished.connect(lambda code, status: self._on_finished(p, led, title, code, status))
-        # Without errorOccurred, a FailedToStart (e.g. program not on PATH) is
-        # silent — the panel shows "start requested" with no STARTED/FINISHED.
-        q.errorOccurred.connect(
-            lambda err: self._append_log(
-                title,
-                f"[{self._ts()}] QProcess error: {err} (program={parts[0]!r})\n",
-            )
-        )
-
-        if is_gaze:
-            # single unified stream
-            q.readyRead.connect(lambda: self._on_gaze_ready_read(p))
-        else:
-            q.readyReadStandardOutput.connect(lambda: self._on_stdout(p, title))
-            q.readyReadStandardError.connect(lambda: self._on_stderr(p, title))
-
-        p.out.clear()
-        p.err.clear()
-        p.q = q
-        p.status = "starting"
-        if led is not None:
-            self._set_led(led, "starting")
-
-        q.start()
-
-    def _stop_proc(self, p: Proc, led: Optional[QLabel], title: str):
-        if not p.q:
-            p.status = "stopped"
-            if led is not None:
-                self._set_led(led, "stopped")
-            return
-        # Drop signal connections first so a late-fired finished/errorOccurred
-        # during/after window teardown can't call back into deleted widgets.
-        try:
-            p.q.disconnect()
-        except Exception:
-            pass
-        if p.q.state() != QProcess.NotRunning:
-            p.q.terminate()
-            if not p.q.waitForFinished(1500):
-                p.q.kill(); p.q.waitForFinished(1500)
-        p.status = "stopped"; p.pid = None
-        if led is not None:
-            self._set_led(led, "stopped")
-        self._append_log(title, f"[{self._ts()}] STOPPED\n")
-
-    def _on_started(self, p: Proc, led: Optional[QLabel], title: str):
-        p.status = "running"; p.pid = p.q.processId()
-        if led is not None:
-            self._set_led(led, "running")
-        self._append_log(title, f"[{self._ts()}] STARTED pid={p.pid} cmd={p.cmd}\n")
-
-    def _on_finished(self, p: Proc, led: Optional[QLabel], title: str, code: int, status):
-        p.pid = None
-        p.status = "stopped" if code == 0 else "error"
-        if led is not None:
-            self._set_led(led, p.status)
-        self._append_log(title, f"[{self._ts()}] FINISHED code={code}\n")
-
-    def _on_stdout(self, p: Proc, title: str):
-        data: QByteArray = p.q.readAllStandardOutput()
-        chunk = bytes(data)
-        if not chunk:
-            return
-
-        # For Gaze: stream append so it behaves like a terminal
-        if title == "Gaze":
-            try:
-                txt = chunk.decode("utf-8", errors="replace")
-            except Exception:
-                txt = "<binary>\n"
-            self._append_log("Gaze", txt)
-            return
-
-        # default behavior (unchanged for other procs)
-        p.out.extend(chunk)
-        self._render_combined_log(title, p)
-
-
-    def _on_stderr(self, p: Proc, title: str):
-        data: QByteArray = p.q.readAllStandardError()
-        chunk = bytes(data)
-        if not chunk:
-            return
-
-        if title == "Gaze":
-            try:
-                txt = chunk.decode("utf-8", errors="replace")
-            except Exception:
-                txt = "<binary>\n"
-            # keep stderr visible but clearly marked
-            self._append_log("Gaze", txt)
-            return
-
-        p.err.extend(chunk)
-        self._render_combined_log(title, p)
     # ---------- Log helpers ----------
     def _on_log_target_changed(self, target: str):
         self._current_log_target = target
@@ -3798,7 +3659,7 @@ class ControlPanel(QMainWindow):
             (self.vlm_service, self.lbl_compute_led, "VLM"),
         ):
             try:
-                self._stop_proc(p, led, title)
+                self.procs.stop(p, led, title)
             except Exception:
                 pass
         # Belt-and-suspenders: same reap as on_vlm_service_stop, in case the
