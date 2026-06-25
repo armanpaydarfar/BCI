@@ -285,6 +285,11 @@ def _gaze_loop(
             continue
         if g is None:
             continue
+        # Sample local_clock the instant the datum arrives — before the depth
+        # math below — so the device->LSL offset is anchored as close to
+        # acquisition as possible (every µs of intervening work inflates the
+        # measured receive latency).
+        recv_lsl = pylsl.local_clock()
 
         # depth_cm from vergence — same computation as
         # GazeSystem (vergence_depth_from_eyestate), inlined so the
@@ -339,7 +344,7 @@ def _gaze_loop(
         # local_clock) before the offset is established or if the device time
         # is missing.
         dev_unix = sample[4]
-        clock.observe(dev_unix, pylsl.local_clock())
+        clock.observe(dev_unix, recv_lsl)
         ts_lsl = clock.to_lsl(dev_unix)
         try:
             outlet.push_sample(sample, timestamp=ts_lsl if ts_lsl is not None else 0.0)
