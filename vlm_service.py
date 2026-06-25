@@ -803,35 +803,40 @@ class VLMService:
             )
         return hit_det, hit_waypoint
 
-    def _cmd_decide(self, req: dict) -> dict:
+    def _segment_depth_waypoints(self, frame_bgr, gaze_xy, *, apply_constraints: bool, depth_log_tag: str):
+        """Shared segment → depth → 3D-waypoints → gaze hit-test pipeline behind
+        both the decide path and the two-object (capture/pair) path.
+
+        Returns ``(dets, waypoints_out, depth_at_gaze, hit_det, hit_waypoint)``.
+
+        ``apply_constraints`` gates the F1 ``_apply_seg_constraints`` filter — the
+        ONE behavioural divergence between the two former copies, now an explicit
+        flag rather than two drifting code paths:
+          * decide path (True): filter detections BEFORE computing waypoints /
+            hit-testing / reasoning, so everything downstream sees one set.
+          * capture/pair path (False): no filter — waypoint + hit-test every det.
+        """
         # Import here so this file parses even if harmony_vlm utils aren't loaded
         from perception.object_detector import compute_3d_waypoints
 
-        cmd_t0 = time.time()
-        bundle, fix, _ = self._latest()
-        if bundle is None:
-            _log("decide: no_frame")
-            return {"ok": False, "error": "no_frame"}
-
-        gaze_xy = (float(bundle.gaze.x), float(bundle.gaze.y))
-        _log(f"decide IN: gaze=({gaze_xy[0]:.0f},{gaze_xy[1]:.0f})")
-        dets = self.detector.detect(bundle.video.bgr)
+        dets = self.detector.detect(frame_bgr)
 
         waypoints_out: list[dict] = []
-        depth_at_gaze_m: Optional[float] = None
+        depth_at_gaze: Optional[float] = None
         if self.depth_estimator is not None:
             _depth_t0 = time.time()
             depth_map, _ = self.depth_estimator.estimate(
-                bundle.video.bgr, f_px=self._focal_px(), gaze_xy=gaze_xy,
+                frame_bgr, f_px=self._focal_px(), gaze_xy=gaze_xy,
             )
             _depth_elapsed_ms = (time.time() - _depth_t0) * 1000.0
-            # F1 constraints (no-op unless enabled). Depth map is available
-            # here, so the depth-band constraint can run; filter before
-            # waypoints/hit-test/reasoning so all downstream sees the same set.
-            dets = _apply_seg_constraints(
-                dets, bundle.video.bgr.shape, self._seg_constraints,
-                depth_map=depth_map, gaze_xy=gaze_xy,
-            )
+            if apply_constraints:
+                # F1 constraints (no-op unless enabled). Depth map is available
+                # here, so the depth-band constraint can run; filter before
+                # waypoints/hit-test/reasoning so all downstream sees the same set.
+                dets = _apply_seg_constraints(
+                    dets, frame_bgr.shape, self._seg_constraints,
+                    depth_map=depth_map, gaze_xy=gaze_xy,
+                )
             K = self.reader.camera_matrix
             wps = compute_3d_waypoints(dets, depth_map, K)
             waypoints_out = [
@@ -846,20 +851,34 @@ class VLMService:
             h, w = depth_map.shape[:2]
             gx = int(np.clip(round(gaze_xy[0]), 0, w - 1))
             gy = int(np.clip(round(gaze_xy[1]), 0, h - 1))
-            depth_at_gaze_m = float(depth_map[gy, gx])
-            _log(f"  depth (in-decide): shape={depth_map.shape[0]}x{depth_map.shape[1]} "
-                 f"at_gaze={depth_at_gaze_m:.2f}m elapsed={_depth_elapsed_ms:.0f}ms")
-        else:
+            depth_at_gaze = float(depth_map[gy, gx])
+            _log(f"  depth ({depth_log_tag}): shape={depth_map.shape[0]}x{depth_map.shape[1]} "
+                 f"at_gaze={depth_at_gaze:.2f}m elapsed={_depth_elapsed_ms:.0f}ms")
+        elif apply_constraints:
             # No depth estimator: apply the geometry + gaze-ROI constraints
             # (depth-band needs a depth map and is silently skipped here).
             dets = _apply_seg_constraints(
-                dets, bundle.video.bgr.shape, self._seg_constraints, gaze_xy=gaze_xy,
+                dets, frame_bgr.shape, self._seg_constraints, gaze_xy=gaze_xy,
             )
 
-        # Pick the detection whose bbox contains the gaze, paired to its
-        # waypoint by label (positional zip is unsafe — see
-        # _hit_det_and_waypoint).
         hit_det, hit_waypoint = self._hit_det_and_waypoint(dets, waypoints_out, gaze_xy)
+        return dets, waypoints_out, depth_at_gaze, hit_det, hit_waypoint
+
+    def _cmd_decide(self, req: dict) -> dict:
+        cmd_t0 = time.time()
+        bundle, fix, _ = self._latest()
+        if bundle is None:
+            _log("decide: no_frame")
+            return {"ok": False, "error": "no_frame"}
+
+        gaze_xy = (float(bundle.gaze.x), float(bundle.gaze.y))
+        _log(f"decide IN: gaze=({gaze_xy[0]:.0f},{gaze_xy[1]:.0f})")
+
+        # Shared pipeline; apply_constraints=True filters detections before
+        # waypoints/hit-test/reasoning (the decide-path divergence).
+        dets, waypoints_out, depth_at_gaze_m, hit_det, hit_waypoint = self._segment_depth_waypoints(
+            bundle.video.bgr, gaze_xy, apply_constraints=True, depth_log_tag="in-decide",
+        )
 
         self._cache_dets(dets, hit_det, hit_waypoint)
 
@@ -901,38 +920,12 @@ class VLMService:
 
         Returns native Detection objects (for passing into reason_async_pair)
         alongside JSON-safe waypoint dicts, so one call covers both the cache
-        payload and the UDP response payload.
+        payload and the UDP response payload. apply_constraints=False: unlike
+        the decide path, the two-object flow does NOT filter detections.
         """
-        from perception.object_detector import compute_3d_waypoints
-
-        dets = self.detector.detect(frame_bgr)
-
-        waypoints_out: list[dict] = []
-        depth_at_gaze: Optional[float] = None
-        if self.depth_estimator is not None:
-            _depth_t0 = time.time()
-            depth_map, _ = self.depth_estimator.estimate(
-                frame_bgr, f_px=self._focal_px(), gaze_xy=gaze_xy,
-            )
-            _depth_elapsed_ms = (time.time() - _depth_t0) * 1000.0
-            wps = compute_3d_waypoints(dets, depth_map, self.reader.camera_matrix)
-            waypoints_out = [
-                {
-                    "label": wp.label,
-                    "position_cam": list(wp.position_cam),
-                    "pixel_center": list(wp.pixel_center),
-                    "depth_median_m": wp.depth_median_m,
-                }
-                for wp in wps
-            ]
-            h, w = depth_map.shape[:2]
-            gx = int(np.clip(round(gaze_xy[0]), 0, w - 1))
-            gy = int(np.clip(round(gaze_xy[1]), 0, h - 1))
-            depth_at_gaze = float(depth_map[gy, gx])
-            _log(f"  depth (in-frame): shape={depth_map.shape[0]}x{depth_map.shape[1]} "
-                 f"at_gaze={depth_at_gaze:.2f}m elapsed={_depth_elapsed_ms:.0f}ms")
-
-        hit_det, hit_waypoint = self._hit_det_and_waypoint(dets, waypoints_out, gaze_xy)
+        dets, waypoints_out, depth_at_gaze, hit_det, hit_waypoint = self._segment_depth_waypoints(
+            frame_bgr, gaze_xy, apply_constraints=False, depth_log_tag="in-frame",
+        )
 
         return {
             "detections": dets,
