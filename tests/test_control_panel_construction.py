@@ -58,8 +58,8 @@ _EXPECTED_METHODS = [
     # training / calibration
     "on_run_harmony_calibration", "on_run_apriltag_control_test",
     "_get_selected_apriltag_calib",
-    # external tools
-    "on_open_labrec", "on_open_mne_viewer",
+    # external tools now live in panel.external_tools.ExternalToolsController
+    # (asserted by test_external_tools_controller_wired below)
     # config read/write
     "on_runtime_apply_config", "on_runtime_reload_config", "on_errp_config_apply",
     # mode / driver / subject
@@ -143,3 +143,14 @@ def test_device_launchers_controller_wired(panel):
               "on_fes_start", "on_fes_stop", "on_fes_refresh",
               "on_driver_start", "on_driver_stop"):
         assert callable(getattr(panel.devices, m, None)), m
+
+
+def test_external_tools_controller_wired(panel):
+    """The external-app launchers (LabRecorder / eegoSports / MNE / impedance /
+    STMsetup / initialize) were extracted into an ExternalToolsController that
+    owns the handlers + the labrec_term / eego_term handles; the panel holds it."""
+    from panel.external_tools import ExternalToolsController
+    assert isinstance(panel.external_tools, ExternalToolsController)
+    for m in ("on_initialize", "on_open_fes_cfg", "on_open_mne_viewer",
+              "on_open_impedance_monitor", "on_open_labrec", "on_open_eego"):
+        assert callable(getattr(panel.external_tools, m, None)), m

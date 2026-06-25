@@ -62,6 +62,7 @@ from panel.config_io import (
 
 from panel.serial_controller import SerialController
 from panel.device_launchers import DeviceLaunchersController
+from panel.external_tools import ExternalToolsController
 from panel.ui_utils import _fixed_v
 
 # ----------------- Paths & constants -----------------
@@ -415,8 +416,28 @@ class ControlPanel(QMainWindow):
 
         # Robot terminal
         self.robot_term: Optional[QProcess] = None
-        self.labrec_term: Optional[QProcess] = None
-        self.eego_term: Optional[QProcess] = None
+
+        # External-app launchers — ExternalToolsController owns the LabRecorder /
+        # eegoSports / MNE / impedance / STMsetup / initialize handlers and the
+        # labrec_term / eego_term QProcess handles. Its buttons live in several
+        # panel sections, so it builds no UI row; the panel wires each button's
+        # clicked to a handler here. The two status LEDs stay panel-built and are
+        # reached through getters.
+        _data_dir = os.path.expanduser(getattr(_HCFG, "DATA_DIR", "") or "") if _HCFG else ""
+        self.external_tools = ExternalToolsController(
+            self,
+            init_sh=INIT_SH,
+            stmsetup_py=STMSETUP_PY,
+            data_dir=_data_dir,
+            get_subject_text=lambda: (self.cmb_subject.currentText().strip() if hasattr(self, "cmb_subject") else ""),
+            get_training_subject=lambda: self.training_subject,
+            eego_led=lambda: self.lbl_eego,
+            labrec_led=lambda: self.lbl_labrec,
+            spawn_external=self._spawn_external,
+            log=self._append_log,
+            set_led=self._set_led,
+            timestamp=self._ts,
+        )
 
         # Logs
         self._log_buffers: Dict[str, str] = {"Marker": "", "FES": "", "Driver": "", "Gaze": "", "VLM": "", "Relay": "", "Robot": "", "Panel": ""}
@@ -538,7 +559,7 @@ class ControlPanel(QMainWindow):
         tb.setIconSize(QSize(18, 18))
         self.addToolBar(tb)
         act_init = QAction(self.style().standardIcon(QStyle.SP_ComputerIcon), "Initialize (open script)", self)
-        act_init.triggered.connect(self.on_initialize)
+        act_init.triggered.connect(self.external_tools.on_initialize)
         tb.addAction(act_init)
 
         tabs = QTabWidget()
@@ -599,7 +620,7 @@ class ControlPanel(QMainWindow):
         self.chk_fes.toggled.connect(self.on_fes_pref_toggled)
         btn_fes_cfg = QPushButton("Configure")
         btn_fes_cfg.setToolTip("Open STMsetup.py")
-        btn_fes_cfg.clicked.connect(self.on_open_fes_cfg)
+        btn_fes_cfg.clicked.connect(self.external_tools.on_open_fes_cfg)
         ff.addWidget(self.chk_fes); ff.addWidget(btn_fes_cfg)
         top.addWidget(gb_fes)
 
@@ -607,11 +628,11 @@ class ControlPanel(QMainWindow):
         gb_utils = QGroupBox("Utilities"); fu = QHBoxLayout(gb_utils)
         self.btn_mne = QPushButton("MNE Viewer")
         self.btn_mne.setToolTip("Open MNE-LSL viewer")
-        self.btn_mne.clicked.connect(self.on_open_mne_viewer)
+        self.btn_mne.clicked.connect(self.external_tools.on_open_mne_viewer)
         fu.addWidget(self.btn_mne)
         self.btn_impedance = QPushButton("Impedance")
         self.btn_impedance.setToolTip("Open impedance monitor")
-        self.btn_impedance.clicked.connect(self.on_open_impedance_monitor)
+        self.btn_impedance.clicked.connect(self.external_tools.on_open_impedance_monitor)
         fu.addWidget(self.btn_impedance)
         top.addWidget(gb_utils)
 
@@ -657,7 +678,7 @@ class ControlPanel(QMainWindow):
         grid.addWidget(QLabel("<b>eegoSports</b>"), row, 0)
         grid.addWidget(self.lbl_eego, row, 1)
         btn_eego = QPushButton("Open eegoSports")
-        btn_eego.clicked.connect(self.on_open_eego)
+        btn_eego.clicked.connect(self.external_tools.on_open_eego)
         grid.addWidget(btn_eego, row, 2)
         row += 1
 
@@ -669,7 +690,7 @@ class ControlPanel(QMainWindow):
         grid.addWidget(QLabel("<b>LabRecorder</b>"), row, 0)
         grid.addWidget(self.lbl_labrec, row, 1)
         btn_labrec = QPushButton("Open LabRecorder")
-        btn_labrec.clicked.connect(self.on_open_labrec)
+        btn_labrec.clicked.connect(self.external_tools.on_open_labrec)
         grid.addWidget(btn_labrec, row, 2)
         row += 1
 
@@ -1858,14 +1879,6 @@ class ControlPanel(QMainWindow):
             self.btn_robot_start.setToolTip("Open SSH terminal running the selected robot tool.")
 
     # ---------- Actions ----------
-    def on_initialize(self):
-        if not os.path.exists(INIT_SH):
-            QMessageBox.warning(self, "Missing", f"Not found:\n{INIT_SH}")
-            return
-        cmd = f'gnome-terminal -- bash -lc "chmod +x \\"{INIT_SH}\\"; \\"{INIT_SH}\\"; exec bash"'
-        subprocess.Popen(cmd, shell=True)
-        QMessageBox.information(self, "Initialize", "Opened initialize_devices.sh in a new terminal.")
-
     def on_mode_changed(self, text: str):
         self.mode = text
         sim_on = (self.mode == "Simulation")
@@ -1912,29 +1925,6 @@ class ControlPanel(QMainWindow):
         self.fes_enabled_pref = 1 if checked else 0
         write_fes_toggle(self.fes_enabled_pref)
         self._append_log("Panel", f"[{self._ts()}] FES_toggle set to {self.fes_enabled_pref}\n")
-
-    def on_open_fes_cfg(self):
-        if not os.path.exists(STMSETUP_PY):
-            QMessageBox.warning(self, "Missing", f"Not found:\n{STMSETUP_PY}")
-            return
-        self._spawn_external(f'python -u "{STMSETUP_PY}"')
-        self._append_log("Panel", f"[{self._ts()}] Opened STMsetup.py\n")
-
-    def on_open_mne_viewer(self):
-        self._spawn_external('mne-lsl viewer')
-        self._append_log("Panel", f"[{self._ts()}] Opened mne-lsl viewer\n")
-
-    def on_open_impedance_monitor(self):
-        sub = (self.cmb_subject.currentText().strip() if hasattr(self, "cmb_subject") else "") or self.training_subject
-        data_dir = os.path.expanduser(getattr(_HCFG, "DATA_DIR", "") or "") if _HCFG else ""
-        if data_dir and sub:
-            cmd = f'impedance-monitor --mode live --cap ca209 --subject "{sub}" --data-dir "{data_dir}"'
-        else:
-            # Fall back — the tool will default to ~/impedance_logs/
-            cmd = 'impedance-monitor --mode live --cap ca209'
-        self._spawn_external(cmd)
-        log_dir = os.path.join(data_dir, f"sub-{sub}", "impedance_logs") if data_dir and sub else "~/impedance_logs"
-        self._append_log("Panel", f"[{self._ts()}] Opened impedance monitor (logs → {log_dir})\n")
 
     # ----- Gaze (NEW) -----
     def _ensure_gaze_paths(self, which: str) -> bool:
@@ -2851,45 +2841,6 @@ class ControlPanel(QMainWindow):
         except Exception as e:
             self._append_log("Robot", f"[{self._ts()}] RemoveOverrides error: {e}\n")
             QMessageBox.warning(self, "Robot", f"RemoveOverrides failed:\n{e}")
-
-    # ----- External apps -----
-    def on_open_labrec(self):
-        if self.labrec_term and self.labrec_term.state() != QProcess.NotRunning:
-            return
-
-        self.labrec_term = QProcess(self)
-        self.labrec_term.started.connect(lambda: (
-            self._set_led(self.lbl_labrec, "running"),
-            self._append_log("Panel", f"[{self._ts()}] LabRecorder terminal opened\n")
-        ))
-        def _labrec_closed(code, status):
-            self._set_led(self.lbl_labrec, "stopped")
-            self._append_log("Panel", f"[{self._ts()}] LabRecorder terminal closed (code={code})\n")
-            self.labrec_term = None
-        self.labrec_term.finished.connect(_labrec_closed)
-
-        self.labrec_term.setProgram("gnome-terminal")
-        self.labrec_term.setArguments(["--wait", "--", "bash", "-lc", "LabRecorder"])
-        self.labrec_term.start()
-
-    def on_open_eego(self):
-        if self.eego_term and self.eego_term.state() != QProcess.NotRunning:
-            return
-
-        self.eego_term = QProcess(self)
-        self.eego_term.started.connect(lambda: (
-            self._set_led(self.lbl_eego, "running"),
-            self._append_log("Panel", f"[{self._ts()}] eegoSports terminal opened\n")
-        ))
-        def _eego_closed(code, status):
-            self._set_led(self.lbl_eego, "stopped")
-            self._append_log("Panel", f"[{self._ts()}] eegoSports terminal closed (code={code})\n")
-            self.eego_term = None
-        self.eego_term.finished.connect(_eego_closed)
-
-        self.eego_term.setProgram("gnome-terminal")
-        self.eego_term.setArguments(["--wait", "--", "bash", "-lc", "eegoSports"])
-        self.eego_term.start()
 
     # ---------- Log helpers ----------
     def _on_log_target_changed(self, target: str):
