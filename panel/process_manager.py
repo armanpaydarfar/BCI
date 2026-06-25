@@ -79,7 +79,13 @@ class ProcessManager(QObject):
         if is_gaze:
             q.setProcessChannelMode(QProcess.MergedChannels)
 
-        parts = shlex.split(p.cmd)
+        # shlex defaults to POSIX mode, which treats backslashes as escape
+        # characters and so mangles Windows paths — the python.exe in
+        # sys.executable becomes a non-existent path, QProcess FailedToStart,
+        # and no STARTED is ever logged. Gate on platform: Linux (the realtime
+        # host) keeps exact POSIX splitting; Windows (the dev box) parses
+        # backslash paths correctly.
+        parts = shlex.split(p.cmd, posix=(os.name != "nt"))
         q.setProgram(parts[0])
         q.setArguments(parts[1:])
         q.setWorkingDirectory(p.cwd)

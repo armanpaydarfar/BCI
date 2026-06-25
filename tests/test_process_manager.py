@@ -92,9 +92,14 @@ def test_real_subprocess_lifecycle(pm, qapp):
     led = object()
     p = Proc("Test", f'{sys.executable} -c "print(1)"', str(ROOT))
     pm.start(p, led, "Test")
-    # Synchronous side effects of start():
+    # Synchronous side effects of start(): start() sets status "starting" then
+    # calls q.start(). On Windows the QProcess `started` signal can fire before
+    # start() returns (the process launches faster than the signal is deferred),
+    # flipping status to "running" — so accept either. The "starting" LED is
+    # still recorded synchronously (before q.start()), so the transition intent
+    # is verified there regardless of the race.
     assert p.q is not None
-    assert p.status == "starting"
+    assert p.status in ("starting", "running")
     assert (led, "starting") in pm.sink.leds
     # Drive the process to completion and flush queued Qt slot calls.
     p.q.waitForStarted(3000)
