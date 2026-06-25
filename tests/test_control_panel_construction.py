@@ -51,8 +51,8 @@ _EXPECTED_METHODS = [
     # (asserted by test_serial_controller_wired below)
     # gaze controls
     "on_gaze_service_query", "_start_gaze_service", "_gaze_udp_request",
-    # marker / fes / driver
-    "on_marker_start", "on_fes_start", "on_driver_start",
+    # marker / fes / driver now live in panel.device_launchers.DeviceLaunchersController
+    # (asserted by test_device_launchers_controller_wired below)
     # robot controls
     "on_robot_start", "_update_robot_buttons_for_mode",
     # training / calibration
@@ -126,3 +126,20 @@ def test_serial_controller_wired(panel):
     for m in ("on_serial_refresh", "on_serial_test", "on_send_arduino_one",
               "on_save_serial_to_config"):
         assert callable(getattr(panel.serial, m, None)), m
+
+
+def test_device_launchers_controller_wired(panel):
+    """The Marker / FES / Driver launch rows + handlers were extracted into a
+    DeviceLaunchersController that owns those rows' widgets; the panel holds it
+    and the controller built its widgets into the grid during construction."""
+    from panel.device_launchers import DeviceLaunchersController
+    assert isinstance(panel.devices, DeviceLaunchersController)
+    # build_marker_fes_into() + build_driver_into() ran during _build_ui → the
+    # controller owns its widgets.
+    for w in ("lbl_marker", "lbl_fes", "lbl_driver",
+              "btn_marker_start", "btn_fes_start", "btn_driver_start"):
+        assert getattr(panel.devices, w, None) is not None, w
+    for m in ("on_marker_start", "on_marker_stop", "on_marker_refresh",
+              "on_fes_start", "on_fes_stop", "on_fes_refresh",
+              "on_driver_start", "on_driver_stop"):
+        assert callable(getattr(panel.devices, m, None)), m

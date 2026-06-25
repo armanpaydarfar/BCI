@@ -61,6 +61,7 @@ from panel.config_io import (
 )
 
 from panel.serial_controller import SerialController
+from panel.device_launchers import DeviceLaunchersController
 from panel.ui_utils import _fixed_v
 
 # ----------------- Paths & constants -----------------
@@ -376,6 +377,24 @@ class ControlPanel(QMainWindow):
         self.driver = Proc("Experiment Driver", None, ROOT)
         self.fes    = Proc("FES Listener", f'python -u "{FES_PY}"', ROOT)
 
+        # Marker / FES / Driver launch rows — DeviceLaunchersController owns those
+        # rows' LEDs/buttons + start-stop-refresh handlers, built into the grid in
+        # _build_ui. The Proc handles + ProcessManager stay on the panel (shared by
+        # command wiring, subject rotation, _tick, closeEvent); driver gating reads
+        # fes_enabled_pref through the getter.
+        self.devices = DeviceLaunchersController(
+            self,
+            procs=self.procs,
+            marker=self.marker,
+            fes=self.fes,
+            driver=self.driver,
+            fes_py=FES_PY,
+            get_fes_enabled=lambda: self.fes_enabled_pref,
+            log=self._append_log,
+            set_led=self._set_led,
+            timestamp=self._ts,
+        )
+
         # ---- Gaze procs (NEW) ----
         self.gaze_runner = Proc("Gaze Runner", None, ROOT)
         self.gaze_service = Proc("Gaze Service", None, ROOT)
@@ -456,9 +475,9 @@ class ControlPanel(QMainWindow):
         # Initialize LEDs
         self._set_led(self.lbl_robot_init, "stopped")
         self._set_led(self.lbl_robot, "stopped")
-        self._set_led(self.lbl_marker, "stopped")
-        self._set_led(self.lbl_fes, "stopped")
-        self._set_led(self.lbl_driver, "stopped")
+        self._set_led(self.devices.lbl_marker, "stopped")
+        self._set_led(self.devices.lbl_fes, "stopped")
+        self._set_led(self.devices.lbl_driver, "stopped")
         self._set_led(self.lbl_eego, "stopped")
         self._set_led(self.lbl_labrec, "stopped")
         self._set_led(self.lbl_gaze_service, "stopped")
@@ -642,35 +661,8 @@ class ControlPanel(QMainWindow):
         grid.addWidget(btn_eego, row, 2)
         row += 1
 
-        # ===== Marker =====
-        self.lbl_marker = QLabel("●"); self._set_led(self.lbl_marker, "stopped")
-        grid.addWidget(QLabel("<b>Marker Stream</b>"), row, 0)
-        grid.addWidget(self.lbl_marker, row, 1)
-        self.btn_marker_start = QPushButton("Start")
-        self.btn_marker_stop  = QPushButton("Stop")
-        self.btn_marker_refresh = QPushButton("Refresh")
-        self.btn_marker_start.clicked.connect(self.on_marker_start)
-        self.btn_marker_stop.clicked.connect(self.on_marker_stop)
-        self.btn_marker_refresh.clicked.connect(self.on_marker_refresh)
-        grid.addWidget(self.btn_marker_start, row, 2)
-        grid.addWidget(self.btn_marker_stop, row, 3)
-        grid.addWidget(self.btn_marker_refresh, row, 4)
-        row += 1
-
-        # ===== FES =====
-        self.lbl_fes = QLabel("●"); self._set_led(self.lbl_fes, "stopped")
-        grid.addWidget(QLabel("<b>FES Listener</b>"), row, 0)
-        grid.addWidget(self.lbl_fes, row, 1)
-        self.btn_fes_start = QPushButton("Start")
-        self.btn_fes_stop  = QPushButton("Stop")
-        self.btn_fes_refresh = QPushButton("Refresh")
-        self.btn_fes_start.clicked.connect(self.on_fes_start)
-        self.btn_fes_stop.clicked.connect(self.on_fes_stop)
-        self.btn_fes_refresh.clicked.connect(self.on_fes_refresh)
-        grid.addWidget(self.btn_fes_start, row, 2)
-        grid.addWidget(self.btn_fes_stop, row, 3)
-        grid.addWidget(self.btn_fes_refresh, row, 4)
-        row += 1
+        # ===== Marker + FES ===== (DeviceLaunchersController owns the rows + handlers)
+        row = self.devices.build_marker_fes_into(grid, row)
 
         # ===== LabRecorder =====
         self.lbl_labrec = QLabel("●"); self._set_led(self.lbl_labrec, "stopped")
@@ -857,20 +849,8 @@ class ControlPanel(QMainWindow):
         # ===== Arduino ===== (SerialController owns the row, widgets + handlers)
         row = self.serial.build_into(grid, row)
 
-        # ===== Driver =====
-        # Anchored at the bottom — starting the experiment driver is the
-        # last step before a session begins, so keeping it visually
-        # separate from device setup matches the operator's flow.
-        self.lbl_driver = QLabel("●"); self._set_led(self.lbl_driver, "stopped")
-        grid.addWidget(QLabel("<b>Experiment Driver</b>"), row, 0)
-        grid.addWidget(self.lbl_driver, row, 1)
-        self.btn_driver_start = QPushButton("Start")
-        self.btn_driver_stop  = QPushButton("Stop")
-        self.btn_driver_start.clicked.connect(self.on_driver_start)
-        self.btn_driver_stop.clicked.connect(self.on_driver_stop)
-        grid.addWidget(self.btn_driver_start, row, 2)
-        grid.addWidget(self.btn_driver_stop, row, 3)
-        row += 1
+        # ===== Driver ===== (DeviceLaunchersController owns the row + handlers)
+        row = self.devices.build_driver_into(grid, row)
 
         # Bottom stretch: absorbs any leftover vertical space in the
         # controls panel so the data rows above stay packed at the
@@ -1956,31 +1936,6 @@ class ControlPanel(QMainWindow):
         log_dir = os.path.join(data_dir, f"sub-{sub}", "impedance_logs") if data_dir and sub else "~/impedance_logs"
         self._append_log("Panel", f"[{self._ts()}] Opened impedance monitor (logs → {log_dir})\n")
 
-    # ----- Marker -----
-    def on_marker_start(self):
-        self.procs.start(self.marker, self.lbl_marker, "Marker")
-    def on_marker_stop(self):
-        self.procs.stop(self.marker, self.lbl_marker, "Marker")
-    def on_marker_refresh(self):
-        self.on_marker_stop()
-        time.sleep(0.1)
-        self.on_marker_start()
-        self._append_log("Marker", f"[{self._ts()}] Refreshed marker stream\n")
-
-    # ----- FES -----
-    def on_fes_start(self):
-        if not os.path.exists(FES_PY):
-            QMessageBox.warning(self, "Missing", f"Not found:\n{FES_PY}")
-            return
-        self.procs.start(self.fes, self.lbl_fes, "FES")
-    def on_fes_stop(self):
-        self.procs.stop(self.fes, self.lbl_fes, "FES")
-    def on_fes_refresh(self):
-        self.on_fes_stop()
-        time.sleep(0.1)
-        self.on_fes_start()
-        self._append_log("FES", f"[{self._ts()}] Refreshed FES listener\n")
-
     # ----- Gaze (NEW) -----
     def _ensure_gaze_paths(self, which: str) -> bool:
         path = GAZE_RUNNER_PY if which == "runner" else GAZE_SERVICE_PY
@@ -2827,20 +2782,6 @@ class ControlPanel(QMainWindow):
         self._spawn_external(f'python -u "{APRILTAG_CONTROL_TEST_PY}" --calib "{calib}"')
         self._append_log("Panel", f"[{self._ts()}] Launched AprilTag control test with:\n  {calib}\n")
 
-    # ----- Driver -----
-    def on_driver_start(self):
-        if not (self.marker.q and self.marker.q.state() != QProcess.NotRunning):
-            QMessageBox.warning(self, "Gating", "Marker not running. Start/refresh Marker first.")
-            return
-        if self.fes_enabled_pref:
-            if not (self.fes.q and self.fes.q.state() != QProcess.NotRunning):
-                QMessageBox.warning(self, "Gating", "FES is enabled but not running. Start FES first.")
-                return
-        self.procs.start(self.driver, self.lbl_driver, "Driver")
-
-    def on_driver_stop(self):
-        self.procs.stop(self.driver, self.lbl_driver, "Driver")
-
     # ----- Robot (no polling) -----
     def on_init_robot(self):
         ssh = (
@@ -3151,9 +3092,9 @@ class ControlPanel(QMainWindow):
     # ---------- Cheap LED maintainer for QProcess-procs ----------
     def _tick(self):
         for p, led in (
-            (self.marker, self.lbl_marker),
-            (self.fes, self.lbl_fes),
-            (self.driver, self.lbl_driver),
+            (self.marker, self.devices.lbl_marker),
+            (self.fes, self.devices.lbl_fes),
+            (self.driver, self.devices.lbl_driver),
             (self.gaze_service, self.lbl_gaze_service),
         ):
             if p.q and p.q.state() != QProcess.NotRunning and p.status != "error":
@@ -3189,9 +3130,9 @@ class ControlPanel(QMainWindow):
         except Exception:
             pass
         for p, led, title in (
-            (self.driver, self.lbl_driver, "Driver"),
-            (self.fes,    self.lbl_fes,    "FES"),
-            (self.marker, self.lbl_marker, "Marker"),
+            (self.driver, self.devices.lbl_driver, "Driver"),
+            (self.fes,    self.devices.lbl_fes,    "FES"),
+            (self.marker, self.devices.lbl_marker, "Marker"),
             (self.gaze_service, self.lbl_gaze_service, "Gaze"),
             (self.gaze_runner, None, "Gaze"),
             (self.vlm_service, self.lbl_compute_led, "VLM"),
