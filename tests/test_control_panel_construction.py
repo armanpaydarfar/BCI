@@ -53,8 +53,8 @@ _EXPECTED_METHODS = [
     "on_gaze_service_query", "_start_gaze_service", "_gaze_udp_request",
     # marker / fes / driver now live in panel.device_launchers.DeviceLaunchersController
     # (asserted by test_device_launchers_controller_wired below)
-    # robot controls
-    "on_robot_start", "_update_robot_buttons_for_mode",
+    # robot controls now live in panel.robot_controller.RobotController
+    # (asserted by test_robot_controller_wired below)
     # training / calibration
     "on_run_harmony_calibration", "on_run_apriltag_control_test",
     "_get_selected_apriltag_calib",
@@ -154,3 +154,16 @@ def test_external_tools_controller_wired(panel):
     for m in ("on_initialize", "on_open_fes_cfg", "on_open_mne_viewer",
               "on_open_impedance_monitor", "on_open_labrec", "on_open_eego"):
         assert callable(getattr(panel.external_tools, m, None)), m
+
+
+def test_robot_controller_wired(panel):
+    """The Robot row (Init / Start / Remove Overrides) + handlers were extracted
+    into a RobotController that owns its widgets; the panel holds it and the
+    controller built its widgets into the grid during construction."""
+    from panel.robot_controller import RobotController
+    assert isinstance(panel.robot, RobotController)
+    for w in ("lbl_robot_init", "lbl_robot", "btn_robot_start", "btn_robot_removeovr"):
+        assert getattr(panel.robot, w, None) is not None, w
+    for m in ("on_init_robot", "on_robot_start", "on_robot_remove_overrides",
+              "_on_robot_term_finished", "_update_robot_buttons_for_mode"):
+        assert callable(getattr(panel.robot, m, None)), m

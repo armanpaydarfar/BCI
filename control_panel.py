@@ -63,6 +63,7 @@ from panel.config_io import (
 from panel.serial_controller import SerialController
 from panel.device_launchers import DeviceLaunchersController
 from panel.external_tools import ExternalToolsController
+from panel.robot_controller import RobotController
 from panel.ui_utils import _fixed_v
 
 # ----------------- Paths & constants -----------------
@@ -414,8 +415,17 @@ class ControlPanel(QMainWindow):
         # cmd is built lazily on connect from the live config.
         self.frame_relay_proc = Proc("Frame Relay", None, ROOT)
 
-        # Robot terminal
-        self.robot_term: Optional[QProcess] = None
+        # Robot — RobotController owns the Robot row (Init / Start / Remove
+        # Overrides), its LEDs/buttons + handlers and the robot_term QProcess
+        # handle, built into the grid in _build_ui. Robot tool selection depends
+        # on the panel's mode, read through the getter at call time.
+        self.robot = RobotController(
+            self,
+            get_mode=lambda: self.mode,
+            log=self._append_log,
+            set_led=self._set_led,
+            timestamp=self._ts,
+        )
 
         # External-app launchers — ExternalToolsController owns the LabRecorder /
         # eegoSports / MNE / impedance / STMsetup / initialize handlers and the
@@ -494,8 +504,8 @@ class ControlPanel(QMainWindow):
         self._set_cmds_for_mode_and_driver()
 
         # Initialize LEDs
-        self._set_led(self.lbl_robot_init, "stopped")
-        self._set_led(self.lbl_robot, "stopped")
+        self._set_led(self.robot.lbl_robot_init, "stopped")
+        self._set_led(self.robot.lbl_robot, "stopped")
         self._set_led(self.devices.lbl_marker, "stopped")
         self._set_led(self.devices.lbl_fes, "stopped")
         self._set_led(self.devices.lbl_driver, "stopped")
@@ -649,29 +659,8 @@ class ControlPanel(QMainWindow):
         grid.setContentsMargins(6, 4, 6, 4)
 
         row = 0
-        # ===== Robot =====
-        # Init + Start + Remove Overrides on one row — these three are
-        # invariably done in sequence at the start of a session, so keeping
-        # them adjacent matches the operator's actual workflow.
-        self.lbl_robot_init = QLabel("●"); self._set_led(self.lbl_robot_init, "stopped")
-        self.lbl_robot      = QLabel("●"); self._set_led(self.lbl_robot, "stopped")
-        led_box = QHBoxLayout()
-        led_box.setContentsMargins(0, 0, 0, 0)
-        led_box.addWidget(self.lbl_robot_init)
-        led_box.addWidget(self.lbl_robot)
-        led_holder = _fixed_v(QWidget()); led_holder.setLayout(led_box)
-        btn_init_robot = QPushButton("Init Robot (SSH)")
-        btn_init_robot.clicked.connect(self.on_init_robot)
-        self.btn_robot_start     = QPushButton("Start (SSH terminal)")
-        self.btn_robot_removeovr = QPushButton("Remove Overrides")
-        self.btn_robot_start.clicked.connect(self.on_robot_start)
-        self.btn_robot_removeovr.clicked.connect(self.on_robot_remove_overrides)
-        grid.addWidget(QLabel("<b>Robot</b>"), row, 0)
-        grid.addWidget(led_holder, row, 1)
-        grid.addWidget(btn_init_robot, row, 2)
-        grid.addWidget(self.btn_robot_start, row, 3)
-        grid.addWidget(self.btn_robot_removeovr, row, 4)
-        row += 1
+        # ===== Robot ===== (RobotController owns the row, widgets + handlers)
+        row = self.robot.build_into(grid, row)
 
         # eegoSports
         self.lbl_eego = QLabel("●"); self._set_led(self.lbl_eego, "stopped")
@@ -1014,7 +1003,7 @@ class ControlPanel(QMainWindow):
         self._building_ui = False
         self._refresh_log_view()
 
-        self._update_robot_buttons_for_mode()
+        self.robot._update_robot_buttons_for_mode()
         self._apply_backend_visibility()
 
     def _apply_backend_visibility(self) -> None:
@@ -1868,15 +1857,7 @@ class ControlPanel(QMainWindow):
             p.env["ARDUINO_PORT"]      = self.serial.serial_port_name or ""
             p.env["ARDUINO_BAUD"]      = str(self.serial.serial_baudrate)
 
-        self._update_robot_buttons_for_mode()
-
-    def _update_robot_buttons_for_mode(self):
-        sim = (self.mode == "Simulation")
-        self.btn_robot_start.setEnabled(not sim)
-        if sim:
-            self.btn_robot_start.setToolTip("Disabled in Simulation mode.")
-        else:
-            self.btn_robot_start.setToolTip("Open SSH terminal running the selected robot tool.")
+        self.robot._update_robot_buttons_for_mode()
 
     # ---------- Actions ----------
     def on_mode_changed(self, text: str):
@@ -2771,76 +2752,6 @@ class ControlPanel(QMainWindow):
         # tag ids / sizes / plane default from the calibration's own meta + world map.
         self._spawn_external(f'python -u "{APRILTAG_CONTROL_TEST_PY}" --calib "{calib}"')
         self._append_log("Panel", f"[{self._ts()}] Launched AprilTag control test with:\n  {calib}\n")
-
-    # ----- Robot (no polling) -----
-    def on_init_robot(self):
-        ssh = (
-            "sshpass -p 'Harmonic-03' ssh -tt root@192.168.2.1 "
-            "'cd /opt/hbi/dev/bin && ./killall.sh && sleep 10 && ./run.sh'"
-        )
-        cmd = f'gnome-terminal -- bash -lc "{ssh}; exec bash"'
-        try:
-            subprocess.Popen(cmd, shell=True)
-            self._set_led(self.lbl_robot_init, "starting")
-            QTimer.singleShot(11_000, lambda: self._set_led(self.lbl_robot_init, "running"))
-            self._append_log("Robot", f"[{self._ts()}] Robot init sequence launched\n")
-        except Exception as e:
-            self._set_led(self.lbl_robot_init, "error")
-            self._append_log("Robot", f"[{self._ts()}] Init launch error: {e}\n")
-            QMessageBox.critical(self, "Initialize Robot", f"Failed to start init sequence:\n{e}")
-
-    def _on_robot_term_finished(self, code: int, status):
-        self._set_led(self.lbl_robot, "stopped")
-        self.btn_robot_start.setEnabled(True)
-        self._append_log("Robot", f"[{self._ts()}] SSH terminal closed (code={code})\n")
-        self.robot_term = None
-
-    def on_robot_start(self):
-        if self.mode == "Simulation":
-            QMessageBox.information(self, "Simulation", "Robot disabled in Simulation mode.")
-            return
-
-        if self.mode == "MI_Bimanual":
-            tool = "MI_Bimanual"
-        elif self.mode == "Gaze_Tracking":
-            tool = "Gaze_Tracking"
-        else:
-            QMessageBox.warning(self, "Robot", "No robot tool for this mode.")
-            return
-
-        if self.robot_term and self.robot_term.state() != QProcess.NotRunning:
-            return
-
-        self.robot_term = QProcess(self)
-        command = (
-            "sshpass -p 'Harmonic-03' ssh -tt root@192.168.2.1 "
-            f"'cd /opt/hbi/dev/bin/tools && ./{tool} && exec bash'"
-        )
-
-        self.robot_term.started.connect(lambda: (
-            self._set_led(self.lbl_robot, "running"),
-            self.btn_robot_start.setEnabled(False),
-            self._append_log("Robot", f"[{self._ts()}] SSH terminal opened for {tool}\n")
-        ))
-        self.robot_term.finished.connect(self._on_robot_term_finished)
-
-        self.robot_term.setProgram("gnome-terminal")
-        self.robot_term.setArguments(["--wait", "--", "bash", "-lc", command])
-        self.robot_term.start()
-
-    def on_robot_remove_overrides(self):
-        try:
-            res = subprocess.run(
-                ["sshpass","-p","Harmonic-03","ssh","-o","StrictHostKeyChecking=no","-tt",
-                 "root@192.168.2.1","cd /opt/hbi/dev/bin/tools && ./RemoveOverrides"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, text=True
-            )
-            if res.stdout: self._append_log("Robot", res.stdout)
-            if res.stderr: self._append_log("Robot", res.stderr)
-            self._append_log("Robot", f"[{self._ts()}] RemoveOverrides rc={res.returncode}\n")
-        except Exception as e:
-            self._append_log("Robot", f"[{self._ts()}] RemoveOverrides error: {e}\n")
-            QMessageBox.warning(self, "Robot", f"RemoveOverrides failed:\n{e}")
 
     # ---------- Log helpers ----------
     def _on_log_target_changed(self, target: str):
