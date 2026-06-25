@@ -47,8 +47,8 @@ _EXPECTED_METHODS = [
     # (asserted by test_process_manager_collaborator_wired below)
     # log files
     "_open_vlm_log_file", "_open_relay_log_file", "_relay_log_callback",
-    # arduino / serial
-    "on_serial_refresh", "on_send_arduino_one", "on_save_serial_to_config",
+    # arduino / serial now lives in panel.serial_controller.SerialController
+    # (asserted by test_serial_controller_wired below)
     # gaze controls
     "on_gaze_service_query", "_start_gaze_service", "_gaze_udp_request",
     # marker / fes / driver
@@ -112,3 +112,17 @@ def test_process_manager_collaborator_wired(panel):
     from panel.process_manager import ProcessManager
     assert isinstance(panel.procs, ProcessManager)
     assert callable(panel.procs.start) and callable(panel.procs.stop)
+
+
+def test_serial_controller_wired(panel):
+    """The Arduino/serial UI row + handlers were extracted into a
+    SerialController that owns its widgets; the panel holds it and the
+    controller built its widgets into the grid during construction."""
+    from panel.serial_controller import SerialController
+    assert isinstance(panel.serial, SerialController)
+    # build_into() ran during _build_ui → the controller owns its widgets.
+    assert panel.serial.lbl_arduino is not None
+    assert panel.serial.cmb_serial_port is not None
+    for m in ("on_serial_refresh", "on_serial_test", "on_send_arduino_one",
+              "on_save_serial_to_config"):
+        assert callable(getattr(panel.serial, m, None)), m

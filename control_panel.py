@@ -38,14 +38,6 @@ IMPORTANT:
 """
 
 import os, sys, time, socket, subprocess, json, threading, glob
-import serial
-import serial.tools.list_ports
-
-# Import ARDUINO_PORT from config; fallback to default if unavailable
-try:
-    from config import ARDUINO_PORT
-except ImportError:
-    ARDUINO_PORT = ""
 
 from typing import Optional, Dict
 
@@ -56,7 +48,7 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QComboBox, QCheckBox, QGridLayout, QLineEdit,
     QTextEdit, QGroupBox, QMessageBox, QSplitter, QToolBar, QStyle,
     QScrollArea, QFormLayout, QDoubleSpinBox, QSpinBox,
-    QListWidget, QSizePolicy,
+    QListWidget,
 )
 
 from panel.process_manager import Proc, ProcessManager
@@ -66,21 +58,10 @@ from panel.config_io import (
     read_fes_toggle, write_fes_toggle,
     _read_float_key, _read_int_key, _read_bool_key, _read_quoted_str_key,
     _write_assign_rhs, _read_01_key,
-    read_arduino_baud_from_config, write_arduino_port_to_config,
-    write_arduino_baud_to_config,
 )
 
-
-def _fixed_v(widget: QWidget) -> QWidget:
-    """Pin a widget's vertical size policy so it stops absorbing leftover
-    grid space. QWidget defaults to Preferred-vertical, which makes any
-    HBox-holder row in a QGridLayout stretch to 4-5x its natural height
-    when the panel has spare vertical room. Fixed clamps it at the
-    sizeHint."""
-    sp = widget.sizePolicy()
-    sp.setVerticalPolicy(QSizePolicy.Fixed)
-    widget.setSizePolicy(sp)
-    return widget
+from panel.serial_controller import SerialController
+from panel.ui_utils import _fixed_v
 
 # ----------------- Paths & constants -----------------
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -372,12 +353,15 @@ class ControlPanel(QMainWindow):
         self.training_subject = read_training_subject()
         self.fes_enabled_pref = read_fes_toggle()
 
-        # Arduino / BCI online config
-        self.serial_port_name = ""
-        try:
-            self.serial_baudrate = str(read_arduino_baud_from_config(9600))
-        except Exception:
-            self.serial_baudrate = "9600"
+        # Arduino / serial controls — SerialController owns its UI row, widgets,
+        # state (port + baud) and handlers; built into the grid in _build_ui.
+        self.serial = SerialController(
+            self,
+            log=self._append_log,
+            set_led=self._set_led,
+            timestamp=self._ts,
+            refresh_cmds=self._set_cmds_for_mode_and_driver,
+        )
 
         # Procs (QProcess-managed). ProcessManager owns their QProcess lifecycle
         # and reports status back through the panel's log/LED callbacks.
@@ -479,7 +463,7 @@ class ControlPanel(QMainWindow):
         self._set_led(self.lbl_labrec, "stopped")
         self._set_led(self.lbl_gaze_service, "stopped")
         self._set_led(self.lbl_compute_led, "stopped")
-        self._set_led(self.lbl_arduino, "stopped")
+        self._set_led(self.serial.lbl_arduino, "stopped")
 
         # When services are hosted remotely (Linux operator panel pointed at
         # a Windows GPU host) the start/stop buttons can't drive local
@@ -870,41 +854,8 @@ class ControlPanel(QMainWindow):
             self.lbl_vlm_pair_token,
         ]
 
-        # ===== Arduino =====
-        # Single-line layout matching the other module rows. Baud lives in
-        # the Runtime config tab (rarely changed); per-test status updates
-        # land in the Panel log buffer rather than a dedicated label, and
-        # the LED reflects the last connection-test / send result.
-        self.lbl_arduino = QLabel("●"); self._set_led(self.lbl_arduino, "stopped")
-        self.cmb_serial_port = QComboBox()
-        self.cmb_serial_port.currentIndexChanged.connect(self.on_serial_port_changed)
-        self.btn_serial_refresh = QPushButton("Refresh")
-        self.btn_serial_refresh.clicked.connect(self.on_serial_refresh)
-        self.btn_serial_test = QPushButton("Test")
-        self.btn_serial_test.clicked.connect(self.on_serial_test)
-        self.btn_save_serial_to_config = QPushButton("Save → config")
-        self.btn_save_serial_to_config.setToolTip(
-            "Writes ARDUINO_PORT to config_local.py (machine-local) and "
-            "ARDUINO_BAUD to config.py."
-        )
-        self.btn_save_serial_to_config.clicked.connect(self.on_save_serial_to_config)
-        self.btn_send_1 = QPushButton("Send 1 (close)")
-        self.btn_send_1.clicked.connect(self.on_send_arduino_one)
-        self.btn_send_0 = QPushButton("Send 0 (open)")
-        self.btn_send_0.clicked.connect(self.on_send_arduino_zero)
-
-        arduino_row = QHBoxLayout()
-        arduino_row.setContentsMargins(0, 0, 0, 0)
-        arduino_row.addWidget(self.cmb_serial_port, 1)
-        for w in (self.btn_serial_refresh, self.btn_serial_test,
-                  self.btn_save_serial_to_config,
-                  self.btn_send_1, self.btn_send_0):
-            arduino_row.addWidget(w)
-        arduino_row_holder = _fixed_v(QWidget()); arduino_row_holder.setLayout(arduino_row)
-        grid.addWidget(QLabel("<b>Arduino</b>"), row, 0)
-        grid.addWidget(self.lbl_arduino, row, 1)
-        grid.addWidget(arduino_row_holder, row, 2, 1, 3)
-        row += 1
+        # ===== Arduino ===== (SerialController owns the row, widgets + handlers)
+        row = self.serial.build_into(grid, row)
 
         # ===== Driver =====
         # Anchored at the bottom — starting the experiment driver is the
@@ -1054,7 +1005,7 @@ class ControlPanel(QMainWindow):
         self._build_errp_config_tab(tabs)
 
         # Initial serial refresh
-        self.on_serial_refresh()
+        self.serial.on_serial_refresh()
         self.on_refresh_calibration_libs()
         self.on_refresh_apriltag_calibs()
         self.on_refresh_training_data_list()
@@ -1874,25 +1825,6 @@ class ControlPanel(QMainWindow):
         self._spawn_external(cmd)
         self._append_log("Panel", f"[{self._ts()}] Launched training: {cmd}\n")
 
-    def on_save_serial_to_config(self):
-        port = (self.serial_port_name or self.cmb_serial_port.currentData() or "").strip()
-        if not port:
-            QMessageBox.warning(self, "Serial", "Select a serial port first.")
-            return
-        try:
-            baud = int(str(self.serial_baudrate).strip())
-        except ValueError:
-            QMessageBox.warning(self, "Serial", "Baud must be an integer (set it in Runtime config).")
-            return
-        try:
-            write_arduino_port_to_config(port)
-            write_arduino_baud_to_config(baud)
-        except Exception as e:
-            QMessageBox.warning(self, "config.py", f"Failed to write Arduino settings:\n{e}")
-            return
-        self._append_log("Panel", f"[{self._ts()}] Saved ARDUINO_PORT={port} ARDUINO_BAUD={baud} to config.py\n")
-        QMessageBox.information(self, "Serial", "ARDUINO_PORT and ARDUINO_BAUD saved to config.py.")
-
     # ---------- LED helper ----------
     def _set_led(self, label: QLabel, state: str):
         color = {
@@ -1932,8 +1864,8 @@ class ControlPanel(QMainWindow):
         for p in (self.marker, self.driver, self.fes, self.gaze_runner, self.gaze_service, self.vlm_service):
             p.env["PYTHONUNBUFFERED"] = "1"
             p.env["TRAINING_SUBJECT"] = self.training_subject
-            p.env["ARDUINO_PORT"]      = getattr(self, "serial_port_name", "") or ""
-            p.env["ARDUINO_BAUD"]      = str(getattr(self, "serial_baudrate", "9600"))
+            p.env["ARDUINO_PORT"]      = self.serial.serial_port_name or ""
+            p.env["ARDUINO_BAUD"]      = str(self.serial.serial_baudrate)
 
         self._update_robot_buttons_for_mode()
 
@@ -2774,142 +2706,6 @@ class ControlPanel(QMainWindow):
         """
         from Utils.perception_clients import udp_request
         return udp_request(GAZE_SERVICE_HOST, int(GAZE_SERVICE_PORT), payload, float(timeout_s))
-
-    # ----- Arduino / Online BCI panel -----
-    def on_serial_refresh(self):
-        self.cmb_serial_port.blockSignals(True)
-        self.cmb_serial_port.clear()
-
-        try:
-            ports = list(serial.tools.list_ports.comports())
-        except Exception as e:
-            self.cmb_serial_port.blockSignals(False)
-            self._append_log("Panel", f"[{self._ts()}] Error listing serial ports: {e}\n")
-            self._set_led(self.lbl_arduino, "error")
-            return
-
-        if not ports:
-            self.cmb_serial_port.addItem("No ports found", "")
-            self.serial_port_name = ""
-            self.cmb_serial_port.blockSignals(False)
-            self._append_log("Panel", f"[{self._ts()}] No serial ports found\n")
-            self._set_led(self.lbl_arduino, "stopped")
-            return
-
-        for p in ports:
-            desc = p.description or "n/a"
-            text = f"{p.device} ({desc})"
-            self.cmb_serial_port.addItem(text, p.device)
-
-        idx = -1
-        if self.serial_port_name:
-            idx = self.cmb_serial_port.findData(self.serial_port_name)
-        if idx < 0:
-            idx = self.cmb_serial_port.findData(ARDUINO_PORT)
-        if idx < 0:
-            idx = 0
-
-        self.cmb_serial_port.setCurrentIndex(idx)
-        self.serial_port_name = self.cmb_serial_port.currentData() or ""
-        self.cmb_serial_port.blockSignals(False)
-
-        self._append_log("Panel", f"[{self._ts()}] Serial ports refreshed. Selected: {self.serial_port_name or 'None'}\n")
-
-        self._set_cmds_for_mode_and_driver()
-
-    def on_serial_port_changed(self, index: int):
-        device = self.cmb_serial_port.itemData(index)
-        self.serial_port_name = device or ""
-        self._append_log("Panel", f"[{self._ts()}] Serial port set to: {self.serial_port_name}\n")
-        # New port not yet validated — clear any prior pass/fail signal.
-        self._set_led(self.lbl_arduino, "stopped")
-        self._set_cmds_for_mode_and_driver()
-
-    def _serial_baud_int(self) -> Optional[int]:
-        """Return the configured baud rate as int, or None on parse failure.
-        Source of truth is ``self.serial_baudrate`` (loaded from config and
-        editable from the Runtime config tab)."""
-        try:
-            return int(str(self.serial_baudrate).strip())
-        except (TypeError, ValueError):
-            return None
-
-    def on_serial_test(self):
-        port = self.serial_port_name or self.cmb_serial_port.currentData()
-        if not port:
-            self._append_log("Panel", f"[{self._ts()}] Serial test: no port selected\n")
-            self._set_led(self.lbl_arduino, "error")
-            QMessageBox.information(self, "Serial test", "No serial port selected.")
-            return
-
-        baud = self._serial_baud_int()
-        if baud is None:
-            self._append_log("Panel", f"[{self._ts()}] Serial test: invalid baudrate {self.serial_baudrate!r}\n")
-            self._set_led(self.lbl_arduino, "error")
-            QMessageBox.warning(self, "Serial test", "Invalid baudrate (set ARDUINO_BAUD in Runtime config).")
-            return
-
-        self._set_led(self.lbl_arduino, "starting")
-        try:
-            ser = serial.Serial(port, baudrate=baud, timeout=1)
-            time.sleep(2)
-            if ser.is_open:
-                self.serial_port_name = port
-                self._append_log("Panel", f"[{self._ts()}] Serial test OK on {port} @ {baud}\n")
-                ser.close()
-                self._set_led(self.lbl_arduino, "running")
-                self._set_cmds_for_mode_and_driver()
-            else:
-                self._append_log("Panel", f"[{self._ts()}] Serial test FAILED (not open)\n")
-                self._set_led(self.lbl_arduino, "error")
-        except Exception as e:
-            self._append_log("Panel", f"[{self._ts()}] Serial test ERROR: {e}\n")
-            self._set_led(self.lbl_arduino, "error")
-            QMessageBox.warning(self, "Serial test", f"Error opening {port}:\n{e}")
-
-    def _send_arduino_manual_value(self, value: str):
-        port = self.serial_port_name or self.cmb_serial_port.currentData()
-        if not port:
-            self._append_log("Panel", f"[{self._ts()}] Arduino send: no port selected\n")
-            self._set_led(self.lbl_arduino, "error")
-            QMessageBox.information(self, "Arduino manual test", "No serial port selected.")
-            return
-
-        baud = self._serial_baud_int()
-        if baud is None:
-            self._append_log("Panel", f"[{self._ts()}] Arduino send: invalid baudrate {self.serial_baudrate!r}\n")
-            self._set_led(self.lbl_arduino, "error")
-            QMessageBox.warning(self, "Arduino manual test", "Invalid baudrate (set ARDUINO_BAUD in Runtime config).")
-            return
-
-        self._set_led(self.lbl_arduino, "starting")
-        try:
-            ser = serial.Serial(port, baudrate=baud, timeout=1)
-            self._append_log("Panel", f"[{self._ts()}] Waiting for Arduino reset (2s)...\n")
-            QApplication.processEvents()
-            time.sleep(2)
-
-            if not ser.is_open:
-                self._append_log("Panel", f"[{self._ts()}] Arduino manual: failed to open {port}\n")
-                self._set_led(self.lbl_arduino, "error")
-                return
-
-            ser.write(value.encode("ascii"))
-            ser.flush()
-            self._append_log("Panel", f"[{self._ts()}] Arduino manual: sent '{value}' on {port}\n")
-            self._set_led(self.lbl_arduino, "running")
-            ser.close()
-
-        except Exception as e:
-            self._append_log("Panel", f"[{self._ts()}] Arduino manual ERROR: {e}\n")
-            self._set_led(self.lbl_arduino, "error")
-            QMessageBox.warning(self, "Arduino manual test", f"Error sending '{value}' on {port}:\n{e}")
-
-    def on_send_arduino_one(self):
-        self._send_arduino_manual_value("1")
-
-    def on_send_arduino_zero(self):
-        self._send_arduino_manual_value("0")
 
     # ----- Harmony calibration / online control -----
     def on_refresh_calibration_libs(self):
