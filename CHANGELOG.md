@@ -8,27 +8,33 @@ The format is **lightweight** (this repo is not strictly semver-tagged). Add bul
 
 ### Cleanup (collaborator-onboarding prep)
 
-- **Decomposed the `control_panel.py` god class by composition.**
+- **Decomposed both panel/service god classes by composition.**
   The ~3800-line, ~150-method `ControlPanel` was split into focused collaborator
   objects under a new `panel/` package; `ControlPanel` is now a thin assembler that
   constructs them and (for UI-owning controllers) calls their `build_into(grid, row)`
   to place their widgets, with cross-cutting concerns (log / LED / timestamp /
   subprocess-spawn) injected as callbacks. Behaviour preserved at the UX level
-  (verbatim widget-build transcription; same wire / subprocess behaviour), guarded
-  by a headless construction test (`tests/test_control_panel_construction.py`) plus
-  per-collaborator unit tests, and visually spot-checked on the running panel.
-  Modules: `panel/{config_io,constants,netutils,ui_utils}.py` (leaf utilities) and
-  the collaborators `process_manager.py` (QProcess lifecycle), `serial_controller.py`
-  (Arduino row), `device_launchers.py` (Marker/FES/Driver rows), `external_tools.py`
-  (LabRecorder/eego/MNE/impedance launchers), `robot_controller.py` (Robot row),
-  `calibration_controller.py` (Harmony + AprilTag calibration), `gaze_controller.py`
-  (Gaze service row). `control_panel.py`: **3828 → 2423 lines (−37%)**.
-  Intentionally left in the panel: mode/subject/driver central session state (the
-  assembler legitimately owns it; controllers read it via injected getters) and
-  log-file management. Deferred to a hardware-in-the-loop session: the VLM-command
-  controls + the frame-relay/verify-chain state machine + remote-services (they
-  share state and verify-chain needs a live Connect to validate), and the
-  `vlm_service` decide-pipeline de-dup.
+  (verbatim widget-build + method transcription; same wire / subprocess behaviour),
+  guarded by a headless construction test (`tests/test_control_panel_construction.py`)
+  + per-collaborator unit tests, and visually spot-checked on the running panel.
+  `panel/` modules: `{config_io,constants,netutils,ui_utils}.py` (leaf utilities)
+  and the collaborators `process_manager` (QProcess lifecycle), `serial_controller`
+  (Arduino row), `device_launchers` (Marker/FES/Driver), `external_tools`
+  (LabRecorder/eego/MNE/impedance), `robot_controller`, `calibration_controller`
+  (Harmony + AprilTag), `gaze_controller`, `runtime_config_controller`
+  (runtime/ErrP config tabs + training), `log_file_controller`, and `vlm_controller`
+  (the whole VLM/perception subsystem: video tab, frame-relay/verify-chain state
+  machine, remote-services, and the VLM commands). **`control_panel.py`: 3828 → 774
+  lines (−80%)**. Left in the panel: mode/subject/driver central session state and
+  the logging/LED sink.
+  `vlm_service.py` (our GPU-host service, not the vendored `perception/`) had its
+  pure helpers extracted into a new `vlm/` package (`seg_ops`, `snapshot_cache`,
+  `wire`), keeping the `VLMService` hub. **`vlm_service.py`: 2093 → 1836 lines.**
+  **Deferred to a hardware-in-the-loop session:** the extracted verify-chain state
+  machine is construction-guarded but its live transitions are NOT exercised by the
+  headless tests — it needs a live Connect smoke before being trusted; and the
+  `vlm_service` decide-pipeline de-dup (`_cmd_decide` vs `_process_frame_and_gaze`)
+  remains, as the two paths differ in seg-constraint application.
 - **Consolidated the two VLM UDP clients into one (behaviour-preserving).**
   `vlm_bridge.VLMBridge` (one consumer — the gaze driver) is folded into
   `Utils.perception_clients.VLMClient` (config-driven, the other 3 consumers,
