@@ -25,6 +25,8 @@ from Utils.gaze.apriltag_world import (  # noqa: E402
     plane_basis,
     plane_coords,
     recover_world_pose,
+    register_world_map_multiview,
+    world_map_geometry_report,
     world_from_plane_coords,
     world_map_from_arrays,
     world_map_to_arrays,
@@ -41,6 +43,100 @@ def _rot_x(deg):
     a = np.radians(deg)
     c, s = np.cos(a), np.sin(a)
     return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+
+
+def test_world_map_geometry_report_flags_skew_and_passes_square():
+    """The geometry gate: a square coplanar layout reports ~90°; a skewed one (the
+    58° failure mode) is flagged; out-of-plane tags are measured."""
+    # Square, coplanar (z=0), +Z up: 0 at origin, 1 along +x, 2 along +y.
+    square = {0: make_transform(np.eye(3), [0.0, 0.0, 0.0]),
+              1: make_transform(np.eye(3), [800.0, 0.0, 0.0]),
+              2: make_transform(np.eye(3), [0.0, 500.0, 0.0])}
+    wm = build_world_map(square)  # <3 tags would skip the normal; 3 is fine
+    rep = world_map_geometry_report(wm, x_edge_ids=[0, 1], y_edge_ids=[2, 0])
+    assert abs(rep["corner_angle_deg"] - 90.0) < 1.0
+    assert rep["max_out_of_plane_mm"] < 1e-6
+    assert abs(rep["x_edge_len_mm"] - 800.0) < 1.0 and abs(rep["y_edge_len_mm"] - 500.0) < 1.0
+
+    # Skewed: tag 1 pulled off the +x axis so the corner is no longer square.
+    skew = dict(square)
+    skew[1] = make_transform(np.eye(3), [800.0, 500.0, 0.0])
+    wmk = build_world_map(skew)
+    repk = world_map_geometry_report(wmk, x_edge_ids=[0, 1], y_edge_ids=[2, 0])
+    assert abs(repk["corner_angle_deg"] - 90.0) > 10.0  # flagged: deviates from square
+
+
+def _rot_y(deg):
+    a = np.radians(deg)
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+
+
+def test_multiview_registration_beats_single_view_under_depth_noise():
+    """REV05: static coplanar upward-facing tags, viewed across a head sweep with
+    per-view single-tag DEPTH noise (perturbation along each view's optical axis,
+    the real failure mode). Multi-view averaging must recover the true static
+    geometry far better than the one-window `build_world_map`, and pin the normal."""
+    rng = np.random.default_rng(0)
+    # Coplanar (z=0), all +Z up; only yaw differs — the physical taped-table layout.
+    world_T = {
+        0: make_transform(np.eye(3), [0.0, 0.0, 0.0]),
+        1: make_transform(_rot_z(90.0), [800.0, 0.0, 0.0]),
+        2: make_transform(np.eye(3), [0.0, 500.0, 0.0]),
+        3: make_transform(_rot_z(45.0), [800.0, 500.0, 0.0]),
+        4: make_transform(_rot_z(20.0), [400.0, 250.0, 0.0]),
+    }
+
+    def noisy_view(T_cam_world, depth_sigma=40.0):
+        frame = {}
+        for i, wt in world_T.items():
+            T = T_cam_world @ wt
+            t = T[:3, 3].copy()
+            t[2] += rng.normal(0.0, depth_sigma)          # depth along optical axis
+            R = T[:3, :3] @ _rot_x(rng.normal(0.0, 1.5)) @ _rot_y(rng.normal(0.0, 1.5))
+            frame[i] = make_transform(R, t)
+        return frame
+
+    # A head sweep: 24 viewpoints varying in angle + position around the table.
+    frames = []
+    for k in range(24):
+        T_cam_world = make_transform(
+            _rot_x(15.0 + 0.7 * k) @ _rot_z(-40.0 + 5.0 * k) @ _rot_y(rng.normal(0, 8)),
+            [rng.normal(0, 120), rng.normal(0, 120), 700.0 + rng.normal(0, 80)])
+        frames.append(noisy_view(T_cam_world))
+
+    def rel_pos_error(wm):
+        # ref is tag 0 at the origin, so rel[i] origin should equal world_T[i] origin.
+        return np.mean([np.linalg.norm(wm["rel"][i][:3, 3] - world_T[i][:3, 3])
+                        for i in world_T])
+
+    single = build_world_map(frames[0])              # one noisy window (today's path)
+    multi = register_world_map_multiview(frames)     # REV05 multi-view
+
+    e_single = rel_pos_error(single)
+    e_multi = rel_pos_error(multi)
+    assert e_multi < 0.4 * e_single, f"multi-view {e_multi:.1f} mm not better than single {e_single:.1f} mm"
+    assert e_multi < 20.0, f"multi-view residual {e_multi:.1f} mm too high"
+    # Coplanar + up → the normal is pinned to the table normal (ref-tag +Z = [0,0,1]).
+    np.testing.assert_allclose(np.abs(multi["plane_normal"]), [0, 0, 1], atol=0.05)
+    # Origins are snapped coplanar: no residual height spread in the ref frame.
+    heights = np.array([multi["rel"][i][:3, 3] @ multi["plane_normal"] for i in multi["ids"]])
+    assert heights.std() < 1e-6
+
+
+def test_multiview_registration_rejects_flipped_views():
+    """A handful of flipped views (gross translation outliers) must not drag the
+    fused map — the per-tag outlier gate drops them."""
+    world_T = {0: make_transform(np.eye(3), [0.0, 0.0, 0.0]),
+               1: make_transform(np.eye(3), [600.0, 0.0, 0.0]),
+               2: make_transform(np.eye(3), [0.0, 400.0, 0.0])}
+    T_cam_world = make_transform(_rot_x(15.0), [0.0, 0.0, 600.0])
+    frames = [{i: T_cam_world @ world_T[i] for i in world_T} for _ in range(10)]
+    # Two flipped views: tag 1 lands 300 mm off (its alternate PnP solution).
+    for f in frames[:2]:
+        bad = f[1].copy(); bad[:3, 3] = bad[:3, 3] + np.array([0.0, 0.0, 300.0]); f[1] = bad
+    wm = register_world_map_multiview(frames)
+    np.testing.assert_allclose(wm["rel"][1][:3, 3], [600.0, 0.0, 0.0], atol=5.0)
 
 
 def _layout():

@@ -92,6 +92,47 @@ def detect_tags(detector, bgr: np.ndarray, K: np.ndarray, tag_size_m: float,
     return out
 
 
+def recover_world_pose_pnp(detections: Dict[int, Dict], world_map: Dict,
+                           K: np.ndarray, *, min_tags: int = 4):
+    """View-robust ``T_cam_world`` from a multi-tag PnP over the tag CENTRES against
+    the known (top-down-registered) world-tag layout.
+
+    Why this exists (operator 2026-06-25): per-tag AprilTag pose estimation is biased
+    by viewing obliquity — the SAME static tags resolve to a ~88° corner viewed
+    top-down but 60–75° from the ~45° seated view, and head movement from a seat can't
+    fix it (no viewpoint diversity). Solving ONE camera pose from all visible tag
+    centres — spread across the image — is well-conditioned even at the oblique view,
+    so the recovered frame matches the true (top-down-registered) geometry instead of
+    the seat's distortion. This is the standard fiducial-board advantage over a single
+    small tag.
+
+    ``detections``: ``{tag_id: {"center": (2,) pixel, ...}}`` from `detect_tags`.
+    ``world_map``: the registered map; ``rel[i][:3,3]`` are the tag centres in the
+    world frame (mm). Requires the SAME map used at capture so the pose is consistent.
+
+    Returns ``T_cam_world`` (4×4) or ``None`` when fewer than ``min_tags`` mapped tags
+    are visible (the caller then falls back to the per-tag consensus
+    `apriltag_world.recover_world_pose`)."""
+    import cv2  # lazy: only the camera path needs it
+    rel = world_map.get("rel", {})
+    common = sorted(int(i) for i in detections if int(i) in rel)
+    if len(common) < int(min_tags):
+        return None
+    obj = np.array([np.asarray(rel[i][:3, 3], dtype=float) for i in common],
+                   dtype=np.float64)
+    img = np.array([np.asarray(detections[i]["center"], dtype=float) for i in common],
+                   dtype=np.float64)
+    # SQPNP: global solver, no coplanar restriction, robust with ≥3 points — so the
+    # coplanar table tags don't trigger the planar two-solution ambiguity that a single
+    # tag suffers. No lens distortion (the relay hands us already-rectified frames).
+    ok, rvec, tvec = cv2.solvePnP(obj, img, np.asarray(K, dtype=float),
+                                  np.zeros((4, 1)), flags=cv2.SOLVEPNP_SQPNP)
+    if not ok:
+        return None
+    R, _ = cv2.Rodrigues(rvec)
+    return make_transform(R, tvec.ravel())
+
+
 class RelayConsumer:
     """Owns a RemoteFrameReader and keeps the latest bundle available on demand.
     The reader's ``__iter__`` blocks, so a daemon thread drains it; callers poll

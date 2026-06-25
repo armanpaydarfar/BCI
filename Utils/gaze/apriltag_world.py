@@ -202,6 +202,143 @@ def recover_world_pose(tags_in_view: Dict[int, np.ndarray],
     return average_pose([ests[k] for k in best]) if len(best) > 1 else ests[best[0]]
 
 
+def register_world_map_multiview(frames: List[Dict[int, np.ndarray]],
+                                 ref_id: Optional[int] = None, *,
+                                 outlier_tol_mm: float = _CONSENSUS_TOL_MM) -> Dict:
+    """Robust world-tag map from MANY viewpoints (REV05, 2026-06-25). Replaces the
+    single-viewpoint window of `_register_tag_map`, which could not defeat the
+    single-tag depth ambiguity: averaging one biased view only sharpened the bias,
+    so each registration produced a different tilted/displaced map (≈70° normal
+    swing, ≈300 mm origin wander run-to-run) and the calibration was a coin-flip.
+
+    The world tags are STATIC, COPLANAR at one height, and all face UP (operator
+    2026-06-25). This fuses a head sweep over them into ONE reproducible map by
+    exploiting all three:
+
+      - **static + many views → triangulate.** For every frame where the reference
+        tag is co-visible, each other tag yields an estimate of its pose *in the
+        reference frame* (`T_ref_i = T_ref_cam · T_cam_i`). The per-view depth bias
+        points along that view's camera axis, so averaging `T_ref_i` over
+        geometrically diverse views decorrelates the bias toward the true static
+        geometry — what one static window cannot do.
+      - **coplanar at one height → project out depth.** All averaged tag origins are
+        projected onto their common best plane, zeroing the residual per-tag height
+        the depth ambiguity injects.
+      - **all up → one shared normal.** `table_normal_from_rel` already takes the
+        flip-aligned mean of the tags' +Z; over the multi-view-averaged `rel` it is
+        the single, stable table normal.
+
+    Args:
+        frames: per-video-frame detections ``[{tag_id: T_cam_tag}, ...]`` collected
+            across the head sweep (tag poses already in the camera frame, mm).
+        ref_id: the tag defining the world frame; default = the tag seen in the most
+            frames (ties → lowest id), the most-constrained anchor.
+        outlier_tol_mm: a per-tag relative-pose estimate whose translation is farther
+            than this from that tag's median estimate is dropped before averaging —
+            rejects the occasional flipped view so it cannot drag the fused pose.
+
+    Returns the same dict shape as `build_world_map`
+    (``ref_id, ids, rel, plane_point, plane_normal``), so it is a drop-in for the
+    downstream solve / `recover_world_pose` runtime.
+    """
+    seen_count: Dict[int, int] = {}
+    for fr in frames:
+        for i in fr:
+            seen_count[int(i)] = seen_count.get(int(i), 0) + 1
+    if not seen_count:
+        raise ValueError("register_world_map_multiview needs ≥1 detection")
+    if ref_id is None:
+        ref = min(seen_count, key=lambda i: (-seen_count[i], i))
+    else:
+        ref = int(ref_id)
+        if ref not in seen_count:
+            raise ValueError(f"ref_id {ref} never observed across the {len(frames)} frames")
+
+    # Per-frame relative poses, anchored on the reference tag (skip frames missing it).
+    obs: Dict[int, List[np.ndarray]] = {}
+    for fr in frames:
+        if ref not in fr:
+            continue
+        T_ref_cam = invert_transform(np.asarray(fr[ref], dtype=float))
+        for i, T in fr.items():
+            obs.setdefault(int(i), []).append(T_ref_cam @ np.asarray(T, dtype=float))
+    if ref not in obs:
+        raise ValueError(f"ref tag {ref} never co-visible with itself — no usable frames")
+
+    # Robust-average each tag's relative pose; drop translation outliers (flips).
+    rel: Dict[int, np.ndarray] = {}
+    for i, mats in obs.items():
+        ts = np.array([M[:3, 3] for M in mats])
+        med = np.median(ts, axis=0)
+        keep = [k for k in range(len(mats)) if np.linalg.norm(ts[k] - med) <= outlier_tol_mm]
+        if not keep:                       # all dispersed (rare): fall back to all
+            keep = list(range(len(mats)))
+        rel[int(i)] = average_pose([mats[k] for k in keep])
+
+    ids = sorted(rel)
+    if len(ids) >= 3:
+        # Shared up-normal, then snap every origin onto the common plane (coplanar).
+        plane_normal = table_normal_from_rel(rel, ids)
+        origins = np.array([rel[i][:3, 3] for i in ids])
+        centroid = origins.mean(axis=0)
+        projected = origins - np.outer((origins - centroid) @ plane_normal, plane_normal)
+        for k, i in enumerate(ids):
+            rel[i] = make_transform(rel[i][:3, :3], projected[k])
+        plane_point = projected.mean(axis=0)
+    else:
+        plane_point, plane_normal = np.zeros(3), np.array([0.0, 0.0, 1.0])
+    return {"ref_id": ref, "ids": ids, "rel": rel,
+            "plane_point": plane_point, "plane_normal": plane_normal}
+
+
+def world_map_geometry_report(world_map: Dict, x_edge_ids: List[int],
+                              y_edge_ids: List[int]) -> Dict:
+    """Sanity-check a registered world map against the KNOWN physical layout
+    (operator 2026-06-25: the world tags are coplanar, all facing up, taped on a
+    flat table whose worked corner is ~90°). Returns the recovered in-plane angle
+    between the +X and +Y table edges, the two edge lengths, and the worst tag
+    out-of-plane deviation — so registration can REJECT a skewed/tilted map before it
+    poisons a whole sweep.
+
+    Why this gate exists: a head sweep with too little viewpoint diversity (operator
+    sitting at a fixed oblique angle) leaves the single-tag depth ambiguity
+    unresolved, so the multiview map comes out skewed — observed 2026-06-25 as a 58.7°
+    corner where the table is ~90°. The geometry is wrong but every per-frame health
+    counter reads fine, so we check the one thing we know a-priori: the corner is
+    square and the tags are coplanar.
+
+    ``x_edge_ids`` / ``y_edge_ids`` are tag-id sequences whose endpoints define the +X
+    and +Y table edges (e.g. ``[0, 1]`` and ``[2, 0]``); the in-plane edge vector is
+    ``pos(ids[-1]) - pos(ids[0])`` projected onto the map plane. A ``corner_angle_deg``
+    of NaN means an edge tag was missing or degenerate."""
+    rel = world_map["rel"]
+    n = np.asarray(world_map["plane_normal"], dtype=float)
+    n = n / np.linalg.norm(n)
+
+    def pos(i: int) -> Optional[np.ndarray]:
+        return np.asarray(rel[int(i)][:3, 3], dtype=float) if int(i) in rel else None
+
+    def in_plane_edge(ids: List[int]) -> Optional[np.ndarray]:
+        a, b = pos(ids[0]), pos(ids[-1])
+        if a is None or b is None:
+            return None
+        v = b - a
+        return v - (v @ n) * n
+
+    ex, ey = in_plane_edge(x_edge_ids), in_plane_edge(y_edge_ids)
+    angle = float("nan")
+    lx = float(np.linalg.norm(ex)) if ex is not None else float("nan")
+    ly = float(np.linalg.norm(ey)) if ey is not None else float("nan")
+    if ex is not None and ey is not None and lx > 1e-6 and ly > 1e-6:
+        angle = float(np.degrees(np.arccos(np.clip(ex @ ey / (lx * ly), -1.0, 1.0))))
+
+    c = np.asarray(world_map["plane_point"], dtype=float)
+    devs = [abs(float((np.asarray(rel[i][:3, 3], dtype=float) - c) @ n))
+            for i in world_map["ids"]]
+    return {"corner_angle_deg": angle, "x_edge_len_mm": lx, "y_edge_len_mm": ly,
+            "max_out_of_plane_mm": float(max(devs)) if devs else 0.0}
+
+
 def world_map_to_arrays(world_map: Dict):
     """Flatten a map to npz-friendly arrays:
     ``(ref_id, ids[int], rels[N,4,4], plane_point[3], plane_normal[3])``."""

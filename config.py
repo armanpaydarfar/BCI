@@ -189,20 +189,34 @@ GAZE_CALIBRATION_USE_IMU = False
 # reachable and Depth Pro is loaded.
 GAZE_CALIBRATION_DEPTH_SOURCE = "vergence"
 
-# REV04 AprilTag gaze↔robot calibration — verified rig defaults (HIL PASS
-# 2026-06-24; verification report §7). The control panel builds the swept-
-# calibration + control-test commands from these so the operator never retypes
-# tag ids / sizes / the EE-tag→hand offset. These are algorithm/protocol
+# REV04 AprilTag gaze↔robot calibration — verified rig defaults. The control panel
+# builds the swept-calibration + control-test commands from these so the operator
+# never retypes tag ids / sizes / the EE-point recipe. These are algorithm/protocol
 # settings (not machine-local paths or IPs), so they live in committed config.py;
 # override per rig here when the physical tag layout changes.
 #   WORLD tags are taped coplanar on the flat table (≥3 → robust consensus pose);
-#   EE tag(s) ride on the end-effector; the offset is the measured EE-tag→hand
-#   vector in the TAG frame (mm), applied per-sample as R_world_eetag·offset.
+#   EE tag(s) ride on the end-effector.
+# EE-point recipe — the verified-good recipe (control-rig, 2026-06-24 and re-confirmed
+# 2026-06-25) is 'pose' (EE-tag pose origin + the measured tag→hand offset, projected
+# onto the table) with the measured offset below. The offset is applied at the SOLVE
+# step (re-derived from the stored sweep transforms); 'rayplane' (tag-centre ray ∩
+# plane, offset-free) is the head-position-dependent alternative kept for diagnostics.
+# Residual accuracy is gated by the single EE tag's orientation noise lever-armed
+# through the offset — an EE multi-tag bundle is the eventual fix.
 APRILTAG_WORLD_TAG_IDS = [0, 1, 2, 3, 4]
 APRILTAG_EE_TAG_IDS = [5]
 APRILTAG_TAG_SIZE_M = 0.08
 APRILTAG_EE_TAG_SIZE_M = 0.04
+APRILTAG_EE_POINT_METHOD = "pose"          # 'pose' (verified-good) | 'rayplane' (diagnostic)
 APRILTAG_T_EETAG_EE_MM = [150.0, -200.0, 0.0]
+# Known table layout, used to sanity-check the registered world map (the tags are
+# coplanar, face up, and the worked corner is ~90°). Endpoints of the +X and +Y table
+# edges by tag id: 2->0 is +Y (toward the far edge), 0->...->1 is +X (along the far
+# edge). After registration the sweep reports the recovered corner angle; far from 90°
+# means the head sweep lacked viewpoint diversity and the map is skewed (re-register
+# with a wider head sweep) rather than poisoning the calibration.
+APRILTAG_TABLE_X_EDGE_IDS = [0, 1]
+APRILTAG_TABLE_Y_EDGE_IDS = [2, 0]
 
 # =============================================================================
 # Pupil Labs Neon — device connection

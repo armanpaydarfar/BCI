@@ -64,7 +64,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -87,13 +87,15 @@ from Utils.gaze.apriltag_detect import (  # noqa: E402
     RelayConsumer,
     detect_tags,
     load_detector,
+    recover_world_pose_pnp,
 )
 from Utils.gaze.apriltag_world import (  # noqa: E402
-    average_pose,
-    build_world_map,
     plane_coords,
     recover_world_pose,
+    register_world_map_multiview,
     table_normal_from_rel,
+    world_map_from_arrays,
+    world_map_geometry_report,
     world_map_to_arrays,
 )
 from Utils.gaze.apriltag_sweep import (  # noqa: E402
@@ -238,20 +240,23 @@ def stage_gaze(args, consumer: RelayConsumer) -> int:
 
 
 def _register_tag_map(consumer, detector, K, ids, tag_size, tag_sizes,
-                      label="tag", dur=2.0):
-    """Average each tag's pose over a short window (all tags visible, the body
-    they sit on held still) and build a rigid map over them via
-    ``build_world_map``. Returns ``(map, sorted_seen_ids)`` or ``(None, [])`` if
-    no listed tag was detected.
+                      label="tag", dur=6.0):
+    """Multi-view registration (REV05, 2026-06-25): collect the listed tags across a
+    slow HEAD SWEEP — the body they sit on held STILL — and fuse them into one
+    reproducible map via ``register_world_map_multiview``. Seeing the static tags
+    from many viewpoints triangulates away the single-tag depth ambiguity that made
+    the old single-window average wander run-to-run (≈300 mm origins, ≈70° normal) —
+    the real reason a calibration was a coin-flip. Returns ``(map, sorted_seen_ids)``
+    or ``(None, [])`` if no listed tag was detected.
 
-    Used for BOTH the static world-tag map and the EE-tag bundle map (rev04 §7):
-    ``build_world_map``/``recover_world_pose`` are frame-agnostic, so the EE
-    bundle is registered exactly like the world bundle — its "world" frame is the
-    EE reference tag's frame, and the hand-measured offset is taken w.r.t. that
-    reference tag."""
-    _log(f"{label}-map registration: keep ALL {label} tags {ids} visible and the "
-         f"body they sit on STILL for ~{dur:.0f}s …")
-    obs = {int(i): [] for i in ids}
+    Used for BOTH the static world-tag map (move the head around the table) and the
+    EE-tag bundle map (hold the EE still, move the head around IT): the EE side is
+    momentarily static during its own registration, so the same multi-view fuse
+    applies; a single EE tag is a 1-entry map (no triangulation, just denoised)."""
+    _log(f"{label}-map registration: keep ALL {label} tags {ids} visible and the body "
+         f"they sit on STILL, then SLOWLY move your head around them for ~{dur:.0f}s "
+         "(many viewpoints → a stable, reproducible map) …")
+    frames: List[Dict[int, np.ndarray]] = []
     last_idx = None
     deadline = time.time() + dur
     while time.time() < deadline:
@@ -261,13 +266,17 @@ def _register_tag_map(consumer, detector, K, ids, tag_size, tag_sizes,
             continue
         last_idx = b.video.frame_idx
         tags = detect_tags(detector, b.video.bgr, K, tag_size, tag_sizes=tag_sizes)
-        for i in ids:
-            if int(i) in tags:
-                obs[int(i)].append(tags[int(i)]["T"])
-    seen = {i: average_pose(v) for i, v in obs.items() if v}
-    if not seen:
+        frame = {int(i): tags[int(i)]["T"] for i in ids if int(i) in tags}
+        if frame:
+            frames.append(frame)
+    if not frames:
         return None, []
-    return build_world_map(seen), sorted(seen)
+    # Report the MAP's ids (tags fused into it = co-visible with the reference), not
+    # every tag merely glimpsed — so a tag that never shared a frame with the ref is
+    # flagged MISSING upstream and the operator re-shows it, rather than silently
+    # dropping out of the map.
+    wm = register_world_map_multiview(frames)
+    return wm, list(wm["ids"])
 
 
 def _resolve_ee_ids(args) -> Optional[List[int]]:
@@ -314,6 +323,87 @@ def _register_map_interactive(consumer, detector, K, ids, world_tag_size,
             continue
         _log(f"  {label} map OK: ref={tag_map['ref_id']}, tags={seen}")
         return tag_map
+
+
+def _check_world_geometry(world_map) -> str:
+    """Log the world-map geometry verdict against the known table layout (corner ~90°,
+    coplanar) and return ``'GOOD'``/``'SKEWED'``/``'UNKNOWN'``. A TOP-DOWN registration
+    should read GOOD; a seated view reads SKEWED because per-tag pose is oblique-biased
+    (operator 2026-06-25) — which is exactly why the map is registered top-down and
+    reused, with seated frames recovered by the multi-tag board PnP."""
+    import config as _cfg
+    xe = list(getattr(_cfg, "APRILTAG_TABLE_X_EDGE_IDS", [0, 1]))
+    ye = list(getattr(_cfg, "APRILTAG_TABLE_Y_EDGE_IDS", [2, 0]))
+    if not all(int(i) in world_map["ids"] for i in (*xe, *ye)):
+        _log("world-map geometry: edge tags not all present — squareness check skipped")
+        return "UNKNOWN"
+    geo = world_map_geometry_report(world_map, xe, ye)
+    corner = geo["corner_angle_deg"]
+    verdict = "GOOD" if np.isfinite(corner) and abs(corner - 90.0) <= 10.0 else "SKEWED"
+    _log(f"world-map geometry: corner {corner:.1f}° (want ~90°), "
+         f"edges {geo['x_edge_len_mm']:.0f}×{geo['y_edge_len_mm']:.0f} mm, "
+         f"out-of-plane {geo['max_out_of_plane_mm']:.1f} mm → {verdict}")
+    return verdict
+
+
+def _save_world_map(world_map, out_dir: str, stamp: Optional[str], tag_size: float,
+                    world_ids: List[int]) -> Path:
+    """Persist a registered world map to ``runs/world_map_<UTC>.npz`` for reuse across
+    seated sweeps (the static tags never move)."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    from datetime import datetime, timezone
+    stamp = stamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = out / f"world_map_{stamp}.npz"
+    ref, ids, rels, pp, pn = world_map_to_arrays(world_map)
+    np.savez_compressed(path, world_map_ref=np.array(ref), world_map_ids=ids,
+                        world_map_rels=rels, world_map_plane_point=pp,
+                        world_map_plane_normal=pn,
+                        meta=np.array({"stage": "register-world", "tag_size_m": tag_size,
+                                       "world_tag_ids": list(world_ids)}, dtype=object))
+    return path
+
+
+def _load_world_map(path: str):
+    """Load a world map saved by `_save_world_map`."""
+    z = np.load(path, allow_pickle=True)
+    return world_map_from_arrays(z["world_map_ref"], z["world_map_ids"],
+                                 z["world_map_rels"], z["world_map_plane_point"],
+                                 z["world_map_plane_normal"])
+
+
+def stage_register_world(args, consumer: RelayConsumer, ui=None) -> int:
+    """Register the STATIC world-tag map ONCE from a TOP-DOWN view and save it (REV05,
+    2026-06-25). Per-tag AprilTag pose is oblique-biased, so the map geometry is only
+    accurate viewed near top-down (operator: ~88° corner standing vs 60–75° seated).
+    Register here (stand over the table — NO robot needed) and reuse the saved map for
+    seated sweeps, where each frame's camera pose is recovered by the multi-tag board
+    PnP — accurate even at the seated 45° angle. Writes ``runs/world_map_<UTC>.npz``."""
+    if not args.world_tag_ids:
+        _log("register-world needs --world-tag-ids")
+        return 2
+    world_ids = [int(i) for i in args.world_tag_ids]
+    detector = load_detector(args.families)
+    K = consumer.camera_matrix
+    _log(f"register-world: view tags {world_ids} @ {args.tag_size} m from TOP-DOWN "
+         "(stand over the table; no robot needed). Geometry is accurate near top-down.")
+    world_map = _register_map_interactive(consumer, detector, K, world_ids,
+                                          args.tag_size, {}, "world",
+                                          "viewed TOP-DOWN, tags STILL", ui=ui)
+    if ui is not None:
+        ui.close()
+    if world_map is None:
+        return 1
+    if _check_world_geometry(world_map) == "SKEWED":
+        _log("  ⚠ geometry SKEWED — re-run from a more TOP-DOWN view (corner should be "
+             "~90°). Saving anyway so you can inspect/retry.")
+    path = _save_world_map(world_map, args.out_dir, args.utc_stamp, args.tag_size, world_ids)
+    _log(f"saved world map → {path}")
+    _log("now sweep seated with it: python tools/apriltag_calibrate.py --stage sweep "
+         f"--with-robot --world-map {path} --world-tag-ids {' '.join(map(str, world_ids))} "
+         "--ee-tag-ids 5 --tag-size 0.08 --ee-tag-size 0.04 --ee-point-method pose "
+         "--t-eetag-ee 150 -200 0 --then-solve")
+    return 0
 
 
 def stage_collect(args, consumer: RelayConsumer) -> int:
@@ -514,42 +604,25 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     _log(f"tag sizes: world {args.tag_size} m, EE {ee_size} m; world tags "
          f"{world_ids}, EE tags {ee_ids}; EE point method: {ee_point_method}")
 
-    world_map = _register_map_interactive(consumer, detector, K, world_ids,
-                                          args.tag_size, tag_sizes, "world", "arm CLEAR",
-                                          ui=ui)
-    if world_map is None:
-        if ui is not None:
-            ui.close()
-        return 1
-    ee_map = _register_map_interactive(consumer, detector, K, ee_ids,
-                                       args.tag_size, tag_sizes, "EE", "the EE STILL",
-                                       ui=ui)
-    if ee_map is None:
-        if ui is not None:
-            ui.close()
-        return 1
-    ee_ref = ee_map["ref_id"]
-    plane_point = world_map["plane_point"]
-    plane_normal = world_map["plane_normal"]
-
     grid = CoverageGrid(cell_size_mm=args.cell_size_mm, min_samples=args.min_samples,
                         min_spread_mm=args.min_spread_mm)
 
+    # Connect the robot but keep the arm LOCKED through world registration (operator
+    # 2026-06-25): a freed arm is limp and can droop into the tags' view, corrupting
+    # the world map. It is freed only AFTER the world map is registered — for EE
+    # placement and the hand-guided sweep (see below). The `finally` re-locks + homes
+    # on every exit, so a freed arm is never left limp.
     link: Optional[HarmonyLink] = None
     arm_is_free = False
     if args.with_robot:
         link = HarmonyLink(args.robot_ip, args.robot_port, args.bind_ip,
                            args.bind_port, side=args.side)
-        if not link.free_arm():
-            _log("could not free the arm (ACK:MASTER_FREE not seen) — aborting sweep")
-            link.close()
-            return 1
-        arm_is_free = True
-        _log("arm FREED — hand-guide the EE slowly across the table surface")
+        _log("robot linked — arm stays LOCKED for world registration (keep it clear)")
     else:
         _log("no --with-robot: Q/X will be NaN (camera-side dry run — verifies "
              "(u,v) + coverage on a recorded stream, not a solvable library)")
 
+    world_map = ee_map = None
     uv_rows: List[np.ndarray] = []
     q_rows: List[np.ndarray] = []
     x_rows: List[np.ndarray] = []
@@ -561,6 +634,48 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     last_idx = None
     accepted = 0
     try:
+        # World map: LOAD the pre-registered top-down map (preferred — accurate geometry
+        # the seated view can't produce) or, as a fallback, register it now seated. The
+        # arm stays LOCKED and clear through this (a limp arm can droop into view).
+        if args.world_map:
+            world_map = _load_world_map(args.world_map)
+            world_ids = list(world_map["ids"])  # the loaded map defines the world tags
+            _log(f"loaded world map {args.world_map}: ref={world_map['ref_id']}, "
+                 f"tags={world_ids}")
+            _check_world_geometry(world_map)
+        else:
+            world_map = _register_map_interactive(consumer, detector, K, world_ids,
+                                                  args.tag_size, tag_sizes, "world",
+                                                  "arm clear & LOCKED", ui=ui)
+            if world_map is None:
+                return 1
+            # Seated registration is oblique-biased (operator 2026-06-25): the verdict
+            # will usually read SKEWED here, which is WHY you should --stage register-world
+            # from a top-down view and pass --world-map instead.
+            if _check_world_geometry(world_map) == "SKEWED":
+                _log("  ⚠ SKEWED from this (seated) view — register top-down once with "
+                     "`--stage register-world` and reuse it via --world-map for an "
+                     "accurate map. Board PnP recovers the seated pose from that map.")
+
+        # World map is ready — NOW free the arm for EE placement + the hand-guided
+        # sweep (operator 2026-06-25: not before, so a limp arm can't droop into the
+        # world tags). The `finally` re-locks + auto-homes on every exit from here.
+        if args.with_robot:
+            if not link.free_arm():
+                _log("could not free the arm (ACK:MASTER_FREE not seen) — aborting sweep")
+                return 1
+            arm_is_free = True
+            _log("arm FREED — place the EE for its registration, then hand-guide the sweep")
+
+        ee_map = _register_map_interactive(consumer, detector, K, ee_ids,
+                                           args.tag_size, tag_sizes, "EE",
+                                           "the EE held STILL", ui=ui)
+        if ee_map is None:
+            return 1
+        ee_ref = ee_map["ref_id"]
+        plane_point = world_map["plane_point"]
+        plane_normal = world_map["plane_normal"]
+
         # Start gate (rev04 §3, operator 2026-06-24): with the arm freed, let the
         # operator position it before any sample is recorded, so the transit into
         # the start pose never enters the library. The deadline starts AFTER the
@@ -593,9 +708,15 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                 q_joints, x_ee, t_robot = np.full(7, np.nan), np.full(3, np.nan), time.time()
 
             tags = detect_tags(detector, b.video.bgr, K, args.tag_size, tag_sizes=tag_sizes)
-            world_view = {i: tags[i]["T"] for i in world_ids if i in tags}
+            world_view = {i: tags[i] for i in world_ids if i in tags}
             ee_view = {i: tags[i]["T"] for i in ee_ids if i in tags}
-            T_cam_world = recover_world_pose(world_view, world_map)
+            # View-robust world pose: one multi-tag board PnP over the visible tag
+            # centres (accurate at the seated oblique angle). Falls back to the per-tag
+            # consensus when <4 mapped tags are visible (heavy occlusion).
+            T_cam_world = recover_world_pose_pnp(world_view, world_map, K)
+            if T_cam_world is None:
+                T_cam_world = recover_world_pose(
+                    {i: world_view[i]["T"] for i in world_view}, world_map)
             T_cam_eetag = recover_world_pose(ee_view, ee_map)
             margins = ([tags[i]["margin"] for i in world_view]
                        + [tags[i]["margin"] for i in ee_view])
@@ -605,13 +726,21 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                 margins=margins, dt_s=dt,
                 min_margin=args.min_margin, max_align_dt_s=args.max_align_dt_s)
 
-            cur_uv = None
+            cur_uv = None      # vision (u,v) — the gaze-side command coordinate (library)
+            disp_xy = None      # what the coverage grid + display use (telemetry base)
             if ok:
                 p_world = _ee_point_world(ee_point_method, T_cam_world, T_cam_eetag,
                                           plane_point, plane_normal, offset_mm)
                 if p_world is not None:
                     cur_uv = plane_coords(p_world, plane_point, plane_normal)
-                    grid.add(cur_uv)
+                    # Telemetry-anchored coverage + display (operator 2026-06-25): bin
+                    # and draw the robot's OWN end-effector (x,y) — the single most
+                    # consistent metric — so the screen shows exactly where the arm is,
+                    # in robot axes. The library still stores the vision (u,v) (gaze is
+                    # the only runtime signal); telemetry anchors coverage/display only.
+                    # No-robot dry run has NaN telemetry → fall back to vision (u,v).
+                    disp_xy = x_ee[:2] if np.all(np.isfinite(x_ee[:2])) else cur_uv
+                    grid.add(disp_xy)
                     uv_rows.append(cur_uv)
                     q_rows.append(q_joints)
                     x_rows.append(x_ee)
@@ -622,7 +751,7 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
 
             target = grid.next_target()
             if ui is not None:
-                ui.update(grid, cur_uv, target)
+                ui.update(grid, disp_xy, target)
                 if ui.should_quit():
                     _log("sweep: quit requested from the coverage view")
                     break
@@ -683,8 +812,13 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     # Tag each saved sample green/amber by its cell's FINAL sufficiency so the solve
     # can build the library from green-cell samples only (rev04 §3, operator
     # 2026-06-24): extraneous transit samples land in still-partial cells and would
-    # otherwise pollute the (u,v)→Q nearest-neighbour lookup.
-    green = grid.sufficient_mask(uv_rows)
+    # otherwise pollute the (u,v)→Q nearest-neighbour lookup. Coverage is in the SAME
+    # frame the grid was fed during the sweep — telemetry base (x,y) with a robot, else
+    # vision (u,v) — so the mask matches what the operator saw fill in.
+    x_arr = np.vstack(x_rows)
+    cov_pts = (x_arr[:, :2] if np.all(np.isfinite(x_arr[:, :2]))
+               else np.vstack(uv_rows))
+    green = grid.sufficient_mask(cov_pts)
     wm_ref, wm_ids, wm_rels, wm_pp, wm_pn = world_map_to_arrays(world_map)
     em_ref, em_ids, em_rels, em_pp, em_pn = world_map_to_arrays(ee_map)
     meta = {
@@ -805,11 +939,18 @@ def _recompute_planar_uv(z, method, offset):
     grid = CoverageGrid(cell_size_mm=cov.get("cell_size_mm", 50.0),
                         min_samples=cov.get("min_samples", 8),
                         min_spread_mm=cov.get("min_spread_mm", 15.0))
-    finite = np.all(np.isfinite(UV), axis=1)
-    for uv in UV[finite]:
-        grid.add(uv)
+    # Coverage is computed in telemetry base (x,y) when present — the same physical,
+    # EE-method-independent frame the sweep used (so re-solving with a different EE
+    # method doesn't move the cells). Falls back to vision (u,v) for a no-robot capture.
+    X = np.asarray(z["X"], dtype=float) if "X" in z.files else None
+    use_base = (X is not None and X.ndim == 2 and X.shape[1] >= 2
+                and bool(np.isfinite(X[:, :2]).all()))
+    cov_pts = X[:, :2] if use_base else UV
+    finite = np.all(np.isfinite(UV), axis=1) & np.all(np.isfinite(cov_pts), axis=1)
+    for p in cov_pts[finite]:
+        grid.add(p)
     green = np.zeros(len(UV), dtype=bool)
-    green[finite] = grid.sufficient_mask(UV[finite])
+    green[finite] = grid.sufficient_mask(cov_pts[finite])
     return UV, green, pp, pn
 
 
@@ -931,15 +1072,25 @@ def stage_solve_planar(args, z, npz_path) -> int:
     # re-sweep. The coverage/green mask is recomputed too, since the cells move.
     green_src = np.asarray(z["green"], dtype=bool) if "green" in z.files else None
     plane_fix = None  # (plane_point, plane_normal) to override in the calib, if recomputed
+    # The EE-point method/offset the OUTPUT library is actually built with — recorded
+    # into the calib meta below. Default to the sweep's (no recompute = library is the
+    # sweep's stored (u,v)); overwritten when we re-derive. Without recording these the
+    # calib meta silently inherited the sweep's values and MISREPORTED a re-solved
+    # library (e.g. a rayplane/0 sweep re-solved to pose+offset still read rayplane/0),
+    # which cost a debugging session 2026-06-25. Read the meta, trust the meta.
+    src_meta_for_recipe = z["meta"].item() if "meta" in z.files else {}
+    applied_method = src_meta_for_recipe.get("ee_point_method")
+    applied_offset = src_meta_for_recipe.get("t_eetag_ee_mm", [0.0, 0.0, 0.0])
     if args.ee_point_method is not None and "T_cam_world" in z.files:
         # EE-tag→hand offset (tag frame, mm): an explicit --t-eetag-ee overrides the
         # zero the sweep stored, so a measured mount offset can be applied on re-solve.
-        meta0 = z["meta"].item() if "meta" in z.files else {}
+        meta0 = src_meta_for_recipe
         offset = np.asarray(args.t_eetag_ee, dtype=float)
         if not offset.any():
             offset = np.asarray(meta0.get("t_eetag_ee_mm", [0.0, 0.0, 0.0]), dtype=float)
         UV, green_src, _pp_fix, _pn_fix = _recompute_planar_uv(z, args.ee_point_method, offset)
         plane_fix = (_pp_fix, _pn_fix)
+        applied_method, applied_offset = args.ee_point_method, offset.tolist()
         _log(f"recomputed (u,v): ee-point-method={args.ee_point_method}, "
              f"t_eetag_ee={offset.tolist()} mm (tag frame); table normal from tag "
              f"orientations = {np.round(_pn_fix, 3).tolist()}")
@@ -1002,7 +1153,11 @@ def stage_solve_planar(args, z, npz_path) -> int:
     calib_meta = dict(src_meta)
     calib_meta.update({"scheme": "planar_uv_nn", "n_points": int(n),
                        "a2_inplane_rms_mm": rms2, "a2_n_points": n2,
-                       "source_capture": npz_path.name})
+                       "source_capture": npz_path.name,
+                       # Record the recipe the LIBRARY was actually built with (not the
+                       # sweep's) so the meta never lies about a re-solved calib again.
+                       "ee_point_method": applied_method,
+                       "t_eetag_ee_mm": applied_offset})
     out_path = npz_path.with_name(npz_path.stem.replace("apriltag_sweep", "apriltag")
                                   + "_calib.npz")
     # Carry the world map + plane through so the control tool recovers the SAME
@@ -1035,9 +1190,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     import config as cfg
     p = argparse.ArgumentParser(description="AprilTag gaze↔robot calibration tool")
     p.add_argument("--stage", required=True,
-                   choices=["detect", "gaze", "collect", "sweep", "solve"])
+                   choices=["detect", "gaze", "collect", "sweep", "solve",
+                            "register-world"])
     p.add_argument("npz", nargs="?", default=None,
                    help="solve stage: path to an apriltag_capture_*.npz")
+    p.add_argument("--world-map", default=None,
+                   help="sweep stage: load a pre-registered world map (from "
+                        "--stage register-world) instead of registering seated. "
+                        "Register the static tags ONCE from a top-down view (where the "
+                        "geometry is accurate) and reuse it across seated sessions.")
     p.add_argument("--families", default="tag36h11")
     p.add_argument("--tag-size", type=float, default=0.06,
                    help="WORLD tag edge length in METRES (default 0.06)")
@@ -1165,6 +1326,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return stage_gaze(args, consumer)
         if args.stage == "collect":
             return stage_collect(args, consumer)
+        if args.stage == "register-world":
+            return stage_register_world(args, consumer, ui=_make_coverage_ui(args))
         if args.stage == "sweep":
             return stage_sweep(args, consumer, ui=_make_coverage_ui(args))
     finally:

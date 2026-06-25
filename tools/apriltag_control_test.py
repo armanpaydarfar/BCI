@@ -55,7 +55,12 @@ from Utils.gaze.apriltag_calib import (  # noqa: E402
     ray_plane_intersection,
     transform_point,
 )
-from Utils.gaze.apriltag_detect import RelayConsumer, detect_tags, load_detector  # noqa: E402
+from Utils.gaze.apriltag_detect import (  # noqa: E402
+    RelayConsumer,
+    detect_tags,
+    load_detector,
+    recover_world_pose_pnp,
+)
 from Utils.gaze.apriltag_world import (  # noqa: E402
     plane_coords,
     recover_world_pose,
@@ -127,11 +132,17 @@ def _sample_uv(consumer: RelayConsumer, detector, K, world_map: dict,
             continue
         gaze_frames += 1
         tags = detect_tags(detector, b.video.bgr, K, tag_size)
-        world_view = {i: tags[i]["T"] for i in world_map["ids"] if i in tags}
+        world_view = {i: tags[i] for i in world_map["ids"] if i in tags}
         per_frame_counts.append(len(world_view))
         for i in world_view:
             ids_seen[int(i)] = ids_seen.get(int(i), 0) + 1
-        T_cam_world = recover_world_pose(world_view, world_map)
+        # Same view-robust board PnP the sweep used (consistency: capture and runtime
+        # must recover the world pose identically). Per-tag consensus is the <4-tag
+        # occlusion fallback.
+        T_cam_world = recover_world_pose_pnp(world_view, world_map, K)
+        if T_cam_world is None:
+            T_cam_world = recover_world_pose(
+                {i: world_view[i]["T"] for i in world_view}, world_map)
         if T_cam_world is None:
             continue
         uv = gaze_point_in_plane_uv(b.gaze.x, b.gaze.y, K, T_cam_world,

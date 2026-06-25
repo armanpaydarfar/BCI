@@ -213,22 +213,27 @@ class CalibrationController(QObject):
             QMessageBox.warning(self._parent, "Missing", f"Not found:\n{self._apriltag_calibrate_py}")
             return
         # REV04 swept calibration + planar solve in one terminal, from the verified
-        # rig config (config.APRILTAG_*). --then-solve writes the *_calib.npz; the
-        # operator hits Refresh afterwards and the control-test button picks it up.
+        # rig config (config.APRILTAG_*). The EE-point method + offset come from config
+        # so the operator switches recipes without retyping: the verified-good recipe is
+        # APRILTAG_EE_POINT_METHOD='rayplane' with a zero offset (re-confirmed on the rig
+        # 2026-06-25; 'pose'+offset regressed via single-EE-tag flips). --then-solve
+        # writes the *_calib.npz; the operator hits Refresh and the control-test button
+        # picks it up.
         world = " ".join(str(int(i)) for i in getattr(self._hcfg, "APRILTAG_WORLD_TAG_IDS", [0, 1, 2, 3, 4]))
         ee = " ".join(str(int(i)) for i in getattr(self._hcfg, "APRILTAG_EE_TAG_IDS", [5]))
         tag = float(getattr(self._hcfg, "APRILTAG_TAG_SIZE_M", 0.08))
         ee_tag = float(getattr(self._hcfg, "APRILTAG_EE_TAG_SIZE_M", 0.04))
-        off = list(getattr(self._hcfg, "APRILTAG_T_EETAG_EE_MM", [150.0, -200.0, 0.0]))
+        method = getattr(self._hcfg, "APRILTAG_EE_POINT_METHOD", "rayplane")
+        off = list(getattr(self._hcfg, "APRILTAG_T_EETAG_EE_MM", [0.0, 0.0, 0.0]))
         # --side defaults to env HARMONY_ACTIVE_SIDE or 'R' in the tool itself.
         cmd = (f'python -u "{self._apriltag_calibrate_py}" --stage sweep --with-robot '
                f'--world-tag-ids {world} --ee-tag-ids {ee} '
                f'--tag-size {tag} --ee-tag-size {ee_tag} '
-               f'--t-eetag-ee {off[0]} {off[1]} {off[2]} '
+               f'--ee-point-method {method} --t-eetag-ee {off[0]} {off[1]} {off[2]} '
                f'--out-dir runs --then-solve')
         self._spawn_external(cmd)
         self._log("Panel", f"[{self._ts()}] Launched AprilTag calibration "
-                  f"(sweep → solve): world {world}, EE {ee}, offset {off}\n")
+                  f"(sweep → solve): world {world}, EE {ee}, method {method}, offset {off}\n")
 
     def on_run_apriltag_control_test(self):
         if not os.path.exists(self._apriltag_control_test_py):
