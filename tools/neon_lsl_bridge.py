@@ -41,6 +41,17 @@ depth_cm is recomputed in this process using the
 `Utils.gaze.gaze_math.vergence_depth_from_eyestate` routine — keeps
 column 3 semantically identical so existing XDFs read the same.
 
+Sample timing: both outlets stamp each LSL sample with the Neon *device*
+time (gaze: `timestamp_unix_seconds`; events: `timestamp_unix_ns`, which
+is the fixation start), mapped to the LSL clock — NOT the bridge push
+time. This matters for events: Pupil's fixation-detection + transport
+latency posted onsets ~235 ms late under the old push-time stamping,
+which dragged the EEG occipital lambda wave to negative latency when
+epoching to fixation onsets. See SoftwareDocs
+projects/harmony-bci/eeg-gaze-fixation/report.md. The device->LSL offset
+is maintained by `_DeviceClockMapper`; before it is established (or if a
+device timestamp is missing) the affected sample falls back to push-time.
+
 Pupillometry is a slow *state* biosignal, not a trial-level MI control
 signal (WS6 found cue-locked MI-vs-Rest AUC ≈ chance). This bridge is
 for *recording* gaze + pupillometry to XDF, not for closed-loop decode.
@@ -141,6 +152,58 @@ GAZE_CHANNELS = [
 ]
 
 
+class _DeviceClockMapper:
+    """Map Neon *device* unix timestamps onto the LSL ``local_clock`` so each
+    sample is stamped at its true capture/onset time instead of the bridge's
+    push time.
+
+    Why this exists: ``push_sample`` with no explicit timestamp lets pylsl stamp
+    the sample with ``local_clock()`` at the moment of the push — i.e. *after*
+    Pupil's fixation-detection latency + transport + poll delay. On the oneshot
+    ALS XDFs that pushed the fixation-onset event ~235 ms late, which dragged the
+    EEG occipital lambda wave to negative latency when epoching to the event (see
+    SoftwareDocs projects/harmony-bci/eeg-gaze-fixation/report.md). The device
+    already reports the true time (gaze: ``timestamp_unix_seconds``; events:
+    ``timestamp_unix_ns`` == the fixation start), so we stamp with that.
+
+    The device-unix -> LSL offset is (local_clock epoch - unix epoch). We track it
+    as the running *minimum* of ``local_clock() - device_unix`` over received gaze
+    samples: receive latency is always >= 0, so the minimum strips it and leaves
+    the true clock offset. A tiny upward leak lets the estimate follow slow clock
+    drift instead of locking onto one anomalously-early sample. Thread-safe: the
+    gaze loop calls observe(), the events loop calls to_lsl().
+    """
+
+    # Upward leak per non-minimal observation. At ~30 Hz this lets the estimate
+    # rise <=~0.15 ms/s — above real crystal drift (tens of ms over a session),
+    # far below the ~235 ms lag being corrected, so it never reintroduces it.
+    _LEAK_S = 5e-6
+
+    def __init__(self) -> None:
+        self._offset: float | None = None
+        self._lock = threading.Lock()
+
+    def observe(self, device_unix_s: float, now_lsl: float) -> None:
+        """Feed one (device unix time, local_clock-at-receive) pair."""
+        if not (device_unix_s and device_unix_s == device_unix_s and device_unix_s > 0):
+            return  # missing / NaN / nonpositive — ignore
+        o = now_lsl - device_unix_s
+        with self._lock:
+            if self._offset is None or o < self._offset:
+                self._offset = o
+            else:
+                self._offset += self._LEAK_S
+
+    def to_lsl(self, device_unix_s: float) -> float | None:
+        """Device unix time -> LSL clock, or None if no estimate / bad input
+        (caller then falls back to push-time stamping)."""
+        with self._lock:
+            off = self._offset
+        if off is None or not (device_unix_s and device_unix_s == device_unix_s and device_unix_s > 0):
+            return None
+        return device_unix_s + off
+
+
 def _build_gaze_outlet(name: str, source_id: str) -> pylsl.StreamOutlet:
     """Construct the multi-channel NeonGaze LSL outlet."""
     info = pylsl.StreamInfo(
@@ -197,12 +260,18 @@ def _gaze_loop(
     device: Device,
     outlet: pylsl.StreamOutlet,
     stop: threading.Event,
+    clock: _DeviceClockMapper,
 ) -> None:
     """Worker thread: pull gaze datums, push 29-channel samples to LSL.
 
     `receive_gaze_datum(timeout_seconds=...)` blocks until a sample
     arrives or the timeout expires. Returning None on timeout lets the
     stop flag get checked between samples without burning CPU.
+
+    Samples are stamped with the device's own capture time (mapped to the
+    LSL clock via `clock`), not the push time, so XDF consumers see true
+    acquisition timing. This loop also feeds `clock` the offset estimate
+    that the events loop reuses to stamp fixation onsets.
     """
     n_pushed = 0
     last_stats = time.monotonic()
@@ -264,8 +333,16 @@ def _gaze_loop(
         sample[2] = worn       # worn
         sample[3] = depth_cm   # depth_cm
 
+        # Stamp at the device capture time, not the push time. sample[4] is the
+        # unix_t channel (timestamp_unix_seconds); feed it to the shared clock
+        # mapper and use the mapped LSL time. Fall back to push-time (ts=0.0 =>
+        # local_clock) before the offset is established or if the device time
+        # is missing.
+        dev_unix = sample[4]
+        clock.observe(dev_unix, pylsl.local_clock())
+        ts_lsl = clock.to_lsl(dev_unix)
         try:
-            outlet.push_sample(sample)
+            outlet.push_sample(sample, timestamp=ts_lsl if ts_lsl is not None else 0.0)
             n_pushed += 1
         except Exception as e:
             print(f"[gaze] push error: {e!r}", flush=True)
@@ -287,12 +364,19 @@ def _events_loop(
     device: Device,
     outlet: pylsl.StreamOutlet,
     stop: threading.Event,
+    clock: _DeviceClockMapper,
 ) -> None:
     """Worker thread: pull eye events, push as JSON markers.
 
     Empty stream is normal — eye events fire only when Pupil's
     realtime detector emits a fixation/blink/saccade. On a still
     operator with eyes open, expect zero events for long stretches.
+
+    Each event is stamped at its true device time (the event's
+    `timestamp_unix_ns`, which equals the fixation start), mapped to the
+    LSL clock via the shared `clock`. This removes the fixation-detection
+    + transport latency that otherwise posted onsets ~235 ms late — the
+    correction that lets EEG epoch cleanly to fixation onsets.
     """
     n_pushed = 0
     last_stats = time.monotonic()
@@ -344,8 +428,19 @@ def _events_loop(
                 {"__type": type(evt).__name__, "__error": str(e)}
             )
 
+        # Stamp at the true onset. timestamp_unix_ns is the event's device
+        # unix time (== the fixation start for FixationOnset events); map it to
+        # the LSL clock with the offset the gaze loop maintains. rtp_ts_unix_seconds
+        # is an equivalent fallback. If neither is present or the offset isn't
+        # established yet, fall back to push-time (ts=0.0 => local_clock).
+        ts_ns = payload.get("timestamp_unix_ns")
+        dev_unix = (
+            ts_ns / 1e9 if isinstance(ts_ns, (int, float))
+            else payload.get("rtp_ts_unix_seconds")
+        )
+        ts_lsl = clock.to_lsl(dev_unix) if isinstance(dev_unix, (int, float)) else None
         try:
-            outlet.push_sample([event_json])
+            outlet.push_sample([event_json], timestamp=ts_lsl if ts_lsl is not None else 0.0)
             n_pushed += 1
         except Exception as e:
             print(f"[events] push error: {e!r}", flush=True)
@@ -430,8 +525,12 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_sig)
     signal.signal(signal.SIGTERM, _on_sig)
 
+    # Shared device->LSL clock offset: the gaze loop estimates it from the
+    # continuous gaze stream; the events loop reuses it to stamp fixation onsets.
+    clock = _DeviceClockMapper()
+
     gaze_thread = threading.Thread(
-        target=_gaze_loop, args=(device, gaze_outlet, stop),
+        target=_gaze_loop, args=(device, gaze_outlet, stop, clock),
         daemon=True, name="neon-gaze-bridge",
     )
     gaze_thread.start()
@@ -439,7 +538,7 @@ def main() -> int:
     events_thread = None
     if events_outlet is not None:
         events_thread = threading.Thread(
-            target=_events_loop, args=(device, events_outlet, stop),
+            target=_events_loop, args=(device, events_outlet, stop, clock),
             daemon=True, name="neon-events-bridge",
         )
         events_thread.start()

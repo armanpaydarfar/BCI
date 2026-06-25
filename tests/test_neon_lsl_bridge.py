@@ -59,3 +59,44 @@ def test_all_channel_entries_well_formed():
         assert isinstance(unit, str) and unit
         assert isinstance(lsl_type, str) and lsl_type
         assert attr is None or isinstance(attr, str)
+
+
+# --- device->LSL clock mapping (the fixation-timing fix) ----------------------
+
+def test_clock_mapper_maps_device_time_to_lsl():
+    # offset = local_clock - device_unix; mapping a device time back must recover
+    # the local_clock time it was observed at (zero-latency sample).
+    m = _load_bridge()
+    cm = m._DeviceClockMapper()
+    dev = 1_779_998_568.7   # a Neon unix timestamp (s)
+    lsl = 500_000.0         # local_clock at receive
+    cm.observe(dev, lsl)
+    assert cm.to_lsl(dev) == pytest.approx(lsl, abs=1e-6)
+    # a later device time maps to a proportionally later LSL time
+    assert cm.to_lsl(dev + 0.250) == pytest.approx(lsl + 0.250, abs=1e-6)
+
+
+def test_clock_mapper_uses_minimum_offset_to_strip_receive_latency():
+    # Receive latency is >=0 and additive on local_clock; the estimator must keep
+    # the MINIMUM offset (the lowest-latency sample), so a later, higher-latency
+    # observation does not push mapped times late.
+    m = _load_bridge()
+    cm = m._DeviceClockMapper()
+    cm.observe(1000.0, 5000.0)          # offset 4000.0 (clean)
+    cm.observe(1001.0, 5001.5)          # offset 4000.5 (0.5 s extra latency)
+    # mapping uses the minimum offset (~4000.0), not the latency-inflated 4000.5:
+    # to_lsl = device_unix + offset = 1002.0 + 4000.0
+    assert cm.to_lsl(1002.0) == pytest.approx(5002.0, abs=1e-3)
+
+
+def test_clock_mapper_returns_none_before_estimate_or_on_bad_input():
+    m = _load_bridge()
+    cm = m._DeviceClockMapper()
+    assert cm.to_lsl(1000.0) is None     # no observation yet -> push-time fallback
+    cm.observe(1000.0, 5000.0)
+    assert cm.to_lsl(float("nan")) is None
+    assert cm.to_lsl(0.0) is None
+    cm.observe(float("nan"), 5001.0)     # bad input ignored, estimate preserved
+    cm.observe(0.0, 5001.0)
+    # offset preserved at 4000.0; to_lsl = device_unix + offset = 1000.0 + 4000.0
+    assert cm.to_lsl(1000.0) == pytest.approx(5000.0, abs=1e-6)
