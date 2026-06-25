@@ -65,12 +65,9 @@ _EXPECTED_METHODS = [
     # (asserted by test_runtime_config_controller_wired below)
     # mode / driver / subject
     "on_mode_changed", "on_save_subject", "_set_cmds_for_mode_and_driver",
-    # vlm frame-relay state machine
-    "_on_vlm_video_connect", "_on_vlm_video_disconnect", "_fire_verify_chain",
-    # remote services
-    "_poll_remote_status", "_apply_remote_status",
-    # vlm commands
-    "on_vlm_service_decide", "on_vlm_capture_first", "on_vlm_decide_pair",
+    # vlm / perception subsystem (frame-relay state machine, remote-status
+    # pollers, vlm commands) now lives in panel.vlm_controller.VlmController
+    # (asserted by test_vlm_controller_wired below)
     # ui build / lifecycle
     "_build_ui", "closeEvent",
 ]
@@ -239,3 +236,43 @@ def test_calibration_controller_wired(panel):
               "on_refresh_apriltag_calibs", "_get_selected_apriltag_calib",
               "on_run_apriltag_calibrate", "on_run_apriltag_control_test"):
         assert callable(getattr(panel.calibration, m, None)), m
+
+
+def test_vlm_controller_wired(panel):
+    """The whole VLM / perception subsystem — the Perception-Pipeline row
+    (3 LEDs + lifecycle/command buttons), the VLM Video tab + its scene widget,
+    the per-Connect verify-chain state machine, the remote/relay status pollers
+    and the VLM service commands — was extracted into a VlmController that owns
+    those widgets + the _remote_status_received Signal + the three status QTimers;
+    the panel holds it and the controller built its widgets during construction.
+
+    NOTE: this proves the wiring resolves headless. It does NOT exercise the
+    verify-chain transitions (no relay, no GPU service, no Neon) — those require
+    a live Connect smoke at the rig."""
+    from panel.vlm_controller import VlmController
+    from PySide6.QtCore import QTimer
+    assert isinstance(panel.vlm, VlmController)
+    # build_pipeline_row_into() + build_vlm_video_tab() ran during _build_ui →
+    # the controller owns its widgets.
+    for w in ("lbl_send_led", "lbl_compute_led", "lbl_receive_led",
+              "btn_vlm_service_start", "btn_vlm_service_stop",
+              "btn_vlm_seg_stream", "spin_vlm_seg_hz", "lbl_vlm_pair_token",
+              "vlm_scene_widget", "vlm_row_widgets", "frame_relay_proc"):
+        assert getattr(panel.vlm, w, None) is not None, w
+    # The three status QTimers landed on the controller.
+    for t in ("_remote_status_timer", "_relay_status_timer",
+              "_seg_stream_log_timer"):
+        assert isinstance(getattr(panel.vlm, t, None), QTimer), t
+    # The _remote_status_received Signal resolves on the controller (it's a
+    # QObject now, so the Signal lives + connects here, not on the panel).
+    assert hasattr(panel.vlm, "_remote_status_received")
+    assert not hasattr(panel, "_remote_status_received")
+    for m in ("build_pipeline_row_into", "build_vlm_video_tab",
+              "_on_vlm_video_connect", "_on_vlm_video_disconnect",
+              "_fire_verify_chain", "_on_handshake_observed",
+              "_on_first_publish_observed", "_on_vlm_payload_received",
+              "_poll_remote_status", "_apply_remote_status",
+              "_poll_relay_status", "configure_remote_services_ui",
+              "on_vlm_service_decide", "on_vlm_capture_first",
+              "on_vlm_decide_pair", "shutdown"):
+        assert callable(getattr(panel.vlm, m, None)), m

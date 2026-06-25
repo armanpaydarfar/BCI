@@ -169,20 +169,25 @@ class TestIsolationInvariant:
         assert isinstance(config.FRAME_RELAY_EMBEDDED, bool)
 
     def test_separated_mode_wired_into_panel_source(self):
-        """Static guard on the real control_panel.py source: the separated-relay
+        """Static guard on the real VlmController source: the separated-relay
         spawn must be gated under `if not FRAME_RELAY_EMBEDDED:` and the
         in-process host under `if FRAME_RELAY_EMBEDDED:`. Asserting the actual
         wiring (not a boolean tautology) so a future edit that deletes the
         separated path or inverts the guard fails CI — that silent re-collapse
         of the decode isolation is the exact regression this file guards
         (root-cause doc §7/§11.3). Import-safe: reads source rather than
-        importing control_panel, which pulls Qt.
+        importing the controller, which pulls Qt.
+
+        The whole VLM subsystem (relay spawn/teardown + the embedded-host
+        branch) was extracted from control_panel.py into
+        panel/vlm_controller.py; this guard follows it there so the invariant
+        stays pinned at its new home.
         """
         import os
         import re
         src_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "control_panel.py",
+            "panel", "vlm_controller.py",
         )
         with open(src_path, "r", encoding="utf-8") as fh:
             src = fh.read()
