@@ -65,6 +65,7 @@ from panel.device_launchers import DeviceLaunchersController
 from panel.external_tools import ExternalToolsController
 from panel.robot_controller import RobotController
 from panel.calibration_controller import CalibrationController
+from panel.gaze_controller import GazeController
 from panel.ui_utils import _fixed_v
 from panel.constants import *  # noqa: F401,F403 — module-level paths + config-derived globals (see panel/constants.py __all__)
 # netutils' import-time block runs the LAN / Tailscale IP discovery + report
@@ -170,6 +171,23 @@ class ControlPanel(QMainWindow):
         # ---- Gaze procs (NEW) ----
         self.gaze_runner = Proc("Gaze Runner", None, ROOT)
         self.gaze_service = Proc("Gaze Service", None, ROOT)
+
+        # Gaze Service row — GazeController owns the row's LED/buttons + the gaze
+        # handlers (on_gaze_*, _start_gaze_service, _gaze_udp_request,
+        # _format_gaze_telemetry_line), built into the grid in _build_ui. The Proc
+        # handles + ProcessManager stay on the panel (shared by command wiring,
+        # subject rotation, _tick, closeEvent); the off-thread Query-Telemetry
+        # worker uses the marshaled log_ui sink.
+        self.gaze = GazeController(
+            self,
+            procs=self.procs,
+            gaze_runner=self.gaze_runner,
+            gaze_service=self.gaze_service,
+            log=self._append_log,
+            log_ui=self._append_log_ui,
+            set_led=self._set_led,
+            timestamp=self._ts,
+        )
 
         # ---- VLM service proc ----
         self.vlm_service = Proc("VLM Service", None, ROOT)
@@ -299,7 +317,7 @@ class ControlPanel(QMainWindow):
         self._set_led(self.devices.lbl_driver, "stopped")
         self._set_led(self.lbl_eego, "stopped")
         self._set_led(self.lbl_labrec, "stopped")
-        self._set_led(self.lbl_gaze_service, "stopped")
+        self._set_led(self.gaze.lbl_gaze_service, "stopped")
         self._set_led(self.lbl_compute_led, "stopped")
         self._set_led(self.serial.lbl_arduino, "stopped")
 
@@ -471,42 +489,8 @@ class ControlPanel(QMainWindow):
         grid.addWidget(btn_labrec, row, 2)
         row += 1
 
-        # ===== Gaze Service =====
-        # Collected in self._gaze_row_widgets so _apply_backend_visibility()
-        # can hide the whole block when GAZE_OR_BACKEND == "vlm". An empty
-        # grid row collapses to zero height in Qt once all its items are
-        # hidden, so toggling visibility is sufficient.
-        self.lbl_gaze_service = QLabel("●"); self._set_led(self.lbl_gaze_service, "stopped")
-        gaze_lbl_title = QLabel("<b>Gaze Service</b>")
-        grid.addWidget(gaze_lbl_title, row, 0)
-        grid.addWidget(self.lbl_gaze_service, row, 1)
-
-        self.btn_gaze_service_headless = QPushButton("Start (Headless)")
-        self.btn_gaze_service_ui = QPushButton("Start (With UI)")
-        self.btn_gaze_service_stop = QPushButton("Stop")
-        self.btn_gaze_service_query = QPushButton("Query Telemetry (UDP)")
-
-        self.btn_gaze_service_headless.clicked.connect(self.on_gaze_service_start_headless)
-        self.btn_gaze_service_ui.clicked.connect(self.on_gaze_service_start_ui)
-        self.btn_gaze_service_stop.clicked.connect(self.on_gaze_service_stop)
-        self.btn_gaze_service_query.clicked.connect(self.on_gaze_service_query)
-
-        grid.addWidget(self.btn_gaze_service_headless, row, 2)
-        grid.addWidget(self.btn_gaze_service_ui, row, 3)
-        grid.addWidget(self.btn_gaze_service_stop, row, 4)
-        row += 1
-
-        gaze_telemetry_lbl = QLabel("<i>Telemetry:</i> view output in View: Gaze")
-        grid.addWidget(gaze_telemetry_lbl, row, 0, 1, 2)
-        grid.addWidget(self.btn_gaze_service_query, row, 2, 1, 3)
-        row += 1
-
-        self._gaze_row_widgets = [
-            gaze_lbl_title, self.lbl_gaze_service,
-            self.btn_gaze_service_headless, self.btn_gaze_service_ui,
-            self.btn_gaze_service_stop,
-            gaze_telemetry_lbl, self.btn_gaze_service_query,
-        ]
+        # ===== Gaze Service ===== (GazeController owns the row, widgets + handlers)
+        row = self.gaze.build_into(grid, row)
 
         # ===== Perception Pipeline =====
         # Three pipeline stages, each with its own LED in the LED column:
@@ -754,7 +738,7 @@ class ControlPanel(QMainWindow):
         is shared by both backends in remote mode and is gated separately
         by the perception-source flag, not by this method."""
         is_vlm = (GAZE_OR_BACKEND == "vlm")
-        for w in getattr(self, "_gaze_row_widgets", ()):
+        for w in getattr(self.gaze, "gaze_row_widgets", ()):
             w.setVisible(not is_vlm)
         for w in getattr(self, "_vlm_row_widgets", ()):
             w.setVisible(is_vlm)
@@ -1646,115 +1630,6 @@ class ControlPanel(QMainWindow):
         write_fes_toggle(self.fes_enabled_pref)
         self._append_log("Panel", f"[{self._ts()}] FES_toggle set to {self.fes_enabled_pref}\n")
 
-    # ----- Gaze (NEW) -----
-    def _ensure_gaze_paths(self, which: str) -> bool:
-        path = GAZE_RUNNER_PY if which == "runner" else GAZE_SERVICE_PY
-        if not os.path.exists(path):
-            QMessageBox.warning(self, "Missing", f"Not found:\n{path}")
-            return False
-        return True
-
-    def on_gaze_runner_start(self):
-        if not self._ensure_gaze_paths("runner"):
-            return
-        # Runner: UI + prints for testing, but logs are captured into View: Gaze.
-        neon_arg = f'--neon-device-host "{NEON_COMPANION_HOST}"' if NEON_COMPANION_HOST else ""
-        self.gaze_runner.cmd = f'python -u "{GAZE_RUNNER_PY}" --mode runner --display 1 --prints 1 {neon_arg}'
-        self.procs.start(self.gaze_runner, None, "Gaze")
-        self._append_log("Gaze", f"[{self._ts()}] Runner start requested\n")
-
-    def on_gaze_runner_stop(self):
-        self.procs.stop(self.gaze_runner, None, "Gaze")
-
-    def on_gaze_service_start_headless(self):
-        self._start_gaze_service(display=0)
-
-    def on_gaze_service_start_ui(self):
-        self._start_gaze_service(display=1)
-
-    def _start_gaze_service(self, *, display: int):
-        if not self._ensure_gaze_paths("service"):
-            return
-
-        # Guard: avoid confusing "address already in use" if already running
-        if _is_port_in_use(int(GAZE_SERVICE_PORT), GAZE_SERVICE_HOST):
-            QMessageBox.warning(
-                self,
-                "Gaze service port in use",
-                f"UDP port {GAZE_SERVICE_HOST}:{GAZE_SERVICE_PORT} appears in use.\n"
-                f"If gaze service is already running, use Stop first.\n"
-                f"Otherwise change GAZE_SERVICE_PORT."
-            )
-
-        # Service: prints can be 0 (supressed) or 1 (verbose) — either way logs go to View: Gaze
-        neon_arg = f'--neon-device-host "{NEON_COMPANION_HOST}"' if NEON_COMPANION_HOST else ""
-        # GPU-host topology: when PERCEPTION_FRAME_SOURCE=remote, gaze_runner
-        # consumes envelopes from the relay instead of opening Neon directly.
-        # Dial host comes from FRAME_RELAY_DIAL_HOST in config.
-        remote_arg = ""
-        if PERCEPTION_FRAME_SOURCE == "remote":
-            relay_dial = str(getattr(_HCFG, "FRAME_RELAY_DIAL_HOST", "127.0.0.1") or "127.0.0.1") if _HCFG else "127.0.0.1"
-            relay_port = int(getattr(_HCFG, "FRAME_RELAY_PORT", 5591)) if _HCFG else 5591
-            remote_arg = (
-                f'--frame-source remote '
-                f'--remote-frame-host {relay_dial} '
-                f'--remote-frame-port {relay_port}'
-            )
-        self.gaze_service.cmd = (
-            f'python -u "{GAZE_SERVICE_PY}" --mode service '
-            f'--display {int(display)} --prints 1 '
-            f'--host {GAZE_BIND_HOST} --port {int(GAZE_SERVICE_PORT)} '
-            f'--udp_log 1 --udp_log_hz 50 {neon_arg} {remote_arg}'
-        )
-        self.procs.start(self.gaze_service, self.lbl_gaze_service, "Gaze")
-        self._append_log("Gaze", f"[{self._ts()}] Service start requested (display={display})\n")
-
-    def on_gaze_service_stop(self):
-        self.procs.stop(self.gaze_service, self.lbl_gaze_service, "Gaze")
-
-    def on_gaze_service_query(self):
-        import threading
-        query_id = int(time.time() * 1000)
-
-        # TX log (already correct)
-        self._append_log("Panel",
-            f"[{self._ts()}] Gaze UDP TX query_id={query_id} -> {GAZE_SERVICE_HOST}:{GAZE_SERVICE_PORT}\n"
-        )
-
-        def worker():
-            t0 = time.time()
-            try:
-                req = {"cmd": "snapshot", "include_objects": True, "query_id": query_id}
-                resp = self._gaze_udp_request(req, timeout_s=float(GAZE_QUERY_TIMEOUT_S))
-
-                dt_ms = (time.time() - t0) * 1000.0
-                pretty = json.dumps(resp, indent=2, sort_keys=True)
-
-                msg = (
-                    f"[{self._ts()}] Gaze UDP RX OK query_id={query_id} "
-                    f"({dt_ms:.0f} ms)\n{pretty}\n"
-                )
-
-                # existing
-                self._append_log_ui("Gaze", msg)
-
-                # ✅ ADD THIS LINE — this is all you need
-                self._append_log_ui("Panel",
-                    f"[{self._ts()}] Gaze UDP RX OK query_id={query_id} ({dt_ms:.0f} ms)\n"
-                )
-
-            except Exception as e:
-                dt_ms = (time.time() - t0) * 1000.0
-                err = (
-                    f"[{self._ts()}] Gaze UDP RX ERROR query_id={query_id} "
-                    f"({dt_ms:.0f} ms): {e}\n"
-                )
-
-                self._append_log_ui("Panel", err)
-                self._append_log_ui("Gaze", err)
-
-        threading.Thread(target=worker, daemon=True).start()
-
     # ----- VLM service handlers -----
 
     def _configure_remote_services_ui(self) -> None:
@@ -1812,7 +1687,7 @@ class ControlPanel(QMainWindow):
             "btn_gaze_service_headless", "btn_gaze_service_ui",
             "btn_gaze_service_stop",
         ):
-            btn = getattr(self, btn_name, None)
+            btn = getattr(self.gaze, btn_name, None)
             if btn is not None:
                 btn.setEnabled(False)
                 btn.setToolTip("Disabled: SERVICES_HOSTED_REMOTELY=True. "
@@ -2271,107 +2146,6 @@ class ControlPanel(QMainWindow):
         self._vlm_last_snapshot_id = None
         self.lbl_vlm_pair_token.setText("<i>snapshot:</i> (consumed)")
 
-    def _format_gaze_telemetry_line(self, snap: dict) -> str:
-        """
-        Build a line similar to your terminal prints, using fields from telemetry JSON.
-        This requires the service to include these keys in its response.
-        """
-        def _f(key, default="--"):
-            v = snap.get(key, None)
-            if v is None:
-                return default
-            return v
-
-        t = _f("t", None)
-        t_txt = f"t={t:.3f}" if isinstance(t, (int, float)) else f"t={t}"
-
-        worn = bool(snap.get("worn", False))
-        gaze_px = snap.get("gaze_px", None)
-        gaze_txt = f"gaze=({gaze_px[0]:.1f},{gaze_px[1]:.1f})" if isinstance(gaze_px, (list, tuple)) and len(gaze_px) >= 2 else "gaze=(--,--)"
-
-        loop_hz = snap.get("loop_hz", float("nan"))
-        video_hz = snap.get("video_hz", float("nan"))
-        det_hz = snap.get("det_hz", float("nan"))
-        det_age_s = snap.get("det_age_s", float("nan"))
-        infer_ms = snap.get("infer_ms", float("nan"))
-
-        imu_w = snap.get("imu_angvel", None)
-        imu_txt = f"imu|w|={imu_w:.2f}rad/s" if isinstance(imu_w, (int, float)) else "imu|w|=--"
-
-        yolo_enabled = bool(snap.get("gov_enabled", True))
-        reason = str(snap.get("gov_reason", "healthy"))
-        cd = float(snap.get("gov_cd_left", 0.0))
-        yolo_txt = f"YOLO={'ON' if yolo_enabled else 'OFF'}({reason}) cd={cd:.2f}s"
-
-        tracks = snap.get("tracks", None)
-        if tracks is None:
-            # fallback: infer from objects list if present
-            objs = snap.get("objects", None)
-            tracks = len(objs) if isinstance(objs, list) else 0
-
-        objs = snap.get("objects", None)
-        if isinstance(objs, list) and len(objs) > 0:
-            # expect entries like {"name": "...", "track_id": 1, "conf": 0.95}
-            parts = []
-            for o in objs[:6]:
-                nm = str(o.get("name", "?"))
-                tid = o.get("track_id", None)
-                cf = o.get("conf", None)
-                if tid is not None and cf is not None:
-                    parts.append(f"{nm}#{int(tid)}({float(cf):.2f})")
-                elif cf is not None:
-                    parts.append(f"{nm}({float(cf):.2f})")
-                else:
-                    parts.append(nm)
-            objs_txt = "objs: " + ", ".join(parts)
-        else:
-            objs_txt = "objs: none"
-
-        hit = snap.get("gaze_hit", None)
-        if isinstance(hit, dict):
-            nm = str(hit.get("name", "none"))
-            tid = hit.get("track_id", None)
-            cf = hit.get("conf", None)
-            if tid is not None and cf is not None:
-                gaze_on = f"gaze_on: {nm}#{int(tid)}({float(cf):.2f})"
-            elif cf is not None:
-                gaze_on = f"gaze_on: {nm}({float(cf):.2f})"
-            else:
-                gaze_on = f"gaze_on: {nm}"
-            mode = str(hit.get("mode", "--"))
-            d = hit.get("dist_px", None)
-            d_txt = f"{float(d):.1f}px" if isinstance(d, (int, float)) else "--"
-            gaze_on = f"{gaze_on} mode={mode} d={d_txt}"
-        else:
-            gaze_on = "gaze_on: none"
-
-        depth_cm = snap.get("depth_cm", float("nan"))
-        miss_mm = snap.get("miss_mm", float("nan"))
-        ipd_mm = snap.get("ipd_mm", float("nan"))
-        depth_txt = f"depth={depth_cm:.1f}cm miss={miss_mm:.1f}mm IPD={ipd_mm:.1f}mm" if all(isinstance(x, (int, float)) for x in [depth_cm, miss_mm, ipd_mm]) else "depth=--"
-
-        hy = snap.get("head_yaw_deg", float("nan"))
-        hp = snap.get("head_pitch_deg", float("nan"))
-        gy = snap.get("gaze_yaw_deg", float("nan"))
-        gp = snap.get("gaze_pitch_deg", float("nan"))
-        head_txt = f"HEAD(yaw,pitch)=({hy:+.0f},{hp:+.0f})"
-        gaze_ang_txt = f"GAZE(yaw,pitch)=({gy:+.0f},{gp:+.0f})"
-
-        return (
-            f"{t_txt} worn={worn} {gaze_txt} | "
-            f"rates: loop={loop_hz:.1f}Hz video={video_hz:.1f}Hz det~{det_hz:.1f}Hz det_age={det_age_s:.2f}s infer={infer_ms:.0f}ms | "
-            f"{imu_txt} | {yolo_txt} | tracks={tracks} | {objs_txt} | {gaze_on} | {depth_txt} | {head_txt} {gaze_ang_txt}"
-        )
-    def _gaze_udp_request(self, payload: dict, timeout_s: float = 0.8) -> dict:
-        """One-shot JSON request against gaze_runner.py (service mode).
-
-        Delegates to ``Utils.perception_clients.udp_request`` to keep the
-        wire format colocated with the VLM client and reusable from the
-        experiment driver.
-        """
-        from Utils.perception_clients import udp_request
-        return udp_request(GAZE_SERVICE_HOST, int(GAZE_SERVICE_PORT), payload, float(timeout_s))
-
     # ---------- Log helpers ----------
     def _on_log_target_changed(self, target: str):
         self._current_log_target = target
@@ -2576,7 +2350,7 @@ class ControlPanel(QMainWindow):
             (self.marker, self.devices.lbl_marker),
             (self.fes, self.devices.lbl_fes),
             (self.driver, self.devices.lbl_driver),
-            (self.gaze_service, self.lbl_gaze_service),
+            (self.gaze_service, self.gaze.lbl_gaze_service),
         ):
             if p.q and p.q.state() != QProcess.NotRunning and p.status != "error":
                 p.status = "running"
@@ -2614,7 +2388,7 @@ class ControlPanel(QMainWindow):
             (self.driver, self.devices.lbl_driver, "Driver"),
             (self.fes,    self.devices.lbl_fes,    "FES"),
             (self.marker, self.devices.lbl_marker, "Marker"),
-            (self.gaze_service, self.lbl_gaze_service, "Gaze"),
+            (self.gaze_service, self.gaze.lbl_gaze_service, "Gaze"),
             (self.gaze_runner, None, "Gaze"),
             (self.vlm_service, self.lbl_compute_led, "VLM"),
         ):

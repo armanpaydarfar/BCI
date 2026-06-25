@@ -49,8 +49,8 @@ _EXPECTED_METHODS = [
     "_open_vlm_log_file", "_open_relay_log_file", "_relay_log_callback",
     # arduino / serial now lives in panel.serial_controller.SerialController
     # (asserted by test_serial_controller_wired below)
-    # gaze controls
-    "on_gaze_service_query", "_start_gaze_service", "_gaze_udp_request",
+    # gaze controls now live in panel.gaze_controller.GazeController
+    # (asserted by test_gaze_controller_wired below)
     # marker / fes / driver now live in panel.device_launchers.DeviceLaunchersController
     # (asserted by test_device_launchers_controller_wired below)
     # robot controls now live in panel.robot_controller.RobotController
@@ -167,6 +167,26 @@ def test_robot_controller_wired(panel):
     for m in ("on_init_robot", "on_robot_start", "on_robot_remove_overrides",
               "_on_robot_term_finished", "_update_robot_buttons_for_mode"):
         assert callable(getattr(panel.robot, m, None)), m
+
+
+def test_gaze_controller_wired(panel):
+    """The Gaze Service row (LED + Start-Headless / Start-With-UI / Stop /
+    Query-Telemetry buttons) + the gaze handlers were extracted into a
+    GazeController that owns its widgets; the panel holds it and the controller
+    built its widgets into the grid during construction."""
+    from panel.gaze_controller import GazeController
+    assert isinstance(panel.gaze, GazeController)
+    # build_into() ran during _build_ui → the controller owns its widgets.
+    assert panel.gaze.lbl_gaze_service is not None
+    for w in ("btn_gaze_service_headless", "btn_gaze_service_ui",
+              "btn_gaze_service_stop", "btn_gaze_service_query"):
+        assert getattr(panel.gaze, w, None) is not None, w
+    for m in ("on_gaze_service_start_headless", "on_gaze_service_start_ui",
+              "on_gaze_service_stop", "on_gaze_service_query",
+              "on_gaze_runner_start", "on_gaze_runner_stop",
+              "_start_gaze_service", "_gaze_udp_request",
+              "_format_gaze_telemetry_line", "_ensure_gaze_paths"):
+        assert callable(getattr(panel.gaze, m, None)), m
 
 
 def test_calibration_controller_wired(panel):
