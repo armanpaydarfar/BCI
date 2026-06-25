@@ -45,8 +45,9 @@ The primary intended use cases are **assistive robotics and rehabilitation resea
     reasoning. It is **vendored from Vivian Chen's `harmony_vlm`** (see
     [`NOTICE.md`](NOTICE.md)) and runs as a **separate process**, never imported into
     the realtime EEG/robot loops.
-  - `vlm_service.py` is the perception host service; `vlm_bridge.py` /
-    `Utils/perception_clients.py` are the UDP request/reply clients the drivers use;
+  - `vlm_service.py` (with its helpers/collaborators in the `vlm/` package) is the
+    perception host service; `Utils/perception_clients.py` (`VLMClient`) is the UDP
+    request/reply client the drivers use;
     `Utils/frame_relay.py` + `Utils/remote_frame_reader.py` ship Neon frames Linux→host
     over TCP. The split is config-gated (`PERCEPTION_FRAME_SOURCE`,
     `SERVICES_HOSTED_REMOTELY`); see
@@ -73,8 +74,8 @@ At a high level, data flows as follows:
 
 Key folders and scripts (non-exhaustive):
 
-- **`control_panel.py`**  
-  - Qt-based launcher for experiments, robot/FES tools, gaze services, and Harmony calibration/online control.
+- **`control_panel.py`** + the **`panel/`** package  
+  - Qt-based launcher for experiments, robot/FES tools, gaze services, and Harmony calibration/online control. `control_panel.py` is a thin assembler; the per-subsystem logic lives in collaborator modules under `panel/` (process management, serial/Arduino, gaze, the VLM/verify-chain subsystem, device launchers, robot, calibration, config tabs, log files) plus leaf utilities (`config_io`, `constants`, `netutils`, `ui_utils`).
 
 - **Experiment drivers (root-level scripts)**  
   - `ExperimentDriver_Online.py`: main online motor-imagery BCI loop.  
