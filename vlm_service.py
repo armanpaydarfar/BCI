@@ -91,10 +91,12 @@ def _cfg_default(name: str, fallback):
 
 
 # Pure module-level helpers extracted into leaf modules under vlm/ (behaviour-
-# preserving — re-imported here so the VLMService methods reference them as bare
-# names exactly as before). The overlay-cap constants (_OVERLAY_*) now live in
-# vlm/seg_ops.py as the defaults _filter_overlay_dets binds; they're re-imported
-# because parse_args() and VLMService.__init__ reference them at module scope.
+# preserving). Some are referenced by VLMService methods / parse_args as bare
+# names; _opt_float / _median_mask_depth / _filter_overlay_dets are re-exported
+# here for tests/test_seg_constraints.py, which imports them from vlm_service to
+# pin the seg-op contract at the service's public surface. The overlay-cap
+# constants (_OVERLAY_*) live in vlm/seg_ops.py as the defaults
+# _filter_overlay_dets binds; parse_args() / VLMService.__init__ use them.
 from vlm.seg_ops import (
     SegConstraints,
     _opt_float,
