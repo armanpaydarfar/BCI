@@ -82,6 +82,59 @@ def _sweep(world_T, *, n=28, depth_sigma=30.0, seed=0):
     return frames
 
 
+def _sweep_with_visibility(world_T, visible_per_frame, *, depth_sigma=30.0, seed=0):
+    """Like ``_sweep`` but only the listed tags are visible in each frame, so a
+    test can control co-visibility (which tag pairs ever share a frame)."""
+    rng = np.random.default_rng(seed)
+    frames = []
+    for k, vis in enumerate(visible_per_frame):
+        T_cam_world = make_transform(
+            _rot_x(15.0 + 0.6 * k) @ _rot_z(-40.0 + 4.0 * k)
+            @ _rot_y(rng.normal(0, 8)),
+            [rng.normal(0, 120), rng.normal(0, 120), 900.0 + rng.normal(0, 80)])
+        frame = {}
+        for i in vis:
+            T = T_cam_world @ world_T[i]
+            t = T[:3, 3].copy()
+            t[2] += rng.normal(0.0, depth_sigma)
+            R = T[:3, :3] @ _rot_x(rng.normal(0, 1.5)) @ _rot_y(rng.normal(0, 1.5))
+            frame[i] = make_transform(R, t)
+        frames.append(frame)
+    return frames
+
+
+def test_pose_graph_places_tag_never_co_visible_with_reference():
+    """The pose-graph win: a tag NEVER in the same frame as the reference is still
+    placed (and accurately) by chaining through a shared neighbour. The old
+    single-anchor fuse, which only used pairs through the reference, would drop it.
+    """
+    world_T = _two_plane_layout()
+    # Even frames show {0,1,2}; odd frames show {1,2,3,4}. Tags 0 and 4 are never
+    # co-visible, but 1 and 2 bridge them.
+    vis = [[0, 1, 2] if k % 2 == 0 else [1, 2, 3, 4] for k in range(40)]
+    frames = _sweep_with_visibility(world_T, vis, seed=7)
+    wm = register_world_map_3d(frames, ref_id=0)
+    assert 4 in wm["ids"], "tag 4 (never co-visible with ref) must still be placed"
+    err4 = np.linalg.norm(wm["rel"][4][:3, 3] - world_T[4][:3, 3])
+    assert err4 < 30.0, f"chained tag 4 residual {err4:.1f} mm too high"
+
+
+def test_pose_graph_survives_reference_tag_flips():
+    """Corrupting the reference tag's pose in ~40% of frames (the flip ambiguity
+    that poisoned the single-anchor map) does not wreck the pose-graph fuse: the
+    bad edges are out-voted by the good majority and the many other pairs."""
+    world_T = _two_plane_layout()
+    frames = _sweep(world_T, n=40, seed=8)
+    flip = make_transform(_rot_x(35.0) @ _rot_y(25.0), [0.0, 0.0, 0.0])
+    for k, fr in enumerate(frames):
+        if k % 5 < 2 and 0 in fr:          # ~40% of frames
+            fr[0] = fr[0] @ flip
+    wm = register_world_map_3d(frames, ref_id=0)
+    err = np.mean([np.linalg.norm(wm["rel"][i][:3, 3] - world_T[i][:3, 3])
+                   for i in world_T])
+    assert err < 25.0, f"pose-graph should reject ref flips; residual {err:.1f} mm"
+
+
 def test_3d_registration_recovers_non_coplanar_layout():
     """Multi-view fuse with NO snap recovers the true 3-D tag origins (ref at
     tag 0 → rel[i] origin ≈ world_T[i] origin) within tolerance."""
