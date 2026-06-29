@@ -414,6 +414,11 @@ def stage_register_world(args, consumer: RelayConsumer, ui=None) -> int:
 
 # ── stage: register-world-3d (WS-4 NON-coplanar world map) ───────────────────
 
+# Cap the frames the LIVE quality recompute fuses each tick so its cost is
+# constant (not O(accumulated frames)); split-half on ~180 frames is plenty for a
+# stable estimate. The final post-capture fuse still uses every frame.
+_LIVE_SAMPLE_FRAMES = 180
+
 
 def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
                                        max_dur=90.0, tag_size, ui=None):
@@ -472,13 +477,23 @@ def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
                 # Gate on split-half REPRODUCIBILITY (map accuracy), not the
                 # per-frame scatter (sensor-noise floor that never improves). Show
                 # scatter only as a dim diagnostic.
+                #
+                # Bound the live estimate to an evenly-spaced subsample so each
+                # recompute is CONSTANT cost — re-fusing all accumulated frames
+                # every tick grew O(frames) and lagged the capture badly. The
+                # final fuse (post-capture) still uses every frame.
                 repro_map = None
                 scatter_mm = None
                 if len(frames) >= 4:
+                    if len(frames) > _LIVE_SAMPLE_FRAMES:
+                        sel = np.linspace(0, len(frames) - 1, _LIVE_SAMPLE_FRAMES).astype(int)
+                        live = [frames[i] for i in sel]
+                    else:
+                        live = frames
                     try:
-                        repro_map = world_map_3d_reproducibility(frames)
+                        repro_map = world_map_3d_reproducibility(live)
                         rep = world_map_3d_geometry_report(
-                            register_world_map_3d(frames), frames)
+                            register_world_map_3d(live), live)
                         scatter_mm = rep["mean_fit_residual_mm"]
                     except ValueError:
                         # Pre-convergence: too few co-visible frames to fuse a half
