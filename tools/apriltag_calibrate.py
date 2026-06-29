@@ -1066,14 +1066,17 @@ def _sleep_until(deadline: float) -> None:
 
 
 def _make_coverage_ui(args):
-    """The sweep's coverage view: the OpenCV box (rev04 §3) unless ``--no-ui``
-    (headless camera-side verification, where only the text summary runs).
+    """The sweep's coverage view, unless ``--no-ui`` (headless, text summary only).
 
-    The box is 2-D top-down only; with ``--coverage-3d`` on the sweep there is no
-    3-D view yet, so the sweep runs headless with the per-z-slice text summary
-    (return None). register-world is unaffected — it never uses --coverage-3d."""
-    if args.no_ui or (getattr(args, "coverage_3d", False) and args.stage == "sweep"):
+    ``--coverage-3d`` on the sweep gets the per-z-slice volumetric view
+    (``VoxelCoverageBoxUI``); otherwise the 2-D top-down box (rev04 §3).
+    register-world stages always get the 2-D box (for the SPACE prompts; they never
+    set --coverage-3d)."""
+    if args.no_ui:
         return None
+    if getattr(args, "coverage_3d", False) and args.stage == "sweep":
+        from Utils.gaze.coverage_voxel_view import VoxelCoverageBoxUI
+        return VoxelCoverageBoxUI(args.cell_size_mm, audio=args.audio)
     from Utils.gaze.coverage_view import CoverageBoxUI
     return CoverageBoxUI(args.cell_size_mm, audio=args.audio)
 
