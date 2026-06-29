@@ -626,9 +626,15 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     uv_rows: List[np.ndarray] = []
     q_rows: List[np.ndarray] = []
     x_rows: List[np.ndarray] = []
+    eequat_rows: List[np.ndarray] = []
     tcw_rows: List[np.ndarray] = []
     tce_rows: List[np.ndarray] = []
     t_rows: List[float] = []
+    # WS-1/WS-2b offline prototyping needs the scene frame at each accepted sample
+    # (to segment the held/target object); --save-frames writes them as a JPEG
+    # sidecar (raw BGR would balloon the npz). frame_rows holds (sample_idx, bgr)
+    # only when enabled.
+    frame_rows: List[np.ndarray] = []
 
     period = 1.0 / args.sample_hz
     last_idx = None
@@ -704,8 +710,10 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                     _sleep_until(next_tick)
                     continue
                 q_joints, x_ee, t_robot = rstate["q"], rstate["ee"], rstate["_t"]
+                ee_quat = rstate.get("ee_quat")
             else:
                 q_joints, x_ee, t_robot = np.full(7, np.nan), np.full(3, np.nan), time.time()
+                ee_quat = None
 
             tags = detect_tags(detector, b.video.bgr, K, args.tag_size, tag_sizes=tag_sizes)
             world_view = {i: tags[i] for i in world_ids if i in tags}
@@ -744,9 +752,13 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                     uv_rows.append(cur_uv)
                     q_rows.append(q_joints)
                     x_rows.append(x_ee)
+                    eequat_rows.append(ee_quat if ee_quat is not None
+                                       else np.full(4, np.nan))
                     tcw_rows.append(T_cam_world)
                     tce_rows.append(T_cam_eetag)
                     t_rows.append(t_robot)
+                    if args.save_frames:
+                        frame_rows.append(b.video.bgr.copy())
                     accepted += 1
 
             target = grid.next_target()
@@ -842,13 +854,28 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                      "min_samples": args.min_samples,
                      "min_spread_mm": args.min_spread_mm,
                      "complete": bool(grid.done())},
-        "units": {"UV": "mm (table plane)", "X": "mm", "Q": "rad", "t_eetag_ee": "mm"},
+        "units": {"UV": "mm (table plane)", "X": "mm", "Q": "rad",
+                  "t_eetag_ee": "mm", "EEQUAT": "[x,y,z,w] scalar-last"},
     }
+    # WS-1/WS-2b scene-frame sidecar: JPEG per accepted sample, index-aligned with
+    # UV/Q/X/EEQUAT rows. Kept out of the npz (raw BGR is ~6 MB/frame); the offline
+    # scripts join by row index via the recorded directory name.
+    frames_dir = None
+    if args.save_frames and frame_rows:
+        import cv2
+        frames_dir = out_dir / f"apriltag_sweep_{stamp}_frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        for i, bgr in enumerate(frame_rows):
+            cv2.imwrite(str(frames_dir / f"{i:05d}.jpg"), bgr,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        _log(f"saved {len(frame_rows)} scene frames → {frames_dir}")
+    meta["frames_dir"] = frames_dir.name if frames_dir is not None else None
     np.savez_compressed(
         out_path,
         UV=np.vstack(uv_rows),
         Q=np.vstack(q_rows),
         X=np.vstack(x_rows),
+        EEQUAT=np.vstack(eequat_rows),
         green=green,
         T_cam_world=np.stack(tcw_rows),
         T_cam_eetag=np.stack(tce_rows),
@@ -1239,6 +1266,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--bind-port", type=int, default=None,
                    help="default: config.UDP_CONTROL_BIND[PORT]")
     p.add_argument("--out-dir", default="runs", help="collect/sweep: directory for the saved npz")
+    p.add_argument("--save-frames", action="store_true",
+                   help="sweep: also save the scene frame at each accepted sample as a "
+                        "JPEG sidecar dir (WS-1/WS-2b offline object segmentation). Off "
+                        "by default — adds ~100s of MB per sweep.")
     p.add_argument("--utc-stamp", default=None,
                    help="collect/sweep: override the auto UTC stamp in the npz filename")
     # sweep stage (REV04 continuous capture + coverage)
