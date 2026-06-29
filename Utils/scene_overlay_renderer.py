@@ -64,6 +64,15 @@ COL_DECISION_FG = (240, 240, 240)
 COL_TRACK     = (220, 180, 60)
 COL_TRACK_HIT = (240, 220, 80)
 
+# WS-5A control-decision overlay (gaze-calibration). Three deliberately
+# distinct hues so target / centroid / footprint never read as the same
+# marker, and none collide with the green/yellow/red detection palette,
+# the white gaze cursor, or the light-blue tracks. BGR values.
+COL_TARGET   = (255, 0, 255)    # magenta — the chosen control target
+COL_CENTROID = (0, 165, 255)    # orange  — segmented-object centroid
+COL_BOTTOM   = (255, 255, 0)    # cyan    — footprint / bottom-of-mask point
+COL_HUD_FG   = (200, 230, 255)  # control HUD text (matches decision text)
+
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 MASK_ALPHA = 0.35
 
@@ -74,6 +83,27 @@ def _conf_color(score: float) -> Tuple[int, int, int]:
     if score >= 0.50:
         return COL_MED_CONF
     return COL_LOW_CONF
+
+
+def _to_pixel(
+    pt: Optional[Tuple[float, float]], w: int, h: int
+) -> Optional[Tuple[int, int]]:
+    """Round a float ``(x, y)`` to integer pixel coords inside a ``w×h`` frame.
+
+    Returns ``None`` when ``pt`` is ``None``, non-finite, or falls outside the
+    frame bounds — the caller then skips drawing that marker. Pulled out as a
+    pure function (no canvas) so the clamping logic the WS-5A control markers
+    rely on can be unit-tested directly.
+    """
+    if pt is None:
+        return None
+    x, y = pt
+    if not (np.isfinite(x) and np.isfinite(y)):
+        return None
+    px, py = int(round(x)), int(round(y))
+    if not (0 <= px < w and 0 <= py < h):
+        return None
+    return px, py
 
 
 class SceneOverlayRenderer:
@@ -100,6 +130,11 @@ class SceneOverlayRenderer:
         current_hit_track_id: Optional[int] = None,
         vlm_state: str = "IDLE",
         decision_text: Optional[str] = None,
+        target_px: Optional[Tuple[float, float]] = None,
+        centroid_px: Optional[Tuple[float, float]] = None,
+        bottom_px: Optional[Tuple[float, float]] = None,
+        nearest_pose_uv: Optional[Tuple[float, float]] = None,
+        target_source: Optional[str] = None,
         copy: bool = True,
     ) -> np.ndarray:
         """Paint detections + gaze + state badge onto ``frame_bgr``.
@@ -132,6 +167,29 @@ class SceneOverlayRenderer:
         decision_text
             Optional short string from the latest decide call (e.g. the
             object label or one-line summary). Drawn under the state badge.
+        target_px
+            WS-5A: ``(x, y)`` pixel of the chosen control target — the point
+            the gaze-calibration control decision actually selected. Drawn as
+            a distinct magenta crosshair + ``target`` label. ``None`` (the
+            default) draws nothing, so callers that don't yet supply control
+            geometry are unaffected.
+        centroid_px
+            WS-5A: ``(x, y)`` of the segmented object's centroid. Orange
+            marker, visually distinct from ``target_px``.
+        bottom_px
+            WS-5A: ``(x, y)`` of the object's footprint / bottom-of-mask point
+            — WS-1's depth-free fallback target. Small cyan marker + ``bottom``
+            label.
+        nearest_pose_uv
+            WS-5A: ``(u, v)`` of the calibration library's nearest pose. Drawn
+            as a text line in the top-right control HUD (not a frame marker —
+            ``(u, v)`` is calibration-space, not necessarily this frame's
+            pixel space).
+        target_source
+            WS-5A: which target path produced ``target_px`` (e.g.
+            ``"centroid"`` / ``"bottom"`` / ``"raw-gaze"``). Drawn as a
+            top-right control HUD line so the operator can see the decision
+            path at a glance.
         copy
             If True (default), allocate a fresh BGR array and return it,
             leaving the caller's frame untouched. False means draw in-place
@@ -160,6 +218,18 @@ class SceneOverlayRenderer:
         # JSON push — that's the whole point of the refactor.
         if gaze_xy is not None:
             self._draw_gaze(canvas, gaze_xy, fixation)
+
+        # WS-5A control-decision overlay. Painted after gaze so the chosen
+        # target sits on top of the cursor, and after detections so it isn't
+        # hidden by a mask blend. Each marker is independently optional.
+        self._draw_control_overlay(
+            canvas,
+            target_px=target_px,
+            centroid_px=centroid_px,
+            bottom_px=bottom_px,
+            nearest_pose_uv=nearest_pose_uv,
+            target_source=target_source,
+        )
 
         self._draw_state_badge(canvas, vlm_state, decision_text)
         self._frame_counter += 1
@@ -302,6 +372,84 @@ class SceneOverlayRenderer:
         cv2.line(canvas, (cx - 12, cy), (cx + 12, cy), COL_GAZE_DOT, 1, cv2.LINE_AA)
         cv2.line(canvas, (cx, cy - 12), (cx, cy + 12), COL_GAZE_DOT, 1, cv2.LINE_AA)
         cv2.circle(canvas, (cx, cy), 3, COL_GAZE_DOT, -1, cv2.LINE_AA)
+
+    def _draw_control_overlay(
+        self,
+        canvas: np.ndarray,
+        *,
+        target_px: Optional[Tuple[float, float]],
+        centroid_px: Optional[Tuple[float, float]],
+        bottom_px: Optional[Tuple[float, float]],
+        nearest_pose_uv: Optional[Tuple[float, float]],
+        target_source: Optional[str],
+    ) -> None:
+        """Paint the WS-5A gaze-calibration control decision.
+
+        Three optional frame markers — chosen target, object centroid, and
+        footprint/bottom point — plus a top-right text HUD for the calibration
+        library's nearest pose and the target-selection path. Every input is
+        optional and drawn only when supplied, so the existing overlay
+        behaviour is unchanged when WS-1 hasn't wired these in yet.
+        """
+        h, w = canvas.shape[:2]
+
+        # Centroid + footprint first, so the target crosshair paints over them
+        # if they happen to coincide.
+        cpt = _to_pixel(centroid_px, w, h)
+        if cpt is not None:
+            cx, cy = cpt
+            cv2.circle(canvas, (cx, cy), 7, COL_CENTROID, 2, cv2.LINE_AA)
+            cv2.circle(canvas, (cx, cy), 2, COL_CENTROID, -1, cv2.LINE_AA)
+            self._draw_label(canvas, "centroid", (cx + 10, cy), COL_CENTROID)
+
+        bpt = _to_pixel(bottom_px, w, h)
+        if bpt is not None:
+            bx, by = bpt
+            # Small filled diamond so it reads differently from the round
+            # centroid marker even before colour registers.
+            diamond = np.array(
+                [[bx, by - 6], [bx + 6, by], [bx, by + 6], [bx - 6, by]],
+                dtype=np.int32,
+            )
+            cv2.fillConvexPoly(canvas, diamond, COL_BOTTOM, cv2.LINE_AA)
+            self._draw_label(canvas, "bottom", (bx + 10, by), COL_BOTTOM)
+
+        tpt = _to_pixel(target_px, w, h)
+        if tpt is not None:
+            tx, ty = tpt
+            # Long crosshair + ring so the chosen target dominates visually.
+            cv2.line(canvas, (tx - 18, ty), (tx + 18, ty), COL_TARGET, 2, cv2.LINE_AA)
+            cv2.line(canvas, (tx, ty - 18), (tx, ty + 18), COL_TARGET, 2, cv2.LINE_AA)
+            cv2.circle(canvas, (tx, ty), 12, COL_TARGET, 2, cv2.LINE_AA)
+            self._draw_label(canvas, "target", (tx + 14, ty - 14), COL_TARGET)
+
+        # Top-right control HUD: calibration nearest-pose readout + target path.
+        hud_lines: List[str] = []
+        if nearest_pose_uv is not None:
+            u, v = nearest_pose_uv
+            if np.isfinite(u) and np.isfinite(v):
+                hud_lines.append(f"nearest-pose uv ({u:.1f}, {v:.1f})")
+        if target_source:
+            hud_lines.append(f"target: {target_source}")
+        if hud_lines:
+            self._draw_hud_top_right(canvas, hud_lines)
+
+    @staticmethod
+    def _draw_hud_top_right(canvas: np.ndarray, lines: List[str]) -> None:
+        """Right-aligned text stack in the top-right corner.
+
+        Kept clear of the top-left VLM state badge so the two HUDs never
+        overlap regardless of frame width.
+        """
+        w = canvas.shape[1]
+        y = 28
+        for text in lines:
+            (tw, th), _ = cv2.getTextSize(text, FONT, 0.55, 1)
+            x = max(w - tw - 16, 0)
+            cv2.rectangle(canvas, (x - 6, y - th - 6),
+                          (x + tw + 6, y + 6), COL_DECISION_BG, -1)
+            cv2.putText(canvas, text, (x, y), FONT, 0.55, COL_HUD_FG, 1, cv2.LINE_AA)
+            y += th + 12
 
     def _draw_state_badge(
         self,
