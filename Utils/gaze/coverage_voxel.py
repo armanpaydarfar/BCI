@@ -50,10 +50,11 @@ class VoxelCoverage:
         if cell_size_mm <= 0:
             raise ValueError("cell_size_mm must be positive")
         if min_spread_mm >= cell_size_mm:
-            # A spread requirement at/above the voxel edge is unsatisfiable inside one
-            # voxel (the bbox diagonal is bounded by the voxel diagonal, but a single
-            # edge length cannot be exceeded along one axis) — almost certainly a
-            # misconfiguration, so fail fast, matching CoverageGrid's guard.
+            # Match CoverageGrid's guard: a per-voxel spread requirement at/above the
+            # voxel edge is almost certainly a misconfiguration. (The 3-D bbox diagonal
+            # within a voxel can in principle reach cell_size·√3, so this is a
+            # conservative sanity bound, not a strict geometric impossibility — it just
+            # keeps a voxel from demanding near-corner-to-corner spread to count.)
             raise ValueError("min_spread_mm must be smaller than cell_size_mm")
         self.cell_size_mm = float(cell_size_mm)
         self.min_samples = int(min_samples)

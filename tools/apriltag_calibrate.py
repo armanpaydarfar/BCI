@@ -1418,6 +1418,17 @@ def stage_solve_3d(args) -> int:
     src_meta = z["meta"].item() if "meta" in z.files else {}
     method = src_meta.get("ee_point_method", "pose")
     offset = np.asarray(src_meta.get("t_eetag_ee_mm", [0.0, 0.0, 0.0]), dtype=float)
+    # A 'rayplane' sweep PROJECTS every EE point onto the table plane
+    # (eetag_rayplane_point_world), so the z height — the whole reason for a 3-D
+    # library — is already destroyed in the source geometry. Building a 3-D calib
+    # from it would yield a coplanar library mislabeled scheme="world_xyz_nn" that
+    # the 3-D control loop would trust. Refuse: a 3-D library needs a 'pose' sweep.
+    if method == "rayplane":
+        _log("solve-3d: this sweep used ee_point_method='rayplane', which projects "
+             "EE points onto the table plane — there is no z to build a 3-D library "
+             "from. Re-capture/solve with the 'pose' method (config "
+             "APRILTAG_EE_POINT_METHOD='pose').")
+        return 2
     # The world plane is only consulted by the 'rayplane' EE method; the default
     # 'pose' ignores it. Read whatever the sweep stored (fall back to z=0 / +Z).
     pp = (np.asarray(z["world_map_plane_point"], dtype=float)

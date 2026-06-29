@@ -5,21 +5,28 @@ This is the 3-D sibling of ``GazeCalibrationMappingV3`` in
 ``calibration_mapping.py``. V3 (REV04 planar) maps a table-plane ``(u,v)``
 query to the recorded joint vector ``Q`` via a 2-D nearest-neighbour — it
 collapses the workspace onto one plane because the REV04 calibration sweep
-and the runtime gaze hit are both *on the table*. WS-4 lifts that
-restriction: the query is a full 3-D point ``p_xyz`` (mm, robot BASE frame)
-and the library is the ``X (N,3)`` EE positions the sweep already records
-(``tools/apriltag_calibrate.py`` save block, X = robot EE position in BASE
-frame, mm). The lookup is then a plain Euclidean 3-D nearest-neighbour over
-``X`` → its clamped ``Q``.
+and the runtime gaze hit are both *on the table*. WS-4 lifts that restriction:
+the query is a full 3-D point ``p_xyz`` (mm) and the library is ``(N,3)``
+points → clamped ``Q`` via a plain Euclidean 3-D nearest-neighbour.
 
-Where the 3-D query comes from (OUT OF SCOPE here, documented for the future
-wiring): the runtime 3-D target point is gaze-ray ∩ object — WS-1's
-segmented-object centroid lifted into 3-D (depth at the fixated pixel), NOT
-dropped onto the table plane. That centroid, expressed in the robot BASE
-frame, is the ``p_xyz`` fed to :meth:`GazeCalibration3D.query_xyz`. Building
-that gaze→3-D-object chain (and the live control loop + 3-D coverage UI that
-consume this class) is the remaining WS-4 work; this module is only the
-lookup/clamp building block, validated by unit tests.
+**Frame is set by the constructor, not by this class** (the NN math is
+frame-agnostic — query and library must simply share a frame, mm):
+  - :meth:`from_calib_npz` — the **live WS-4 path**. Loads ``P_WORLD3D`` (the
+    EE point in the **WORLD** frame, un-projected) written by
+    ``apriltag_calibrate.py``'s ``solve-3d`` stage. The runtime feeds a
+    world-frame gaze→object point (``apriltag_control_test_3d.object_point_world_mm``),
+    so library and query are both world-frame mm.
+  - ``__init__`` / :meth:`from_arrays` with the sweep's ``X (N,3)`` — a
+    diagnostic/secondary path. ``X`` is the robot EE position in the robot
+    **BASE** frame (mm); a query against it must therefore also be base-frame.
+    Do **not** mix: a world-frame query against a base-frame ``X`` library is a
+    silent frame error.
+
+Where the 3-D world query comes from (the live loop, already built): gaze-ray ∩
+object — WS-1's segmented-object centroid lifted into 3-D (depth at the fixated
+pixel), expressed in the WORLD frame, NOT dropped onto the table plane. The
+remaining WS-4 work is the 3-D coverage UI and rig validation; this module is
+the lookup/clamp building block, validated by unit tests.
 
 Frozen-core note (WS-4 constraint): this is NEW SURFACE. It does not edit
 the REV05 2-D core. It imports ``GazeMappingResult`` and
@@ -45,15 +52,17 @@ from Utils.gaze.calibration_mapping import (
 
 
 class GazeCalibration3D:
-    """3-D nearest-neighbour mapping: a calibration library of EE positions
-    ``X (N,3)`` (mm, robot BASE frame) → the recorded joint vectors ``Q
-    (N,7)`` (rad), workspace-clamped.
+    """3-D nearest-neighbour mapping: a calibration library of 3-D points
+    ``(N,3)`` (mm) → the recorded joint vectors ``Q (N,7)`` (rad),
+    workspace-clamped. The point **frame is whatever the constructor loaded**
+    (see the module docstring): :meth:`from_calib_npz` → WORLD frame
+    (``P_WORLD3D``, the live path); ``__init__``/:meth:`from_arrays` with the
+    sweep ``X`` → robot BASE frame (diagnostic). Query and library must share a
+    frame — the NN itself is frame-agnostic.
 
     Mirrors ``GazeCalibrationMappingV3`` exactly, with the single difference
-    that the index is over 3-D points (Euclidean NN in ``X``) rather than the
-    table-plane ``(u,v)``. Construction reads the same sweep NPZ V3 reads —
-    the ``X`` column is already stored alongside ``UV``/``Q`` — so the 3-D
-    library is built directly from an existing planar sweep with no re-record.
+    that the index is over 3-D points (Euclidean NN) rather than the
+    table-plane ``(u,v)``.
 
     The workspace clamp is the same envelope as V2/V3 (``Q`` min/max over the
     valid rows, widened by ``WORKSPACE_BOUNDS_MARGIN``) and is the only
@@ -157,17 +166,20 @@ class GazeCalibration3D:
         return cls.from_arrays(npz_data["P_WORLD3D"], npz_data["Q"])
 
     def query_xyz(self, p_xyz) -> GazeMappingResult:
-        """Nearest calibrated EE point to ``p_xyz`` (mm, BASE frame) → its
-        clamped joint vector.
+        """Nearest calibrated point to ``p_xyz`` (mm, in the library's frame) →
+        its clamped joint vector. ``p_xyz`` MUST be in the same frame the library
+        was built in (WORLD for :meth:`from_calib_npz`, BASE for the ``X`` path) —
+        see the class docstring; the NN is frame-agnostic and will silently match
+        the wrong pose if the frames differ.
 
         ``dist`` is the Euclidean 3-D distance (mm) to the matched library
         point — the caller's far/implausible-target gate uses it, exactly as
         V3's in-plane distance gate does. ``x_target`` is the matched library
-        ``X`` point (where that pose's EE actually sat); ``features`` is the
-        query ``p_xyz``.
+        point (where that pose's EE actually sat); ``features`` is the query
+        ``p_xyz``.
 
         Args:
-            p_xyz: 3-vector target point (mm, robot BASE frame). Must be finite.
+            p_xyz: 3-vector target point (mm, library frame). Must be finite.
 
         Returns:
             ``GazeMappingResult`` with ``q_target`` already workspace-clamped.
