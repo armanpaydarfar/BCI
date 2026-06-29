@@ -122,6 +122,17 @@ def test_object_target_pixel_bottom_uses_object_not_enclosing_blob():
     np.testing.assert_allclose(px, [490.0, 460.0], atol=1.0)
 
 
+def test_object_target_pixel_overlapping_smaller_distractor_does_not_win():
+    # b': a smaller plate mask overlaps the cup and also contains the gaze, but its
+    # centroid sits off to the side. Smallest-area would wrongly pick the plate;
+    # nearest-centroid-to-gaze correctly keeps the cup (gaze is near the cup centre).
+    cup = _square(400, 360, 540, 500)        # area 19600, centroid (470,430)
+    plate = _square(455, 425, 545, 495)      # area 6300 (smaller), centroid (500,460)
+    dets = [{"mask_polygon": cup}, {"mask_polygon": plate}]
+    px = _object_target_pixel(dets, (465.0, 435.0), "centroid")
+    np.testing.assert_allclose(px, [470.0, 430.0], atol=2.0)   # cup, not plate
+
+
 def test_object_target_pixel_rejects_far_outside_gaze():
     dets = [{"mask_polygon": _square(200, 200, 300, 300)}]
     assert _object_target_pixel(dets, (1000.0, 1000.0), "centroid") is None

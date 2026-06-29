@@ -167,3 +167,24 @@ def test_world_eetag_recovered_from_mm_saved_transforms():
     # The old bug (no conversion) leaves the translation ~1000x off — guard it.
     B_bug = t_world_eetag_from_vision(T_cw_mm, T_ce_mm)
     assert np.linalg.norm(B_bug[:3, 3] - B_truth[:3, 3]) > 1.0
+
+
+def test_load_sweep_converts_saved_mm_transforms_to_metres(tmp_path):
+    """Call-site guard: a sweep saves T_cam_* with MM translations; load_sweep must
+    return metres (the prior bug was the loader reading mm and the solve mixing
+    m/mm). Guards the wiring the helper test alone would miss."""
+    from Analyze_handeye_axzb import load_sweep
+    R = Rotation.from_euler("xyz", [5, 10, 15], degrees=True).as_matrix()
+    T_mm = make_transform(R, [300.0, -400.0, 1200.0])     # mm, as the sweep saves
+    n = 3
+    npz = tmp_path / "sweep.npz"
+    np.savez(npz,
+             X=np.tile([100.0, 200.0, 300.0], (n, 1)),
+             EEQUAT=np.tile([0.0, 0.0, 0.0, 1.0], (n, 1)),
+             T_cam_world=np.tile(T_mm, (n, 1, 1)),
+             T_cam_eetag=np.tile(T_mm, (n, 1, 1)),
+             green=np.ones(n, bool),
+             meta=np.array({}, dtype=object))
+    data = load_sweep(str(npz))
+    np.testing.assert_allclose(data["T_cam_world"][0, :3, 3], [0.3, -0.4, 1.2], atol=1e-9)
+    np.testing.assert_allclose(data["T_cam_world"][0, :3, :3], R, atol=1e-12)

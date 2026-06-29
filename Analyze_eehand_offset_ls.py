@@ -16,9 +16,10 @@ the hand-measured config offset APRILTAG_T_EETAG_EE_MM = [150, -200, 0] mm
 Two rotation sources select how R(i) is built (--r-source):
   vision (default) : R(i) = rotation part of T_world_eetag(i) = inv(T_cam_world)
                      @ T_cam_eetag, fully self-contained from the sweep npz.
-  fk               : R(i) = R_world_base @ R(T_base_ee(i)), where R_world_base
-                     comes from the WS-2a hand-eye result (--handeye-npz) and
-                     T_base_ee is rebuilt from X (mm->m) + EEQUAT.
+  fk               : R(i) = R_world_base @ R(quat(i)), where R_world_base comes
+                     from the WS-2a hand-eye result (--handeye-npz) and the EE
+                     orientation is the FK quaternion EEQUAT (the robot position
+                     X is not used — only orientation is taken from FK).
 
 The segmentation/backprojection stage needs the perception stack (FastSAM +
 Depth Pro) and the machine-local PERCEPTION_MODELS_DIR; on a host without it the
@@ -314,9 +315,11 @@ def load_R_world_base(handeye_npz):
     )
 
 
-def build_rotations_fk(X_mm, EEQUAT, T_cam_world, T_cam_eetag, idx, R_world_base):
-    """R(i) = R_world_base @ R(T_base_ee(i)); t_world_eetag(i) from the sweep.
+def build_rotations_fk(EEQUAT, T_cam_world, T_cam_eetag, idx, R_world_base):
+    """R(i) = R_world_base @ R(quat(i)); t_world_eetag(i) from the sweep.
 
+    The rotation comes purely from the FK orientation quaternion (EEQUAT) lifted
+    into world frame by R_world_base — the robot EE position X is not needed here.
     The translation arm of the LS equation still comes from the vision-observed
     EE-tag origin in the world frame (inv(T_cam_world)@T_cam_eetag); only the
     rotation is swapped to the FK chain so the two R-sources share one geometry.
@@ -426,7 +429,6 @@ def main(argv=None):
         return 2
 
     d = np.load(npz_path, allow_pickle=True)
-    X_mm = np.asarray(d["X"], dtype=np.float64)
     T_cam_world = vision_transforms_to_metres(d["T_cam_world"])
     T_cam_eetag = vision_transforms_to_metres(d["T_cam_eetag"])
     green = np.asarray(d["green"], dtype=bool) if "green" in d.files else None
@@ -483,7 +485,7 @@ def main(argv=None):
             return 2
         R_world_base = load_R_world_base(args.handeye_npz)
         R_list, t_list = build_rotations_fk(
-            X_mm, EEQUAT, T_cam_world, T_cam_eetag, idx, R_world_base)
+            EEQUAT, T_cam_world, T_cam_eetag, idx, R_world_base)
 
     # Segmentation / backprojection (perception-gated).
     frames_dir_name = meta.get("frames_dir")

@@ -119,15 +119,17 @@ def _object_target_pixel(detections: List[dict], gaze_xy: Tuple[float, float],
     tall-object top/bottom overshoot). ``detections`` are vlm_service ``segment``
     dicts; only those with a ``mask_polygon`` are candidates.
 
-    The fixated object is the **smallest mask that contains the gaze**. This is
-    deliberate, not "most inside": FastSAM returns nested masks (a cup sits inside
-    the table/tray blob), and ``segment`` is unfiltered, so several masks contain
-    the gaze. Picking by *largest signed point-in-polygon distance* would always
-    return the enclosing blob (a point is "more inside" the bigger region) → the
-    table centroid, not the cup. Smallest-containing-area selects the specific
-    fixated object. If no mask contains the gaze, fall back to the nearest mask
-    within ``_HIT_OUTSIDE_TOL_PX`` (jitter slack); beyond that the hit is rejected
-    (None → caller falls back to raw gaze). From the chosen mask:
+    The fixated object is the **containing mask whose centroid is nearest the
+    gaze**. FastSAM returns nested/overlapping masks (a cup sits inside the table
+    blob; a plate may overlap the cup) and ``segment`` is unfiltered, so several
+    masks contain the gaze. Picking by *largest signed point-in-polygon distance*
+    returns the enclosing blob (a point is "more inside" the bigger region → the
+    table centroid); picking by *smallest area* mis-fires when a smaller distractor
+    overlaps the target. Nearest-centroid-to-gaze handles both: the cup's centroid
+    is near the gaze, the table's and an off-to-the-side plate's are not. If no mask
+    contains the gaze, fall back to the nearest mask within ``_HIT_OUTSIDE_TOL_PX``
+    (jitter slack); beyond that the hit is rejected (None → caller falls back to raw
+    gaze). From the chosen mask:
       - ``centroid``: the mask area centroid (cv2 moments) — the §1a controlled
         point, consistent with WS-2b's calibration target.
       - ``bottom``: the footprint pixel — mean x along the lowest mask row — i.e.
@@ -136,7 +138,15 @@ def _object_target_pixel(detections: List[dict], gaze_xy: Tuple[float, float],
     if source not in ("centroid", "bottom"):
         return None
     gx, gy = float(gaze_xy[0]), float(gaze_xy[1])
-    contained = []          # (area, cnt) for masks that contain the gaze
+
+    def _centroid(cnt):
+        m = cv2.moments(cnt)
+        if abs(m["m00"]) > 1e-6:
+            return (m["m10"] / m["m00"], m["m01"] / m["m00"])
+        p = cnt.reshape(-1, 2).astype(float)
+        return (float(p[:, 0].mean()), float(p[:, 1].mean()))
+
+    contained = []          # (centroid_dist, area, cnt) for masks containing gaze
     nearest_cnt = None      # fallback: closest mask when gaze is outside all
     nearest_dist = -1e18
     for det in detections:
@@ -146,11 +156,22 @@ def _object_target_pixel(detections: List[dict], gaze_xy: Tuple[float, float],
         cnt = np.asarray(poly, dtype=np.int32).reshape(-1, 1, 2)
         dist = cv2.pointPolygonTest(cnt, (gx, gy), True)  # +inside, -outside (px)
         if dist >= 0.0:
-            contained.append((float(cv2.contourArea(cnt)), cnt))
+            cxm, cym = _centroid(cnt)
+            contained.append((float(np.hypot(cxm - gx, cym - gy)),
+                              float(cv2.contourArea(cnt)), cnt))
         elif dist > nearest_dist:
             nearest_dist, nearest_cnt = dist, cnt
     if contained:
-        best_poly = min(contained, key=lambda c: c[0])[1]   # smallest containing
+        # The fixated object is the containing mask whose CENTROID is nearest the
+        # gaze (area as a deterministic tie-break). Nearest-centroid beats
+        # smallest-area: it returns the cup both when the cup nests inside the table
+        # blob (the table centroid is far from the gaze) AND when a smaller
+        # distractor (e.g. a plate) overlaps the cup with its centroid off to the
+        # side (smallest-area would wrongly pick the distractor). It is still a
+        # heuristic, not the server's full probabilistic hit-test — clutter where
+        # gaze lands nearer a distractor's centre than the target's can mis-pick;
+        # the far-NN gate + manual GO are the backstops.
+        best_poly = min(contained, key=lambda c: (c[0], c[1]))[2]
     elif nearest_cnt is not None and nearest_dist >= -_HIT_OUTSIDE_TOL_PX:
         best_poly = nearest_cnt                              # gaze just outside
     else:
@@ -199,10 +220,20 @@ def _object_target_uv(vlm: "VLMClient", source: str, gaze_uv: np.ndarray, diag: 
         _log(f"WS-1: segmentation unavailable ({(seg or {}).get('error')}); using raw gaze")
         return gaze_uv, "gaze"
     svc_gaze = seg.get("gaze_px")
-    if svc_gaze is not None and np.hypot(svc_gaze[0] - gpx[0],
-                                         svc_gaze[1] - gpx[1]) > _GAZE_DIVERGENCE_TOL_PX:
-        _log(f"WS-1: service gaze {np.round(svc_gaze,0)} diverges from ours "
-             f"{np.round(gpx,0)} (stale/moving frame); using raw gaze")
+    if svc_gaze is None:
+        # Older vlm_service (perception is versioned independently on the GPU host)
+        # doesn't return gaze_px, so the divergence guard can't run. Proceed but
+        # warn — the guarantee is degraded, not the motion safety (far-NN + GO gate).
+        _log("WS-1: service did not return gaze_px (older vlm_service?); "
+             "cross-frame divergence guard unavailable this resolve")
+    elif (not np.all(np.isfinite(svc_gaze))
+          or np.hypot(svc_gaze[0] - gpx[0], svc_gaze[1] - gpx[1])
+          > _GAZE_DIVERGENCE_TOL_PX):
+        # Non-finite service gaze (a blink / lost track on the service's frame) or a
+        # gaze that disagrees with ours = the masks are from the wrong instant. NaN
+        # must FALL BACK, not slip through (nan > tol is False).
+        _log(f"WS-1: service gaze {np.round(svc_gaze,0)} unusable/diverges from ours "
+             f"{np.round(gpx,0)} (stale/moving/blink frame); using raw gaze")
         return gaze_uv, "gaze"
     tpx = _object_target_pixel(seg.get("detections", []), (gpx[0], gpx[1]), source)
     if tpx is None:
