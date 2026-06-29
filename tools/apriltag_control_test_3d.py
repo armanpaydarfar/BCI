@@ -91,6 +91,13 @@ from Utils.gaze.apriltag_world import (  # noqa: E402
 from Utils.gaze.calibration_mapping import WORKSPACE_BOUNDS_MARGIN  # noqa: E402
 from Utils.gaze.calibration_mapping_3d import GazeCalibration3D  # noqa: E402
 from Utils.gaze.harmony_link import HarmonyLink  # noqa: E402
+from Utils.gaze.object_target import (  # noqa: E402
+    GAZE_DIVERGENCE_TOL_PX,
+    gaze_divergence_ok,
+    pixel_on_plane_world,
+    select_object_pixel,
+    table_plane_from_map,
+)
 from Utils.perception_clients import VLMClient  # noqa: E402
 
 
@@ -142,6 +149,7 @@ def _recover_world_pose(consumer: RelayConsumer, detector, K, world_map: dict,
     operator can confirm the head-invariant anchor is solid before committing a
     move (more tags → a more stable, flip-proof pose)."""
     last_tcw: Optional[np.ndarray] = None
+    last_gaze: Optional[Tuple[float, float]] = None  # our-frame gaze at the solved frame
     last_idx = None
     frames_with_pose = 0
     per_frame_counts: List[int] = []
@@ -168,11 +176,17 @@ def _recover_world_pose(consumer: RelayConsumer, detector, K, world_map: dict,
             continue
         frames_with_pose += 1
         last_tcw = T_cam_world
+        # Capture OUR-frame gaze on the solved frame, for the object-plane path's
+        # cross-frame guard (service gaze vs ours). Absent/non-finite → leave None.
+        g = getattr(b, "gaze", None)
+        if g is not None and np.isfinite(getattr(g, "x", np.nan)) and np.isfinite(getattr(g, "y", np.nan)):
+            last_gaze = (float(g.x), float(g.y))
     diag = {
         "frames": frames_with_pose,
         "median_world_tags": float(np.median(per_frame_counts)) if per_frame_counts else 0.0,
         "tags_seen": sorted(ids_seen),
         "mapped_tags": sorted(int(i) for i in world_map["ids"]),
+        "gaze_px": last_gaze,
     }
     return last_tcw, diag
 
@@ -203,6 +217,80 @@ def _commit_move(link: HarmonyLink, q_cmd: np.ndarray, idx: int, dur_s: float) -
         _log(f"  readback: actual EE = {np.round(st['ee'], 1)} mm")
     else:
         _log("  readback: telemetry timed out — verify the arm visually")
+
+
+def _fmt_px(p) -> str:
+    if p is None:
+        return "n/a"
+    try:
+        return f"({float(p[0]):.0f},{float(p[1]):.0f})"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _px_dist(a, b) -> float:
+    try:
+        return float(np.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1])))
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _resolve_object_plane(vlm, args, K, T_cam_world, diag,
+                          table_point, table_normal) -> Optional[np.ndarray]:
+    """Depth-free target: the fixated object's footprint/centroid pixel cast onto
+    the table plane → world ``(x,y,z)`` mm. Logs each stage; returns None (with a
+    logged reason) on any miss, so the caller refuses the move."""
+    try:
+        seg = vlm.segment(include_masks=True)
+    except OSError as exc:
+        _log(f"segment request failed ({exc!r}); is vlm_service up? NOT moving.")
+        return None
+    if not (isinstance(seg, dict) and seg.get("ok")):
+        _log(f"segment unavailable ({(seg or {}).get('error')}); NOT moving.")
+        return None
+    dets = seg.get("detections", [])
+    svc_gaze, our_gaze = seg.get("gaze_px"), diag.get("gaze_px")
+    if not gaze_divergence_ok(svc_gaze, our_gaze):
+        _log(f"segment: {len(dets)} masks, service gaze={_fmt_px(svc_gaze)} vs ours "
+             f"{_fmt_px(our_gaze)} diverged >{GAZE_DIVERGENCE_TOL_PX:.0f}px (head moved "
+             "during resolve). NOT moving — hold still and re-resolve.")
+        return None
+    px, py, sel = select_object_pixel(dets, svc_gaze, args.target_point)
+    if px is None:
+        _log(f"segment: {sel['n_dets']} masks, none under gaze "
+             f"(n_contained={sel['n_contained']}); no object to target. NOT moving.")
+        return None
+    p_world = pixel_on_plane_world(px, py, K, T_cam_world, table_point, table_normal)
+    if p_world is None:
+        _log("object pixel ray missed the table plane (parallel/behind). NOT moving.")
+        return None
+    _log(f"object: {sel['pick']} mask, area={sel.get('mask_area_px', 0):.0f}px → "
+         f"{args.target_point} pixel=({px:.0f},{py:.0f})  "
+         f"[{len(dets)} masks, gaze div={_px_dist(svc_gaze, our_gaze):.0f}px]")
+    return p_world
+
+
+def _resolve_depth(vlm, T_cam_world) -> Optional[np.ndarray]:
+    """Legacy Depth Pro target: vlm_service.waypoints → hit_waypoint.position_cam →
+    world. Kept as an explicit fallback (--target-source depth)."""
+    try:
+        wp = vlm.waypoints()
+    except OSError as exc:
+        _log(f"waypoints request failed ({exc!r}); is vlm_service up? NOT moving.")
+        return None
+    if not (isinstance(wp, dict) and wp.get("ok")):
+        _log(f"waypoints unavailable ({(wp or {}).get('error')}); NOT moving.")
+        return None
+    if wp.get("depth_enabled") is False:
+        _log("vlm_service has NO depth (started without --enable-depth). NOT moving.")
+        return None
+    hit = wp.get("hit_waypoint")
+    if hit is None:
+        _log("no object hit at the fixation. NOT moving.")
+        return None
+    _log(f"object hit: {hit.get('label')!r} @ depth {hit.get('depth_median_m')} m, "
+         f"position_cam={np.round(np.asarray(hit['position_cam'], float), 3).tolist()} m")
+    return object_point_world_mm(hit["position_cam"], T_cam_world)
 
 
 def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
@@ -240,16 +328,36 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
     detector = load_detector(args.families)
     K = consumer.camera_matrix
 
-    # Always object-3-D: the 3-D target comes from perception (no plane fallback).
     import config as cfg
     vlm = VLMClient(cfg)
 
+    # object_plane (default, robust): fit the TABLE plane from the table tags ONCE,
+    # up front, so a bad table-tag set / non-coplanar tags fail loud here, not
+    # mid-session. The plane supplies depth at runtime (no Depth Pro).
+    table_point = table_normal = None
+    if args.target_source == "object_plane":
+        try:
+            table_point, table_normal, tinfo = table_plane_from_map(
+                world_map, args.table_tag_ids)
+        except ValueError as exc:
+            _log(f"cannot fit the table plane: {exc}. Pass --table-tag-ids (table tags "
+                 "only), or fall back to --target-source depth.")
+            return 2
+        _log(f"table plane from tags {tinfo['table_ids']}: out-of-plane residual "
+             f"max={tinfo['max_resid_mm']:.1f} mm, rms={tinfo['rms_resid_mm']:.1f} mm "
+             "(large ⇒ wrong table-tag set or a bumped tag)")
+
     _log(f"calibration: {mapping.num_valid_samples} world (x,y,z)→Q poses. Workspace "
          f"clamp from Q±{WORKSPACE_BOUNDS_MARGIN:.0%}. Robot dur={args.dur:.1f}s.")
-    _log(f"3-D target via vlm_service.waypoints ({vlm.host}:{vlm.port}); depth REQUIRED.")
+    if args.target_source == "object_plane":
+        _log(f"3-D target: DEPTH-FREE — fixated object's {args.target_point} pixel ∩ "
+             f"table plane (segment masks from {vlm.host}:{vlm.port}; no Depth Pro).")
+    else:
+        _log(f"3-D target: Depth Pro position_cam (vlm_service.waypoints "
+             f"{vlm.host}:{vlm.port}); depth REQUIRED.")
     _log("Per move: fixate the object, Enter to RESOLVE; review; then 'g' to GO "
          "('g' again to confirm a far fixation), 'r' to re-resolve, 'h' to home, "
-         "'q' to quit. NO autonomous motion; refuses to move without a depth hit.")
+         "'q' to quit. NO autonomous motion; refuses to move on any uncertainty.")
 
     pending: Optional[Tuple[np.ndarray, int, float, bool]] = None  # (q_cmd, idx, dist, clamped)
     far_armed = False  # a far fixation needs a SECOND 'g' to commit (review safety)
@@ -278,7 +386,7 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
             continue
 
         # default (Enter / 'r'): resolve a fixation
-        _log(f"resolving — fixate the object, anchoring the world frame for "
+        _log(f"── resolve ── fixate the object; anchoring world frame for "
              f"{args.sample_s:.1f}s …")
         T_cam_world, diag = _recover_world_pose(consumer, detector, K, world_map,
                                                 tag_size, args.sample_s)
@@ -287,33 +395,21 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
                  f"{diag['mapped_tags']}) — keep ≥1 world tag in view")
             pending, far_armed = None, False
             continue
+        _log(f"world anchor: {diag['frames']} frames, median "
+             f"{diag['median_world_tags']:.0f}/{len(diag['mapped_tags'])} world tags/frame, "
+             f"saw {diag['tags_seen']}, our gaze={_fmt_px(diag.get('gaze_px'))}")
 
-        # Object 3-D target from perception. Any uncertainty → refuse to move
-        # (Tier-1 fail-safe): no plane fallback exists for a 3-D point.
-        try:
-            wp = vlm.waypoints()
-        except OSError as exc:
-            _log(f"waypoints request failed ({exc!r}); cannot resolve a 3-D target — "
-                 "is vlm_service up? NOT moving.")
-            pending, far_armed = None, False
-            continue
-        if not (isinstance(wp, dict) and wp.get("ok")):
-            _log(f"waypoints unavailable ({(wp or {}).get('error')}); NOT moving.")
-            pending, far_armed = None, False
-            continue
-        if wp.get("depth_enabled") is False:
-            _log("vlm_service has NO depth (started without --enable-depth); 3-D "
-                 "control needs depth. NOT moving.")
-            pending, far_armed = None, False
-            continue
-        hit = wp.get("hit_waypoint")
-        if hit is None:
-            _log("no object hit at the fixation; nothing to resolve. NOT moving.")
+        # Target (Tier-1 fail-safe: any uncertainty → return None → NOT moving).
+        if args.target_source == "object_plane":
+            p_world = _resolve_object_plane(vlm, args, K, T_cam_world, diag,
+                                            table_point, table_normal)
+        else:
+            p_world = _resolve_depth(vlm, T_cam_world)
+        if p_world is None:
             pending, far_armed = None, False
             continue
 
         try:
-            p_world = object_point_world_mm(hit["position_cam"], T_cam_world)
             result = mapping.query_xyz(p_world)
         except (KeyError, ValueError) as exc:
             _log(f"resolved target is unusable ({exc}); NOT moving.")
@@ -321,18 +417,13 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
             continue
         idx, dist = result.idx, result.dist
         q_cmd, clamped = result.q_target, result.clamped
-        _log(f"world anchor: pose from {diag['frames']} frames, median "
-             f"{diag['median_world_tags']:.0f}/{len(diag['mapped_tags'])} world tags/frame, "
-             f"saw {diag['tags_seen']}")
-        _log(f"object hit: {hit.get('label')!r} @ depth {hit.get('depth_median_m')} m, "
-             f"position_cam={np.round(np.asarray(hit['position_cam'], float), 3).tolist()} m")
-        _log(f"target world point = {np.round(p_world, 1)} mm")
-        _log(f"nearest calibrated pose #{idx}: library xyz={np.round(result.x_target,1)} "
+        _log(f"target world point = {np.round(p_world, 1).tolist()} mm")
+        _log(f"nearest calibrated pose #{idx}: library xyz={np.round(result.x_target,1).tolist()} "
              f"mm, dist={dist:.1f} mm, clamped={clamped}")
         _log(f"joint target (rad) = {np.round(q_cmd,4).tolist()}")
         if dist > args.max_nn_dist_mm:
-            _log(f"WARNING: {dist:.0f} mm from the nearest calibrated pose "
-                 "(outside the calibrated region).")
+            _log(f"WARNING: {dist:.0f} mm from the nearest calibrated pose — outside the "
+                 "calibrated region (sweep didn't cover here, or the target is wrong).")
         _log("press 'g' to GO, 'r' to re-resolve")
         pending, far_armed = (q_cmd, idx, dist, clamped), False
     return 0
@@ -352,6 +443,21 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="world-pose anchoring window (s) — hold the head still")
     p.add_argument("--max-nn-dist-mm", type=float, default=80.0,
                    help="warn/guard if the nearest calibrated pose is farther than this")
+    p.add_argument("--target-source", choices=["object_plane", "depth"],
+                   default="object_plane",
+                   help="how to get the 3-D target. 'object_plane' (default, robust): "
+                        "fixated object's footprint/centroid pixel cast onto the TABLE "
+                        "plane (depth-free). 'depth': legacy Depth Pro position_cam "
+                        "(vlm_service.waypoints).")
+    p.add_argument("--target-point", choices=["footprint", "centroid"],
+                   default="footprint",
+                   help="object_plane: which mask pixel to cast — 'footprint' (lowest "
+                        "mask row, the object↔table contact, overshoot-free) or "
+                        "'centroid'. Default footprint.")
+    p.add_argument("--table-tag-ids", type=int, nargs="+", default=None,
+                   help="world tag ids physically ON the table, used to fit the table "
+                        "plane (default: config.APRILTAG_WORLD_TAG_IDS). Exclude "
+                        "wall/elevated tags here.")
     p.add_argument("--side", default=None, help="robot active side R/L")
     p.add_argument("--relay-host", default=None)
     p.add_argument("--relay-port", type=int, default=None)
@@ -360,6 +466,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--bind-ip", default=None)
     p.add_argument("--bind-port", type=int, default=None)
     args = p.parse_args(argv)
+
+    if args.table_tag_ids is None:
+        args.table_tag_ids = list(getattr(cfg, "APRILTAG_WORLD_TAG_IDS", [0, 1, 2, 3, 4]))
 
     import os
     args.relay_host = args.relay_host or getattr(cfg, "FRAME_RELAY_DIAL_HOST", "127.0.0.1")
