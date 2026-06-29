@@ -150,6 +150,7 @@ def select_object_pixel(detections: List[Dict], gaze_xy: Tuple[float, float],
         else:
             px, py = float(pts[:, 0].mean()), float(pts[:, 1].mean())
     info["mask_area_px"] = float(cv2.contourArea(cnt))
+    info["mask_polygon"] = pts.astype(int).tolist()  # chosen object outline, for the viz
     return px, py, info
 
 

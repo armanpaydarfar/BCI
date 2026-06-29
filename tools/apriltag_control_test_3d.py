@@ -85,9 +85,11 @@ from Utils.gaze.apriltag_detect import (  # noqa: E402
     recover_world_pose_pnp,
 )
 from Utils.gaze.apriltag_world import (  # noqa: E402
+    plane_coords,
     recover_world_pose,
     world_map_from_arrays,
 )
+from Utils.gaze.control_view import ControlView  # noqa: E402
 from Utils.gaze.calibration_mapping import WORKSPACE_BOUNDS_MARGIN  # noqa: E402
 from Utils.gaze.calibration_mapping_3d import GazeCalibration3D  # noqa: E402
 from Utils.gaze.harmony_link import HarmonyLink  # noqa: E402
@@ -236,61 +238,65 @@ def _px_dist(a, b) -> float:
 
 
 def _resolve_object_plane(vlm, args, K, T_cam_world, diag,
-                          table_point, table_normal) -> Optional[np.ndarray]:
+                          table_point, table_normal):
     """Depth-free target: the fixated object's footprint/centroid pixel cast onto
-    the table plane → world ``(x,y,z)`` mm. Logs each stage; returns None (with a
-    logged reason) on any miss, so the caller refuses the move."""
+    the table plane → world ``(x,y,z)`` mm. Logs each stage; returns
+    ``(p_world, viz)`` or ``(None, None)`` on a logged miss. ``viz`` carries
+    ``gaze_px``/``mask_polygon``/``target_px`` for the visual interface."""
     try:
         seg = vlm.segment(include_masks=True)
     except OSError as exc:
         _log(f"segment request failed ({exc!r}); is vlm_service up? NOT moving.")
-        return None
+        return None, None
     if not (isinstance(seg, dict) and seg.get("ok")):
         _log(f"segment unavailable ({(seg or {}).get('error')}); NOT moving.")
-        return None
+        return None, None
     dets = seg.get("detections", [])
     svc_gaze, our_gaze = seg.get("gaze_px"), diag.get("gaze_px")
     if not gaze_divergence_ok(svc_gaze, our_gaze):
         _log(f"segment: {len(dets)} masks, service gaze={_fmt_px(svc_gaze)} vs ours "
              f"{_fmt_px(our_gaze)} diverged >{GAZE_DIVERGENCE_TOL_PX:.0f}px (head moved "
              "during resolve). NOT moving — hold still and re-resolve.")
-        return None
+        return None, None
     px, py, sel = select_object_pixel(dets, svc_gaze, args.target_point)
     if px is None:
         _log(f"segment: {sel['n_dets']} masks, none under gaze "
              f"(n_contained={sel['n_contained']}); no object to target. NOT moving.")
-        return None
+        return None, None
     p_world = pixel_on_plane_world(px, py, K, T_cam_world, table_point, table_normal)
     if p_world is None:
         _log("object pixel ray missed the table plane (parallel/behind). NOT moving.")
-        return None
+        return None, None
     _log(f"object: {sel['pick']} mask, area={sel.get('mask_area_px', 0):.0f}px → "
          f"{args.target_point} pixel=({px:.0f},{py:.0f})  "
          f"[{len(dets)} masks, gaze div={_px_dist(svc_gaze, our_gaze):.0f}px]")
-    return p_world
+    viz = {"gaze_px": svc_gaze, "mask_polygon": sel.get("mask_polygon"),
+           "target_px": (px, py)}
+    return p_world, viz
 
 
-def _resolve_depth(vlm, T_cam_world) -> Optional[np.ndarray]:
+def _resolve_depth(vlm, T_cam_world):
     """Legacy Depth Pro target: vlm_service.waypoints → hit_waypoint.position_cam →
-    world. Kept as an explicit fallback (--target-source depth)."""
+    world. Kept as an explicit fallback (--target-source depth). Returns
+    ``(p_world, None)`` (no viz for the legacy path) or ``(None, None)``."""
     try:
         wp = vlm.waypoints()
     except OSError as exc:
         _log(f"waypoints request failed ({exc!r}); is vlm_service up? NOT moving.")
-        return None
+        return None, None
     if not (isinstance(wp, dict) and wp.get("ok")):
         _log(f"waypoints unavailable ({(wp or {}).get('error')}); NOT moving.")
-        return None
+        return None, None
     if wp.get("depth_enabled") is False:
         _log("vlm_service has NO depth (started without --enable-depth). NOT moving.")
-        return None
+        return None, None
     hit = wp.get("hit_waypoint")
     if hit is None:
         _log("no object hit at the fixation. NOT moving.")
-        return None
+        return None, None
     _log(f"object hit: {hit.get('label')!r} @ depth {hit.get('depth_median_m')} m, "
          f"position_cam={np.round(np.asarray(hit['position_cam'], float), 3).tolist()} m")
-    return object_point_world_mm(hit["position_cam"], T_cam_world)
+    return object_point_world_mm(hit["position_cam"], T_cam_world), None
 
 
 def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
@@ -347,6 +353,15 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
              f"max={tinfo['max_resid_mm']:.1f} mm, rms={tinfo['rms_resid_mm']:.1f} mm "
              "(large ⇒ wrong table-tag set or a bumped tag)")
 
+    # Visual interface (object_plane only): project the library to table (u,v) once
+    # for the top-down coverage backdrop, so each resolve shows the target landing
+    # inside or outside the calibrated region.
+    ui: Optional[ControlView] = None
+    if args.target_source == "object_plane" and not args.no_ui:
+        lib_uv = plane_coords(np.asarray(z["P_WORLD3D"], dtype=float),
+                              table_point, table_normal)
+        ui = ControlView(lib_uv)
+
     _log(f"calibration: {mapping.num_valid_samples} world (x,y,z)→Q poses. Workspace "
          f"clamp from Q±{WORKSPACE_BOUNDS_MARGIN:.0%}. Robot dur={args.dur:.1f}s.")
     if args.target_source == "object_plane":
@@ -401,10 +416,10 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
 
         # Target (Tier-1 fail-safe: any uncertainty → return None → NOT moving).
         if args.target_source == "object_plane":
-            p_world = _resolve_object_plane(vlm, args, K, T_cam_world, diag,
-                                            table_point, table_normal)
+            p_world, viz = _resolve_object_plane(vlm, args, K, T_cam_world, diag,
+                                                 table_point, table_normal)
         else:
-            p_world = _resolve_depth(vlm, T_cam_world)
+            p_world, viz = _resolve_depth(vlm, T_cam_world)
         if p_world is None:
             pending, far_armed = None, False
             continue
@@ -425,7 +440,25 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
             _log(f"WARNING: {dist:.0f} mm from the nearest calibrated pose — outside the "
                  "calibrated region (sweep didn't cover here, or the target is wrong).")
         _log("press 'g' to GO, 'r' to re-resolve")
+        if ui is not None and viz is not None:
+            b = consumer.latest()
+            scene = b.video.bgr if (b is not None and b.video is not None) else None
+            tgt_uv = plane_coords(np.asarray(p_world, float), table_point, table_normal)
+            near_uv = plane_coords(np.asarray(result.x_target, float), table_point, table_normal)
+            ui.update(
+                scene, gaze_px=viz["gaze_px"], mask_polygon=viz["mask_polygon"],
+                target_px=viz["target_px"], target_uv=tgt_uv, nearest_uv=near_uv,
+                lines=[
+                    f"target world {np.round(p_world,0).tolist()} mm   "
+                    f"nearest #{idx} dist={dist:.0f} mm   clamped={clamped}",
+                    f"anchor {diag['frames']}f median {diag['median_world_tags']:.0f}"
+                    f"/{len(diag['mapped_tags'])} tags   "
+                    + ("OUTSIDE calibrated region" if dist > args.max_nn_dist_mm
+                       else "in calibrated region"),
+                ])
         pending, far_armed = (q_cmd, idx, dist, clamped), False
+    if ui is not None:
+        ui.close()
     return 0
 
 
@@ -458,6 +491,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="world tag ids physically ON the table, used to fit the table "
                         "plane (default: config.APRILTAG_WORLD_TAG_IDS). Exclude "
                         "wall/elevated tags here.")
+    p.add_argument("--no-ui", action="store_true",
+                   help="disable the visual interface (scene + top-down table view)")
     p.add_argument("--side", default=None, help="robot active side R/L")
     p.add_argument("--relay-host", default=None)
     p.add_argument("--relay-port", type=int, default=None)
