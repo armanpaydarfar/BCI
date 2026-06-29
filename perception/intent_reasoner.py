@@ -37,7 +37,11 @@ SYSTEM_PROMPT = (
     "Respond ONLY with valid JSON matching the provided schema. "
     "Never issue motion commands. "
     "Provide a clarification_question based on the top candidate — "
-    "natural, short, and specific."
+    "natural, short, and specific. "
+    "For the object being grasped, if a natural human grasp affordance is "
+    "obvious, also return grasp_region with a coarse region label "
+    "(e.g. \"handle\", \"rim\", \"mid-body\") and optionally a grasp pixel on "
+    "the object; otherwise omit it or set it to null."
 )
 
 PAIR_SYSTEM_PROMPT = (
@@ -54,7 +58,11 @@ PAIR_SYSTEM_PROMPT = (
     "Respond ONLY with valid JSON matching the provided schema. "
     "Never issue motion commands. "
     "Provide a clarification_question based on the top candidate — "
-    "natural, short, and specific."
+    "natural, short, and specific. "
+    "For the primary object being grasped, if a natural human grasp "
+    "affordance is obvious, also return grasp_region with a coarse region "
+    "label (e.g. \"handle\", \"rim\", \"mid-body\") and optionally a grasp "
+    "pixel on the object; otherwise omit it or set it to null."
 )
 
 JSON_SCHEMA_DESCRIPTION = """\
@@ -70,10 +78,16 @@ Respond with a JSON object with these fields:
     {"intent": <string>, "confidence": <float>}
   ],
   "clarification_question": <string — question based on top candidate>,
-  "reasoning": <string — brief explanation of ranking>
+  "reasoning": <string — brief explanation of ranking>,
+  "grasp_region": <optional object for the object to be grasped, or null —
+    {"label": <string — that object's name>,
+     "region": <string — coarse grasp hint, e.g. "handle", "mid-body", "rim", or null>,
+     "grasp_pixel": [<x>, <y>] | null}>
 }
 The candidates array must have exactly 5 entries, ranked from most to least likely.
-Confidence scores should sum to approximately 1.0."""
+Confidence scores should sum to approximately 1.0.
+grasp_region is OPTIONAL: include it only when a natural human grasp affordance is
+obvious for the object being grasped; otherwise omit it or set it to null."""
 
 FALLBACK_RESPONSE: dict = {
     "object": None,
@@ -88,6 +102,39 @@ FALLBACK_RESPONSE: dict = {
     "clarification_question": "I couldn't determine your intent. What would you like to do?",
     "reasoning": "API call failed or returned unparseable output.",
 }
+
+
+def _coerce_grasp_region(value) -> Optional[dict]:
+    """Normalize the optional grasp_region hint to {"label","region","grasp_pixel"} or None.
+
+    WS3 first pass (semantic grasp region): the grasp hint is a coarse field the
+    intent VLM *may* emit alongside the existing decision — NOT a dedicated
+    grasp-affordance network. The model family for a real affordance predictor is
+    TBD; this stays a deliberately swappable, optional hint so the control/motion
+    path is untouched. A missing, null, or malformed value degrades to None
+    (consistent with this file's JSON-repair style) so every existing consumer —
+    none of which read grasp_region — keeps working unchanged.
+    """
+    if not isinstance(value, dict):
+        return None
+
+    label = value.get("label")
+    label = label if isinstance(label, str) else None
+
+    region = value.get("region")
+    region = region if isinstance(region, str) else None
+
+    grasp_pixel = None
+    px = value.get("grasp_pixel")
+    if isinstance(px, (list, tuple)) and len(px) == 2:
+        try:
+            grasp_pixel = [float(px[0]), float(px[1])]
+        except (TypeError, ValueError):
+            grasp_pixel = None  # malformed coordinate → drop the pixel, keep the rest
+
+    if label is None and region is None and grasp_pixel is None:
+        return None  # nothing usable survived coercion
+    return {"label": label, "region": region, "grasp_pixel": grasp_pixel}
 
 
 # ── frame annotation ─────────────────────────────────────────────────────────
@@ -525,7 +572,7 @@ class IntentReasoner:
                 print(f"[VLM] WARN: session-log append failed: {exc!r}", file=sys.stderr)
 
         try:
-            return json.loads(raw)
+            result = json.loads(raw)
         except json.JSONDecodeError:
             # Attempt to repair truncated JSON (e.g. Gemini ran out of tokens)
             import re
@@ -539,10 +586,16 @@ class IntentReasoner:
                 repaired += ']' * open_brackets + '}' * open_braces
                 result = json.loads(repaired)
                 print(f"[VLM] Repaired truncated JSON", file=sys.stderr)
-                return result
             except Exception:
                 print(f"[VLM] Failed to parse response, using fallback", file=sys.stderr)
                 return dict(FALLBACK_RESPONSE)
+
+        # WS3: normalize the optional grasp_region hint. Coerce in place so a
+        # missing/malformed value becomes a uniform None rather than leaking a
+        # malformed dict to consumers; absent in the fallback path means omitted.
+        if isinstance(result, dict):
+            result["grasp_region"] = _coerce_grasp_region(result.get("grasp_region"))
+        return result
 
     # ── backend implementations ───────────────────────────────────────────
 
