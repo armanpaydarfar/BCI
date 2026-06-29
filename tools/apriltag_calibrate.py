@@ -847,6 +847,13 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     period = 1.0 / args.sample_hz
     last_idx = None
     accepted = 0
+    # Diagnostics so a pasted sweep log explains itself: why samples were dropped
+    # (tag not seen / low margin / time-misaligned) and how reliably the controlled
+    # (EE/object) tag was recovered — the operator's "tag had a bad view at some
+    # angles" concern shows up here as a low ee-seen fraction + 'ee_not_seen' drops.
+    drop_reasons: Dict[str, int] = {}
+    n_processed = 0       # frames that reached the accept gate
+    ee_seen_frames = 0    # of those, how many recovered the controlled tag pose
     try:
         # World map: LOAD the pre-registered top-down map (preferred — accurate geometry
         # the seated view can't produce) or, as a fallback, register it now seated. The
@@ -941,6 +948,11 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                 world_seen=T_cam_world is not None, ee_seen=T_cam_eetag is not None,
                 margins=margins, dt_s=dt,
                 min_margin=args.min_margin, max_align_dt_s=args.max_align_dt_s)
+            n_processed += 1
+            if T_cam_eetag is not None:
+                ee_seen_frames += 1
+            if not ok:
+                drop_reasons[reason] = drop_reasons.get(reason, 0) + 1
 
             cur_uv = None      # vision (u,v) — the gaze-side command coordinate (library)
             disp_xy = None      # what the coverage grid + display use (telemetry base)
@@ -987,8 +999,9 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                 s = grid.summary()
                 tgt = "—" if target is None else np.round(target, 0).tolist()
                 label = "voxels" if args.coverage_3d else "cells"
+                ee_pct = (100.0 * ee_seen_frames / n_processed) if n_processed else 0.0
                 _log(f"  accepted={accepted} {label}={int(s['visited'])} "
-                     f"sufficient={int(s['sufficient'])} → go to {tgt}"
+                     f"sufficient={int(s['sufficient'])} ee-tag seen {ee_pct:.0f}% → go to {tgt}"
                      + ("" if ok else f"  (last drop: {reason})"))
                 if args.coverage_3d:
                     # The volumetric analog of the 2-D box: a per-z-slice occupancy
@@ -1030,6 +1043,24 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
             link.close()
         if ui is not None:
             ui.close()
+
+    # Sweep diagnostics (always — a short/failed sweep still explains itself).
+    ee_pct = (100.0 * ee_seen_frames / n_processed) if n_processed else 0.0
+    drops = (", ".join(f"{r}={c}" for r, c
+                       in sorted(drop_reasons.items(), key=lambda kv: -kv[1])) or "none")
+    _log(f"sweep summary: {n_processed} frames processed, {accepted} accepted; "
+         f"controlled tag {ee_ids} recovered in {ee_pct:.0f}% of frames")
+    _log(f"  drops by reason: {drops}  "
+         "(ee_not_seen ⇒ the tracked tag was occluded/oblique → re-orient it; "
+         "low_margin ⇒ tag too small/blurred; misaligned ⇒ slow down)")
+    if x_rows:
+        X = np.array(x_rows, dtype=float)
+        fin = X[np.all(np.isfinite(X[:, :3]), axis=1)] if X.ndim == 2 and X.shape[1] >= 3 else X[:0]
+        if fin.shape[0]:
+            _log(f"  arm reach (telemetry EE) mm: "
+                 f"x[{fin[:,0].min():.0f},{fin[:,0].max():.0f}] "
+                 f"y[{fin[:,1].min():.0f},{fin[:,1].max():.0f}] "
+                 f"z[{fin[:,2].min():.0f},{fin[:,2].max():.0f}]")
 
     if len(uv_rows) < 3:
         _log(f"only {len(uv_rows)} accepted samples (<3) — not saving a solvable npz")
