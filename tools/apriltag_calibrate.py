@@ -1498,6 +1498,16 @@ def stage_solve_3d(args) -> int:
     src_meta = z["meta"].item() if "meta" in z.files else {}
     method = src_meta.get("ee_point_method", "pose")
     offset = np.asarray(src_meta.get("t_eetag_ee_mm", [0.0, 0.0, 0.0]), dtype=float)
+    # Re-solve override: an explicit --ee-point-method takes BOTH the method and the
+    # --t-eetag-ee offset from the CLI verbatim (a literal [0,0,0] IS honoured — e.g.
+    # to put the controlled point at the EE tag), so a sweep can be re-solved with a
+    # corrected mount/grasp offset without re-capturing. The calib meta below records
+    # whatever was actually applied. Mirrors the planar solve's override.
+    if args.ee_point_method is not None:
+        method = args.ee_point_method
+        offset = np.asarray(args.t_eetag_ee, dtype=float)
+        _log(f"re-solve override: ee_point_method={method}, "
+             f"t_eetag_ee_mm={offset.tolist()} (controlled point = EE tag + this offset)")
     # A 'rayplane' sweep PROJECTS every EE point onto the table plane
     # (eetag_rayplane_point_world), so the z height — the whole reason for a 3-D
     # library — is already destroyed in the source geometry. Building a 3-D calib
