@@ -414,7 +414,8 @@ def stage_register_world(args, consumer: RelayConsumer, ui=None) -> int:
 # ── stage: register-world-3d (WS-4 NON-coplanar world map) ───────────────────
 
 
-def _register_world_map_3d_interactive(consumer, detector, K, ids, tag_size, dur, ui=None):
+def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
+                                       max_dur=90.0, tag_size, ui=None):
     """Collect a head sweep over the static world tags and fuse a TRUE-3-D map
     (``register_world_map_3d`` — NO coplanar snap), retrying until every listed tag
     is captured. Mirrors ``_register_map_interactive``'s prompt/retry, but uses the
@@ -424,20 +425,34 @@ def _register_world_map_3d_interactive(consumer, detector, K, ids, tag_size, dur
 
     The operator hint differs from REV05's: a 3-D layout WANTS to be seen from many
     heights/angles (so off-table tags triangulate), and being non-coplanar is
-    expected rather than a fault."""
+    expected rather than a fault.
+
+    With a ``RegistrationView`` the capture is operator-driven: the per-tag
+    reproducibility residual + viewpoint diversity are recomputed live on the frames
+    so far and shown on the window, so the operator sweeps until the tags go green
+    and presses SPACE to accept (capped at ``max_dur``). Headless it falls back to
+    the original blind fixed ``dur`` window."""
     while True:
         if ui is not None:
+            from Utils.gaze.registration_view import (
+                classify_tags, cone_half_angle_deg, registration_summary)
             if not ui.prompt(f"Show world tags {ids}",
                              ["viewed from MANY heights/angles (non-coplanar is OK)",
-                              "press SPACE to register, q to abort"]):
+                              "SPACE begins LIVE registration; sweep until green",
+                              "then SPACE again to accept, q to abort"]):
                 _log("  world-3d registration aborted from the coverage window")
                 return None, []
         else:
             input(f"place ALL world tags {ids} visible, then Enter to register the "
                   "3-D world map > ")
         frames: List[Dict[int, np.ndarray]] = []
+        # Live per-tag counters (UI path only): detection count and the viewing
+        # directions seen, which drive the diversity/quality readout.
+        views: Dict[int, int] = {}
+        bearings: Dict[int, List[np.ndarray]] = {}
         last_idx = None
-        deadline = time.time() + dur
+        last_ui = 0.0
+        deadline = time.time() + (max_dur if ui is not None else dur)
         while time.time() < deadline:
             b = consumer.latest()
             if (b is None or b.video is None or b.video.bgr is None
@@ -449,6 +464,30 @@ def _register_world_map_3d_interactive(consumer, detector, K, ids, tag_size, dur
             frame = {int(i): tags[int(i)]["T"] for i in ids if int(i) in tags}
             if frame:
                 frames.append(frame)
+                for i, T in frame.items():
+                    views[i] = views.get(i, 0) + 1
+                    bearings.setdefault(i, []).append(np.asarray(T, dtype=float)[:3, 3])
+            if ui is not None and time.time() - last_ui >= 0.3:
+                res_map = None
+                if len(frames) >= 2:
+                    try:
+                        rep = world_map_3d_geometry_report(
+                            register_world_map_3d(frames), frames)
+                        res_map = rep["per_tag_residual_mm"]
+                    except ValueError:
+                        # Pre-convergence: the reference tag isn't yet co-visible with
+                        # itself across these few frames. Expected transient — show
+                        # views/diversity only; the authoritative fuse runs post-capture.
+                        res_map = None
+                diversity = {i: cone_half_angle_deg(bearings[i]) for i in bearings}
+                qualities = classify_tags(ids, views, res_map, diversity)
+                ui.update(b.video.bgr, tags, qualities, registration_summary(qualities))
+                last_ui = time.time()
+                if ui.aborted():
+                    _log("  world-3d registration aborted from the coverage window")
+                    return None, []
+                if ui.finished():
+                    break
         if not frames:
             _log("  no world tags detected — reposition and retry")
             continue
@@ -508,7 +547,7 @@ def stage_register_world_3d(args, consumer: RelayConsumer, ui=None) -> int:
          "heights/angles (no robot needed). A non-coplanar layout is expected — the "
          "3-D fuse keeps tags off the table plane (NO coplanar snap).")
     world_map, frames = _register_world_map_3d_interactive(
-        consumer, detector, K, world_ids, args.tag_size, dur=6.0, ui=ui)
+        consumer, detector, K, world_ids, tag_size=args.tag_size, ui=ui)
     if ui is not None:
         ui.close()
     if world_map is None:
@@ -1068,12 +1107,16 @@ def _sleep_until(deadline: float) -> None:
 def _make_coverage_ui(args):
     """The sweep's coverage view, unless ``--no-ui`` (headless, text summary only).
 
-    ``--coverage-3d`` on the sweep gets the per-z-slice volumetric view
-    (``VoxelCoverageBoxUI``); otherwise the 2-D top-down box (rev04 §3).
-    register-world stages always get the 2-D box (for the SPACE prompts; they never
-    set --coverage-3d)."""
+    ``register-world-3d`` gets the live ``RegistrationView`` (per-tag residual +
+    viewpoint-diversity quality, operator-driven finish). ``--coverage-3d`` on the
+    sweep gets the per-z-slice volumetric view (``VoxelCoverageBoxUI``); otherwise
+    the 2-D top-down box (rev04 §3). The 2-D ``register-world`` stage still uses the
+    box (for its SPACE prompts)."""
     if args.no_ui:
         return None
+    if args.stage == "register-world-3d":
+        from Utils.gaze.registration_view import RegistrationView
+        return RegistrationView(args.world_tag_ids or [])
     if getattr(args, "coverage_3d", False) and args.stage == "sweep":
         from Utils.gaze.coverage_voxel_view import VoxelCoverageBoxUI
         return VoxelCoverageBoxUI(args.cell_size_mm, audio=args.audio)
