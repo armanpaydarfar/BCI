@@ -122,6 +122,40 @@ class GazeCalibration3D:
         and clamp setup stay in one place."""
         return cls({"X": np.asarray(X), "Q": np.asarray(Q)})
 
+    @classmethod
+    def from_calib_npz(cls, npz_data: Dict[str, np.ndarray]) -> "GazeCalibration3D":
+        """Build the 3-D library from a WS-4 ``solve-3d`` calibration NPZ
+        (``tools/apriltag_calibrate.py --stage solve-3d``).
+
+        That calib stores the library points under ``P_WORLD3D`` — the EE origin
+        in the WORLD frame in FULL 3-D (mm), i.e. the same ``p_world`` the planar
+        solve computes but WITHOUT the table-plane projection, so the table-height
+        ``z`` is retained. The key is deliberately distinct from a sweep's ``X``
+        (robot BASE-frame telemetry): the runtime queries the gaze→object centroid
+        in the SAME world frame, so there is no base-frame / hand-eye transform and
+        the two point spaces must never be confused. Reading a dedicated key keeps
+        that contract explicit rather than overloading ``X``.
+
+        Args:
+            npz_data: dict-like (an ``np.load(...)`` result or a plain dict) with
+                ``P_WORLD3D (N,3)`` (mm, world frame) and ``Q (N,7)`` (rad).
+
+        Returns:
+            A ``GazeCalibration3D`` indexed over the world-frame points.
+
+        Raises:
+            KeyError: ``P_WORLD3D`` or ``Q`` missing (not a solve-3d calib NPZ).
+        """
+        keys = npz_data.files if hasattr(npz_data, "files") else npz_data
+        for key in ("P_WORLD3D", "Q"):
+            if key not in keys:
+                raise KeyError(
+                    f"3-D calib requires NPZ key {key!r}; this looks like a "
+                    "non-3-D calibration (expected the apriltag_3d_*_calib.npz "
+                    "schema with P_WORLD3D/Q columns)."
+                )
+        return cls.from_arrays(npz_data["P_WORLD3D"], npz_data["Q"])
+
     def query_xyz(self, p_xyz) -> GazeMappingResult:
         """Nearest calibrated EE point to ``p_xyz`` (mm, BASE frame) → its
         clamped joint vector.

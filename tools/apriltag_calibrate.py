@@ -98,11 +98,16 @@ from Utils.gaze.apriltag_world import (  # noqa: E402
     world_map_geometry_report,
     world_map_to_arrays,
 )
+from Utils.gaze.apriltag_world_3d import (  # noqa: E402
+    register_world_map_3d,
+    world_map_3d_geometry_report,
+)
 from Utils.gaze.apriltag_sweep import (  # noqa: E402
     accept_sweep_sample,
     frame_telemetry_dt,
 )
 from Utils.gaze.coverage import CoverageGrid  # noqa: E402
+from Utils.gaze.coverage_voxel import VoxelCoverage  # noqa: E402
 from Utils.gaze.harmony_link import HarmonyLink  # noqa: E402
 
 
@@ -406,6 +411,121 @@ def stage_register_world(args, consumer: RelayConsumer, ui=None) -> int:
     return 0
 
 
+# ── stage: register-world-3d (WS-4 NON-coplanar world map) ───────────────────
+
+
+def _register_world_map_3d_interactive(consumer, detector, K, ids, tag_size, dur, ui=None):
+    """Collect a head sweep over the static world tags and fuse a TRUE-3-D map
+    (``register_world_map_3d`` — NO coplanar snap), retrying until every listed tag
+    is captured. Mirrors ``_register_map_interactive``'s prompt/retry, but uses the
+    3-D fuse and RETURNS the raw per-frame detections alongside the map so
+    ``world_map_3d_geometry_report`` can recompute the per-tag reproducibility
+    residual. Returns ``(map, frames)`` or ``(None, [])`` if aborted from the window.
+
+    The operator hint differs from REV05's: a 3-D layout WANTS to be seen from many
+    heights/angles (so off-table tags triangulate), and being non-coplanar is
+    expected rather than a fault."""
+    while True:
+        if ui is not None:
+            if not ui.prompt(f"Show world tags {ids}",
+                             ["viewed from MANY heights/angles (non-coplanar is OK)",
+                              "press SPACE to register, q to abort"]):
+                _log("  world-3d registration aborted from the coverage window")
+                return None, []
+        else:
+            input(f"place ALL world tags {ids} visible, then Enter to register the "
+                  "3-D world map > ")
+        frames: List[Dict[int, np.ndarray]] = []
+        last_idx = None
+        deadline = time.time() + dur
+        while time.time() < deadline:
+            b = consumer.latest()
+            if (b is None or b.video is None or b.video.bgr is None
+                    or b.video.frame_idx == last_idx):
+                time.sleep(0.005)
+                continue
+            last_idx = b.video.frame_idx
+            tags = detect_tags(detector, b.video.bgr, K, tag_size)
+            frame = {int(i): tags[int(i)]["T"] for i in ids if int(i) in tags}
+            if frame:
+                frames.append(frame)
+        if not frames:
+            _log("  no world tags detected — reposition and retry")
+            continue
+        world_map = register_world_map_3d(frames)
+        seen = list(world_map["ids"])
+        missing = [i for i in ids if i not in seen]
+        if missing:
+            _log(f"  registered {seen}, MISSING {missing} — re-show all world tags "
+                 "(the map needs every tag so any subset works later), then retry")
+            continue
+        _log(f"  world 3-D map OK: ref={world_map['ref_id']}, tags={seen}")
+        return world_map, frames
+
+
+def _save_world_map_3d(world_map, out_dir: str, stamp: Optional[str], tag_size: float,
+                       world_ids: List[int], report: Dict) -> Path:
+    """Persist a 3-D (non-coplanar) world map to ``runs/world_map_3d_<UTC>.npz``.
+
+    Reuses ``world_map_to_arrays`` — the 3-D map dict shape is identical to the REV05
+    map (only the meaning of ``plane_*`` differs: here the best-fit plane through the
+    fused 3-D origins, informational only). The geometry report is stored in meta so
+    the non-planarity / reproducibility readout travels with the map."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    from datetime import datetime, timezone
+    stamp = stamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = out / f"world_map_3d_{stamp}.npz"
+    ref, ids, rels, pp, pn = world_map_to_arrays(world_map)
+    np.savez_compressed(path, world_map_ref=np.array(ref), world_map_ids=ids,
+                        world_map_rels=rels, world_map_plane_point=pp,
+                        world_map_plane_normal=pn,
+                        meta=np.array({"stage": "register-world-3d",
+                                       "tag_size_m": tag_size,
+                                       "world_tag_ids": list(world_ids),
+                                       "geometry_3d": report}, dtype=object))
+    return path
+
+
+def stage_register_world_3d(args, consumer: RelayConsumer, ui=None) -> int:
+    """Register a NON-coplanar (true-3-D) STATIC world-tag map and save it (WS-4).
+
+    The 3-D sibling of ``stage_register_world``: same camera-only multi-view fuse,
+    but it calls ``register_world_map_3d`` (no coplanar snap) so tags on more than
+    one plane — a back panel, a shelf, objects at height — keep their genuine 3-D
+    positions instead of being flattened onto the table. Runs
+    ``world_map_3d_geometry_report`` to surface the non-planarity (the positive
+    signal the structure was preserved) and the per-tag reproducibility residual
+    (the 3-D analogue of REV05's skew gate), then writes
+    ``runs/world_map_3d_<UTC>.npz``. No robot needed."""
+    if not args.world_tag_ids:
+        _log("register-world-3d needs --world-tag-ids")
+        return 2
+    world_ids = [int(i) for i in args.world_tag_ids]
+    detector = load_detector(args.families)
+    K = consumer.camera_matrix
+    _log(f"register-world-3d: view tags {world_ids} @ {args.tag_size} m from MANY "
+         "heights/angles (no robot needed). A non-coplanar layout is expected — the "
+         "3-D fuse keeps tags off the table plane (NO coplanar snap).")
+    world_map, frames = _register_world_map_3d_interactive(
+        consumer, detector, K, world_ids, args.tag_size, dur=6.0, ui=ui)
+    if ui is not None:
+        ui.close()
+    if world_map is None:
+        return 1
+    report = world_map_3d_geometry_report(world_map, frames)
+    _log(f"3-D geometry: non-planarity max_out_of_plane={report['max_out_of_plane_mm']:.1f} mm, "
+         f"z_spread={report['z_spread_mm']:.1f} mm (large ⇒ genuine 3-D structure; "
+         "near-0 ⇒ effectively coplanar, REV05 would do)")
+    _log(f"3-D reproducibility: per-tag fit residual max={report['max_fit_residual_mm']:.1f} mm, "
+         f"mean={report['mean_fit_residual_mm']:.1f} mm (small ⇒ the sweep had enough "
+         "viewpoint diversity to triangulate)")
+    path = _save_world_map_3d(world_map, args.out_dir, args.utc_stamp, args.tag_size,
+                              world_ids, report)
+    _log(f"saved 3-D world map → {path}")
+    return 0
+
+
 def stage_collect(args, consumer: RelayConsumer) -> int:
     ee_ids = _resolve_ee_ids(args)
     if not args.world_tag_ids or ee_ids is None:
@@ -594,6 +714,12 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     if not args.world_tag_ids or ee_ids is None:
         _log("sweep needs --world-tag-ids and --ee-tag-id/--ee-tag-ids")
         return 2
+    if args.coverage_3d and not args.with_robot:
+        # 3-D voxel coverage bins the EE (x,y,z) from robot telemetry; a camera-side
+        # dry run has only the 2-D table (u,v) and no z, so there is no volume to
+        # cover. Fail fast rather than silently degrade to a meaningless single slice.
+        _log("--coverage-3d needs --with-robot (the z axis comes from EE telemetry)")
+        return 2
     world_ids = [int(i) for i in args.world_tag_ids]
     detector = load_detector(args.families)
     K = consumer.camera_matrix
@@ -604,8 +730,17 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     _log(f"tag sizes: world {args.tag_size} m, EE {ee_size} m; world tags "
          f"{world_ids}, EE tags {ee_ids}; EE point method: {ee_point_method}")
 
-    grid = CoverageGrid(cell_size_mm=args.cell_size_mm, min_samples=args.min_samples,
-                        min_spread_mm=args.min_spread_mm)
+    # Opt-in 3-D volumetric coverage (WS-4): bin the EE (x,y,z) into voxels so the
+    # operator covers the workspace VOLUME, not just one table slice. Default off →
+    # the 2-D top-down grid path below is unchanged. Both classes share the public
+    # API (add/summary/next_target/done/visited_cells/sufficient_mask), so the rest
+    # of the loop is agnostic to which one it holds.
+    if args.coverage_3d:
+        grid = VoxelCoverage(cell_size_mm=args.cell_size_mm, min_samples=args.min_samples,
+                             min_spread_mm=args.min_spread_mm)
+    else:
+        grid = CoverageGrid(cell_size_mm=args.cell_size_mm, min_samples=args.min_samples,
+                            min_spread_mm=args.min_spread_mm)
 
     # Connect the robot but keep the arm LOCKED through world registration (operator
     # 2026-06-25): a freed arm is limp and can droop into the tags' view, corrupting
@@ -747,7 +882,13 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                     # in robot axes. The library still stores the vision (u,v) (gaze is
                     # the only runtime signal); telemetry anchors coverage/display only.
                     # No-robot dry run has NaN telemetry → fall back to vision (u,v).
-                    disp_xy = x_ee[:2] if np.all(np.isfinite(x_ee[:2])) else cur_uv
+                    # With --coverage-3d, bin the full EE (x,y,z) into voxels instead
+                    # (the z axis is the whole point); --with-robot is enforced above so
+                    # the telemetry is finite here.
+                    if args.coverage_3d:
+                        disp_xy = x_ee[:3]
+                    else:
+                        disp_xy = x_ee[:2] if np.all(np.isfinite(x_ee[:2])) else cur_uv
                     grid.add(disp_xy)
                     uv_rows.append(cur_uv)
                     q_rows.append(q_joints)
@@ -772,9 +913,14 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
             if now - last_report >= 1.0:
                 s = grid.summary()
                 tgt = "—" if target is None else np.round(target, 0).tolist()
-                _log(f"  accepted={accepted} cells={int(s['visited'])} "
+                label = "voxels" if args.coverage_3d else "cells"
+                _log(f"  accepted={accepted} {label}={int(s['visited'])} "
                      f"sufficient={int(s['sufficient'])} → go to {tgt}"
                      + ("" if ok else f"  (last drop: {reason})"))
+                if args.coverage_3d:
+                    # The volumetric analog of the 2-D box: a per-z-slice occupancy
+                    # projection so the operator can see which heights are still thin.
+                    _log(f"    z-slices (sufficient/visited): {grid.status_text()}")
                 last_report = now
 
             # Stopping is operator-driven by default (SPACE in the coverage window /
@@ -828,8 +974,13 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     # frame the grid was fed during the sweep — telemetry base (x,y) with a robot, else
     # vision (u,v) — so the mask matches what the operator saw fill in.
     x_arr = np.vstack(x_rows)
-    cov_pts = (x_arr[:, :2] if np.all(np.isfinite(x_arr[:, :2]))
-               else np.vstack(uv_rows))
+    if args.coverage_3d:
+        # Voxel coverage was fed the EE (x,y,z); recompute green over the same 3-D
+        # points so the mask matches the voxels the operator saw fill in.
+        cov_pts = x_arr[:, :3]
+    else:
+        cov_pts = (x_arr[:, :2] if np.all(np.isfinite(x_arr[:, :2]))
+                   else np.vstack(uv_rows))
     green = grid.sufficient_mask(cov_pts)
     wm_ref, wm_ids, wm_rels, wm_pp, wm_pn = world_map_to_arrays(world_map)
     em_ref, em_ids, em_rels, em_pp, em_pn = world_map_to_arrays(ee_map)
@@ -857,6 +1008,10 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
         "units": {"UV": "mm (table plane)", "X": "mm", "Q": "rad",
                   "t_eetag_ee": "mm", "EEQUAT": "[x,y,z,w] scalar-last"},
     }
+    if args.coverage_3d:
+        # Record the volumetric mode only when used, so a default (2-D) sweep's saved
+        # meta is byte-identical to before this feature; green was computed over (x,y,z).
+        meta["coverage"]["mode"] = "voxel_3d"
     # WS-1/WS-2b scene-frame sidecar: JPEG per accepted sample, index-aligned with
     # UV/Q/X/EEQUAT rows. Kept out of the npz (raw BGR is ~6 MB/frame); the offline
     # scripts join by row index via the recorded directory name.
@@ -912,8 +1067,12 @@ def _sleep_until(deadline: float) -> None:
 
 def _make_coverage_ui(args):
     """The sweep's coverage view: the OpenCV box (rev04 §3) unless ``--no-ui``
-    (headless camera-side verification, where only the text summary runs)."""
-    if args.no_ui:
+    (headless camera-side verification, where only the text summary runs).
+
+    The box is 2-D top-down only; with ``--coverage-3d`` on the sweep there is no
+    3-D view yet, so the sweep runs headless with the per-z-slice text summary
+    (return None). register-world is unaffected — it never uses --coverage-3d."""
+    if args.no_ui or (getattr(args, "coverage_3d", False) and args.stage == "sweep"):
         return None
     from Utils.gaze.coverage_view import CoverageBoxUI
     return CoverageBoxUI(args.cell_size_mm, audio=args.audio)
@@ -1211,6 +1370,133 @@ def stage_solve_planar(args, z, npz_path) -> int:
     return 0
 
 
+# ── stage: solve-3d (WS-4 world-frame (x,y,z)→Q library) ─────────────────────
+
+
+def stage_solve_3d(args) -> int:
+    """WS-4 3-D solve: build a world-frame ``(x,y,z)→Q`` library from a sweep npz.
+
+    Mirrors ``stage_solve_planar`` but keeps the EE point in FULL 3-D — it omits the
+    table-plane projection (``plane_coords``) the planar solve applies. Each accepted
+    sample's ``p_world = eetag_to_world_point(T_cam_world, T_cam_eetag, offset)`` is
+    the SAME world EE point the planar path computes; the planar path then flattens it
+    to ``(u,v)`` on the table, here it is stored as-is so the table-height ``z`` is
+    retained. No plane projection → 3-D: objects above the table become reachable.
+
+    Self-contained in the WORLD frame: the runtime 3-D target (gaze→object centroid
+    in world frame) is queried against this library by ``GazeCalibration3D``, so no
+    robot base-frame / hand-eye transform is needed. (The planar solve's A2 base-xy
+    similarity is a 2-D-only diagnostic with a non-coplanarity degeneracy, so it has
+    no 3-D analogue and is dropped.)
+
+    EE-point method + mount offset come from the sweep's meta (the recipe the sweep
+    baked in), exactly as ``--then-solve`` relies on for the planar path. Green-cell
+    filtering matches the planar solve. Writes ``apriltag_3d_<UTC>_calib.npz`` with
+    ``P_WORLD3D`` (N,3) + ``Q`` (N,7) + the world-map arrays, loadable by
+    ``GazeCalibration3D.from_calib_npz``."""
+    npz_path = Path(args.npz)
+    if not npz_path.is_file():
+        _log(f"npz not found: {npz_path}")
+        return 2
+    z = np.load(npz_path, allow_pickle=True)
+    if "T_cam_world" not in z.files or "T_cam_eetag" not in z.files:
+        _log(f"{npz_path.name} lacks T_cam_world/T_cam_eetag — not a sweep capture. "
+             "solve-3d recomputes the 3-D EE world point from the per-sample transforms.")
+        return 2
+
+    Tcw = np.asarray(z["T_cam_world"], dtype=float)
+    Tce = np.asarray(z["T_cam_eetag"], dtype=float)
+    Q = np.asarray(z["Q"], dtype=float)
+    if Tcw.shape[0] != Tce.shape[0] or Tcw.shape[0] != Q.shape[0]:
+        _log(f"row mismatch: T_cam_world {Tcw.shape[0]}, T_cam_eetag {Tce.shape[0]}, "
+             f"Q {Q.shape[0]} — corrupt sweep npz")
+        return 2
+
+    # Recipe from the sweep's meta — the EE-point method and the hand-measured mount
+    # offset the sweep recorded. Read the meta, trust the meta (the planar solve learnt
+    # the same lesson, 2026-06-25): the calib must report the recipe it was built with.
+    src_meta = z["meta"].item() if "meta" in z.files else {}
+    method = src_meta.get("ee_point_method", "pose")
+    offset = np.asarray(src_meta.get("t_eetag_ee_mm", [0.0, 0.0, 0.0]), dtype=float)
+    # The world plane is only consulted by the 'rayplane' EE method; the default
+    # 'pose' ignores it. Read whatever the sweep stored (fall back to z=0 / +Z).
+    pp = (np.asarray(z["world_map_plane_point"], dtype=float)
+          if "world_map_plane_point" in z.files else np.zeros(3))
+    pn = (np.asarray(z["world_map_plane_normal"], dtype=float)
+          if "world_map_plane_normal" in z.files else np.array([0.0, 0.0, 1.0]))
+
+    # The EE world point in FULL 3-D — the SAME p_world the planar sweep computed
+    # via _ee_point_world, but WITHOUT the subsequent plane_coords projection. For the
+    # default 'pose' method this is exactly eetag_to_world_point(...); the table-height
+    # z survives, which is the entire point of the 3-D path.
+    pts = [_ee_point_world(method, Tcw[i], Tce[i], pp, pn, offset) for i in range(len(Tcw))]
+    P_world3d = np.array([p if p is not None else np.full(3, np.nan) for p in pts],
+                         dtype=float)
+
+    # Green-only filtering — identical policy to the planar solve (rev04 §3): transit
+    # samples in still-partial coverage cells pollute the NN lookup. A pre-mask npz
+    # keeps all; --include-partial keeps all.
+    green_src = np.asarray(z["green"], dtype=bool) if "green" in z.files else None
+    if args.green_only and green_src is not None:
+        kept = int(green_src.sum())
+        _log(f"green-only: {kept}/{len(green_src)} samples in sufficient cells "
+             f"(dropped {len(green_src) - kept} partial-cell; --include-partial keeps all)")
+        P_world3d, Q = P_world3d[green_src], Q[green_src]
+    elif args.green_only:
+        _log("green-only requested but this npz has no 'green' mask (pre-fix sweep) "
+             "— using all accepted samples")
+    else:
+        _log("--include-partial: using all accepted samples (green + amber cells)")
+
+    # The library needs finite (p_world, Q); a no-robot dry-run sweep has NaN Q, and a
+    # rayplane miss leaves a NaN point.
+    lib_ok = np.all(np.isfinite(P_world3d), axis=1) & np.all(np.isfinite(Q[:, :7]), axis=1)
+    P_world3d, Q = P_world3d[lib_ok], Q[lib_ok]
+    n = P_world3d.shape[0]
+    if n < 3:
+        _log(f"only {n} finite (P_WORLD3D,Q) rows (<3) — cannot build a 3-D library. "
+             "Was --with-robot used during the sweep?")
+        return 1
+    z_ptp = float(np.ptp(P_world3d[:, 2]))
+    _log(f"3-D library: {n} (x,y,z)→Q rows; "
+         f"x∈[{P_world3d[:,0].min():.0f},{P_world3d[:,0].max():.0f}] "
+         f"y∈[{P_world3d[:,1].min():.0f},{P_world3d[:,1].max():.0f}] "
+         f"z∈[{P_world3d[:,2].min():.0f},{P_world3d[:,2].max():.0f}] mm")
+    _log(f"z range = {z_ptp:.0f} mm (≈0 would mean a flat/planar sweep — the planar "
+         "solve would then suffice; a 3-D library wants real height variation)")
+
+    calib_meta = dict(src_meta)
+    calib_meta.update({
+        "scheme": "world_xyz_nn",
+        "n_points": int(n),
+        "source_capture": npz_path.name,
+        # The recipe the LIBRARY was actually built with (from the sweep meta).
+        "ee_point_method": method,
+        "t_eetag_ee_mm": offset.tolist(),
+        "z_range_mm": z_ptp,
+        "units": {"P_WORLD3D": "mm (world frame, full 3-D)", "Q": "rad",
+                  "t_eetag_ee": "mm"},
+    })
+    out_path = npz_path.with_name(
+        npz_path.stem.replace("apriltag_sweep", "apriltag_3d") + "_calib.npz")
+    # Carry the world map through so the runtime recovers the SAME world frame the
+    # library points live in (the gaze→object 3-D target is expressed in it).
+    extra = {}
+    for k in ("world_map_ref", "world_map_ids", "world_map_rels",
+              "world_map_plane_point", "world_map_plane_normal"):
+        if k in z.files:
+            extra[k] = z[k]
+    np.savez_compressed(
+        out_path,
+        P_WORLD3D=P_world3d, Q=Q,
+        meta=np.array(calib_meta, dtype=object),
+        **extra,
+    )
+    _log(f"3-D calibration → {out_path}")
+    _log("consume it (live loop): GazeCalibration3D.from_calib_npz(np.load(...))")
+    return 0
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 
@@ -1219,7 +1505,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="AprilTag gaze↔robot calibration tool")
     p.add_argument("--stage", required=True,
                    choices=["detect", "gaze", "collect", "sweep", "solve",
-                            "register-world"])
+                            "register-world", "register-world-3d", "solve-3d"])
     p.add_argument("npz", nargs="?", default=None,
                    help="solve stage: path to an apriltag_capture_*.npz")
     p.add_argument("--world-map", default=None,
@@ -1298,6 +1584,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--max-align-dt-ms", type=float, default=50.0,
                    help="sweep: reject a sample whose frame↔telemetry offset exceeds "
                         "this (stale frame); default = one 20 Hz tick")
+    p.add_argument("--coverage-3d", action="store_true",
+                   help="sweep: track 3-D VOLUMETRIC coverage (x,y,z voxels) instead of "
+                        "the 2-D top-down grid — bins the EE (x,y,z) telemetry so the "
+                        "operator knows when the workspace VOLUME (not one slice) is "
+                        "covered. Runs headless with a per-z-slice text summary (no 3-D "
+                        "OpenCV view yet); requires --with-robot for the z axis. Default "
+                        "off → the 2-D grid path is unchanged.")
     p.add_argument("--no-ui", action="store_true",
                    help="sweep: run headless with a text summary (no OpenCV coverage box)")
     p.add_argument("--audio", action="store_true",
@@ -1346,6 +1639,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             _log("solve needs an npz path argument")
             return 2
         return stage_solve(args)
+    if args.stage == "solve-3d":
+        if not args.npz:
+            _log("solve-3d needs an npz path argument")
+            return 2
+        return stage_solve_3d(args)
 
     _log(f"connecting to relay {args.relay_host}:{args.relay_port} …")
     consumer = RelayConsumer(args.relay_host, args.relay_port)
@@ -1360,6 +1658,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return stage_collect(args, consumer)
         if args.stage == "register-world":
             return stage_register_world(args, consumer, ui=_make_coverage_ui(args))
+        if args.stage == "register-world-3d":
+            return stage_register_world_3d(args, consumer, ui=_make_coverage_ui(args))
         if args.stage == "sweep":
             return stage_sweep(args, consumer, ui=_make_coverage_ui(args))
     finally:
