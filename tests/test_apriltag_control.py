@@ -101,6 +101,27 @@ def test_object_target_pixel_picks_mask_gaze_is_inside():
     np.testing.assert_allclose(px, [450.0, 450.0], atol=0.5)
 
 
+def test_object_target_pixel_picks_smallest_containing_mask():
+    # FastSAM nests masks: a small cup inside the big table blob. Gaze at the cup
+    # centre is contained by BOTH. The fixated object is the cup -> its centroid,
+    # NOT the table's. (Regression: max-signed-distance selection returned the big
+    # blob, a confidently-wrong robot target.)
+    table = _square(0, 0, 1000, 800)
+    cup = _square(440, 360, 540, 460)        # small, fully inside the table mask
+    dets = [{"mask_polygon": table}, {"mask_polygon": cup}]
+    px = _object_target_pixel(dets, (490.0, 410.0), "centroid")
+    np.testing.assert_allclose(px, [490.0, 410.0], atol=1.0)
+
+
+def test_object_target_pixel_bottom_uses_object_not_enclosing_blob():
+    table = _square(0, 0, 1000, 800)
+    cup = _square(440, 360, 540, 460)
+    dets = [{"mask_polygon": table}, {"mask_polygon": cup}]
+    px = _object_target_pixel(dets, (490.0, 410.0), "bottom")
+    # Footprint is the cup's bottom row (~y=460), not the table's (y=800).
+    np.testing.assert_allclose(px, [490.0, 460.0], atol=1.0)
+
+
 def test_object_target_pixel_rejects_far_outside_gaze():
     dets = [{"mask_polygon": _square(200, 200, 300, 300)}]
     assert _object_target_pixel(dets, (1000.0, 1000.0), "centroid") is None

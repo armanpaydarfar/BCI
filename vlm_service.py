@@ -655,7 +655,12 @@ class VLMService:
             out.append(obj)
 
         self._cache_dets(dets)
-        return {"ok": True, "detections": out, "elapsed_s": elapsed, "n": len(out)}
+        # gaze_px is the SERVICE frame's gaze at detection time. A consumer that
+        # hit-tests these masks with its OWN gaze (e.g. the WS-1 control tool)
+        # uses it to detect a stale/divergent frame and fall back rather than aim
+        # at the wrong object.
+        return {"ok": True, "detections": out, "elapsed_s": elapsed, "n": len(out),
+                "gaze_px": [float(bundle.gaze.x), float(bundle.gaze.y)]}
 
     def _cmd_recognize(self, req: dict) -> dict:
         """F5: fast COCO-class naming of the gaze object — no Gemini round-trip.

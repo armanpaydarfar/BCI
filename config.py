@@ -212,10 +212,13 @@ APRILTAG_T_EETAG_EE_MM = [150.0, -200.0, 0.0]
 # WS-1 control-test target source. 'gaze' (default) is the frozen REV05 behaviour:
 # the raw gaze pixel's ray ∩ table plane. 'centroid'/'bottom' instead segment the
 # fixated object (FastSAM via vlm_service.segment) and aim at its mask centroid or
-# its bottom-of-mask footprint pixel — both cast through THIS frame's pose, so no
-# depth and no cross-frame 3-D sync. They kill the tall-object top/bottom overshoot
-# (the centroid/footprint is invariant to where on the object gaze lands). Any miss
-# (no service, no mask hit, ray miss) falls back to 'gaze' and is logged.
+# its bottom-of-mask footprint pixel, cast through this fixation's pose — depth-free
+# (no metric 3-D point, so monocular-depth scale error never enters; the only
+# residual is a 2-D pixel drift if the head moves between the service's frame and
+# ours, guarded by a service-vs-our-gaze divergence check). They kill the tall-object
+# top/bottom overshoot (the centroid/footprint is invariant to where on the object
+# gaze lands). Any miss (no service, no mask hit, gaze divergence, ray miss) falls
+# back to 'gaze' and is logged.
 APRILTAG_WS1_TARGET_SOURCE = "gaze"        # 'gaze' (REV05) | 'centroid' | 'bottom'
 # Known table layout, used to sanity-check the registered world map (the tags are
 # coplanar, face up, and the worked corner is ~90°). Endpoints of the +X and +Y table
