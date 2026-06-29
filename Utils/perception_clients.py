@@ -183,6 +183,22 @@ class VLMClient:
             timeout_s,
         )
 
+    def waypoints(self, *, timeout_s: float = 15.0) -> Dict[str, Any]:
+        """Fast 3-D-waypoints request for WS4's live control loop: ``decide()``
+        minus the Gemini reasoner.
+
+        The service runs the same segment → depth → 3D-waypoints → gaze hit-test
+        pipeline as ``decide`` but skips the reasoner round-trip, because Gemini's
+        30-40 s latency is unusable per-fixation in a control loop. Returns
+        ``waypoints`` / ``hit_waypoint`` / ``depth_at_gaze_m`` / ``gaze_px``.
+        Depth Pro can take ~1 s, hence the generous default timeout.
+        """
+        return _udp_request(
+            self.host, self.port,
+            {"cmd": "waypoints"},
+            timeout_s,
+        )
+
     def decide(self, *, vlm_timeout_s: float = 30.0,
                sock_timeout_s: float = 40.0) -> Dict[str, Any]:
         return _udp_request(

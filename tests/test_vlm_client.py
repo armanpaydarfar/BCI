@@ -138,6 +138,12 @@ def test_decide_wire_payload(mock_service):
     assert mock_service.requests[-1] == {"cmd": "decide", "timeout": 25.0}
 
 
+def test_waypoints_wire_payload(mock_service):
+    client = _client(mock_service)
+    client.waypoints()  # bare command — no params on the wire
+    assert mock_service.requests[-1] == {"cmd": "waypoints"}
+
+
 def test_decide_pair_wire_payload(mock_service):
     client = _client(mock_service)
     client.decide_pair(snapshot_id="snap-7", vlm_timeout_s=40.0)

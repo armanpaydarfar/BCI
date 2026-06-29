@@ -562,6 +562,7 @@ class VLMService:
             "segment_stream": lambda: self.segment_stream.cmd_segment_stream(req),
             "recognize": lambda: self._cmd_recognize(req),
             "depth": lambda: self._cmd_depth(req),
+            "waypoints": lambda: self._cmd_waypoints(req),
             "reason": lambda: self._cmd_reason(req),
             "decide": lambda: self._cmd_decide(req),
             "capture_first": lambda: self._cmd_capture_first(req),
@@ -916,6 +917,53 @@ class VLMService:
         elapsed_ms = (time.time() - cmd_t0) * 1000.0
         _log(f"decide OUT: hit={hit_lbl!r} dets={len(dets)} elapsed={elapsed_ms:.0f}ms")
         return {"ok": True, **decision}
+
+    def _cmd_waypoints(self, req: dict) -> dict:
+        """Fast 3-D-waypoints path for WS4's live control loop: ``decide`` minus
+        the Gemini reasoner.
+
+        Runs the exact shared segment → depth → 3D-waypoints → gaze hit-test
+        pipeline that ``_cmd_decide`` runs (``apply_constraints=True``, same dets
+        cached for the overlay), but DOES NOT call ``reasoner.reason_async`` and
+        DOES NOT enter the THINKING overlay state. The reasoner is unusable in a
+        per-fixation control loop — Gemini's 30-40 s round-trip dwarfs the loop
+        period — whereas the geometry pipeline (FastSAM + Depth Pro) returns in
+        ~1 s, so this exposes just the 3-D output the loop needs.
+
+        Returns ``waypoints`` / ``hit_waypoint`` / ``depth_at_gaze_m`` /
+        ``gaze_px``. When the service was started without --enable-depth there is
+        no depth map, so ``waypoints`` is empty and ``hit_waypoint`` is None;
+        ``depth_enabled: False`` is set so the caller can distinguish "depth off"
+        from "nothing at gaze".
+        """
+        cmd_t0 = time.time()
+        bundle, _, _ = self._latest()
+        if bundle is None:
+            _log("waypoints: no_frame")
+            return {"ok": False, "error": "no_frame"}
+
+        gaze_xy = (float(bundle.gaze.x), float(bundle.gaze.y))
+        _log(f"waypoints IN: gaze=({gaze_xy[0]:.0f},{gaze_xy[1]:.0f})")
+
+        dets, waypoints_out, depth_at_gaze_m, hit_det, hit_waypoint = self._segment_depth_waypoints(
+            bundle.video.bgr, gaze_xy, apply_constraints=True, depth_log_tag="in-waypoints",
+        )
+        self._cache_dets(dets, hit_det, hit_waypoint)
+
+        resp: Dict[str, Any] = {
+            "ok": True,
+            "waypoints": waypoints_out,
+            "hit_waypoint": hit_waypoint,
+            "depth_at_gaze_m": depth_at_gaze_m,
+            "gaze_px": list(gaze_xy),
+        }
+        if self.depth_estimator is None:
+            resp["depth_enabled"] = False
+        hit_lbl = (hit_waypoint or {}).get("label") if isinstance(hit_waypoint, dict) else None
+        elapsed_ms = (time.time() - cmd_t0) * 1000.0
+        _log(f"waypoints OUT: hit={hit_lbl!r} dets={len(dets)} "
+             f"wps={len(waypoints_out)} elapsed={elapsed_ms:.0f}ms")
+        return resp
 
     def _process_frame_and_gaze(self, frame_bgr, gaze_xy: tuple[float, float]) -> dict:
         """Segment + depth + waypoints + hit-test for an arbitrary frame.
