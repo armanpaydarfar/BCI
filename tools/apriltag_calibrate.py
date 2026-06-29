@@ -101,6 +101,7 @@ from Utils.gaze.apriltag_world import (  # noqa: E402
 from Utils.gaze.apriltag_world_3d import (  # noqa: E402
     register_world_map_3d,
     world_map_3d_geometry_report,
+    world_map_3d_reproducibility,
 )
 from Utils.gaze.apriltag_sweep import (  # noqa: E402
     accept_sweep_sample,
@@ -467,21 +468,27 @@ def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
                 for i, T in frame.items():
                     views[i] = views.get(i, 0) + 1
                     bearings.setdefault(i, []).append(np.asarray(T, dtype=float)[:3, 3])
-            if ui is not None and time.time() - last_ui >= 0.3:
-                res_map = None
-                if len(frames) >= 2:
+            if ui is not None and time.time() - last_ui >= 0.4:
+                # Gate on split-half REPRODUCIBILITY (map accuracy), not the
+                # per-frame scatter (sensor-noise floor that never improves). Show
+                # scatter only as a dim diagnostic.
+                repro_map = None
+                scatter_mm = None
+                if len(frames) >= 4:
                     try:
+                        repro_map = world_map_3d_reproducibility(frames)
                         rep = world_map_3d_geometry_report(
                             register_world_map_3d(frames), frames)
-                        res_map = rep["per_tag_residual_mm"]
+                        scatter_mm = rep["mean_fit_residual_mm"]
                     except ValueError:
-                        # Pre-convergence: the reference tag isn't yet co-visible with
-                        # itself across these few frames. Expected transient — show
-                        # views/diversity only; the authoritative fuse runs post-capture.
-                        res_map = None
+                        # Pre-convergence: too few co-visible frames to fuse a half
+                        # yet. Expected transient — show views/diversity only.
+                        repro_map = None
                 diversity = {i: cone_half_angle_deg(bearings[i]) for i in bearings}
-                qualities = classify_tags(ids, views, res_map, diversity)
-                ui.update(b.video.bgr, tags, qualities, registration_summary(qualities))
+                qualities = classify_tags(ids, views, repro_map, diversity)
+                summary = registration_summary(qualities)
+                summary["scatter_mm"] = scatter_mm
+                ui.update(b.video.bgr, tags, qualities, summary)
                 last_ui = time.time()
                 if ui.aborted():
                     _log("  world-3d registration aborted from the coverage window")
@@ -532,11 +539,11 @@ def stage_register_world_3d(args, consumer: RelayConsumer, ui=None) -> int:
     The 3-D sibling of ``stage_register_world``: same camera-only multi-view fuse,
     but it calls ``register_world_map_3d`` (no coplanar snap) so tags on more than
     one plane — a back panel, a shelf, objects at height — keep their genuine 3-D
-    positions instead of being flattened onto the table. Runs
-    ``world_map_3d_geometry_report`` to surface the non-planarity (the positive
-    signal the structure was preserved) and the per-tag reproducibility residual
-    (the 3-D analogue of REV05's skew gate), then writes
-    ``runs/world_map_3d_<UTC>.npz``. No robot needed."""
+    positions instead of being flattened onto the table. Reports non-planarity
+    (the positive signal the structure was preserved), the split-half
+    ``world_map_3d_reproducibility`` (the real quality gate — map accuracy from
+    independent data), and the per-frame scatter (raw sensor noise, context only),
+    then writes ``runs/world_map_3d_<UTC>.npz``. No robot needed."""
     if not args.world_tag_ids:
         _log("register-world-3d needs --world-tag-ids")
         return 2
@@ -556,9 +563,21 @@ def stage_register_world_3d(args, consumer: RelayConsumer, ui=None) -> int:
     _log(f"3-D geometry: non-planarity max_out_of_plane={report['max_out_of_plane_mm']:.1f} mm, "
          f"z_spread={report['z_spread_mm']:.1f} mm (large ⇒ genuine 3-D structure; "
          "near-0 ⇒ effectively coplanar, REV05 would do)")
-    _log(f"3-D reproducibility: per-tag fit residual max={report['max_fit_residual_mm']:.1f} mm, "
-         f"mean={report['mean_fit_residual_mm']:.1f} mm (small ⇒ the sweep had enough "
-         "viewpoint diversity to triangulate)")
+    # Reproducibility (split-half map disagreement) is the real quality verdict;
+    # the per-frame scatter is raw AprilTag sensor noise and floors out regardless
+    # of how the operator sweeps, so it is reported only as context.
+    repro = world_map_3d_reproducibility(frames)
+    report["reproducibility_mm"] = repro
+    if repro:
+        rv = np.array(list(repro.values()))
+        _log(f"3-D reproducibility (split-half map disagreement): mean={rv.mean():.1f} mm, "
+             f"max={rv.max():.1f} mm — THIS is the quality gate (small ⇒ the fused map "
+             "is accurate). Worst tags: "
+             f"{sorted(repro, key=lambda i: -repro[i])[:4]}")
+    else:
+        _log("3-D reproducibility: too few frames / common tags to split-half — capture longer")
+    _log(f"3-D per-frame scatter (sensor noise, NOT the gate): mean={report['mean_fit_residual_mm']:.1f} mm, "
+         f"max={report['max_fit_residual_mm']:.1f} mm")
     path = _save_world_map_3d(world_map, args.out_dir, args.utc_stamp, args.tag_size,
                               world_ids, report)
     _log(f"saved 3-D world map → {path}")

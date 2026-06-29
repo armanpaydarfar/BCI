@@ -28,6 +28,7 @@ from Utils.gaze.apriltag_world import (  # noqa: E402
 from Utils.gaze.apriltag_world_3d import (  # noqa: E402
     register_world_map_3d,
     world_map_3d_geometry_report,
+    world_map_3d_reproducibility,
 )
 
 
@@ -133,6 +134,25 @@ def test_pose_graph_survives_reference_tag_flips():
     err = np.mean([np.linalg.norm(wm["rel"][i][:3, 3] - world_T[i][:3, 3])
                    for i in world_T])
     assert err < 25.0, f"pose-graph should reject ref flips; residual {err:.1f} mm"
+
+
+def test_reproducibility_tracks_accuracy_not_scatter():
+    """Split-half reproducibility reflects map ACCURACY, not per-frame scatter.
+    Low per-view noise → both the scatter and the reproducibility are small; the
+    point of the metric is that it stays meaningful when scatter is the wrong
+    gate (see the accuracy-roadmap verification). Here a clean sweep reproduces to
+    a few mm and every tag has a value."""
+    world_T = _two_plane_layout()
+    frames = _sweep(world_T, n=60, depth_sigma=8.0, seed=4)
+    repro = world_map_3d_reproducibility(frames, seed=1)
+    assert set(repro.keys()) == set(world_T.keys())
+    assert max(repro.values()) < 25.0, f"clean sweep should reproduce tightly: {repro}"
+
+
+def test_reproducibility_empty_when_too_few_frames():
+    world_T = _two_plane_layout()
+    frames = _sweep(world_T, n=3, seed=4)
+    assert world_map_3d_reproducibility(frames) == {}
 
 
 def test_3d_registration_recovers_non_coplanar_layout():

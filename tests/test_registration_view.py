@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from Utils.gaze.registration_view import (  # noqa: E402
     GOOD_DIVERSITY_DEG,
-    GOOD_RESIDUAL_MM,
+    GOOD_REPRO_MM,
     MIN_VIEWS,
     classify_tags,
     cone_half_angle_deg,
@@ -49,18 +49,18 @@ def test_cone_angle_is_scale_invariant():
 def test_classify_states():
     ids = [0, 1, 2, 3]
     views = {1: MIN_VIEWS + 5, 2: MIN_VIEWS + 5, 3: 3}  # 0 never seen
-    residuals = {1: GOOD_RESIDUAL_MM - 2, 2: 40.0, 3: 5.0}
+    repro = {1: GOOD_REPRO_MM - 2, 2: 45.0, 3: 5.0}
     diversity = {1: GOOD_DIVERSITY_DEG + 5, 2: GOOD_DIVERSITY_DEG + 5, 3: 30.0}
-    q = classify_tags(ids, views, residuals, diversity)
+    q = classify_tags(ids, views, repro, diversity)
     assert q[0].state == "unseen"          # never detected
-    assert q[1].state == "good"            # views + diversity + low residual
-    assert q[2].state == "weak"            # residual too high
-    assert q[3].state == "weak"            # too few views despite low residual
+    assert q[1].state == "good"            # views + diversity + reproducible
+    assert q[2].state == "weak"            # reproducibility too high
+    assert q[3].state == "weak"            # too few views despite low reproducibility
 
 
-def test_classify_no_residuals_yet_is_not_good():
-    # Before the first fuse converges there is no residual map; a tag can be at most
-    # weak (we never call it good without the residual it is gated on).
+def test_classify_no_repro_yet_is_not_good():
+    # Before enough frames there is no reproducibility map; a tag can be at most
+    # weak (never good without the reproducibility it is gated on).
     ids = [0]
     q = classify_tags(ids, {0: MIN_VIEWS + 50}, None, {0: GOOD_DIVERSITY_DEG + 20})
     assert q[0].state == "weak"
@@ -69,19 +69,19 @@ def test_classify_no_residuals_yet_is_not_good():
 def test_summary_all_good_accept_condition():
     ids = [0, 1]
     good = dict(views={0: MIN_VIEWS, 1: MIN_VIEWS},
-                residuals={0: 5.0, 1: 6.0},
+                repro={0: 5.0, 1: 6.0},
                 diversity={0: GOOD_DIVERSITY_DEG + 1, 1: GOOD_DIVERSITY_DEG + 1})
     s = registration_summary(classify_tags(ids, **good))
     assert s["all_good"] is True
     assert s["n_good"] == 2 and s["n_total"] == 2
     assert s["weak_ids"] == []
-    assert abs(s["mean_residual_mm"] - 5.5) < 1e-9
+    assert abs(s["mean_repro_mm"] - 5.5) < 1e-9
 
 
 def test_summary_worklist_lists_weak_and_unseen():
     ids = [0, 1, 2]
     q = classify_tags(ids, views={1: MIN_VIEWS, 2: 2},
-                      residuals={1: 5.0, 2: 5.0},
+                      repro={1: 5.0, 2: 5.0},
                       diversity={1: GOOD_DIVERSITY_DEG + 1, 2: 5.0})
     s = registration_summary(q)
     assert s["all_good"] is False

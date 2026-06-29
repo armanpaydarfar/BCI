@@ -60,7 +60,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from Utils.gaze.apriltag_calib import invert_transform, make_transform
+from Utils.gaze.apriltag_calib import invert_transform, make_transform, umeyama_rigid
 from Utils.gaze.apriltag_world import _CONSENSUS_TOL_MM, average_pose, fit_plane
 
 
@@ -312,3 +312,46 @@ def world_map_3d_geometry_report(world_map: Dict,
         "z_spread_mm": z_spread,
         "num_tags": len(ids),
     }
+
+
+def world_map_3d_reproducibility(frames: List[Dict[int, np.ndarray]], *,
+                                 seed: int = 0) -> Dict[int, float]:
+    """Split-half reproducibility of the fused map (per-tag, mm) — the
+    ground-truth-free estimate of map ACCURACY.
+
+    The per-frame ``world_map_3d_geometry_report`` residual measures raw sensor
+    *scatter* (the AprilTag per-frame pose noise), which floors out and barely
+    improves with more views — so it is the wrong thing to gate registration on.
+    What matters is whether the FUSED map is accurate, i.e. reproducible from
+    independent data. This randomly splits the frames into two halves, fuses each
+    into its own pose-graph map, rigidly aligns the two on their common tags, and
+    returns per tag the distance between the two independent estimates of that
+    tag's position. Small ⇒ the map is reproducible (the original "≈300 mm
+    run-to-run wander" was exactly large disagreement here); large ⇒ the geometry
+    is not pinned down regardless of how low the per-frame scatter looks.
+
+    Returns ``{tag_id: disagreement_mm}``; empty if there are too few frames, a
+    half fails to fuse, or fewer than 3 common tags to align on. The half-map
+    disagreement slightly OVER-estimates the full-map error (each half has half
+    the data), so it is a conservative gate.
+    """
+    if len(frames) < 4:
+        return {}
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(len(frames))
+    h1 = [frames[i] for i in idx[:len(frames) // 2]]
+    h2 = [frames[i] for i in idx[len(frames) // 2:]]
+    try:
+        m1 = register_world_map_3d(h1)
+        m2 = register_world_map_3d(h2)
+    except ValueError:
+        return {}
+    common = [i for i in m1["ids"] if i in m2["ids"]]
+    if len(common) < 3:
+        return {}
+    A = np.array([m1["rel"][i][:3, 3] for i in common], dtype=float)
+    B = np.array([m2["rel"][i][:3, 3] for i in common], dtype=float)
+    T, _ = umeyama_rigid(A, B)
+    A_aligned = (T[:3, :3] @ A.T).T + T[:3, 3]
+    return {int(common[k]): float(np.linalg.norm(A_aligned[k] - B[k]))
+            for k in range(len(common))}
