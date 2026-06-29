@@ -876,6 +876,7 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
         Q=np.vstack(q_rows),
         X=np.vstack(x_rows),
         EEQUAT=np.vstack(eequat_rows),
+        K=np.asarray(K, dtype=float),
         green=green,
         T_cam_world=np.stack(tcw_rows),
         T_cam_eetag=np.stack(tce_rows),
