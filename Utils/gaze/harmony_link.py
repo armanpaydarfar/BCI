@@ -62,11 +62,20 @@ def build_joint_command_str(q, dur_s: float) -> str:
 
 
 def parse_telemetry(text: str, side: str) -> Optional[Dict[str, np.ndarray]]:
-    """Parse a ``q;seq`` / capture telemetry JSON line into ``{q (7,), ee (3,)}``
-    for the active side, or None if it isn't a usable telemetry packet. Mirrors
-    ``RobotLink.query_state`` (:210-221) — q is joint angles (rad), ee is EE
-    position (mm, base frame). Used for both the calibration (X,Q) capture and
-    the settle check."""
+    """Parse a ``q;seq`` / capture telemetry JSON line into
+    ``{q (7,), ee (3,), ee_quat (4,)|None}`` for the active side, or None if it
+    isn't a usable telemetry packet. Mirrors ``RobotLink.query_state`` (:210-221) —
+    q is joint angles (rad), ee is EE position (mm, base frame). Used for both the
+    calibration (X,Q) capture and the settle check.
+
+    ``ee_quat`` is the EE orientation quaternion ``[x, y, z, w]`` (scalar-last),
+    which the firmware ships alongside ``pos_mm`` (``Gaze_Tracking.cpp:836/839``,
+    ``pose.h:15-17``) but every Python consumer historically dropped. It is parsed
+    **defensively** — absent or malformed → None — so the long-standing q/ee
+    contract is byte-identical for callers that don't need orientation. Consumed
+    by the WS-2a FK-orientation hand-eye solve (offline); never by the motion
+    path. The frame of the quat is fixed by the (closed-source) Harmony SHR
+    manager, not this codebase; callers must establish it empirically."""
     text = text.strip()
     if not text.startswith("{"):
         return None
@@ -83,7 +92,14 @@ def parse_telemetry(text: str, side: str) -> Optional[Dict[str, np.ndarray]]:
         return None
     if q.size < _ARM_JOINTS or ee.size < 3:
         return None
-    return {"q": q[:_ARM_JOINTS].copy(), "ee": ee[:3].copy()}
+    ee_quat = None
+    try:
+        quat = np.asarray(pkt[key_ee]["quat"], dtype=float).ravel()
+        if quat.size >= 4 and np.all(np.isfinite(quat[:4])):
+            ee_quat = quat[:4].copy()
+    except (KeyError, TypeError, ValueError):
+        ee_quat = None
+    return {"q": q[:_ARM_JOINTS].copy(), "ee": ee[:3].copy(), "ee_quat": ee_quat}
 
 
 class HarmonyLink:
@@ -138,7 +154,8 @@ class HarmonyLink:
 
     # ── telemetry (read-only) ─────────────────────────────────────────────────
     def query_state(self) -> Optional[Dict[str, np.ndarray]]:
-        """One ``q;seq`` round-trip → ``{q (7,), ee (3,), _t}`` or None. Read-only.
+        """One ``q;seq`` round-trip → ``{q (7,), ee (3,), ee_quat (4,)|None, _t}``
+        or None. Read-only.
 
         ``_t`` is the control-host ``time.time()`` at which the telemetry reply was
         received — the SAME clock the relay consumer stamps a frame's arrival with
@@ -164,8 +181,8 @@ class HarmonyLink:
 
     def capture_pose(self) -> Optional[Dict[str, np.ndarray]]:
         """``c`` — capture + lock at the current joints; consume the follow-up
-        telemetry line. Returns ``{q (7,), ee (3,)}`` or None. Mirrors
-        ``harmony_free_arm_calibration.capture_pose`` (:607-645)."""
+        telemetry line. Returns ``{q (7,), ee (3,), ee_quat (4,)|None}`` or None.
+        Mirrors ``harmony_free_arm_calibration.capture_pose`` (:607-645)."""
         self.send("c")
         t0 = time.time()
         ack_seen = False

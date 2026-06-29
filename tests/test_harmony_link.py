@@ -64,6 +64,37 @@ def test_parse_telemetry_left_side():
     np.testing.assert_allclose(out["ee"], [10.0, 20.0, 30.0])
 
 
+def test_parse_telemetry_parses_ee_quat():
+    """The firmware ships ``quat:[x,y,z,w]`` alongside pos_mm; parse it scalar-last."""
+    pkt = json.dumps({
+        "qR": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
+        "eeR": {"pos_mm": [100.0, 200.0, 300.0], "quat": [0.0, 0.0, 0.0, 1.0]},
+    })
+    out = parse_telemetry(pkt, "R")
+    assert out is not None
+    np.testing.assert_allclose(out["ee_quat"], [0.0, 0.0, 0.0, 1.0])
+
+
+def test_parse_telemetry_ee_quat_none_when_absent():
+    """Historic contract preserved: a packet without ``quat`` still parses q/ee,
+    with ee_quat None (never raises, never drops the sample)."""
+    out = parse_telemetry(_telemetry(), "R")
+    assert out is not None
+    assert out["ee_quat"] is None
+    np.testing.assert_allclose(out["ee"], [100.0, 200.0, 300.0])
+
+
+def test_parse_telemetry_ee_quat_none_when_malformed():
+    """A short/malformed quat degrades to None rather than crashing the parse."""
+    pkt = json.dumps({
+        "qR": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
+        "eeR": {"pos_mm": [1, 2, 3], "quat": [0.0, 1.0]},
+    })
+    out = parse_telemetry(pkt, "R")
+    assert out is not None
+    assert out["ee_quat"] is None
+
+
 def test_parse_telemetry_rejects_non_json():
     assert parse_telemetry("ACK:CAPTURED_LOCKED", "R") is None
     assert parse_telemetry("", "R") is None
