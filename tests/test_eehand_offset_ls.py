@@ -103,3 +103,36 @@ def test_world_eetag_from_sweep_matches_chain():
     T_cam_eetag[:3, 3] = [0.4, -0.1, 0.8]
     T_we = world_eetag_from_sweep(T_cam_world, T_cam_eetag)
     assert np.allclose(T_we, invert_se3(T_cam_world) @ T_cam_eetag)
+
+
+# ── WS-2b units regression (C2): sweep saves T_cam_* in MM, depth is metres ─────
+
+from scipy.spatial.transform import Rotation  # noqa: E402
+
+from Analyze_eehand_offset_ls import vision_transforms_to_metres  # noqa: E402
+from Utils.gaze.apriltag_calib import make_transform  # noqa: E402
+
+
+def test_vision_transforms_to_metres_scales_translation_only():
+    R = Rotation.from_euler("xyz", [10, 20, 30], degrees=True).as_matrix()
+    T_mm = make_transform(R, [150.0, -200.0, 500.0])
+    T_m = vision_transforms_to_metres(T_mm)
+    np.testing.assert_allclose(T_m[:3, :3], R, atol=1e-12)
+    np.testing.assert_allclose(T_m[:3, 3], [0.15, -0.20, 0.50], atol=1e-12)
+
+
+def test_world_eetag_metres_from_mm_saved_transforms():
+    """world_eetag_from_sweep must be metres so it differences cleanly against the
+    metres Depth-Pro centroid; mm-in would be ~1000x off."""
+    Rcw = Rotation.from_euler("xyz", [5, -15, 25], degrees=True).as_matrix()
+    Rce = Rotation.from_euler("xyz", [-20, 10, 40], degrees=True).as_matrix()
+    T_cw_m = make_transform(Rcw, [0.10, 0.20, 0.80])
+    T_ce_m = make_transform(Rce, [0.05, -0.10, 0.70])
+    B_truth = world_eetag_from_sweep(T_cw_m, T_ce_m)                  # metres truth
+    T_cw_mm = T_cw_m.copy(); T_cw_mm[:3, 3] *= 1000.0
+    T_ce_mm = T_ce_m.copy(); T_ce_mm[:3, 3] *= 1000.0
+    B_hat = world_eetag_from_sweep(vision_transforms_to_metres(T_cw_mm),
+                                   vision_transforms_to_metres(T_ce_mm))
+    np.testing.assert_allclose(B_hat, B_truth, atol=1e-9)
+    B_bug = world_eetag_from_sweep(T_cw_mm, T_ce_mm)
+    assert np.linalg.norm(B_bug[:3, 3] - B_truth[:3, 3]) > 1.0

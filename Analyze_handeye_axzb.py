@@ -8,8 +8,8 @@ Input is an AprilTag calibration sweep npz produced by
 with index-aligned arrays:
   X        (N,3)   robot EE position, mm, BASE frame (telemetry pos_mm)
   EEQUAT   (N,4)   robot EE orientation quaternion [x,y,z,w] scalar-last, BASE frame
-  T_cam_world (N,4,4)  camera->world tag pose, METERS
-  T_cam_eetag (N,4,4)  camera->eetag tag pose, METERS
+  T_cam_world (N,4,4)  camera->world tag pose, saved in MM; load_sweep converts to m
+  T_cam_eetag (N,4,4)  camera->eetag tag pose, saved in MM; load_sweep converts to m
   K        (3,3)   scene-cam intrinsics
   green    (N,)    bool, sample lands in a sufficient coverage cell
   meta     (obj)   dict with t_eetag_ee_mm, tag sizes, side
@@ -60,15 +60,29 @@ _METHOD_NAMES = ("CALIB_ROBOT_WORLD_HAND_EYE_SHAH", "CALIB_ROBOT_WORLD_HAND_EYE_
 def t_base_ee_from_telemetry(x_mm: np.ndarray, quat_xyzw: np.ndarray) -> np.ndarray:
     """base->ee FK transform from telemetry position (mm) and quaternion [x,y,z,w].
 
-    Position is converted mm->meters to match the vision transforms, which are in
-    meters (apriltag_calibrate.py save block stores T_cam_* in meters)."""
+    Position is converted mm->meters to match the vision transforms, which
+    load_sweep has already converted to metres (the sweep saves T_cam_* in mm)."""
     R = Rotation.from_quat(np.asarray(quat_xyzw, dtype=float)).as_matrix()
     t_m = np.asarray(x_mm, dtype=float).ravel() / 1000.0
     return make_transform(R, t_m)
 
 
+def vision_transforms_to_metres(T):
+    """Convert tag-pose transform translations from MM to metres (rotation
+    untouched). The sweep saves T_cam_* with mm translations (apriltag_detect.py
+    rescales m->mm to match robot telemetry / the X column), but this script works
+    in metres (FK X is converted to m in t_base_ee_from_telemetry). Mixing the two
+    makes the AX=ZB translation block 1000x wrong (the rotation deliverable
+    R_world_base is scale-independent, which masked the bug). Pure; accepts a single
+    (4,4) or a batch (N,4,4)."""
+    T = np.asarray(T, dtype=float).copy()
+    T[..., :3, 3] /= 1000.0
+    return T
+
+
 def t_world_eetag_from_vision(T_cam_world: np.ndarray, T_cam_eetag: np.ndarray) -> np.ndarray:
-    """world->eetag = inv(cam->world) @ cam->eetag."""
+    """world->eetag = inv(cam->world) @ cam->eetag. Inputs are metres (caller passes
+    transforms already through vision_transforms_to_metres)."""
     return invert_transform(T_cam_world) @ T_cam_eetag
 
 
@@ -226,8 +240,8 @@ def load_sweep(npz_path: str):
             f"{sorted(d.files)}")
     X = np.asarray(d["X"], dtype=float)
     EEQUAT = np.asarray(d["EEQUAT"], dtype=float)
-    T_cam_world = np.asarray(d["T_cam_world"], dtype=float)
-    T_cam_eetag = np.asarray(d["T_cam_eetag"], dtype=float)
+    T_cam_world = vision_transforms_to_metres(d["T_cam_world"])
+    T_cam_eetag = vision_transforms_to_metres(d["T_cam_eetag"])
     green = np.asarray(d["green"]).astype(bool) if "green" in d else None
     meta = d["meta"].item() if "meta" in d else {}
 

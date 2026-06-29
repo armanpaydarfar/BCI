@@ -131,3 +131,39 @@ def test_variety_ok_with_rotation():
     rep = rotation_variety_report(R_list)
     assert rep["warn"] is False
     assert rep["mean_pairwise_deg"] > rep["threshold_deg"]
+
+
+# ── WS-2a units regression (C3): sweep saves T_cam_* in MM, not metres ──────────
+
+from Analyze_handeye_axzb import (  # noqa: E402
+    t_world_eetag_from_vision,
+    vision_transforms_to_metres,
+)
+from Utils.gaze.apriltag_calib import make_transform  # noqa: E402
+
+
+def test_vision_transforms_to_metres_scales_translation_only():
+    R = Rotation.from_euler("xyz", [10, 20, 30], degrees=True).as_matrix()
+    T_mm = make_transform(R, [150.0, -200.0, 500.0])
+    T_m = vision_transforms_to_metres(T_mm)
+    np.testing.assert_allclose(T_m[:3, :3], R, atol=1e-12)            # rotation kept
+    np.testing.assert_allclose(T_m[:3, 3], [0.15, -0.20, 0.50], atol=1e-12)
+    batch = vision_transforms_to_metres(np.stack([T_mm, T_mm]))       # (N,4,4)
+    np.testing.assert_allclose(batch[1, :3, 3], [0.15, -0.20, 0.50], atol=1e-12)
+
+
+def test_world_eetag_recovered_from_mm_saved_transforms():
+    """The vision side must end up in metres so AX=ZB doesn't mix m (FK) with mm."""
+    Rcw = Rotation.from_euler("xyz", [5, -15, 25], degrees=True).as_matrix()
+    Rce = Rotation.from_euler("xyz", [-20, 10, 40], degrees=True).as_matrix()
+    T_cw_m = make_transform(Rcw, [0.10, 0.20, 0.80])
+    T_ce_m = make_transform(Rce, [0.05, -0.10, 0.70])
+    B_truth = t_world_eetag_from_vision(T_cw_m, T_ce_m)               # metres truth
+    T_cw_mm = T_cw_m.copy(); T_cw_mm[:3, 3] *= 1000.0                 # as the sweep saves
+    T_ce_mm = T_ce_m.copy(); T_ce_mm[:3, 3] *= 1000.0
+    B_hat = t_world_eetag_from_vision(vision_transforms_to_metres(T_cw_mm),
+                                      vision_transforms_to_metres(T_ce_mm))
+    np.testing.assert_allclose(B_hat, B_truth, atol=1e-9)
+    # The old bug (no conversion) leaves the translation ~1000x off — guard it.
+    B_bug = t_world_eetag_from_vision(T_cw_mm, T_ce_mm)
+    assert np.linalg.norm(B_bug[:3, 3] - B_truth[:3, 3]) > 1.0

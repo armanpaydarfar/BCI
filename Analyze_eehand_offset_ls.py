@@ -128,8 +128,21 @@ def quat_xyzw_to_R(q):
     return Rotation.from_quat(np.asarray(q, dtype=np.float64)).as_matrix()
 
 
+def vision_transforms_to_metres(T):
+    """Convert tag-pose transform translations from MM to metres (rotation
+    untouched). The sweep saves T_cam_* with mm translations (apriltag_detect.py
+    rescales m->mm to match robot telemetry), but this script is metres-internal
+    (Depth Pro depth is in m; the LS core declares metres). Mixing the two scales
+    a centroid/offset 1000x — so every loaded vision transform passes through here.
+    Pure; accepts a single (4,4) or a batch (N,4,4)."""
+    T = np.asarray(T, dtype=np.float64).copy()
+    T[..., :3, 3] /= 1000.0
+    return T
+
+
 def world_eetag_from_sweep(T_cam_world_i, T_cam_eetag_i):
-    """T_world_eetag(i) = inv(T_cam_world) @ T_cam_eetag (metres)."""
+    """T_world_eetag(i) = inv(T_cam_world) @ T_cam_eetag. Inputs are metres (the
+    caller passes transforms already through vision_transforms_to_metres)."""
     return invert_se3(T_cam_world_i) @ np.asarray(T_cam_eetag_i, dtype=np.float64)
 
 
@@ -414,8 +427,8 @@ def main(argv=None):
 
     d = np.load(npz_path, allow_pickle=True)
     X_mm = np.asarray(d["X"], dtype=np.float64)
-    T_cam_world = np.asarray(d["T_cam_world"], dtype=np.float64)
-    T_cam_eetag = np.asarray(d["T_cam_eetag"], dtype=np.float64)
+    T_cam_world = vision_transforms_to_metres(d["T_cam_world"])
+    T_cam_eetag = vision_transforms_to_metres(d["T_cam_eetag"])
     green = np.asarray(d["green"], dtype=bool) if "green" in d.files else None
     meta = d["meta"].item() if "meta" in d.files else {}
     n_total = T_cam_world.shape[0]
