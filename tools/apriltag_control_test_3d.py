@@ -410,6 +410,26 @@ def _resolve_depth(vlm, T_cam_world):
     return object_point_world_mm(hit["position_cam"], T_cam_world), None
 
 
+def _read_command(ui) -> str:
+    """Read the operator's command. With a ControlView, read it FROM the window
+    (cv2 keys) so the terminal stays log-only and the window keeps focus; otherwise
+    fall back to terminal input(). Returns '' (resolve), 'g', 'r', 'h', or 'q'."""
+    if ui is None:
+        return input("> ").strip().lower()
+    while True:
+        k = ui.poll_key(60)
+        if k in (ord("q"), 27):              # q or ESC → quit
+            return "q"
+        if k == ord("h"):
+            return "h"
+        if k == ord("g"):
+            return "g"
+        if k == ord("r"):
+            return "r"
+        if k in (13, 10, 32):                # Enter / space → resolve (default)
+            return ""
+
+
 def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
     z = np.load(args.calib, allow_pickle=True)
     meta = z["meta"].item() if "meta" in z.files else {}
@@ -495,14 +515,15 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
     else:
         _log(f"3-D target: Depth Pro position_cam (vlm_service.waypoints "
              f"{vlm.host}:{vlm.port}); depth REQUIRED.")
-    _log("Per move: fixate the object, Enter to RESOLVE; review; then 'g' to GO "
-         "('g' again to confirm a far fixation), 'r' to re-resolve, 'h' to home, "
-         "'q' to quit. NO autonomous motion; refuses to move on any uncertainty.")
+    _log("Per move (keys IN the control window when shown, else this terminal): "
+         "fixate the object, ENTER to RESOLVE; review; then 'g' to GO ('g' again to "
+         "confirm a far fixation), 'r' to re-resolve, 'h' to home, 'q' to quit. NO "
+         "autonomous motion; refuses to move on any uncertainty.")
 
     pending: Optional[Tuple[np.ndarray, int, float, bool]] = None  # (q_cmd, idx, dist, clamped)
     far_armed = False  # a far fixation needs a SECOND 'g' to commit (review safety)
     while True:
-        cmd = input("> ").strip().lower()
+        cmd = _read_command(ui)
         if cmd == "q":
             break
         if cmd == "h":

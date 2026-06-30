@@ -73,9 +73,9 @@ def table_uv_bounds(library_uv: np.ndarray, extra_uv: Optional[np.ndarray] = Non
 
 
 class ControlView:
-    """cv2 three-pane control visualiser. ``update`` redraws one resolve; ``close``
-    tears down. Non-blocking — the operator drives from the terminal; this is a
-    glance surface refreshed each resolve."""
+    """cv2 three-pane control visualiser. ``update`` redraws one resolve; ``poll_key``
+    reads the operator's command FROM the window (so the terminal stays log-only);
+    ``close`` tears down."""
 
     def __init__(self, library_uv: np.ndarray, library_z: np.ndarray, *,
                  width: int = 1500, height: int = 640, panel_h: int = 88,
@@ -92,6 +92,27 @@ class ControlView:
         self.window = window
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window, width, height)
+        # First frame so the window is focusable for key input before the first
+        # resolve — the operator drives from THIS window (cv2 keys); terminal = logs.
+        ph = np.full((height, width, 3), _COLOR_BG, dtype=np.uint8)
+        cv2.putText(ph, "AprilTag 3-D control - click this window, then drive with the keys "
+                    "below", (24, height // 2 - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    _COLOR_TEXT, 1, cv2.LINE_AA)
+        cv2.putText(ph, "ENTER resolve    g GO    r re-resolve    h home    q quit",
+                    (24, height // 2 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, _COLOR_TEXT, 2,
+                    cv2.LINE_AA)
+        self._last_canvas = ph
+        cv2.imshow(window, ph)
+        cv2.waitKey(1)
+
+    def poll_key(self, timeout_ms: int = 50) -> int:
+        """Re-show the last frame and return a key pressed IN the window (cv2 highgui),
+        or -1 if none within the timeout. This is what lets the operator drive from the
+        window instead of the terminal (which steals window focus)."""
+        cv2 = self._cv2
+        if self._last_canvas is not None:
+            cv2.imshow(self.window, self._last_canvas)
+        return cv2.waitKey(max(1, int(timeout_ms))) & 0xFF
 
     def update(self, scene_bgr: Optional[np.ndarray], *,
                gaze_px, mask_polygon, target_px,
@@ -108,6 +129,10 @@ class ControlView:
         for k, text in enumerate(list(lines)[:3]):
             cv2.putText(canvas, text, (12, scene_h + 24 + k * 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.46, _COLOR_TEXT, 1, cv2.LINE_AA)
+        cv2.putText(canvas, "ENTER resolve   g GO   r re-resolve   h home   q quit",
+                    (12, self.height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.44,
+                    _COLOR_TEXT, 1, cv2.LINE_AA)
+        self._last_canvas = canvas
         cv2.imshow(self.window, canvas)
         cv2.waitKey(1)
 
