@@ -100,7 +100,6 @@ from Utils.gaze.object_target import (  # noqa: E402
     pixel_on_plane_world,
     select_object_pixel,
     table_plane_from_map,
-    world_to_pixel,
 )
 from Utils.perception_clients import VLMClient  # noqa: E402
 
@@ -139,10 +138,57 @@ def object_point_world_mm(position_cam_m, T_cam_world: np.ndarray) -> np.ndarray
 # ── world-pose recovery (over a short window) ─────────────────────────────────
 
 
+def _make_frame_undistorter(K, dist_coeffs):
+    """``bgr -> rectified bgr`` (cv2 remap, SAME K), or None if no usable distortion.
+    The Neon ships raw wide-FOV frames; tag pose/PnP assume a pinhole, so frames must
+    be undistorted before detection (2026-06-30 root cause). Lazy maps."""
+    if dist_coeffs is None:
+        return None
+    dist = np.asarray(dist_coeffs, float).ravel()
+    if not np.any(np.abs(dist) > 1e-9):
+        return None
+    import cv2
+    Kf = np.asarray(K, float)
+    maps = [None, None]
+
+    def _u(bgr):
+        if maps[0] is None:
+            h, w = bgr.shape[:2]
+            maps[0], maps[1] = cv2.initUndistortRectifyMap(Kf, dist, None, Kf, (w, h), cv2.CV_32FC1)
+        return cv2.remap(bgr, maps[0], maps[1], cv2.INTER_LINEAR)
+
+    return _u
+
+
+def _undistort_px(xy, K, dist):
+    """Map a RAW pixel (a VLM mask/gaze pixel, localized on a raw frame) into the
+    rectified pinhole frame, so it can be cast through the tag-recovered (rectified)
+    pose with the same K. No-op if dist is None. ``xy`` = (x, y) or None."""
+    if xy is None or dist is None:
+        return xy
+    import cv2
+    a = np.asarray(xy, float).reshape(1, 1, 2)
+    u = cv2.undistortPoints(a, np.asarray(K, float), np.asarray(dist, float),
+                            P=np.asarray(K, float))
+    return (float(u[0, 0, 0]), float(u[0, 0, 1]))
+
+
+def _project_world_px(p_world, K, T_cam_world, dist):
+    """Project a world point to the RAW (distorted) scene pixel — so the viz marker
+    lands correctly on the raw display frame the operator sees. Pinhole if dist None."""
+    import cv2
+    Tcw = np.asarray(T_cam_world, float)
+    rvec, _ = cv2.Rodrigues(Tcw[:3, :3])
+    d = np.asarray(dist, float) if dist is not None else np.zeros(5)
+    px, _ = cv2.projectPoints(np.asarray(p_world, float).reshape(1, 3), rvec,
+                              Tcw[:3, 3], np.asarray(K, float), d)
+    return (float(px[0, 0, 0]), float(px[0, 0, 1]))
+
+
 def _recover_world_pose(consumer: RelayConsumer, detector, K, world_map: dict,
                         tag_size: float, dur_s: float, *,
-                        ee_tag_id: Optional[int] = None, ee_tag_size: Optional[float] = None
-                        ) -> Tuple[Optional[np.ndarray], dict]:
+                        ee_tag_id: Optional[int] = None, ee_tag_size: Optional[float] = None,
+                        dist_coeffs=None) -> Tuple[Optional[np.ndarray], dict]:
     """Recover ``T_cam_world`` over a short window, keeping the LAST frame whose
     pose solved, using the SAME view-robust board PnP the sweep/2-D tool use
     (per-tag consensus is the <4-tag occlusion fallback). Unlike the 2-D tool's
@@ -164,6 +210,7 @@ def _recover_world_pose(consumer: RelayConsumer, detector, K, world_map: dict,
     # the world tags), else its pose comes out mis-scaled.
     tag_sizes = ({int(ee_tag_id): float(ee_tag_size)}
                  if ee_tag_id is not None and ee_tag_size else None)
+    undist = _make_frame_undistorter(K, dist_coeffs)
     deadline = time.time() + dur_s
     while time.time() < deadline:
         b = consumer.latest()
@@ -173,7 +220,8 @@ def _recover_world_pose(consumer: RelayConsumer, detector, K, world_map: dict,
         last_idx = b.video.frame_idx
         if not getattr(b, "worn", True):
             continue
-        tags = detect_tags(detector, b.video.bgr, K, tag_size, tag_sizes=tag_sizes)
+        bgr = undist(b.video.bgr) if undist is not None else b.video.bgr
+        tags = detect_tags(detector, bgr, K, tag_size, tag_sizes=tag_sizes)
         world_view = {i: tags[i] for i in world_map["ids"] if i in tags}
         per_frame_counts.append(len(world_view))
         for i in world_view:
@@ -251,7 +299,7 @@ def _px_dist(a, b) -> float:
 
 
 def _resolve_object_plane(vlm, args, K, T_cam_world, diag,
-                          table_point, table_normal):
+                          table_point, table_normal, dist_coeffs=None):
     """Depth-free target: the fixated object's footprint/centroid pixel cast onto
     the table plane → world ``(x,y,z)`` mm. Logs each stage; returns
     ``(p_world, viz)`` or ``(None, None)`` on a logged miss. ``viz`` carries
@@ -292,11 +340,16 @@ def _resolve_object_plane(vlm, args, K, T_cam_world, diag,
             _log(f"segment: {sel['n_dets']} masks, none under gaze "
                  f"(n_contained={sel['n_contained']}, {sel.get('rejected_large',0)} table-sized dropped); no object to target. NOT moving.")
             return None, None
-        base = pixel_on_plane_world(fpx, fpy, K, T_cam_world, table_point, table_normal)
+        # Undistort the VLM pixels (raw-frame coords) before casting through the
+        # rectified tag pose — otherwise the lens distortion (tens of px at the edges)
+        # corrupts the ray, the same root cause that broke the map.
+        ufp = _undistort_px((fpx, fpy), K, dist_coeffs)
+        base = pixel_on_plane_world(ufp[0], ufp[1], K, T_cam_world, table_point, table_normal)
         if base is None:
             _log("footprint ray missed the table plane (parallel/behind). NOT moving.")
             return None, None
-        p_world = height_on_vertical(svc_gaze, base, table_normal, K, T_cam_world)
+        p_world = height_on_vertical(_undistort_px(svc_gaze, K, dist_coeffs), base,
+                                     table_normal, K, T_cam_world)
         if p_world is None:
             _log("gaze-height ray unusable; NOT moving.")
             return None, None
@@ -313,16 +366,18 @@ def _resolve_object_plane(vlm, args, K, T_cam_world, diag,
             _log(f"segment: {sel['n_dets']} masks, none under gaze "
                  f"(n_contained={sel['n_contained']}, {sel.get('rejected_large',0)} table-sized dropped); no object to target. NOT moving.")
             return None, None
-        p_world = pixel_on_plane_world(px, py, K, T_cam_world, table_point, table_normal)
+        up = _undistort_px((px, py), K, dist_coeffs)   # raw VLM pixel → rectified before cast
+        p_world = pixel_on_plane_world(up[0], up[1], K, T_cam_world, table_point, table_normal)
         if p_world is None:
             _log("object pixel ray missed the table plane (parallel/behind). NOT moving.")
             return None, None
         _log(f"object: {sel['pick']} mask, area={sel.get('mask_area_px', 0):.0f}px → "
              f"{args.target_point} pixel=({px:.0f},{py:.0f})  "
              f"[{len(dets)} masks, gaze div={_px_dist(svc_gaze, our_gaze):.0f}px]")
-    # Reproject the chosen 3-D target onto the scene so the viz marker shows where it
-    # lands (rides up the object in gaze_height mode); fall back to the gaze pixel.
-    tgt_px = world_to_pixel(p_world, K, T_cam_world) or svc_gaze
+    # Reproject the chosen 3-D target onto the RAW scene (with distortion) so the viz
+    # marker lands correctly on the raw display frame (rides up the object in
+    # gaze_height mode).
+    tgt_px = _project_world_px(p_world, K, T_cam_world, dist_coeffs)
     # The footprint (table-level base under the target) anchors the side view's
     # vertical line — it's the gaze_height base, else the on-table target itself.
     base_world = base if args.target_point == "gaze_height" else p_world
@@ -389,6 +444,9 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
                 else float(meta.get("tag_size_m", 0.06)))
     detector = load_detector(args.families)
     K = consumer.camera_matrix
+    dist_coeffs = consumer.distortion_coeffs
+    if dist_coeffs is not None:
+        _log("  undistorting frames + VLM pixels before casting (Neon lens) — matches the map")
 
     import config as cfg
     vlm = VLMClient(cfg)
@@ -464,7 +522,7 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
         T_cam_world, diag = _recover_world_pose(
             consumer, detector, K, world_map, tag_size, args.sample_s,
             ee_tag_id=(args.ee_tag_id if ui is not None else None),
-            ee_tag_size=args.ee_tag_size)
+            ee_tag_size=args.ee_tag_size, dist_coeffs=dist_coeffs)
         if T_cam_world is None:
             _log(f"no world pose (world tags seen={diag['tags_seen']} of "
                  f"{diag['mapped_tags']}) — keep ≥1 world tag in view")
@@ -477,7 +535,7 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
         # Target (Tier-1 fail-safe: any uncertainty → return None → NOT moving).
         if args.target_source == "object_plane":
             p_world, viz = _resolve_object_plane(vlm, args, K, T_cam_world, diag,
-                                                 table_point, table_normal)
+                                                 table_point, table_normal, dist_coeffs)
         else:
             p_world, viz = _resolve_depth(vlm, T_cam_world)
         if p_world is None:
