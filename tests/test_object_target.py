@@ -20,9 +20,11 @@ sys.path.insert(0, str(ROOT))
 from Utils.gaze.apriltag_calib import invert_transform, make_transform, transform_point  # noqa: E402
 from Utils.gaze.object_target import (  # noqa: E402
     gaze_divergence_ok,
+    height_on_vertical,
     pixel_on_plane_world,
     select_object_pixel,
     table_plane_from_map,
+    world_to_pixel,
 )
 
 _K = np.array([[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]])
@@ -39,6 +41,19 @@ def _cam_looking_down(height_mm=1000.0):
 def _project(P_world, K, T_cam_world):
     p = transform_point(T_cam_world, np.asarray(P_world, float))
     return K[0, 0] * p[0] / p[2] + K[0, 2], K[1, 1] * p[1] / p[2] + K[1, 2]
+
+
+def _cam_lookat(eye, target):
+    """T_cam_world for a camera at ``eye`` looking at ``target`` (OpenCV axes:
+    +z forward, +x right, +y down). Oblique so object height is observable."""
+    eye, target = np.asarray(eye, float), np.asarray(target, float)
+    fwd = target - eye
+    fwd /= np.linalg.norm(fwd)
+    right = np.cross(fwd, [0.0, 0.0, 1.0])
+    right /= np.linalg.norm(right)
+    down = np.cross(fwd, right)
+    R_world_cam = np.column_stack([right, down, fwd])
+    return invert_transform(make_transform(R_world_cam, eye))
 
 
 def test_pixel_on_plane_world_roundtrip():
@@ -118,6 +133,41 @@ def test_select_miss_when_gaze_far_outside():
     det = {"mask_polygon": _square(100, 100, 20)}
     px, py, info = select_object_pixel([det], (1000.0, 1000.0), "centroid")
     assert px is None and py is None and info["pick"] == "miss"
+
+
+def test_height_on_vertical_recovers_looked_at_height():
+    # Oblique view so height is observable. base on the table; look at a point 200 mm
+    # up the object's vertical line → recover that height.
+    Tcw = _cam_lookat([0.0, -700.0, 500.0], [0.0, 0.0, 100.0])
+    base = np.array([0.0, 0.0, 0.0])
+    n = np.array([0.0, 0.0, 1.0])
+    for h in (0.0, 120.0, 250.0):
+        looked = base + np.array([0.0, 0.0, h])
+        u, v = _project(looked, _K, Tcw)
+        got = height_on_vertical((u, v), base, n, _K, Tcw)
+        assert got is not None
+        np.testing.assert_allclose(got, looked, atol=1.0)
+
+
+def test_height_on_vertical_clamps_and_xy_locked():
+    Tcw = _cam_lookat([0.0, -700.0, 500.0], [0.0, 0.0, 100.0])
+    base = np.array([50.0, -30.0, 0.0])
+    n = np.array([0.0, 0.0, 1.0])
+    # A gaze far above the object clamps to max_height, and XY stays the base XY.
+    looked = base + np.array([0.0, 0.0, 2000.0])
+    u, v = _project(looked, _K, Tcw)
+    got = height_on_vertical((u, v), base, n, _K, Tcw, max_height_mm=400.0)
+    assert abs(got[2] - 400.0) < 1e-6
+    np.testing.assert_allclose(got[:2], base[:2], atol=1e-6)
+
+
+def test_world_to_pixel_roundtrips_with_project():
+    Tcw = _cam_lookat([0.0, -700.0, 500.0], [0.0, 0.0, 100.0])
+    P = np.array([80.0, -40.0, 150.0])
+    u0, v0 = _project(P, _K, Tcw)
+    px = world_to_pixel(P, _K, Tcw)
+    assert px is not None
+    np.testing.assert_allclose(px, (u0, v0), atol=1e-6)
 
 
 def test_gaze_divergence_guard():

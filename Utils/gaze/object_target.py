@@ -180,6 +180,60 @@ def pixel_on_plane_world(px: float, py: float, K: np.ndarray,
     return transform_point(invert_transform(T_cam_world), hit_cam)
 
 
+def height_on_vertical(gaze_px, base_world: np.ndarray, table_normal: np.ndarray,
+                       K: np.ndarray, T_cam_world: np.ndarray, *,
+                       max_height_mm: float = 600.0) -> Optional[np.ndarray]:
+    """Target on the object's vertical centerline at the height the gaze looks at.
+
+    The depth-free height extension: with the XY anchored at ``base_world`` (the
+    object's footprint on the table), the operator's height along the object is the
+    point on the VERTICAL line ``base_world + t·n`` (n = table normal) closest to
+    the gaze ray. Look at the base → ~table height; look higher → up the object.
+    This is what lets "look at a part → move there" work without depth (and lets a
+    stacked object be targeted up its supporting column). ``t`` is clamped to
+    ``[0, max_height_mm]`` so a near-side-on ray can't yield an absurd height.
+
+    Assumes the object stands roughly vertical at ``base_world``'s XY. Returns the
+    world point, or None on a bad pixel/K. Ill-conditioned from straight overhead
+    (the vertical is along the view) — t then falls back toward the base.
+    """
+    ray_cam = gaze_ray_cam(float(gaze_px[0]), float(gaze_px[1]), K)
+    if ray_cam is None:
+        return None
+    T_wc = invert_transform(T_cam_world)            # world ← cam
+    cam_org = T_wc[:3, 3]
+    ray_w = T_wc[:3, :3] @ ray_cam
+    nrm = float(np.linalg.norm(ray_w))
+    if nrm < 1e-9:
+        return None
+    ray_w = ray_w / nrm
+    n = np.asarray(table_normal, dtype=float)
+    n = n / max(float(np.linalg.norm(n)), 1e-9)
+    P1 = np.asarray(base_world, dtype=float)
+    # Closest point on the vertical line (P1, n) to the gaze ray (cam_org, ray_w).
+    w0 = P1 - cam_org
+    b = float(n @ ray_w)
+    denom = 1.0 - b * b                              # a = c = 1 (unit dirs)
+    if abs(denom) < 1e-9:                            # ray ∥ vertical → height unobservable
+        t = 0.0
+    else:
+        t = (b * float(ray_w @ w0) - float(n @ w0)) / denom
+    t = float(np.clip(t, 0.0, max_height_mm))
+    return P1 + t * n
+
+
+def world_to_pixel(p_world: np.ndarray, K: np.ndarray,
+                   T_cam_world: np.ndarray) -> Optional[tuple]:
+    """Project a world point to a scene-camera pixel (for the visual interface, e.g.
+    drawing where the chosen 3-D target lands on the image). None if behind the
+    camera."""
+    p_cam = transform_point(T_cam_world, np.asarray(p_world, dtype=float))
+    if p_cam[2] <= 1e-6:
+        return None
+    return (float(K[0, 0] * p_cam[0] / p_cam[2] + K[0, 2]),
+            float(K[1, 1] * p_cam[1] / p_cam[2] + K[1, 2]))
+
+
 def gaze_divergence_ok(service_gaze_px, our_gaze_px,
                        tol_px: float = GAZE_DIVERGENCE_TOL_PX) -> bool:
     """True if the service-frame gaze and our-frame gaze agree within ``tol_px``.

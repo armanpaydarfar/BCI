@@ -96,9 +96,11 @@ from Utils.gaze.harmony_link import HarmonyLink  # noqa: E402
 from Utils.gaze.object_target import (  # noqa: E402
     GAZE_DIVERGENCE_TOL_PX,
     gaze_divergence_ok,
+    height_on_vertical,
     pixel_on_plane_world,
     select_object_pixel,
     table_plane_from_map,
+    world_to_pixel,
 )
 from Utils.perception_clients import VLMClient  # noqa: E402
 
@@ -258,20 +260,45 @@ def _resolve_object_plane(vlm, args, K, T_cam_world, diag,
              f"{_fmt_px(our_gaze)} diverged >{GAZE_DIVERGENCE_TOL_PX:.0f}px (head moved "
              "during resolve). NOT moving — hold still and re-resolve.")
         return None, None
-    px, py, sel = select_object_pixel(dets, svc_gaze, args.target_point)
-    if px is None:
-        _log(f"segment: {sel['n_dets']} masks, none under gaze "
-             f"(n_contained={sel['n_contained']}); no object to target. NOT moving.")
-        return None, None
-    p_world = pixel_on_plane_world(px, py, K, T_cam_world, table_point, table_normal)
-    if p_world is None:
-        _log("object pixel ray missed the table plane (parallel/behind). NOT moving.")
-        return None, None
-    _log(f"object: {sel['pick']} mask, area={sel.get('mask_area_px', 0):.0f}px → "
-         f"{args.target_point} pixel=({px:.0f},{py:.0f})  "
-         f"[{len(dets)} masks, gaze div={_px_dist(svc_gaze, our_gaze):.0f}px]")
+    if args.target_point == "gaze_height":
+        # XY from the footprint (overshoot-free, stable); height from the gaze ray ∩
+        # the object's vertical line through that footprint.
+        fpx, fpy, sel = select_object_pixel(dets, svc_gaze, "footprint")
+        if fpx is None:
+            _log(f"segment: {sel['n_dets']} masks, none under gaze "
+                 f"(n_contained={sel['n_contained']}); no object to target. NOT moving.")
+            return None, None
+        base = pixel_on_plane_world(fpx, fpy, K, T_cam_world, table_point, table_normal)
+        if base is None:
+            _log("footprint ray missed the table plane (parallel/behind). NOT moving.")
+            return None, None
+        p_world = height_on_vertical(svc_gaze, base, table_normal, K, T_cam_world)
+        if p_world is None:
+            _log("gaze-height ray unusable; NOT moving.")
+            return None, None
+        n = np.asarray(table_normal, float) / max(np.linalg.norm(table_normal), 1e-9)
+        h_mm = float((np.asarray(p_world) - base) @ n)
+        _log(f"object: {sel['pick']} mask, area={sel.get('mask_area_px', 0):.0f}px → "
+             f"footprint=({fpx:.0f},{fpy:.0f}), gaze height={h_mm:.0f} mm above table  "
+             f"[{len(dets)} masks, gaze div={_px_dist(svc_gaze, our_gaze):.0f}px]")
+    else:
+        px, py, sel = select_object_pixel(dets, svc_gaze, args.target_point)
+        if px is None:
+            _log(f"segment: {sel['n_dets']} masks, none under gaze "
+                 f"(n_contained={sel['n_contained']}); no object to target. NOT moving.")
+            return None, None
+        p_world = pixel_on_plane_world(px, py, K, T_cam_world, table_point, table_normal)
+        if p_world is None:
+            _log("object pixel ray missed the table plane (parallel/behind). NOT moving.")
+            return None, None
+        _log(f"object: {sel['pick']} mask, area={sel.get('mask_area_px', 0):.0f}px → "
+             f"{args.target_point} pixel=({px:.0f},{py:.0f})  "
+             f"[{len(dets)} masks, gaze div={_px_dist(svc_gaze, our_gaze):.0f}px]")
+    # Reproject the chosen 3-D target onto the scene so the viz marker shows where it
+    # lands (rides up the object in gaze_height mode); fall back to the gaze pixel.
+    tgt_px = world_to_pixel(p_world, K, T_cam_world) or svc_gaze
     viz = {"gaze_px": svc_gaze, "mask_polygon": sel.get("mask_polygon"),
-           "target_px": (px, py)}
+           "target_px": tgt_px}
     return p_world, viz
 
 
@@ -482,11 +509,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "fixated object's footprint/centroid pixel cast onto the TABLE "
                         "plane (depth-free). 'depth': legacy Depth Pro position_cam "
                         "(vlm_service.waypoints).")
-    p.add_argument("--target-point", choices=["footprint", "centroid"],
+    p.add_argument("--target-point", choices=["footprint", "centroid", "gaze_height"],
                    default="footprint",
-                   help="object_plane: which mask pixel to cast — 'footprint' (lowest "
-                        "mask row, the object↔table contact, overshoot-free) or "
-                        "'centroid'. Default footprint.")
+                   help="object_plane target. 'footprint' (default): lowest mask row ∩ "
+                        "table (overshoot-free, table height). 'centroid': mask centroid "
+                        "∩ table. 'gaze_height': footprint XY but height from the gaze ray "
+                        "∩ the object's vertical line — look at a part, move to its height "
+                        "(for tall/stacked objects).")
     p.add_argument("--table-tag-ids", type=int, nargs="+", default=None,
                    help="world tag ids physically ON the table, used to fit the table "
                         "plane (default: config.APRILTAG_WORLD_TAG_IDS). Exclude "
