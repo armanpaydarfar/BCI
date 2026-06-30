@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -462,70 +463,93 @@ def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
         views: Dict[int, int] = {}
         bearings: Dict[int, List[np.ndarray]] = {}
         last_idx = None
-        last_ui = 0.0
-        # Cached quality readout (recomputed on the 0.4 s timer below). Initialised so
-        # the per-frame redraw has something valid to show before the first recompute.
+        # The split-half reproducibility re-fuse is far too heavy to run on the draw
+        # thread — doing so froze the feed every 0.4 s (operator-reported). Run it in a
+        # background worker that reads a SNAPSHOT of the frames so far and publishes a
+        # cached readout; the main loop only appends frames + redraws (both cheap), so
+        # the video stays smooth. Detection still runs per frame on the main thread.
         qualities = classify_tags(ids, {}, None, {}) if ui is not None else None
         summary = registration_summary(qualities) if ui is not None else None
         if summary is not None:
             summary["scatter_mm"] = None
-        deadline = time.time() + (max_dur if ui is not None else dur)
-        while time.time() < deadline:
-            b = consumer.latest()
-            if (b is None or b.video is None or b.video.bgr is None
-                    or b.video.frame_idx == last_idx):
-                time.sleep(0.005)
-                continue
-            last_idx = b.video.frame_idx
-            tags = detect_tags(detector, b.video.bgr, K, tag_size)
-            frame = {int(i): tags[int(i)]["T"] for i in ids if int(i) in tags}
-            if frame:
-                frames.append(frame)
-                corner_frames.append({int(i): tags[int(i)]["corners"]
-                                      for i in ids if int(i) in tags})
-                for i, T in frame.items():
-                    views[i] = views.get(i, 0) + 1
-                    bearings.setdefault(i, []).append(np.asarray(T, dtype=float)[:3, 3])
-            if ui is not None:
-                # Recompute the EXPENSIVE quality readout on a 0.4 s timer — the
-                # split-half reproducibility re-fuses the map and must not run per
-                # frame — and cache it. Gate on reproducibility (map accuracy), not
-                # per-frame scatter (a sensor-noise floor that never improves; shown
-                # only as a dim diagnostic). The estimate is bounded to an evenly-
-                # spaced subsample so each recompute is CONSTANT cost; the final fuse
-                # (post-capture) still uses every frame.
-                if time.time() - last_ui >= 0.4:
+        data_lock = threading.Lock()
+        readout_lock = threading.Lock()
+        stop_worker = threading.Event()
+
+        def _recompute_loop():
+            nonlocal qualities, summary
+            while not stop_worker.wait(0.4):
+                with data_lock:
+                    snap = list(frames)
+                    v = dict(views)
+                    bd = {k: list(val) for k, val in bearings.items()}
+                try:
                     repro_map = None
                     scatter_mm = None
-                    if len(frames) >= 4:
-                        if len(frames) > _LIVE_SAMPLE_FRAMES:
-                            sel = np.linspace(0, len(frames) - 1, _LIVE_SAMPLE_FRAMES).astype(int)
-                            live = [frames[i] for i in sel]
+                    if len(snap) >= 4:
+                        # Bound to an evenly-spaced subsample so each recompute is
+                        # CONSTANT cost; the final fuse (post-capture) uses every frame.
+                        if len(snap) > _LIVE_SAMPLE_FRAMES:
+                            sel = np.linspace(0, len(snap) - 1, _LIVE_SAMPLE_FRAMES).astype(int)
+                            live = [snap[i] for i in sel]
                         else:
-                            live = frames
+                            live = snap
                         try:
                             repro_map = world_map_3d_reproducibility(live)
                             rep = world_map_3d_geometry_report(
                                 register_world_map_3d(live), live)
                             scatter_mm = rep["mean_fit_residual_mm"]
                         except ValueError:
-                            # Pre-convergence: too few co-visible frames to fuse a
-                            # half yet. Expected transient — show views/diversity only.
-                            repro_map = None
-                    diversity = {i: cone_half_angle_deg(bearings[i]) for i in bearings}
-                    qualities = classify_tags(ids, views, repro_map, diversity)
-                    summary = registration_summary(qualities)
-                    summary["scatter_mm"] = scatter_mm
-                    last_ui = time.time()
-                # Redraw EVERY frame (cheap cv2 blit) so the video stays smooth and
-                # SPACE/q stay responsive — trapping the redraw behind the 0.4 s
-                # re-fuse gate was what made the feed lag at ~2.5 fps.
-                ui.update(b.video.bgr, tags, qualities, summary)
-                if ui.aborted():
-                    _log("  world-3d registration aborted from the coverage window")
-                    return None, [], []
-                if ui.finished():
-                    break
+                            repro_map = None     # pre-convergence; views/diversity only
+                    diversity = {i: cone_half_angle_deg(bd[i]) for i in bd}
+                    q = classify_tags(ids, v, repro_map, diversity)
+                    s = registration_summary(q)
+                    s["scatter_mm"] = scatter_mm
+                    with readout_lock:
+                        qualities, summary = q, s
+                except Exception as exc:         # keep the readout thread alive on a
+                    _log(f"  (live quality recompute hiccup: {exc!r})")  # transient error
+
+        worker = None
+        if ui is not None:
+            worker = threading.Thread(target=_recompute_loop, name="reg-recompute",
+                                      daemon=True)
+            worker.start()
+        deadline = time.time() + (max_dur if ui is not None else dur)
+        try:
+            while time.time() < deadline:
+                b = consumer.latest()
+                if (b is None or b.video is None or b.video.bgr is None
+                        or b.video.frame_idx == last_idx):
+                    time.sleep(0.005)
+                    continue
+                last_idx = b.video.frame_idx
+                tags = detect_tags(detector, b.video.bgr, K, tag_size)
+                frame = {int(i): tags[int(i)]["T"] for i in ids if int(i) in tags}
+                if frame:
+                    with data_lock:
+                        frames.append(frame)
+                        corner_frames.append({int(i): tags[int(i)]["corners"]
+                                              for i in ids if int(i) in tags})
+                        for i, T in frame.items():
+                            views[i] = views.get(i, 0) + 1
+                            bearings.setdefault(i, []).append(
+                                np.asarray(T, dtype=float)[:3, 3])
+                if ui is not None:
+                    with readout_lock:
+                        q, s = qualities, summary
+                    # Redraw EVERY frame (cheap cv2 blit) so the video is smooth and
+                    # SPACE/q stay responsive; the heavy re-fuse is off-thread above.
+                    ui.update(b.video.bgr, tags, q, s)
+                    if ui.aborted():
+                        _log("  world-3d registration aborted from the coverage window")
+                        return None, [], []
+                    if ui.finished():
+                        break
+        finally:
+            stop_worker.set()
+            if worker is not None:
+                worker.join(timeout=1.0)
         if not frames:
             _log("  no world tags detected — reposition and retry")
             continue
@@ -541,7 +565,8 @@ def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
 
 
 def _save_world_map_3d(world_map, out_dir: str, stamp: Optional[str], tag_size: float,
-                       world_ids: List[int], report: Dict, corner_frames=None) -> Path:
+                       world_ids: List[int], report: Dict, corner_frames=None,
+                       K=None) -> Path:
     """Persist a 3-D (non-coplanar) world map to ``runs/world_map_3d_<UTC>.npz``.
 
     Reuses ``world_map_to_arrays`` — the 3-D map dict shape is identical to the REV05
@@ -559,6 +584,8 @@ def _save_world_map_3d(world_map, out_dir: str, stamp: Optional[str], tag_size: 
     # captured so a structure-free map's keys are unchanged.
     extra = ({"corner_obs": np.array(corner_frames, dtype=object)}
              if corner_frames else {})
+    if K is not None:                              # intrinsics travel with the map so the
+        extra["K"] = np.asarray(K, dtype=float)    # Tier-2 BA needs no --k-npz borrow
     np.savez_compressed(path, world_map_ref=np.array(ref), world_map_ids=ids,
                         world_map_rels=rels, world_map_plane_point=pp,
                         world_map_plane_normal=pn,
@@ -650,7 +677,7 @@ def stage_register_world_3d(args, consumer: RelayConsumer, ui=None) -> int:
     _log(f"3-D per-frame scatter (sensor noise, NOT the gate): mean={report['mean_fit_residual_mm']:.1f} mm, "
          f"max={report['max_fit_residual_mm']:.1f} mm")
     path = _save_world_map_3d(world_map, args.out_dir, args.utc_stamp, args.tag_size,
-                              world_ids, report, corner_frames=corner_frames)
+                              world_ids, report, corner_frames=corner_frames, K=K)
     _log(f"saved 3-D world map → {path} ({len(corner_frames)} frames of corner "
          "observations for Tier-2 bundle adjustment)")
     return 0

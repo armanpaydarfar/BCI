@@ -436,6 +436,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--ref-tag", type=int, default=None, help="gauge tag (default: map ref)")
     p.add_argument("--struct-weight", type=float, default=5.0)
     p.add_argument("--max-frames", type=int, default=80)
+    p.add_argument("--k-npz", help="borrow camera intrinsics K from another npz (e.g. a "
+                   "sweep) when the map npz predates K-in-map; the Neon scene cam is "
+                   "device-fixed so any same-device capture's K is valid")
     p.add_argument("--self-test", action="store_true")
     args = p.parse_args(argv)
     if args.self_test:
@@ -457,7 +460,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     tag_size = float(meta.get("tag_size_m", 0.08))
     ref = args.ref_tag if args.ref_tag is not None else int(wm["ref_id"])
     groups = {"table": args.table_tag_ids, "wall": args.wall_tag_ids}
-    rel_ref, rep = bundle_adjust(corner_frames, np.asarray(z["K"], float), tag_size, rel_init,
+    if "K" in z.files:
+        K = np.asarray(z["K"], float)
+    elif args.k_npz:
+        kz = np.load(args.k_npz, allow_pickle=True)
+        if "K" not in kz.files:
+            print(f"{args.k_npz} has no K either"); return 2
+        K = np.asarray(kz["K"], float)
+        print(f"borrowed K from {args.k_npz} (map npz predates K-in-map)")
+    else:
+        print("map npz has no K (registered before K-in-map). Re-run with "
+              "--k-npz <a sweep npz from the SAME Neon> to borrow intrinsics."); return 2
+    rel_ref, rep = bundle_adjust(corner_frames, K, tag_size, rel_init,
                                  ref_tag=ref, plane_groups=groups, struct_w=args.struct_weight,
                                  max_frames=args.max_frames, verbose=print)
     print(f"BA: reproj rms {rep['reproj_rms_px_before']:.1f}->{rep['reproj_rms_px_after']:.2f} px, "
