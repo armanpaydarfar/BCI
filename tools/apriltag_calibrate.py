@@ -99,6 +99,7 @@ from Utils.gaze.apriltag_world import (  # noqa: E402
     world_map_to_arrays,
 )
 from Utils.gaze.apriltag_world_3d import (  # noqa: E402
+    apply_plane_structure,
     register_world_map_3d,
     world_map_3d_geometry_report,
     world_map_3d_reproducibility,
@@ -447,11 +448,15 @@ def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
                               "SPACE begins LIVE registration; sweep until green",
                               "then SPACE again to accept, q to abort"]):
                 _log("  world-3d registration aborted from the coverage window")
-                return None, []
+                return None, [], []
         else:
             input(f"place ALL world tags {ids} visible, then Enter to register the "
                   "3-D world map > ")
         frames: List[Dict[int, np.ndarray]] = []
+        # Per-frame tag CORNER pixels, saved for the Tier-2 constrained bundle
+        # adjustment (corner reprojection s.t. coplanar/perpendicular). Index-aligned
+        # with ``frames``.
+        corner_frames: List[Dict[int, np.ndarray]] = []
         # Live per-tag counters (UI path only): detection count and the viewing
         # directions seen, which drive the diversity/quality readout.
         views: Dict[int, int] = {}
@@ -470,6 +475,8 @@ def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
             frame = {int(i): tags[int(i)]["T"] for i in ids if int(i) in tags}
             if frame:
                 frames.append(frame)
+                corner_frames.append({int(i): tags[int(i)]["corners"]
+                                      for i in ids if int(i) in tags})
                 for i, T in frame.items():
                     views[i] = views.get(i, 0) + 1
                     bearings.setdefault(i, []).append(np.asarray(T, dtype=float)[:3, 3])
@@ -507,7 +514,7 @@ def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
                 last_ui = time.time()
                 if ui.aborted():
                     _log("  world-3d registration aborted from the coverage window")
-                    return None, []
+                    return None, [], []
                 if ui.finished():
                     break
         if not frames:
@@ -521,11 +528,11 @@ def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
                  "(the map needs every tag so any subset works later), then retry")
             continue
         _log(f"  world 3-D map OK: ref={world_map['ref_id']}, tags={seen}")
-        return world_map, frames
+        return world_map, frames, corner_frames
 
 
 def _save_world_map_3d(world_map, out_dir: str, stamp: Optional[str], tag_size: float,
-                       world_ids: List[int], report: Dict) -> Path:
+                       world_ids: List[int], report: Dict, corner_frames=None) -> Path:
     """Persist a 3-D (non-coplanar) world map to ``runs/world_map_3d_<UTC>.npz``.
 
     Reuses ``world_map_to_arrays`` — the 3-D map dict shape is identical to the REV05
@@ -538,13 +545,19 @@ def _save_world_map_3d(world_map, out_dir: str, stamp: Optional[str], tag_size: 
     stamp = stamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = out / f"world_map_3d_{stamp}.npz"
     ref, ids, rels, pp, pn = world_map_to_arrays(world_map)
+    # Corner observations (per-frame {tag_id: (4,2) px}) for the Tier-2 constrained
+    # bundle adjustment; an object array since tags-per-frame vary. Saved only when
+    # captured so a structure-free map's keys are unchanged.
+    extra = ({"corner_obs": np.array(corner_frames, dtype=object)}
+             if corner_frames else {})
     np.savez_compressed(path, world_map_ref=np.array(ref), world_map_ids=ids,
                         world_map_rels=rels, world_map_plane_point=pp,
                         world_map_plane_normal=pn,
                         meta=np.array({"stage": "register-world-3d",
                                        "tag_size_m": tag_size,
                                        "world_tag_ids": list(world_ids),
-                                       "geometry_3d": report}, dtype=object))
+                                       "geometry_3d": report}, dtype=object),
+                        **extra)
     return path
 
 
@@ -568,13 +581,37 @@ def stage_register_world_3d(args, consumer: RelayConsumer, ui=None) -> int:
     _log(f"register-world-3d: view tags {world_ids} @ {args.tag_size} m from MANY "
          "heights/angles (no robot needed). A non-coplanar layout is expected — the "
          "3-D fuse keeps tags off the table plane (NO coplanar snap).")
-    world_map, frames = _register_world_map_3d_interactive(
+    world_map, frames, corner_frames = _register_world_map_3d_interactive(
         consumer, detector, K, world_ids, tag_size=args.tag_size, ui=ui)
     if ui is not None:
         ui.close()
     if world_map is None:
         return 1
+    # Tier-1 structural hardening (opt-in): if the rig's coplanar/perpendicular tag
+    # groups are given, snap each group onto its plane and square the planes — this
+    # corrects the single-tag depth ambiguity the fuse can't (table reads flat, the
+    # table⊥wall reads 90°), so board-PnP recovery + the table target ride on a
+    # structurally-correct map.
+    struct = None
+    if args.table_plane_tag_ids or args.wall_plane_tag_ids:
+        groups = {}
+        if args.table_plane_tag_ids:
+            groups["table"] = [int(i) for i in args.table_plane_tag_ids]
+        if args.wall_plane_tag_ids:
+            groups["wall"] = [int(i) for i in args.wall_plane_tag_ids]
+        perp = [("table", "wall")] if {"table", "wall"} <= set(groups) else []
+        world_map, struct = apply_plane_structure(world_map, groups, perpendicular_pairs=perp)
+        for name, g in struct["groups"].items():
+            _log(f"structure: {name} plane — corrected origin flatness max={g['flatness_max_mm']:.1f} "
+                 f"rms={g['flatness_rms_mm']:.1f} mm (tags {g['ids']})")
+        for pair, p in struct["perpendicular"].items():
+            off = abs(90.0 - p["angle_before_deg"])
+            verdict = "OK" if off <= 8.0 else "POOR — registration was far from square; re-capture"
+            _log(f"structure: {pair} was {p['angle_before_deg']:.1f}° (off 90° by {off:.1f}°) "
+                 f"→ squared to 90°, each normal moved {p['normal_moved_deg']:.1f}° [{verdict}]")
     report = world_map_3d_geometry_report(world_map, frames)
+    if struct is not None:
+        report["structure"] = struct
     _log(f"3-D geometry: non-planarity max_out_of_plane={report['max_out_of_plane_mm']:.1f} mm, "
          f"z_spread={report['z_spread_mm']:.1f} mm (large ⇒ genuine 3-D structure; "
          "near-0 ⇒ effectively coplanar, REV05 would do)")
@@ -594,8 +631,9 @@ def stage_register_world_3d(args, consumer: RelayConsumer, ui=None) -> int:
     _log(f"3-D per-frame scatter (sensor noise, NOT the gate): mean={report['mean_fit_residual_mm']:.1f} mm, "
          f"max={report['max_fit_residual_mm']:.1f} mm")
     path = _save_world_map_3d(world_map, args.out_dir, args.utc_stamp, args.tag_size,
-                              world_ids, report)
-    _log(f"saved 3-D world map → {path}")
+                              world_ids, report, corner_frames=corner_frames)
+    _log(f"saved 3-D world map → {path} ({len(corner_frames)} frames of corner "
+         "observations for Tier-2 bundle adjustment)")
     return 0
 
 
@@ -1695,6 +1733,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="one or more world tag ids; collect registers a map over "
                         "them so any visible subset recovers the world frame "
                         "(occlusion-robust). detect/gaze use the first.")
+    p.add_argument("--table-plane-tag-ids", type=int, nargs="+", default=None,
+                   help="register-world-3d: tag ids physically coplanar ON THE TABLE. "
+                        "Given (with --wall-plane-tag-ids), the map is hardened — these "
+                        "tags are snapped coplanar and the table⊥wall planes squared to "
+                        "90° (fixes the single-tag depth ambiguity). Off = pure fuse.")
+    p.add_argument("--wall-plane-tag-ids", type=int, nargs="+", default=None,
+                   help="register-world-3d: tag ids coplanar ON THE WALL (perpendicular "
+                        "to the table). See --table-plane-tag-ids.")
     p.add_argument("--ee-tag-id", type=int, default=None,
                    help="single EE tag id (back-compat: a 1-entry EE map)")
     p.add_argument("--ee-tag-ids", type=int, nargs="+", default=None,
