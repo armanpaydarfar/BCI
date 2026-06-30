@@ -193,6 +193,7 @@ class ControlPanel(QMainWindow):
             harmony_online_control_py=HARMONY_ONLINE_CONTROL_PY,
             apriltag_calibrate_py=APRILTAG_CALIBRATE_PY,
             apriltag_control_test_py=APRILTAG_CONTROL_TEST_PY,
+            apriltag_control_test_3d_py=APRILTAG_CONTROL_TEST_3D_PY,
             hcfg=_HCFG,
             spawn_external=self._spawn_external,
             log=self._append_log,
