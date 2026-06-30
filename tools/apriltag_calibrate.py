@@ -463,6 +463,12 @@ def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
         bearings: Dict[int, List[np.ndarray]] = {}
         last_idx = None
         last_ui = 0.0
+        # Cached quality readout (recomputed on the 0.4 s timer below). Initialised so
+        # the per-frame redraw has something valid to show before the first recompute.
+        qualities = classify_tags(ids, {}, None, {}) if ui is not None else None
+        summary = registration_summary(qualities) if ui is not None else None
+        if summary is not None:
+            summary["scatter_mm"] = None
         deadline = time.time() + (max_dur if ui is not None else dur)
         while time.time() < deadline:
             b = consumer.latest()
@@ -480,38 +486,41 @@ def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
                 for i, T in frame.items():
                     views[i] = views.get(i, 0) + 1
                     bearings.setdefault(i, []).append(np.asarray(T, dtype=float)[:3, 3])
-            if ui is not None and time.time() - last_ui >= 0.4:
-                # Gate on split-half REPRODUCIBILITY (map accuracy), not the
-                # per-frame scatter (sensor-noise floor that never improves). Show
-                # scatter only as a dim diagnostic.
-                #
-                # Bound the live estimate to an evenly-spaced subsample so each
-                # recompute is CONSTANT cost — re-fusing all accumulated frames
-                # every tick grew O(frames) and lagged the capture badly. The
-                # final fuse (post-capture) still uses every frame.
-                repro_map = None
-                scatter_mm = None
-                if len(frames) >= 4:
-                    if len(frames) > _LIVE_SAMPLE_FRAMES:
-                        sel = np.linspace(0, len(frames) - 1, _LIVE_SAMPLE_FRAMES).astype(int)
-                        live = [frames[i] for i in sel]
-                    else:
-                        live = frames
-                    try:
-                        repro_map = world_map_3d_reproducibility(live)
-                        rep = world_map_3d_geometry_report(
-                            register_world_map_3d(live), live)
-                        scatter_mm = rep["mean_fit_residual_mm"]
-                    except ValueError:
-                        # Pre-convergence: too few co-visible frames to fuse a half
-                        # yet. Expected transient — show views/diversity only.
-                        repro_map = None
-                diversity = {i: cone_half_angle_deg(bearings[i]) for i in bearings}
-                qualities = classify_tags(ids, views, repro_map, diversity)
-                summary = registration_summary(qualities)
-                summary["scatter_mm"] = scatter_mm
+            if ui is not None:
+                # Recompute the EXPENSIVE quality readout on a 0.4 s timer — the
+                # split-half reproducibility re-fuses the map and must not run per
+                # frame — and cache it. Gate on reproducibility (map accuracy), not
+                # per-frame scatter (a sensor-noise floor that never improves; shown
+                # only as a dim diagnostic). The estimate is bounded to an evenly-
+                # spaced subsample so each recompute is CONSTANT cost; the final fuse
+                # (post-capture) still uses every frame.
+                if time.time() - last_ui >= 0.4:
+                    repro_map = None
+                    scatter_mm = None
+                    if len(frames) >= 4:
+                        if len(frames) > _LIVE_SAMPLE_FRAMES:
+                            sel = np.linspace(0, len(frames) - 1, _LIVE_SAMPLE_FRAMES).astype(int)
+                            live = [frames[i] for i in sel]
+                        else:
+                            live = frames
+                        try:
+                            repro_map = world_map_3d_reproducibility(live)
+                            rep = world_map_3d_geometry_report(
+                                register_world_map_3d(live), live)
+                            scatter_mm = rep["mean_fit_residual_mm"]
+                        except ValueError:
+                            # Pre-convergence: too few co-visible frames to fuse a
+                            # half yet. Expected transient — show views/diversity only.
+                            repro_map = None
+                    diversity = {i: cone_half_angle_deg(bearings[i]) for i in bearings}
+                    qualities = classify_tags(ids, views, repro_map, diversity)
+                    summary = registration_summary(qualities)
+                    summary["scatter_mm"] = scatter_mm
+                    last_ui = time.time()
+                # Redraw EVERY frame (cheap cv2 blit) so the video stays smooth and
+                # SPACE/q stay responsive — trapping the redraw behind the 0.4 s
+                # re-fuse gate was what made the feed lag at ~2.5 fps.
                 ui.update(b.video.bgr, tags, qualities, summary)
-                last_ui = time.time()
                 if ui.aborted():
                     _log("  world-3d registration aborted from the coverage window")
                     return None, [], []
