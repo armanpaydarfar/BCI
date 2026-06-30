@@ -1007,17 +1007,18 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                                           plane_point, plane_normal, offset_mm)
                 if p_world is not None:
                     cur_uv = plane_coords(p_world, plane_point, plane_normal)
-                    # Telemetry-anchored coverage + display (operator 2026-06-25): bin
-                    # and draw the robot's OWN end-effector (x,y) — the single most
-                    # consistent metric — so the screen shows exactly where the arm is,
-                    # in robot axes. The library still stores the vision (u,v) (gaze is
-                    # the only runtime signal); telemetry anchors coverage/display only.
-                    # No-robot dry run has NaN telemetry → fall back to vision (u,v).
-                    # With --coverage-3d, bin the full EE (x,y,z) into voxels instead
-                    # (the z axis is the whole point); --with-robot is enforced above so
-                    # the telemetry is finite here.
+                    # Coverage frame: the 2-D (REV05 EE-tag) sweep bins the robot's OWN
+                    # telemetry EE (x,y) — the most consistent metric, in robot axes.
+                    # BUT --coverage-3d (the object-tag/depth-free workflow) bins the
+                    # CONTROLLED POINT in the WORLD frame (``p_world`` = the tag's
+                    # position, the actual (x,y,z)→Q library coordinate), NOT the
+                    # telemetry EE — otherwise the voxel coverage shows where the arm
+                    # went (robot frame) while the library it builds lives in the world
+                    # frame, and the operator fills the wrong volume (the offline check
+                    # found table-level + corner gaps the telemetry view would hide).
+                    # No-robot dry run → vision (u,v) fallback for the 2-D path.
                     if args.coverage_3d:
-                        disp_xy = x_ee[:3]
+                        disp_xy = np.asarray(p_world, dtype=float)[:3]
                     else:
                         disp_xy = x_ee[:2] if np.all(np.isfinite(x_ee[:2])) else cur_uv
                     grid.add(disp_xy)
