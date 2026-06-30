@@ -423,7 +423,8 @@ _LIVE_SAMPLE_FRAMES = 180
 
 
 def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
-                                       max_dur=90.0, tag_size, ui=None):
+                                       max_dur=90.0, tag_size, ui=None,
+                                       dist_coeffs=None):
     """Collect a head sweep over the static world tags and fuse a TRUE-3-D map
     (``register_world_map_3d`` — NO coplanar snap), retrying until every listed tag
     is captured. Mirrors ``_register_map_interactive``'s prompt/retry, but uses the
@@ -435,11 +436,24 @@ def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
     heights/angles (so off-table tags triangulate), and being non-coplanar is
     expected rather than a fault.
 
+    ``dist_coeffs``: the Neon lens distortion. When given, every frame is UNDISTORTED
+    (cv2.remap, same K) before detection, so the fused poses + saved corners are in a
+    rectified pinhole frame. The Neon ships raw wide-FOV frames; without this the
+    pinhole pose is biased by tens of px at the edges (the 2026-06-30 root cause of
+    the ~15px BA reproj floor / 42mm scatter / 0.65 scale).
+
     With a ``RegistrationView`` the capture is operator-driven: the per-tag
     reproducibility residual + viewpoint diversity are recomputed live on the frames
     so far and shown on the window, so the operator sweeps until the tags go green
     and presses SPACE to accept (capped at ``max_dur``). Headless it falls back to
     the original blind fixed ``dur`` window."""
+    import cv2  # lazy: only the camera path needs it
+    dist = (np.asarray(dist_coeffs, dtype=float).ravel()
+            if dist_coeffs is not None and np.any(np.abs(np.asarray(dist_coeffs)) > 1e-9)
+            else None)
+    umap = [None, None]      # lazily-built undistort remap (K + frame size are constant)
+    if dist is not None:
+        _log(f"  undistorting frames before detection (Neon lens, |k1|={abs(dist[0]):.3f})")
     while True:
         if ui is not None:
             from Utils.gaze.registration_view import (
@@ -480,9 +494,12 @@ def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
             nonlocal qualities, summary
             while not stop_worker.wait(0.4):
                 with data_lock:
-                    snap = list(frames)
+                    # Bound the snapshot to a recent window so the worker's per-cycle
+                    # cost is CONSTANT — copying ALL frames each tick made the capture
+                    # laggier as it grew. The final fuse (post-capture) uses every frame.
+                    snap = frames[-_LIVE_SAMPLE_FRAMES:]
                     v = dict(views)
-                    bd = {k: list(val) for k, val in bearings.items()}
+                    bd = {k: val[-_LIVE_SAMPLE_FRAMES:] for k, val in bearings.items()}
                 try:
                     repro_map = None
                     scatter_mm = None
@@ -524,7 +541,14 @@ def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
                     time.sleep(0.005)
                     continue
                 last_idx = b.video.frame_idx
-                tags = detect_tags(detector, b.video.bgr, K, tag_size)
+                bgr = b.video.bgr
+                if dist is not None:                       # rectify before detection
+                    if umap[0] is None:
+                        h, w = bgr.shape[:2]
+                        umap[0], umap[1] = cv2.initUndistortRectifyMap(
+                            K, dist, None, K, (w, h), cv2.CV_32FC1)
+                    bgr = cv2.remap(bgr, umap[0], umap[1], cv2.INTER_LINEAR)
+                tags = detect_tags(detector, bgr, K, tag_size)
                 frame = {int(i): tags[int(i)]["T"] for i in ids if int(i) in tags}
                 if frame:
                     with data_lock:
@@ -540,16 +564,19 @@ def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
                         q, s = qualities, summary
                     # Redraw EVERY frame (cheap cv2 blit) so the video is smooth and
                     # SPACE/q stay responsive; the heavy re-fuse is off-thread above.
-                    ui.update(b.video.bgr, tags, q, s)
+                    ui.update(bgr, tags, q, s)
                     if ui.aborted():
                         _log("  world-3d registration aborted from the coverage window")
                         return None, [], []
                     if ui.finished():
                         break
         finally:
+            # Join generously: a daemon worker still mid-fuse at interpreter teardown
+            # aborts the process ("terminate called" core dump). With the bounded
+            # snapshot above a fuse is well under this, so the worker exits cleanly.
             stop_worker.set()
             if worker is not None:
-                worker.join(timeout=1.0)
+                worker.join(timeout=3.0)
         if not frames:
             _log("  no world tags detected — reposition and retry")
             continue
@@ -618,7 +645,8 @@ def stage_register_world_3d(args, consumer: RelayConsumer, ui=None) -> int:
          "heights/angles (no robot needed). A non-coplanar layout is expected — the "
          "3-D fuse keeps tags off the table plane (NO coplanar snap).")
     world_map, frames, corner_frames = _register_world_map_3d_interactive(
-        consumer, detector, K, world_ids, tag_size=args.tag_size, ui=ui)
+        consumer, detector, K, world_ids, tag_size=args.tag_size, ui=ui,
+        dist_coeffs=consumer.distortion_coeffs)
     if ui is not None:
         ui.close()
     if world_map is None:

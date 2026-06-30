@@ -179,6 +179,15 @@ class RelayConsumer:
     def camera_matrix(self) -> np.ndarray:
         return np.asarray(self._reader.camera_matrix, dtype=float)
 
+    @property
+    def distortion_coeffs(self):
+        """Factory lens-distortion coefficients from the relay handshake (the Neon
+        scene cam is wide-FOV and ships RAW frames), or None. The AprilTag pipeline
+        must undistort with these before pose/PnP/BA — without it the pinhole
+        assumption biases corners by tens of px at the image edges."""
+        d = self._reader.distortion_coeffs
+        return None if d is None else np.asarray(d, dtype=float).ravel()
+
     def close(self) -> None:
         self._stop.set()
         try:
