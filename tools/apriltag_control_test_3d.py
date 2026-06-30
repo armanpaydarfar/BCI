@@ -583,6 +583,16 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
         _log(f"target world point = {np.round(p_world, 1).tolist()} mm")
         _log(f"nearest calibrated pose #{idx}: library xyz={np.round(result.x_target,1).tolist()} "
              f"mm, dist={dist:.1f} mm, clamped={clamped}")
+        # Hard refuse a target far beyond the calibrated region: a stray gaze (e.g. the
+        # operator glancing at the computer screen to read the result) casts to a point
+        # ~1 m away. Refuse outright — no double-g — so it can't be committed and the
+        # log isn't cluttered with garbage resolves.
+        if dist > args.max_resolve_dist_mm:
+            _log(f"REFUSED: target is {dist:.0f} mm from the nearest calibrated pose "
+                 f"(> {args.max_resolve_dist_mm:.0f} mm hard limit) — almost certainly a "
+                 "mis-fixation (gaze past the object, e.g. the screen). Re-resolve.")
+            pending, far_armed = None, False
+            continue
         _log(f"joint target (rad) = {np.round(q_cmd,4).tolist()}")
         if dist > args.max_nn_dist_mm:
             _log(f"WARNING: {dist:.0f} mm from the nearest calibrated pose — outside the "
@@ -632,6 +642,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="world-pose anchoring window (s) — hold the head still")
     p.add_argument("--max-nn-dist-mm", type=float, default=80.0,
                    help="warn/guard if the nearest calibrated pose is farther than this")
+    p.add_argument("--max-resolve-dist-mm", type=float, default=300.0,
+                   help="HARD refuse a target this far from any calibrated pose — a "
+                        "mis-fixation (e.g. gaze drifting to the computer screen lands "
+                        "~1m away); refused outright, no double-g override")
     p.add_argument("--target-source", choices=["object_plane", "depth"],
                    default="object_plane",
                    help="how to get the 3-D target. 'object_plane' (default, robust): "
