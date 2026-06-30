@@ -130,6 +130,21 @@ def test_select_footprint_row():
     assert abs(cy - 100.0) < 1.0
 
 
+def test_select_rejects_table_sized_mask():
+    # A huge "table" mask containing the gaze + a small object mask also containing
+    # it. With the area guard, the table is rejected and the object is picked.
+    frame_area = 640 * 480
+    table = {"mask_polygon": _square(320, 240, 300)}   # ~0.78 of the frame
+    obj = {"mask_polygon": _square(330, 250, 25)}
+    px, py, info = select_object_pixel([table, obj], (332.0, 252.0), "centroid",
+                                       frame_area_px=frame_area, max_area_frac=0.5)
+    assert info["rejected_large"] == 1
+    np.testing.assert_allclose([px, py], [330.0, 250.0], atol=1.0)   # the object, not the table
+    # Without a frame area the guard is off (legacy behaviour) → table can win.
+    _, _, info2 = select_object_pixel([table, obj], (332.0, 252.0), "centroid")
+    assert info2["rejected_large"] == 0
+
+
 def test_select_miss_when_gaze_far_outside():
     det = {"mask_polygon": _square(100, 100, 20)}
     px, py, info = select_object_pixel([det], (1000.0, 1000.0), "centroid")

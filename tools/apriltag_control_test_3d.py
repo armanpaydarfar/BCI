@@ -271,13 +271,18 @@ def _resolve_object_plane(vlm, args, K, T_cam_world, diag,
              f"{_fmt_px(our_gaze)} diverged >{GAZE_DIVERGENCE_TOL_PX:.0f}px (head moved "
              "during resolve). NOT moving — hold still and re-resolve.")
         return None, None
+    # Frame area (≈ from the principal point) for the table-rejection guard: masks
+    # bigger than a fraction of the frame are the table/background, not an object.
+    frame_area = 4.0 * float(K[0, 2]) * float(K[1, 2])
     if args.target_point == "gaze_height":
         # XY from the footprint (overshoot-free, stable); height from the gaze ray ∩
         # the object's vertical line through that footprint.
-        fpx, fpy, sel = select_object_pixel(dets, svc_gaze, "footprint")
+        fpx, fpy, sel = select_object_pixel(dets, svc_gaze, "footprint",
+                                            frame_area_px=frame_area,
+                                            max_area_frac=args.max_object_area_frac)
         if fpx is None:
             _log(f"segment: {sel['n_dets']} masks, none under gaze "
-                 f"(n_contained={sel['n_contained']}); no object to target. NOT moving.")
+                 f"(n_contained={sel['n_contained']}, {sel.get('rejected_large',0)} table-sized dropped); no object to target. NOT moving.")
             return None, None
         base = pixel_on_plane_world(fpx, fpy, K, T_cam_world, table_point, table_normal)
         if base is None:
@@ -293,10 +298,12 @@ def _resolve_object_plane(vlm, args, K, T_cam_world, diag,
              f"footprint=({fpx:.0f},{fpy:.0f}), gaze height={h_mm:.0f} mm above table  "
              f"[{len(dets)} masks, gaze div={_px_dist(svc_gaze, our_gaze):.0f}px]")
     else:
-        px, py, sel = select_object_pixel(dets, svc_gaze, args.target_point)
+        px, py, sel = select_object_pixel(dets, svc_gaze, args.target_point,
+                                          frame_area_px=frame_area,
+                                          max_area_frac=args.max_object_area_frac)
         if px is None:
             _log(f"segment: {sel['n_dets']} masks, none under gaze "
-                 f"(n_contained={sel['n_contained']}); no object to target. NOT moving.")
+                 f"(n_contained={sel['n_contained']}, {sel.get('rejected_large',0)} table-sized dropped); no object to target. NOT moving.")
             return None, None
         p_world = pixel_on_plane_world(px, py, K, T_cam_world, table_point, table_normal)
         if p_world is None:
@@ -542,6 +549,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "∩ table. 'gaze_height': footprint XY but height from the gaze ray "
                         "∩ the object's vertical line — look at a part, move to its height "
                         "(for tall/stacked objects).")
+    p.add_argument("--max-object-area-frac", type=float, default=0.5,
+                   help="object_plane: drop any segment larger than this fraction of "
+                        "the frame as the TABLE / background (so the table is never "
+                        "picked as the target). Default 0.5.")
     p.add_argument("--table-tag-ids", type=int, nargs="+", default=None,
                    help="world tag ids physically ON the table, used to fit the table "
                         "plane (default: config.APRILTAG_WORLD_TAG_IDS). Exclude "

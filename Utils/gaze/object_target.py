@@ -83,7 +83,9 @@ def table_plane_from_map(world_map: Dict,
 def select_object_pixel(detections: List[Dict], gaze_xy: Tuple[float, float],
                         source: str, *,
                         outside_tol_px: float = HIT_OUTSIDE_TOL_PX,
-                        bottom_band_px: float = BOTTOM_BAND_PX
+                        bottom_band_px: float = BOTTOM_BAND_PX,
+                        frame_area_px: Optional[float] = None,
+                        max_area_frac: float = 0.5
                         ) -> Tuple[Optional[float], Optional[float], Dict]:
     """Pick the fixated WHOLE object's mask and return its target pixel.
 
@@ -99,22 +101,36 @@ def select_object_pixel(detections: List[Dict], gaze_xy: Tuple[float, float],
     over-segmented object. With no containing mask, fall back to the nearest mask
     within ``outside_tol_px``; a clean miss returns ``(None, None, info)``.
 
-    Returns ``(px, py, info)``. ``info`` has ``n_dets``/``n_contained``/``pick``
-    and, on a hit, ``mask_area_px`` — log it to see WHY a target was chosen.
+    **Table rejection:** with ``frame_area_px`` set, any mask larger than
+    ``max_area_frac`` of the frame is dropped as the table / whole-scene blob, so
+    the table can't be picked as the target even when the gaze sits in its mask.
+
+    Returns ``(px, py, info)``. ``info`` has ``n_dets``/``n_contained``/
+    ``rejected_large``/``pick`` and, on a hit, ``mask_area_px`` — log it to see WHY
+    a target was chosen.
     """
     import cv2  # lazy: only the perception path needs it
 
     gx, gy = float(gaze_xy[0]), float(gaze_xy[1])
+    # A mask larger than ``max_area_frac`` of the frame is the TABLE / background, not
+    # a graspable object — exclude it as a candidate (the table is segmentable and
+    # would otherwise be picked when the gaze sits inside its sprawling mask). Needs
+    # frame_area_px; off when None.
+    area_cap = (max_area_frac * float(frame_area_px)) if frame_area_px else None
     contained: List[Tuple[float, float, np.ndarray]] = []   # (centroid_dist, area, contour)
     nearest_outside: Optional[Tuple[float, np.ndarray]] = None  # (outside_dist, contour)
+    n_rejected_large = 0
     for det in detections:
         poly = det.get("mask_polygon")
         if poly is None or len(poly) < 3:
             continue
         cnt = np.asarray(poly, dtype=np.int32).reshape(-1, 1, 2)
-        signed = cv2.pointPolygonTest(cnt, (gx, gy), True)  # ≥0 inside, signed mm-of-pixels
         M = cv2.moments(cnt)
         area = float(M["m00"])
+        if area_cap is not None and area > area_cap:
+            n_rejected_large += 1          # table / whole-scene blob — not an object
+            continue
+        signed = cv2.pointPolygonTest(cnt, (gx, gy), True)  # ≥0 inside, signed mm-of-pixels
         if area > 0:
             cxy = (M["m10"] / area, M["m01"] / area)
         else:
@@ -127,7 +143,8 @@ def select_object_pixel(detections: List[Dict], gaze_xy: Tuple[float, float],
             if nearest_outside is None or od < nearest_outside[0]:
                 nearest_outside = (od, cnt)
 
-    info: Dict = {"n_dets": len(detections), "n_contained": len(contained)}
+    info: Dict = {"n_dets": len(detections), "n_contained": len(contained),
+                  "rejected_large": n_rejected_large}
     if contained:
         cnt = min(contained, key=lambda c: (c[0], c[1]))[2]
         info["pick"] = "contained"
