@@ -319,6 +319,113 @@ def height_on_vertical(gaze_px, base_world: np.ndarray, table_normal: np.ndarray
     return P1 + t * n
 
 
+def triangulate_vertical_line(cam_origins: np.ndarray, ray_dirs: np.ndarray,
+                              table_point: np.ndarray, table_normal: np.ndarray
+                              ) -> Tuple[Optional[np.ndarray], float]:
+    """Footprint (table point) of an object's vertical line, triangulated from many
+    gaze rays taken from DIFFERENT head positions while looking at the object.
+
+    Each gaze ray, dropped straight onto the table plane, is a 2-D "shadow" line that
+    passes through the object's footprint; rays from different viewpoints converge
+    there. The footprint is the least-squares intersection of those shadow lines —
+    so the operator never aims at the (possibly occluded) base, only at the object.
+
+    ``cam_origins``/``ray_dirs``: (N,3) world-frame ray origins + directions (one per
+    captured frame). Returns ``(footprint_world_mm, residual_mm)``; residual is the
+    mean perpendicular distance of the shadows to the fit (large ⇒ rays too parallel,
+    i.e. the head didn't move enough). ``(None, inf)`` if < 2 usable rays."""
+    o = np.asarray(cam_origins, dtype=float).reshape(-1, 3)
+    d = np.asarray(ray_dirs, dtype=float).reshape(-1, 3)
+    n = np.asarray(table_normal, dtype=float)
+    n = n / max(float(np.linalg.norm(n)), 1e-9)
+    p0 = np.asarray(table_point, dtype=float)
+    eye = np.eye(3)
+    A = np.zeros((3, 3))
+    b = np.zeros(3)
+    qs, us, used = [], [], 0
+    for oi, di in zip(o, d):
+        nd = float(np.linalg.norm(di))
+        if nd < 1e-9:
+            continue
+        di = di / nd
+        u = di - (di @ n) * n                       # shadow direction (drop the vertical)
+        nu = float(np.linalg.norm(u))
+        if nu < 1e-6:                               # looking straight down → no XY info
+            continue
+        u = u / nu
+        q = oi - ((oi - p0) @ n) * n                 # ray origin dropped onto the table
+        P = eye - np.outer(u, u)                     # ⟂-to-shadow projector
+        A += P; b += P @ q; qs.append(q); us.append(u); used += 1
+    if used < 2:
+        return None, float("inf")
+    f = np.linalg.lstsq(A, b, rcond=None)[0]
+    f = f - ((f - p0) @ n) * n                       # snap onto the table plane
+    resid = float(np.mean([np.linalg.norm((eye - np.outer(u, u)) @ (f - q))
+                           for q, u in zip(qs, us)]))
+    return f, resid
+
+
+def gaze_line_distance_target(gaze_px, footprint: np.ndarray, table_normal: np.ndarray,
+                              K: np.ndarray, T_cam_world: np.ndarray, *,
+                              max_height_mm: float = 600.0):
+    """For one registered object (vertical line at ``footprint``), the gaze ray's
+    closest-approach DISTANCE to that line (mm — for choosing which object the gaze is
+    on) and the target point at the gaze height on it. ``None`` on a bad ray."""
+    ray_cam = gaze_ray_cam(float(gaze_px[0]), float(gaze_px[1]), K)
+    if ray_cam is None:
+        return None
+    T_wc = invert_transform(T_cam_world)
+    cam_org = T_wc[:3, 3]
+    ray_w = T_wc[:3, :3] @ ray_cam
+    nrm = float(np.linalg.norm(ray_w))
+    if nrm < 1e-9:
+        return None
+    ray_w = ray_w / nrm
+    n = np.asarray(table_normal, dtype=float)
+    n = n / max(float(np.linalg.norm(n)), 1e-9)
+    f = np.asarray(footprint, dtype=float)
+    cross = np.cross(n, ray_w)
+    cn = float(np.linalg.norm(cross))
+    w = f - cam_org
+    if cn < 1e-9:                                    # gaze ∥ vertical → use ⟂ distance
+        dist = float(np.linalg.norm(w - (w @ ray_w) * ray_w))
+    else:
+        dist = float(abs(w @ cross) / cn)            # skew-line closest approach
+    target = height_on_vertical(gaze_px, f, table_normal, K, T_cam_world,
+                                max_height_mm=max_height_mm)
+    if target is None:
+        return None
+    return dist, target
+
+
+def select_vertical_line(gaze_px, footprints: List[np.ndarray], table_normal: np.ndarray,
+                         K: np.ndarray, T_cam_world: np.ndarray, *,
+                         max_dist_mm: float = 60.0, max_height_mm: float = 600.0):
+    """Pick the registered object whose vertical line the gaze ray passes CLOSEST to,
+    and return the target at the gaze height on it. The footprints come from
+    ``triangulate_vertical_line`` — so a cup on a block is reached without segmenting
+    anything (the cup's own line + the gaze height). Refuses (``None``) if the nearest
+    line is farther than ``max_dist_mm`` (gaze not on any registered object).
+
+    Returns ``(target_world | None, info)``; ``info`` has ``idx``/``dist``/``n`` (or a
+    ``reason`` on refuse)."""
+    best = None
+    for i, f in enumerate(footprints):
+        r = gaze_line_distance_target(gaze_px, f, table_normal, K, T_cam_world,
+                                      max_height_mm=max_height_mm)
+        if r is None:
+            continue
+        dist, target = r
+        if best is None or dist < best[0]:
+            best = (dist, target, i)
+    if best is None:
+        return None, {"reason": "no_ray", "n": len(footprints)}
+    if best[0] > max_dist_mm:
+        return None, {"reason": "too_far", "nearest_dist": best[0],
+                      "idx": best[2], "n": len(footprints)}
+    return best[1], {"idx": best[2], "dist": best[0], "n": len(footprints)}
+
+
 def world_to_pixel(p_world: np.ndarray, K: np.ndarray,
                    T_cam_world: np.ndarray) -> Optional[tuple]:
     """Project a world point to a scene-camera pixel (for the visual interface, e.g.
