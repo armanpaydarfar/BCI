@@ -800,8 +800,15 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     ee_size = args.ee_tag_size or args.tag_size
     tag_sizes = {int(i): ee_size for i in ee_ids}
     ee_point_method = args.ee_point_method or "pose"
+    # Optional stabilizer tag (e.g. the rigid EE tag 5): record its pose per sample
+    # for the wobble diagnostic. Size it (own --stabilizer-tag-size or the EE size)
+    # so its pose is scaled right when detected alongside the controlled tag.
+    stab_id = int(args.stabilizer_tag_id) if args.stabilizer_tag_id is not None else None
+    if stab_id is not None:
+        tag_sizes[stab_id] = args.stabilizer_tag_size or ee_size
     _log(f"tag sizes: world {args.tag_size} m, EE {ee_size} m; world tags "
-         f"{world_ids}, EE tags {ee_ids}; EE point method: {ee_point_method}")
+         f"{world_ids}, EE tags {ee_ids}; EE point method: {ee_point_method}"
+         + (f"; stabilizer tag {stab_id}" if stab_id is not None else ""))
 
     # Opt-in 3-D volumetric coverage (WS-4): bin the EE (x,y,z) into voxels so the
     # operator covers the workspace VOLUME, not just one table slice. Default off →
@@ -837,6 +844,7 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     eequat_rows: List[np.ndarray] = []
     tcw_rows: List[np.ndarray] = []
     tce_rows: List[np.ndarray] = []
+    tstab_rows: List[np.ndarray] = []   # stabilizer tag pose per accepted sample (NaN if unseen)
     t_rows: List[float] = []
     # WS-1/WS-2b offline prototyping needs the scene frame at each accepted sample
     # (to segment the held/target object); --save-frames writes them as a JPEG
@@ -983,6 +991,9 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                     tcw_rows.append(T_cam_world)
                     tce_rows.append(T_cam_eetag)
                     t_rows.append(t_robot)
+                    if stab_id is not None:
+                        tstab_rows.append(tags[stab_id]["T"] if stab_id in tags
+                                          else np.full((4, 4), np.nan))
                     if args.save_frames:
                         frame_rows.append(b.video.bgr.copy())
                     accepted += 1
@@ -1062,6 +1073,28 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                  f"y[{fin[:,1].min():.0f},{fin[:,1].max():.0f}] "
                  f"z[{fin[:,2].min():.0f},{fin[:,2].max():.0f}]")
 
+    # Stabilizer wobble: over samples where BOTH the controlled tag and the
+    # stabilizer (rigid EE) tag were seen, the spread of the controlled↔stabilizer
+    # offset IS the grip/hand-wobble error. Small ⇒ the controlled tag alone is
+    # rigid enough; large ⇒ rebuild the library from stabilizer + the solved offset.
+    if stab_id is not None and tstab_rows:
+        offs = []
+        for tce, tstab in zip(tce_rows, tstab_rows):
+            if np.all(np.isfinite(tce)) and np.all(np.isfinite(tstab)):
+                offs.append((invert_transform(np.asarray(tstab, float))
+                             @ np.asarray(tce, float))[:3, 3])
+        if len(offs) >= 2:
+            O = np.array(offs)
+            sd = O.std(axis=0)
+            _log(f"  stabilizer tag {stab_id}: both tags seen in {len(offs)}/{len(tce_rows)} "
+                 f"samples; controlled↔stabilizer offset mean={np.round(O.mean(axis=0),1).tolist()} "
+                 f"mm, wobble std=[{sd[0]:.1f},{sd[1]:.1f},{sd[2]:.1f}] mm "
+                 f"(|sd|={float(np.linalg.norm(sd)):.1f}); small ⇒ rigid, large ⇒ use "
+                 "stabilizer+offset for the library)")
+        else:
+            _log(f"  stabilizer tag {stab_id}: <2 samples with both tags visible "
+                 "— couldn't measure wobble (keep it in view alongside the controlled tag)")
+
     if len(uv_rows) < 3:
         _log(f"only {len(uv_rows)} accepted samples (<3) — not saving a solvable npz")
         return 1
@@ -1129,6 +1162,12 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                         [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         _log(f"saved {len(frame_rows)} scene frames → {frames_dir}")
     meta["frames_dir"] = frames_dir.name if frames_dir is not None else None
+    meta["stabilizer_tag_id"] = stab_id
+    # Stabilizer poses (index-aligned with T_cam_eetag) only when recorded, so a
+    # default sweep's npz keys are unchanged. Lets an offline solve rebuild the
+    # library from the rigid tag + its solved offset without re-capturing.
+    stab_save = ({"T_cam_stab": np.stack(tstab_rows)}
+                 if stab_id is not None and tstab_rows else {})
     np.savez_compressed(
         out_path,
         UV=np.vstack(uv_rows),
@@ -1145,6 +1184,7 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
         ee_map_ref=np.array(em_ref), ee_map_ids=em_ids, ee_map_rels=em_rels,
         ee_map_plane_point=em_pp, ee_map_plane_normal=em_pn,
         meta=np.array(meta, dtype=object),
+        **stab_save,
     )
     _log(f"saved {len(uv_rows)} swept samples ({int(green.sum())} in green/sufficient "
          f"cells) → {out_path}")
@@ -1667,6 +1707,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--t-eetag-ee", type=float, nargs=3, default=[0.0, 0.0, 0.0],
                    metavar=("X", "Y", "Z"),
                    help="hand-measured EE-tag→EE offset vector in MM")
+    p.add_argument("--stabilizer-tag-id", type=int, default=None,
+                   help="sweep: also record this tag's pose per sample (e.g. the rigid "
+                        "EE tag 5 while the controlled tag 18 is hand-held). Logs the "
+                        "controlled↔stabilizer offset wobble and saves the poses so an "
+                        "offline solve can rebuild the library from the rigid tag. "
+                        "Diagnostic only — does not change the captured library.")
+    p.add_argument("--stabilizer-tag-size", type=float, default=None,
+                   help="stabilizer tag edge length in METRES (default: --ee-tag-size)")
     p.add_argument("--duration", type=float, default=10.0,
                    help="detect/gaze sampling window (s)")
     p.add_argument("--with-robot", action="store_true",
