@@ -30,6 +30,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
+from typing import Callable  # noqa: F401  (used in string annotations)
 
 os.environ.setdefault("NUMBA_DISABLE_CACHING", "1")
 os.environ["MNE_USE_NUMBA"] = "false"

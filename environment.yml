@@ -62,6 +62,7 @@ dependencies:
   - xgboost             # live online `xgb_cov` decoder (runtime_common.py); unpickles + runs XGBClassifier at query time
   - pyside6             # Qt control panel (control_panel.py) + matplotlib Qt backend
   - pytest              # tests/ + the .githooks pre-commit gate
+  - pyflakes            # static undefined-name gate (tests/test_no_undefined_names.py)
   - pip
   - pip:
       - pylsl==1.16.2   # PINNED: realtime API stability. The drivers + Tier-1 stream files call the deprecated `resolve_stream(...)`, which pylsl 1.17+ REMOVED (renamed `resolve_streams`). Migrating that across 11 realtime files is out of scope; hold the known-good version.

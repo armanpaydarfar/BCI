@@ -14,6 +14,7 @@ import base64
 import json
 import sys
 import traceback
+from pathlib import Path
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Optional
 
@@ -475,7 +476,6 @@ class IntentReasoner:
 
     def _call_api(self, messages: list[dict], system_prompt: str = SYSTEM_PROMPT, gaze_hit_info: str = "") -> dict:
         import sys
-        from pathlib import Path
 
         # ── Log prompt ────────────────────────────────────────────────
         import time as _time
