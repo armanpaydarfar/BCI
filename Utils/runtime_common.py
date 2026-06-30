@@ -17,6 +17,7 @@ from sklearn.metrics import confusion_matrix
 from Utils.visualization import (
     draw_class_feedback_cues,
     draw_class_fixation_idle,
+    draw_time_balls,
 )
 # Experiment utilities
 from Utils.experiment_utils import (

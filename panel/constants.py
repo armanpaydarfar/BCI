@@ -45,6 +45,7 @@ HARMONY_ONLINE_CONTROL_PY   = os.path.join(ROOT, "harmony_online_control.py")
 # WS5 AprilTag gaze↔robot calibration + control test (rev03).
 APRILTAG_CALIBRATE_PY       = os.path.join(ROOT, "tools", "apriltag_calibrate.py")
 APRILTAG_CONTROL_TEST_PY    = os.path.join(ROOT, "tools", "apriltag_control_test.py")
+APRILTAG_CONTROL_TEST_3D_PY = os.path.join(ROOT, "tools", "apriltag_control_test_3d.py")  # REV06
 
 # ---- Gaze scripts (same folder as control_panel.py per your note) ----
 GAZE_RUNNER_PY = os.path.join(ROOT, "gaze_runner.py")
@@ -127,7 +128,7 @@ __all__ = [
     "DRIVER_ONLINE_GLOVE_PY", "DRIVER_BIMANUAL_PY", "DRIVER_OFFLINE_PY",
     "DRIVER_ERRP_ONLINE_PY", "FES_PY", "STMSETUP_PY", "INIT_SH",
     "HARMONY_CALIBRATION_EXEC_PY", "HARMONY_ONLINE_CONTROL_PY",
-    "APRILTAG_CALIBRATE_PY", "APRILTAG_CONTROL_TEST_PY",
+    "APRILTAG_CALIBRATE_PY", "APRILTAG_CONTROL_TEST_PY", "APRILTAG_CONTROL_TEST_3D_PY",
     "GAZE_RUNNER_PY", "GAZE_SERVICE_PY", "VLM_SERVICE_PY",
     "GAZE_SERVICE_HOST", "GAZE_BIND_HOST", "GAZE_SERVICE_PORT",
     "GAZE_QUERY_TIMEOUT_S", "VLM_SERVICE_HOST", "VLM_BIND_HOST",

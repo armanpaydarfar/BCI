@@ -209,6 +209,27 @@ APRILTAG_TAG_SIZE_M = 0.08
 APRILTAG_EE_TAG_SIZE_M = 0.04
 APRILTAG_EE_POINT_METHOD = "pose"          # 'pose' (verified-good) | 'rayplane' (diagnostic)
 APRILTAG_T_EETAG_EE_MM = [150.0, -200.0, 0.0]
+# WS-4 REV06 3-D depth-free calibration (canonical 2026-06-30). Table + wall tag
+# groups (their UNION is the world map for register-world-3d, which snaps them
+# coplanar + squares table⟂wall); the held object's controlled-point tag (sweep);
+# and the rigid EE stabilizer tag (sweep wobble diagnostic + control-view EE). The
+# object + stabilizer are small tags → APRILTAG_EE_TAG_SIZE_M. The control panel's
+# Robot-Test buttons build the REV06 chain from these.
+APRILTAG_TABLE_TAG_IDS = [0, 1, 2, 3, 4, 12]   # coplanar ON the table
+APRILTAG_WALL_TAG_IDS = [6, 7, 8, 9, 10, 11]   # coplanar ON the wall (perpendicular to the table)
+APRILTAG_OBJECT_TAG_IDS = [18]                 # held-object controlled point (sweep)
+APRILTAG_STABILIZER_TAG_ID = 5                 # rigid EE tag (sweep wobble + control-view EE)
+# WS-1 control-test target source. 'gaze' (default) is the frozen REV05 behaviour:
+# the raw gaze pixel's ray ∩ table plane. 'centroid'/'bottom' instead segment the
+# fixated object (FastSAM via vlm_service.segment) and aim at its mask centroid or
+# its bottom-of-mask footprint pixel, cast through this fixation's pose — depth-free
+# (no metric 3-D point, so monocular-depth scale error never enters; the only
+# residual is a 2-D pixel drift if the head moves between the service's frame and
+# ours, guarded by a service-vs-our-gaze divergence check). They kill the tall-object
+# top/bottom overshoot (the centroid/footprint is invariant to where on the object
+# gaze lands). Any miss (no service, no mask hit, gaze divergence, ray miss) falls
+# back to 'gaze' and is logged.
+APRILTAG_WS1_TARGET_SOURCE = "gaze"        # 'gaze' (REV05) | 'centroid' | 'bottom'
 # Known table layout, used to sanity-check the registered world map (the tags are
 # coplanar, face up, and the worked corner is ~90°). Endpoints of the +X and +Y table
 # edges by tag id: 2->0 is +Y (toward the far edge), 0->...->1 is +X (along the far

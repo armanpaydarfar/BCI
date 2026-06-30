@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -79,6 +80,7 @@ from Utils.gaze.apriltag_calib import (  # noqa: E402
     eetag_to_world_point,
     gaze_ray_cam,
     geodesic_angle_deg,
+    invert_transform,
     per_point_errors,
     umeyama_rigid,
     umeyama_similarity_2d,
@@ -98,11 +100,18 @@ from Utils.gaze.apriltag_world import (  # noqa: E402
     world_map_geometry_report,
     world_map_to_arrays,
 )
+from Utils.gaze.apriltag_world_3d import (  # noqa: E402
+    apply_plane_structure,
+    register_world_map_3d,
+    world_map_3d_geometry_report,
+    world_map_3d_reproducibility,
+)
 from Utils.gaze.apriltag_sweep import (  # noqa: E402
     accept_sweep_sample,
     frame_telemetry_dt,
 )
 from Utils.gaze.coverage import CoverageGrid  # noqa: E402
+from Utils.gaze.coverage_voxel import VoxelCoverage  # noqa: E402
 from Utils.gaze.harmony_link import HarmonyLink  # noqa: E402
 
 
@@ -406,6 +415,303 @@ def stage_register_world(args, consumer: RelayConsumer, ui=None) -> int:
     return 0
 
 
+# ── stage: register-world-3d (WS-4 NON-coplanar world map) ───────────────────
+
+# Cap the frames the LIVE quality recompute fuses each tick so its cost is
+# constant (not O(accumulated frames)); split-half on ~180 frames is plenty for a
+# stable estimate. The final post-capture fuse still uses every frame.
+_LIVE_SAMPLE_FRAMES = 180
+
+
+def _register_world_map_3d_interactive(consumer, detector, K, ids, *, dur=6.0,
+                                       max_dur=90.0, tag_size, ui=None,
+                                       dist_coeffs=None):
+    """Collect a head sweep over the static world tags and fuse a TRUE-3-D map
+    (``register_world_map_3d`` — NO coplanar snap), retrying until every listed tag
+    is captured. Mirrors ``_register_map_interactive``'s prompt/retry, but uses the
+    3-D fuse and RETURNS the raw per-frame detections alongside the map so
+    ``world_map_3d_geometry_report`` can recompute the per-tag reproducibility
+    residual. Returns ``(map, frames)`` or ``(None, [])`` if aborted from the window.
+
+    The operator hint differs from REV05's: a 3-D layout WANTS to be seen from many
+    heights/angles (so off-table tags triangulate), and being non-coplanar is
+    expected rather than a fault.
+
+    ``dist_coeffs``: the Neon lens distortion. When given, every frame is UNDISTORTED
+    (cv2.remap, same K) before detection, so the fused poses + saved corners are in a
+    rectified pinhole frame. The Neon ships raw wide-FOV frames; without this the
+    pinhole pose is biased by tens of px at the edges (the 2026-06-30 root cause of
+    the ~15px BA reproj floor / 42mm scatter / 0.65 scale).
+
+    With a ``RegistrationView`` the capture is operator-driven: the per-tag
+    reproducibility residual + viewpoint diversity are recomputed live on the frames
+    so far and shown on the window, so the operator sweeps until the tags go green
+    and presses SPACE to accept (capped at ``max_dur``). Headless it falls back to
+    the original blind fixed ``dur`` window."""
+    import cv2  # lazy: only the camera path needs it
+    dist = (np.asarray(dist_coeffs, dtype=float).ravel()
+            if dist_coeffs is not None and np.any(np.abs(np.asarray(dist_coeffs)) > 1e-9)
+            else None)
+    umap = [None, None]      # lazily-built undistort remap (K + frame size are constant)
+    if dist is not None:
+        _log(f"  undistorting frames before detection (Neon lens, |k1|={abs(dist[0]):.3f})")
+    while True:
+        if ui is not None:
+            from Utils.gaze.registration_view import (
+                classify_tags, cone_half_angle_deg, registration_summary)
+            if not ui.prompt(f"Show world tags {ids}",
+                             ["viewed from MANY heights/angles (non-coplanar is OK)",
+                              "SPACE begins LIVE registration; sweep until green",
+                              "then SPACE again to accept, q to abort"]):
+                _log("  world-3d registration aborted from the coverage window")
+                return None, [], []
+        else:
+            input(f"place ALL world tags {ids} visible, then Enter to register the "
+                  "3-D world map > ")
+        frames: List[Dict[int, np.ndarray]] = []
+        # Per-frame tag CORNER pixels, saved for the Tier-2 constrained bundle
+        # adjustment (corner reprojection s.t. coplanar/perpendicular). Index-aligned
+        # with ``frames``.
+        corner_frames: List[Dict[int, np.ndarray]] = []
+        # Live per-tag counters (UI path only): detection count and the viewing
+        # directions seen, which drive the diversity/quality readout.
+        views: Dict[int, int] = {}
+        bearings: Dict[int, List[np.ndarray]] = {}
+        last_idx = None
+        # The split-half reproducibility re-fuse is far too heavy to run on the draw
+        # thread — doing so froze the feed every 0.4 s (operator-reported). Run it in a
+        # background worker that reads a SNAPSHOT of the frames so far and publishes a
+        # cached readout; the main loop only appends frames + redraws (both cheap), so
+        # the video stays smooth. Detection still runs per frame on the main thread.
+        qualities = classify_tags(ids, {}, None, {}) if ui is not None else None
+        summary = registration_summary(qualities) if ui is not None else None
+        if summary is not None:
+            summary["scatter_mm"] = None
+        data_lock = threading.Lock()
+        readout_lock = threading.Lock()
+        stop_worker = threading.Event()
+
+        def _recompute_loop():
+            nonlocal qualities, summary
+            while not stop_worker.wait(0.4):
+                with data_lock:
+                    # Bound the snapshot to a recent window so the worker's per-cycle
+                    # cost is CONSTANT — copying ALL frames each tick made the capture
+                    # laggier as it grew. The final fuse (post-capture) uses every frame.
+                    snap = frames[-_LIVE_SAMPLE_FRAMES:]
+                    v = dict(views)
+                    bd = {k: val[-_LIVE_SAMPLE_FRAMES:] for k, val in bearings.items()}
+                try:
+                    repro_map = None
+                    scatter_mm = None
+                    if len(snap) >= 4:
+                        # Bound to an evenly-spaced subsample so each recompute is
+                        # CONSTANT cost; the final fuse (post-capture) uses every frame.
+                        if len(snap) > _LIVE_SAMPLE_FRAMES:
+                            sel = np.linspace(0, len(snap) - 1, _LIVE_SAMPLE_FRAMES).astype(int)
+                            live = [snap[i] for i in sel]
+                        else:
+                            live = snap
+                        try:
+                            repro_map = world_map_3d_reproducibility(live)
+                            rep = world_map_3d_geometry_report(
+                                register_world_map_3d(live), live)
+                            scatter_mm = rep["mean_fit_residual_mm"]
+                        except ValueError:
+                            repro_map = None     # pre-convergence; views/diversity only
+                    diversity = {i: cone_half_angle_deg(bd[i]) for i in bd}
+                    q = classify_tags(ids, v, repro_map, diversity)
+                    s = registration_summary(q)
+                    s["scatter_mm"] = scatter_mm
+                    with readout_lock:
+                        qualities, summary = q, s
+                except Exception as exc:         # keep the readout thread alive on a
+                    _log(f"  (live quality recompute hiccup: {exc!r})")  # transient error
+
+        worker = None
+        if ui is not None:
+            worker = threading.Thread(target=_recompute_loop, name="reg-recompute",
+                                      daemon=True)
+            worker.start()
+        deadline = time.time() + (max_dur if ui is not None else dur)
+        try:
+            while time.time() < deadline:
+                b = consumer.latest()
+                if (b is None or b.video is None or b.video.bgr is None
+                        or b.video.frame_idx == last_idx):
+                    time.sleep(0.005)
+                    continue
+                last_idx = b.video.frame_idx
+                bgr = b.video.bgr
+                if dist is not None:                       # rectify before detection
+                    if umap[0] is None:
+                        h, w = bgr.shape[:2]
+                        umap[0], umap[1] = cv2.initUndistortRectifyMap(
+                            K, dist, None, K, (w, h), cv2.CV_32FC1)
+                    bgr = cv2.remap(bgr, umap[0], umap[1], cv2.INTER_LINEAR)
+                tags = detect_tags(detector, bgr, K, tag_size)
+                frame = {int(i): tags[int(i)]["T"] for i in ids if int(i) in tags}
+                if frame:
+                    with data_lock:
+                        frames.append(frame)
+                        corner_frames.append({int(i): tags[int(i)]["corners"]
+                                              for i in ids if int(i) in tags})
+                        for i, T in frame.items():
+                            views[i] = views.get(i, 0) + 1
+                            bearings.setdefault(i, []).append(
+                                np.asarray(T, dtype=float)[:3, 3])
+                if ui is not None:
+                    with readout_lock:
+                        q, s = qualities, summary
+                    # Redraw EVERY frame (cheap cv2 blit) so the video is smooth and
+                    # SPACE/q stay responsive; the heavy re-fuse is off-thread above.
+                    ui.update(bgr, tags, q, s)
+                    if ui.aborted():
+                        _log("  world-3d registration aborted from the coverage window")
+                        return None, [], []
+                    if ui.finished():
+                        break
+        finally:
+            # Join generously: a daemon worker still mid-fuse at interpreter teardown
+            # aborts the process ("terminate called" core dump). With the bounded
+            # snapshot above a fuse is well under this, so the worker exits cleanly.
+            stop_worker.set()
+            if worker is not None:
+                worker.join(timeout=3.0)
+        if not frames:
+            _log("  no world tags detected — reposition and retry")
+            continue
+        world_map = register_world_map_3d(frames)
+        seen = list(world_map["ids"])
+        missing = [i for i in ids if i not in seen]
+        if missing:
+            _log(f"  registered {seen}, MISSING {missing} — re-show all world tags "
+                 "(the map needs every tag so any subset works later), then retry")
+            continue
+        _log(f"  world 3-D map OK: ref={world_map['ref_id']}, tags={seen}")
+        return world_map, frames, corner_frames
+
+
+def _save_world_map_3d(world_map, out_dir: str, stamp: Optional[str], tag_size: float,
+                       world_ids: List[int], report: Dict, corner_frames=None,
+                       K=None) -> Path:
+    """Persist a 3-D (non-coplanar) world map to ``runs/world_map_3d_<UTC>.npz``.
+
+    Reuses ``world_map_to_arrays`` — the 3-D map dict shape is identical to the REV05
+    map (only the meaning of ``plane_*`` differs: here the best-fit plane through the
+    fused 3-D origins, informational only). The geometry report is stored in meta so
+    the non-planarity / reproducibility readout travels with the map."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    from datetime import datetime, timezone
+    stamp = stamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = out / f"world_map_3d_{stamp}.npz"
+    ref, ids, rels, pp, pn = world_map_to_arrays(world_map)
+    # Corner observations (per-frame {tag_id: (4,2) px}) for the Tier-2 constrained
+    # bundle adjustment; an object array since tags-per-frame vary. Saved only when
+    # captured so a structure-free map's keys are unchanged.
+    extra = ({"corner_obs": np.array(corner_frames, dtype=object)}
+             if corner_frames else {})
+    if K is not None:                              # intrinsics travel with the map so the
+        extra["K"] = np.asarray(K, dtype=float)    # Tier-2 BA needs no --k-npz borrow
+    np.savez_compressed(path, world_map_ref=np.array(ref), world_map_ids=ids,
+                        world_map_rels=rels, world_map_plane_point=pp,
+                        world_map_plane_normal=pn,
+                        meta=np.array({"stage": "register-world-3d",
+                                       "tag_size_m": tag_size,
+                                       "world_tag_ids": list(world_ids),
+                                       "geometry_3d": report}, dtype=object),
+                        **extra)
+    return path
+
+
+def stage_register_world_3d(args, consumer: RelayConsumer, ui=None) -> int:
+    """Register a NON-coplanar (true-3-D) STATIC world-tag map and save it (WS-4).
+
+    The 3-D sibling of ``stage_register_world``: same camera-only multi-view fuse,
+    but it calls ``register_world_map_3d`` (no coplanar snap) so tags on more than
+    one plane — a back panel, a shelf, objects at height — keep their genuine 3-D
+    positions instead of being flattened onto the table. Reports non-planarity
+    (the positive signal the structure was preserved), the split-half
+    ``world_map_3d_reproducibility`` (the real quality gate — map accuracy from
+    independent data), and the per-frame scatter (raw sensor noise, context only),
+    then writes ``runs/world_map_3d_<UTC>.npz``. No robot needed."""
+    if not args.world_tag_ids:
+        _log("register-world-3d needs --world-tag-ids")
+        return 2
+    world_ids = [int(i) for i in args.world_tag_ids]
+    detector = load_detector(args.families)
+    K = consumer.camera_matrix
+    _log(f"register-world-3d: view tags {world_ids} @ {args.tag_size} m from MANY "
+         "heights/angles (no robot needed). A non-coplanar layout is expected — the "
+         "3-D fuse keeps tags off the table plane (NO coplanar snap).")
+    world_map, frames, corner_frames = _register_world_map_3d_interactive(
+        consumer, detector, K, world_ids, tag_size=args.tag_size, ui=ui,
+        dist_coeffs=consumer.distortion_coeffs)
+    if ui is not None:
+        ui.close()
+    if world_map is None:
+        return 1
+    # Tier-1 structural hardening (opt-in): if the rig's coplanar/perpendicular tag
+    # groups are given, snap each group onto its plane and square the planes — this
+    # corrects the single-tag depth ambiguity the fuse can't (table reads flat, the
+    # table⊥wall reads 90°), so board-PnP recovery + the table target ride on a
+    # structurally-correct map.
+    struct = None
+    if args.table_plane_tag_ids or args.wall_plane_tag_ids:
+        groups = {}
+        if args.table_plane_tag_ids:
+            groups["table"] = [int(i) for i in args.table_plane_tag_ids]
+        if args.wall_plane_tag_ids:
+            groups["wall"] = [int(i) for i in args.wall_plane_tag_ids]
+        # Loudly flag plane tags that never made it into the map — apply_plane_structure
+        # silently skips a group with <3 mapped tags, so a typo or an uncaptured tag
+        # would DISABLE structural hardening with no other sign (audit 2026-06-30).
+        mapped = {int(i) for i in world_map.get("rel", {})}
+        for name, ids in groups.items():
+            missing = [i for i in ids if i not in mapped]
+            if missing:
+                _log(f"structure: WARNING {name}-plane tags {missing} are NOT in the map "
+                     f"(not in --world-tag-ids or never captured) — that group keeps only "
+                     f"{[i for i in ids if i in mapped]}; <3 ⇒ its hardening is DISABLED.")
+        perp = [("table", "wall")] if {"table", "wall"} <= set(groups) else []
+        world_map, struct = apply_plane_structure(world_map, groups, perpendicular_pairs=perp)
+        for name, g in struct["groups"].items():
+            _log(f"structure: {name} plane — corrected origin flatness max={g['flatness_max_mm']:.1f} "
+                 f"rms={g['flatness_rms_mm']:.1f} mm (tags {g['ids']})")
+        for pair, p in struct["perpendicular"].items():
+            off = abs(90.0 - p["angle_before_deg"])
+            verdict = "OK" if off <= 8.0 else "POOR — registration was far from square; re-capture"
+            _log(f"structure: {pair} was {p['angle_before_deg']:.1f}° (off 90° by {off:.1f}°) "
+                 f"→ squared to 90°, each normal moved {p['normal_moved_deg']:.1f}° [{verdict}]")
+    report = world_map_3d_geometry_report(world_map, frames)
+    if struct is not None:
+        report["structure"] = struct
+    _log(f"3-D geometry: non-planarity max_out_of_plane={report['max_out_of_plane_mm']:.1f} mm, "
+         f"z_spread={report['z_spread_mm']:.1f} mm (large ⇒ genuine 3-D structure; "
+         "near-0 ⇒ effectively coplanar, REV05 would do)")
+    # Reproducibility (split-half map disagreement) is the real quality verdict;
+    # the per-frame scatter is raw AprilTag sensor noise and floors out regardless
+    # of how the operator sweeps, so it is reported only as context.
+    repro = world_map_3d_reproducibility(frames)
+    report["reproducibility_mm"] = repro
+    if repro:
+        rv = np.array(list(repro.values()))
+        _log(f"3-D reproducibility (split-half map disagreement): mean={rv.mean():.1f} mm, "
+             f"max={rv.max():.1f} mm — THIS is the quality gate (small ⇒ the fused map "
+             "is accurate). Worst tags: "
+             f"{sorted(repro, key=lambda i: -repro[i])[:4]}")
+    else:
+        _log("3-D reproducibility: too few frames / common tags to split-half — capture longer")
+    _log(f"3-D per-frame scatter (sensor noise, NOT the gate): mean={report['mean_fit_residual_mm']:.1f} mm, "
+         f"max={report['max_fit_residual_mm']:.1f} mm")
+    path = _save_world_map_3d(world_map, args.out_dir, args.utc_stamp, args.tag_size,
+                              world_ids, report, corner_frames=corner_frames, K=K)
+    _log(f"saved 3-D world map → {path} ({len(corner_frames)} frames of corner "
+         "observations for Tier-2 bundle adjustment)")
+    return 0
+
+
 def stage_collect(args, consumer: RelayConsumer) -> int:
     ee_ids = _resolve_ee_ids(args)
     if not args.world_tag_ids or ee_ids is None:
@@ -578,6 +884,31 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
 _SWEEP_AUTO_HOME_DUR_S = 5.0
 
 
+def _make_undistorter(K, dist_coeffs):
+    """Return a callable ``bgr -> rectified_bgr`` (cv2 remap, SAME K), or None when
+    there's no usable distortion. The Neon ships RAW wide-FOV frames while AprilTag
+    pose/PnP/BA assume a pinhole, so frames MUST be undistorted before detection or
+    the corners are biased tens of px at the edges (2026-06-30 root cause). The remap
+    is built lazily on the first frame (K + size are constant)."""
+    if dist_coeffs is None:
+        return None
+    dist = np.asarray(dist_coeffs, dtype=float).ravel()
+    if not np.any(np.abs(dist) > 1e-9):
+        return None
+    import cv2
+    Kf = np.asarray(K, dtype=float)
+    maps: List = [None, None]
+
+    def _u(bgr):
+        if maps[0] is None:
+            h, w = bgr.shape[:2]
+            maps[0], maps[1] = cv2.initUndistortRectifyMap(
+                Kf, dist, None, Kf, (w, h), cv2.CV_32FC1)
+        return cv2.remap(bgr, maps[0], maps[1], cv2.INTER_LINEAR)
+
+    return _u
+
+
 def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     """REV04 continuous swept capture (rev04 §2). The operator frees the arm and
     hand-guides the EE **across the table surface** while a ~20 Hz loop pairs each
@@ -594,18 +925,43 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     if not args.world_tag_ids or ee_ids is None:
         _log("sweep needs --world-tag-ids and --ee-tag-id/--ee-tag-ids")
         return 2
+    if args.coverage_3d and not args.with_robot:
+        # 3-D voxel coverage bins the EE (x,y,z) from robot telemetry; a camera-side
+        # dry run has only the 2-D table (u,v) and no z, so there is no volume to
+        # cover. Fail fast rather than silently degrade to a meaningless single slice.
+        _log("--coverage-3d needs --with-robot (the z axis comes from EE telemetry)")
+        return 2
     world_ids = [int(i) for i in args.world_tag_ids]
     detector = load_detector(args.families)
     K = consumer.camera_matrix
+    undistort = _make_undistorter(K, consumer.distortion_coeffs)
+    if undistort is not None:
+        _log("  undistorting frames before detection (Neon lens) — matches the map")
     offset_mm = np.asarray(args.t_eetag_ee, dtype=float)
     ee_size = args.ee_tag_size or args.tag_size
     tag_sizes = {int(i): ee_size for i in ee_ids}
     ee_point_method = args.ee_point_method or "pose"
+    # Optional stabilizer tag (e.g. the rigid EE tag 5): record its pose per sample
+    # for the wobble diagnostic. Size it (own --stabilizer-tag-size or the EE size)
+    # so its pose is scaled right when detected alongside the controlled tag.
+    stab_id = int(args.stabilizer_tag_id) if args.stabilizer_tag_id is not None else None
+    if stab_id is not None:
+        tag_sizes[stab_id] = args.stabilizer_tag_size or ee_size
     _log(f"tag sizes: world {args.tag_size} m, EE {ee_size} m; world tags "
-         f"{world_ids}, EE tags {ee_ids}; EE point method: {ee_point_method}")
+         f"{world_ids}, EE tags {ee_ids}; EE point method: {ee_point_method}"
+         + (f"; stabilizer tag {stab_id}" if stab_id is not None else ""))
 
-    grid = CoverageGrid(cell_size_mm=args.cell_size_mm, min_samples=args.min_samples,
-                        min_spread_mm=args.min_spread_mm)
+    # Opt-in 3-D volumetric coverage (WS-4): bin the EE (x,y,z) into voxels so the
+    # operator covers the workspace VOLUME, not just one table slice. Default off →
+    # the 2-D top-down grid path below is unchanged. Both classes share the public
+    # API (add/summary/next_target/done/visited_cells/sufficient_mask), so the rest
+    # of the loop is agnostic to which one it holds.
+    if args.coverage_3d:
+        grid = VoxelCoverage(cell_size_mm=args.cell_size_mm, min_samples=args.min_samples,
+                             min_spread_mm=args.min_spread_mm)
+    else:
+        grid = CoverageGrid(cell_size_mm=args.cell_size_mm, min_samples=args.min_samples,
+                            min_spread_mm=args.min_spread_mm)
 
     # Connect the robot but keep the arm LOCKED through world registration (operator
     # 2026-06-25): a freed arm is limp and can droop into the tags' view, corrupting
@@ -626,13 +982,27 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     uv_rows: List[np.ndarray] = []
     q_rows: List[np.ndarray] = []
     x_rows: List[np.ndarray] = []
+    eequat_rows: List[np.ndarray] = []
     tcw_rows: List[np.ndarray] = []
     tce_rows: List[np.ndarray] = []
+    tstab_rows: List[np.ndarray] = []   # stabilizer tag pose per accepted sample (NaN if unseen)
     t_rows: List[float] = []
+    # WS-1/WS-2b offline prototyping needs the scene frame at each accepted sample
+    # (to segment the held/target object); --save-frames writes them as a JPEG
+    # sidecar (raw BGR would balloon the npz). frame_rows holds (sample_idx, bgr)
+    # only when enabled.
+    frame_rows: List[np.ndarray] = []
 
     period = 1.0 / args.sample_hz
     last_idx = None
     accepted = 0
+    # Diagnostics so a pasted sweep log explains itself: why samples were dropped
+    # (tag not seen / low margin / time-misaligned) and how reliably the controlled
+    # (EE/object) tag was recovered — the operator's "tag had a bad view at some
+    # angles" concern shows up here as a low ee-seen fraction + 'ee_not_seen' drops.
+    drop_reasons: Dict[str, int] = {}
+    n_processed = 0       # frames that reached the accept gate
+    ee_seen_frames = 0    # of those, how many recovered the controlled tag pose
     try:
         # World map: LOAD the pre-registered top-down map (preferred — accurate geometry
         # the seated view can't produce) or, as a fallback, register it now seated. The
@@ -697,6 +1067,7 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                 _sleep_until(next_tick)
                 continue
             last_idx = b.video.frame_idx
+            bgr = undistort(b.video.bgr) if undistort is not None else b.video.bgr
 
             if link is not None:
                 rstate = link.query_state()
@@ -704,10 +1075,12 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                     _sleep_until(next_tick)
                     continue
                 q_joints, x_ee, t_robot = rstate["q"], rstate["ee"], rstate["_t"]
+                ee_quat = rstate.get("ee_quat")
             else:
                 q_joints, x_ee, t_robot = np.full(7, np.nan), np.full(3, np.nan), time.time()
+                ee_quat = None
 
-            tags = detect_tags(detector, b.video.bgr, K, args.tag_size, tag_sizes=tag_sizes)
+            tags = detect_tags(detector, bgr, K, args.tag_size, tag_sizes=tag_sizes)
             world_view = {i: tags[i] for i in world_ids if i in tags}
             ee_view = {i: tags[i]["T"] for i in ee_ids if i in tags}
             # View-robust world pose: one multi-tag board PnP over the visible tag
@@ -725,6 +1098,11 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                 world_seen=T_cam_world is not None, ee_seen=T_cam_eetag is not None,
                 margins=margins, dt_s=dt,
                 min_margin=args.min_margin, max_align_dt_s=args.max_align_dt_s)
+            n_processed += 1
+            if T_cam_eetag is not None:
+                ee_seen_frames += 1
+            if not ok:
+                drop_reasons[reason] = drop_reasons.get(reason, 0) + 1
 
             cur_uv = None      # vision (u,v) — the gaze-side command coordinate (library)
             disp_xy = None      # what the coverage grid + display use (telemetry base)
@@ -733,20 +1111,32 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                                           plane_point, plane_normal, offset_mm)
                 if p_world is not None:
                     cur_uv = plane_coords(p_world, plane_point, plane_normal)
-                    # Telemetry-anchored coverage + display (operator 2026-06-25): bin
-                    # and draw the robot's OWN end-effector (x,y) — the single most
-                    # consistent metric — so the screen shows exactly where the arm is,
-                    # in robot axes. The library still stores the vision (u,v) (gaze is
-                    # the only runtime signal); telemetry anchors coverage/display only.
-                    # No-robot dry run has NaN telemetry → fall back to vision (u,v).
-                    disp_xy = x_ee[:2] if np.all(np.isfinite(x_ee[:2])) else cur_uv
+                    # Telemetry-anchored coverage + display (REV05 §2C, operator
+                    # 2026-06-25): bin and draw the robot's OWN end-effector — the
+                    # single most consistent metric (no AprilTag depth ambiguity/flips/
+                    # head-dependence) — so the screen shows exactly where the arm is.
+                    # The command library still stores the vision controlled point
+                    # (gaze is the only runtime signal); telemetry anchors coverage/
+                    # display/quality, NOT the command. --coverage-3d voxel-bins the
+                    # full telemetry EE (x,y,z). No-robot dry run → vision (u,v).
+                    if args.coverage_3d:
+                        disp_xy = x_ee[:3]
+                    else:
+                        disp_xy = x_ee[:2] if np.all(np.isfinite(x_ee[:2])) else cur_uv
                     grid.add(disp_xy)
                     uv_rows.append(cur_uv)
                     q_rows.append(q_joints)
                     x_rows.append(x_ee)
+                    eequat_rows.append(ee_quat if ee_quat is not None
+                                       else np.full(4, np.nan))
                     tcw_rows.append(T_cam_world)
                     tce_rows.append(T_cam_eetag)
                     t_rows.append(t_robot)
+                    if stab_id is not None:
+                        tstab_rows.append(tags[stab_id]["T"] if stab_id in tags
+                                          else np.full((4, 4), np.nan))
+                    if args.save_frames:
+                        frame_rows.append(bgr.copy())   # rectified, matches the map
                     accepted += 1
 
             target = grid.next_target()
@@ -760,9 +1150,15 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
             if now - last_report >= 1.0:
                 s = grid.summary()
                 tgt = "—" if target is None else np.round(target, 0).tolist()
-                _log(f"  accepted={accepted} cells={int(s['visited'])} "
-                     f"sufficient={int(s['sufficient'])} → go to {tgt}"
+                label = "voxels" if args.coverage_3d else "cells"
+                ee_pct = (100.0 * ee_seen_frames / n_processed) if n_processed else 0.0
+                _log(f"  accepted={accepted} {label}={int(s['visited'])} "
+                     f"sufficient={int(s['sufficient'])} ee-tag seen {ee_pct:.0f}% → go to {tgt}"
                      + ("" if ok else f"  (last drop: {reason})"))
+                if args.coverage_3d:
+                    # The volumetric analog of the 2-D box: a per-z-slice occupancy
+                    # projection so the operator can see which heights are still thin.
+                    _log(f"    z-slices (sufficient/visited): {grid.status_text()}")
                 last_report = now
 
             # Stopping is operator-driven by default (SPACE in the coverage window /
@@ -800,6 +1196,54 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
         if ui is not None:
             ui.close()
 
+    # Sweep diagnostics (always — a short/failed sweep still explains itself).
+    ee_pct = (100.0 * ee_seen_frames / n_processed) if n_processed else 0.0
+    drops = (", ".join(f"{r}={c}" for r, c
+                       in sorted(drop_reasons.items(), key=lambda kv: -kv[1])) or "none")
+    _log(f"sweep summary: {n_processed} frames processed, {accepted} accepted; "
+         f"controlled tag {ee_ids} recovered in {ee_pct:.0f}% of frames")
+    _log(f"  drops by reason: {drops}  "
+         "(ee_not_seen ⇒ the tracked tag was occluded/oblique → re-orient it; "
+         "low_margin ⇒ tag too small/blurred; misaligned ⇒ slow down)")
+    if x_rows:
+        X = np.array(x_rows, dtype=float)
+        fin = X[np.all(np.isfinite(X[:, :3]), axis=1)] if X.ndim == 2 and X.shape[1] >= 3 else X[:0]
+        if fin.shape[0]:
+            _log(f"  arm reach (telemetry EE) mm: "
+                 f"x[{fin[:,0].min():.0f},{fin[:,0].max():.0f}] "
+                 f"y[{fin[:,1].min():.0f},{fin[:,1].max():.0f}] "
+                 f"z[{fin[:,2].min():.0f},{fin[:,2].max():.0f}]")
+
+    # Stabilizer wobble: over samples where BOTH the controlled tag and the
+    # stabilizer (rigid EE) tag were seen, the spread of the controlled↔stabilizer
+    # offset IS the grip/hand-wobble error. Small ⇒ the controlled tag alone is
+    # rigid enough; large ⇒ rebuild the library from stabilizer + the solved offset.
+    if stab_id is not None and tstab_rows:
+        # Wrapped: this is an OPTIONAL post-capture diagnostic and runs BEFORE the
+        # npz save — a failure here must never discard the (expensive) sweep. Log and
+        # continue to the save. (A missing invert_transform import once lost a full
+        # sweep this way, 2026-06-30.)
+        try:
+            offs = []
+            for tce, tstab in zip(tce_rows, tstab_rows):
+                if np.all(np.isfinite(tce)) and np.all(np.isfinite(tstab)):
+                    offs.append((invert_transform(np.asarray(tstab, float))
+                                 @ np.asarray(tce, float))[:3, 3])
+            if len(offs) >= 2:
+                O = np.array(offs)
+                sd = O.std(axis=0)
+                _log(f"  stabilizer tag {stab_id}: both tags seen in {len(offs)}/{len(tce_rows)} "
+                     f"samples; controlled↔stabilizer offset mean={np.round(O.mean(axis=0),1).tolist()} "
+                     f"mm, wobble std=[{sd[0]:.1f},{sd[1]:.1f},{sd[2]:.1f}] mm "
+                     f"(|sd|={float(np.linalg.norm(sd)):.1f}); small ⇒ rigid, large ⇒ use "
+                     "stabilizer+offset for the library)")
+            else:
+                _log(f"  stabilizer tag {stab_id}: <2 samples with both tags visible "
+                     "— couldn't measure wobble (keep it in view alongside the controlled tag)")
+        except Exception as exc:
+            _log(f"  stabilizer wobble diagnostic failed ({exc!r}) — skipping it, "
+                 "the sweep is still being saved")
+
     if len(uv_rows) < 3:
         _log(f"only {len(uv_rows)} accepted samples (<3) — not saving a solvable npz")
         return 1
@@ -816,8 +1260,13 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     # frame the grid was fed during the sweep — telemetry base (x,y) with a robot, else
     # vision (u,v) — so the mask matches what the operator saw fill in.
     x_arr = np.vstack(x_rows)
-    cov_pts = (x_arr[:, :2] if np.all(np.isfinite(x_arr[:, :2]))
-               else np.vstack(uv_rows))
+    if args.coverage_3d:
+        # Voxel coverage was fed the EE (x,y,z); recompute green over the same 3-D
+        # points so the mask matches the voxels the operator saw fill in.
+        cov_pts = x_arr[:, :3]
+    else:
+        cov_pts = (x_arr[:, :2] if np.all(np.isfinite(x_arr[:, :2]))
+                   else np.vstack(uv_rows))
     green = grid.sufficient_mask(cov_pts)
     wm_ref, wm_ids, wm_rels, wm_pp, wm_pn = world_map_to_arrays(world_map)
     em_ref, em_ids, em_rels, em_pp, em_pn = world_map_to_arrays(ee_map)
@@ -842,13 +1291,39 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                      "min_samples": args.min_samples,
                      "min_spread_mm": args.min_spread_mm,
                      "complete": bool(grid.done())},
-        "units": {"UV": "mm (table plane)", "X": "mm", "Q": "rad", "t_eetag_ee": "mm"},
+        "units": {"UV": "mm (table plane)", "X": "mm", "Q": "rad",
+                  "t_eetag_ee": "mm", "EEQUAT": "[x,y,z,w] scalar-last"},
     }
+    if args.coverage_3d:
+        # Record the volumetric mode only when used, so a default (2-D) sweep's saved
+        # meta is byte-identical to before this feature; green was computed over (x,y,z).
+        meta["coverage"]["mode"] = "voxel_3d"
+    # WS-1/WS-2b scene-frame sidecar: JPEG per accepted sample, index-aligned with
+    # UV/Q/X/EEQUAT rows. Kept out of the npz (raw BGR is ~6 MB/frame); the offline
+    # scripts join by row index via the recorded directory name.
+    frames_dir = None
+    if args.save_frames and frame_rows:
+        import cv2
+        frames_dir = out_dir / f"apriltag_sweep_{stamp}_frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        for i, bgr in enumerate(frame_rows):
+            cv2.imwrite(str(frames_dir / f"{i:05d}.jpg"), bgr,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        _log(f"saved {len(frame_rows)} scene frames → {frames_dir}")
+    meta["frames_dir"] = frames_dir.name if frames_dir is not None else None
+    meta["stabilizer_tag_id"] = stab_id
+    # Stabilizer poses (index-aligned with T_cam_eetag) only when recorded, so a
+    # default sweep's npz keys are unchanged. Lets an offline solve rebuild the
+    # library from the rigid tag + its solved offset without re-capturing.
+    stab_save = ({"T_cam_stab": np.stack(tstab_rows)}
+                 if stab_id is not None and tstab_rows else {})
     np.savez_compressed(
         out_path,
         UV=np.vstack(uv_rows),
         Q=np.vstack(q_rows),
         X=np.vstack(x_rows),
+        EEQUAT=np.vstack(eequat_rows),
+        K=np.asarray(K, dtype=float),
         green=green,
         T_cam_world=np.stack(tcw_rows),
         T_cam_eetag=np.stack(tce_rows),
@@ -858,6 +1333,7 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
         ee_map_ref=np.array(em_ref), ee_map_ids=em_ids, ee_map_rels=em_rels,
         ee_map_plane_point=em_pp, ee_map_plane_normal=em_pn,
         meta=np.array(meta, dtype=object),
+        **stab_save,
     )
     _log(f"saved {len(uv_rows)} swept samples ({int(green.sum())} in green/sufficient "
          f"cells) → {out_path}")
@@ -883,10 +1359,21 @@ def _sleep_until(deadline: float) -> None:
 
 
 def _make_coverage_ui(args):
-    """The sweep's coverage view: the OpenCV box (rev04 §3) unless ``--no-ui``
-    (headless camera-side verification, where only the text summary runs)."""
+    """The sweep's coverage view, unless ``--no-ui`` (headless, text summary only).
+
+    ``register-world-3d`` gets the live ``RegistrationView`` (per-tag residual +
+    viewpoint-diversity quality, operator-driven finish). ``--coverage-3d`` on the
+    sweep gets the per-z-slice volumetric view (``VoxelCoverageBoxUI``); otherwise
+    the 2-D top-down box (rev04 §3). The 2-D ``register-world`` stage still uses the
+    box (for its SPACE prompts)."""
     if args.no_ui:
         return None
+    if args.stage == "register-world-3d":
+        from Utils.gaze.registration_view import RegistrationView
+        return RegistrationView(args.world_tag_ids or [])
+    if getattr(args, "coverage_3d", False) and args.stage == "sweep":
+        from Utils.gaze.coverage_voxel_view import VoxelCoverageBoxUI
+        return VoxelCoverageBoxUI(args.cell_size_mm, audio=args.audio)
     from Utils.gaze.coverage_view import CoverageBoxUI
     return CoverageBoxUI(args.cell_size_mm, audio=args.audio)
 
@@ -1183,6 +1670,154 @@ def stage_solve_planar(args, z, npz_path) -> int:
     return 0
 
 
+# ── stage: solve-3d (WS-4 world-frame (x,y,z)→Q library) ─────────────────────
+
+
+def stage_solve_3d(args) -> int:
+    """WS-4 3-D solve: build a world-frame ``(x,y,z)→Q`` library from a sweep npz.
+
+    Mirrors ``stage_solve_planar`` but keeps the EE point in FULL 3-D — it omits the
+    table-plane projection (``plane_coords``) the planar solve applies. Each accepted
+    sample's ``p_world = eetag_to_world_point(T_cam_world, T_cam_eetag, offset)`` is
+    the SAME world EE point the planar path computes; the planar path then flattens it
+    to ``(u,v)`` on the table, here it is stored as-is so the table-height ``z`` is
+    retained. No plane projection → 3-D: objects above the table become reachable.
+
+    Self-contained in the WORLD frame: the runtime 3-D target (gaze→object centroid
+    in world frame) is queried against this library by ``GazeCalibration3D``, so no
+    robot base-frame / hand-eye transform is needed. (The planar solve's A2 base-xy
+    similarity is a 2-D-only diagnostic with a non-coplanarity degeneracy, so it has
+    no 3-D analogue and is dropped.)
+
+    EE-point method + mount offset come from the sweep's meta (the recipe the sweep
+    baked in), exactly as ``--then-solve`` relies on for the planar path. Green-cell
+    filtering matches the planar solve. Writes ``apriltag_3d_<UTC>_calib.npz`` with
+    ``P_WORLD3D`` (N,3) + ``Q`` (N,7) + the world-map arrays, loadable by
+    ``GazeCalibration3D.from_calib_npz``."""
+    npz_path = Path(args.npz)
+    if not npz_path.is_file():
+        _log(f"npz not found: {npz_path}")
+        return 2
+    z = np.load(npz_path, allow_pickle=True)
+    if "T_cam_world" not in z.files or "T_cam_eetag" not in z.files:
+        _log(f"{npz_path.name} lacks T_cam_world/T_cam_eetag — not a sweep capture. "
+             "solve-3d recomputes the 3-D EE world point from the per-sample transforms.")
+        return 2
+
+    Tcw = np.asarray(z["T_cam_world"], dtype=float)
+    Tce = np.asarray(z["T_cam_eetag"], dtype=float)
+    Q = np.asarray(z["Q"], dtype=float)
+    if Tcw.shape[0] != Tce.shape[0] or Tcw.shape[0] != Q.shape[0]:
+        _log(f"row mismatch: T_cam_world {Tcw.shape[0]}, T_cam_eetag {Tce.shape[0]}, "
+             f"Q {Q.shape[0]} — corrupt sweep npz")
+        return 2
+
+    # Recipe from the sweep's meta — the EE-point method and the hand-measured mount
+    # offset the sweep recorded. Read the meta, trust the meta (the planar solve learnt
+    # the same lesson, 2026-06-25): the calib must report the recipe it was built with.
+    src_meta = z["meta"].item() if "meta" in z.files else {}
+    method = src_meta.get("ee_point_method", "pose")
+    offset = np.asarray(src_meta.get("t_eetag_ee_mm", [0.0, 0.0, 0.0]), dtype=float)
+    # Re-solve override: an explicit --ee-point-method takes BOTH the method and the
+    # --t-eetag-ee offset from the CLI verbatim (a literal [0,0,0] IS honoured — e.g.
+    # to put the controlled point at the EE tag), so a sweep can be re-solved with a
+    # corrected mount/grasp offset without re-capturing. The calib meta below records
+    # whatever was actually applied. Mirrors the planar solve's override.
+    if args.ee_point_method is not None:
+        method = args.ee_point_method
+        offset = np.asarray(args.t_eetag_ee, dtype=float)
+        _log(f"re-solve override: ee_point_method={method}, "
+             f"t_eetag_ee_mm={offset.tolist()} (controlled point = EE tag + this offset)")
+    # A 'rayplane' sweep PROJECTS every EE point onto the table plane
+    # (eetag_rayplane_point_world), so the z height — the whole reason for a 3-D
+    # library — is already destroyed in the source geometry. Building a 3-D calib
+    # from it would yield a coplanar library mislabeled scheme="world_xyz_nn" that
+    # the 3-D control loop would trust. Refuse: a 3-D library needs a 'pose' sweep.
+    if method == "rayplane":
+        _log("solve-3d: this sweep used ee_point_method='rayplane', which projects "
+             "EE points onto the table plane — there is no z to build a 3-D library "
+             "from. Re-capture/solve with the 'pose' method (config "
+             "APRILTAG_EE_POINT_METHOD='pose').")
+        return 2
+    # The world plane is only consulted by the 'rayplane' EE method; the default
+    # 'pose' ignores it. Read whatever the sweep stored (fall back to z=0 / +Z).
+    pp = (np.asarray(z["world_map_plane_point"], dtype=float)
+          if "world_map_plane_point" in z.files else np.zeros(3))
+    pn = (np.asarray(z["world_map_plane_normal"], dtype=float)
+          if "world_map_plane_normal" in z.files else np.array([0.0, 0.0, 1.0]))
+
+    # The EE world point in FULL 3-D — the SAME p_world the planar sweep computed
+    # via _ee_point_world, but WITHOUT the subsequent plane_coords projection. For the
+    # default 'pose' method this is exactly eetag_to_world_point(...); the table-height
+    # z survives, which is the entire point of the 3-D path.
+    pts = [_ee_point_world(method, Tcw[i], Tce[i], pp, pn, offset) for i in range(len(Tcw))]
+    P_world3d = np.array([p if p is not None else np.full(3, np.nan) for p in pts],
+                         dtype=float)
+
+    # Green-only filtering — identical policy to the planar solve (rev04 §3): transit
+    # samples in still-partial coverage cells pollute the NN lookup. A pre-mask npz
+    # keeps all; --include-partial keeps all.
+    green_src = np.asarray(z["green"], dtype=bool) if "green" in z.files else None
+    if args.green_only and green_src is not None:
+        kept = int(green_src.sum())
+        _log(f"green-only: {kept}/{len(green_src)} samples in sufficient cells "
+             f"(dropped {len(green_src) - kept} partial-cell; --include-partial keeps all)")
+        P_world3d, Q = P_world3d[green_src], Q[green_src]
+    elif args.green_only:
+        _log("green-only requested but this npz has no 'green' mask (pre-fix sweep) "
+             "— using all accepted samples")
+    else:
+        _log("--include-partial: using all accepted samples (green + amber cells)")
+
+    # The library needs finite (p_world, Q); a no-robot dry-run sweep has NaN Q, and a
+    # rayplane miss leaves a NaN point.
+    lib_ok = np.all(np.isfinite(P_world3d), axis=1) & np.all(np.isfinite(Q[:, :7]), axis=1)
+    P_world3d, Q = P_world3d[lib_ok], Q[lib_ok]
+    n = P_world3d.shape[0]
+    if n < 3:
+        _log(f"only {n} finite (P_WORLD3D,Q) rows (<3) — cannot build a 3-D library. "
+             "Was --with-robot used during the sweep?")
+        return 1
+    z_ptp = float(np.ptp(P_world3d[:, 2]))
+    _log(f"3-D library: {n} (x,y,z)→Q rows; "
+         f"x∈[{P_world3d[:,0].min():.0f},{P_world3d[:,0].max():.0f}] "
+         f"y∈[{P_world3d[:,1].min():.0f},{P_world3d[:,1].max():.0f}] "
+         f"z∈[{P_world3d[:,2].min():.0f},{P_world3d[:,2].max():.0f}] mm")
+    _log(f"z range = {z_ptp:.0f} mm (≈0 would mean a flat/planar sweep — the planar "
+         "solve would then suffice; a 3-D library wants real height variation)")
+
+    calib_meta = dict(src_meta)
+    calib_meta.update({
+        "scheme": "world_xyz_nn",
+        "n_points": int(n),
+        "source_capture": npz_path.name,
+        # The recipe the LIBRARY was actually built with (from the sweep meta).
+        "ee_point_method": method,
+        "t_eetag_ee_mm": offset.tolist(),
+        "z_range_mm": z_ptp,
+        "units": {"P_WORLD3D": "mm (world frame, full 3-D)", "Q": "rad",
+                  "t_eetag_ee": "mm"},
+    })
+    out_path = npz_path.with_name(
+        npz_path.stem.replace("apriltag_sweep", "apriltag_3d") + "_calib.npz")
+    # Carry the world map through so the runtime recovers the SAME world frame the
+    # library points live in (the gaze→object 3-D target is expressed in it).
+    extra = {}
+    for k in ("world_map_ref", "world_map_ids", "world_map_rels",
+              "world_map_plane_point", "world_map_plane_normal"):
+        if k in z.files:
+            extra[k] = z[k]
+    np.savez_compressed(
+        out_path,
+        P_WORLD3D=P_world3d, Q=Q,
+        meta=np.array(calib_meta, dtype=object),
+        **extra,
+    )
+    _log(f"3-D calibration → {out_path}")
+    _log("consume it (live loop): GazeCalibration3D.from_calib_npz(np.load(...))")
+    return 0
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 
@@ -1191,7 +1826,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="AprilTag gaze↔robot calibration tool")
     p.add_argument("--stage", required=True,
                    choices=["detect", "gaze", "collect", "sweep", "solve",
-                            "register-world"])
+                            "register-world", "register-world-3d", "solve-3d"])
     p.add_argument("npz", nargs="?", default=None,
                    help="solve stage: path to an apriltag_capture_*.npz")
     p.add_argument("--world-map", default=None,
@@ -1209,6 +1844,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="one or more world tag ids; collect registers a map over "
                         "them so any visible subset recovers the world frame "
                         "(occlusion-robust). detect/gaze use the first.")
+    p.add_argument("--table-plane-tag-ids", type=int, nargs="+", default=None,
+                   help="register-world-3d: tag ids physically coplanar ON THE TABLE. "
+                        "Given (with --wall-plane-tag-ids), the map is hardened — these "
+                        "tags are snapped coplanar and the table⊥wall planes squared to "
+                        "90° (fixes the single-tag depth ambiguity). Off = pure fuse.")
+    p.add_argument("--wall-plane-tag-ids", type=int, nargs="+", default=None,
+                   help="register-world-3d: tag ids coplanar ON THE WALL (perpendicular "
+                        "to the table). See --table-plane-tag-ids.")
     p.add_argument("--ee-tag-id", type=int, default=None,
                    help="single EE tag id (back-compat: a 1-entry EE map)")
     p.add_argument("--ee-tag-ids", type=int, nargs="+", default=None,
@@ -1221,6 +1864,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--t-eetag-ee", type=float, nargs=3, default=[0.0, 0.0, 0.0],
                    metavar=("X", "Y", "Z"),
                    help="hand-measured EE-tag→EE offset vector in MM")
+    p.add_argument("--stabilizer-tag-id", type=int, default=None,
+                   help="sweep: also record this tag's pose per sample (e.g. the rigid "
+                        "EE tag 5 while the controlled tag 18 is hand-held). Logs the "
+                        "controlled↔stabilizer offset wobble and saves the poses so an "
+                        "offline solve can rebuild the library from the rigid tag. "
+                        "Diagnostic only — does not change the captured library.")
+    p.add_argument("--stabilizer-tag-size", type=float, default=None,
+                   help="stabilizer tag edge length in METRES (default: --ee-tag-size)")
     p.add_argument("--duration", type=float, default=10.0,
                    help="detect/gaze sampling window (s)")
     p.add_argument("--with-robot", action="store_true",
@@ -1239,6 +1890,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--bind-port", type=int, default=None,
                    help="default: config.UDP_CONTROL_BIND[PORT]")
     p.add_argument("--out-dir", default="runs", help="collect/sweep: directory for the saved npz")
+    p.add_argument("--save-frames", action="store_true",
+                   help="sweep: also save the scene frame at each accepted sample as a "
+                        "JPEG sidecar dir (WS-1/WS-2b offline object segmentation). Off "
+                        "by default — adds ~100s of MB per sweep.")
     p.add_argument("--utc-stamp", default=None,
                    help="collect/sweep: override the auto UTC stamp in the npz filename")
     # sweep stage (REV04 continuous capture + coverage)
@@ -1266,6 +1921,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--max-align-dt-ms", type=float, default=50.0,
                    help="sweep: reject a sample whose frame↔telemetry offset exceeds "
                         "this (stale frame); default = one 20 Hz tick")
+    p.add_argument("--coverage-3d", action="store_true",
+                   help="sweep: track 3-D VOLUMETRIC coverage (x,y,z voxels) instead of "
+                        "the 2-D top-down grid — bins the EE (x,y,z) telemetry so the "
+                        "operator knows when the workspace VOLUME (not one slice) is "
+                        "covered. Runs headless with a per-z-slice text summary (no 3-D "
+                        "OpenCV view yet); requires --with-robot for the z axis. Default "
+                        "off → the 2-D grid path is unchanged.")
     p.add_argument("--no-ui", action="store_true",
                    help="sweep: run headless with a text summary (no OpenCV coverage box)")
     p.add_argument("--audio", action="store_true",
@@ -1314,6 +1976,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             _log("solve needs an npz path argument")
             return 2
         return stage_solve(args)
+    if args.stage == "solve-3d":
+        if not args.npz:
+            _log("solve-3d needs an npz path argument")
+            return 2
+        return stage_solve_3d(args)
 
     _log(f"connecting to relay {args.relay_host}:{args.relay_port} …")
     consumer = RelayConsumer(args.relay_host, args.relay_port)
@@ -1328,6 +1995,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return stage_collect(args, consumer)
         if args.stage == "register-world":
             return stage_register_world(args, consumer, ui=_make_coverage_ui(args))
+        if args.stage == "register-world-3d":
+            return stage_register_world_3d(args, consumer, ui=_make_coverage_ui(args))
         if args.stage == "sweep":
             return stage_sweep(args, consumer, ui=_make_coverage_ui(args))
     finally:

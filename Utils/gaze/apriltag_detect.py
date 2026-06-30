@@ -62,8 +62,9 @@ def rescale_pose_t_mm(pose_t_m, true_size_m: float, ref_size_m: float) -> np.nda
 
 def detect_tags(detector, bgr: np.ndarray, K: np.ndarray, tag_size_m: float,
                 tag_sizes: Dict[int, float] = None) -> Dict[int, Dict]:
-    """Detect tags → ``{tag_id: {T (4×4, mm), margin, hamming, center}}``. Pose
-    translation is metres→mm so it matches robot telemetry / the X column.
+    """Detect tags → ``{tag_id: {T (4×4, mm), margin, hamming, center, corners}}``
+    (``corners`` is the (4,2) corner pixels, for constrained bundle adjustment).
+    Pose translation is metres→mm so it matches robot telemetry / the X column.
 
     ``tag_size_m`` is the default physical edge (m); ``tag_sizes`` optionally
     overrides it per tag id (e.g. ``{ee_tag_id: 0.04}`` for a small EE tag while
@@ -88,6 +89,7 @@ def detect_tags(detector, bgr: np.ndarray, K: np.ndarray, tag_size_m: float,
             "margin": float(r.decision_margin),
             "hamming": int(r.hamming),
             "center": np.asarray(r.center, dtype=float),
+            "corners": np.asarray(r.corners, dtype=float),  # (4,2) px — for constrained BA
         }
     return out
 
@@ -177,6 +179,15 @@ class RelayConsumer:
     def camera_matrix(self) -> np.ndarray:
         return np.asarray(self._reader.camera_matrix, dtype=float)
 
+    @property
+    def distortion_coeffs(self):
+        """Factory lens-distortion coefficients from the relay handshake (the Neon
+        scene cam is wide-FOV and ships RAW frames), or None. The AprilTag pipeline
+        must undistort with these before pose/PnP/BA — without it the pinhole
+        assumption biases corners by tens of px at the image edges."""
+        d = self._reader.distortion_coeffs
+        return None if d is None else np.asarray(d, dtype=float).ravel()
+
     def close(self) -> None:
         self._stop.set()
         try:
@@ -186,3 +197,7 @@ class RelayConsumer:
             # the daemon thread's iterator exit; a failure here is benign on a
             # bench tool already shutting down.
             pass
+        # Join the drain thread so it isn't mid-decode (an av/cv2 C call) when the
+        # interpreter tears down — that aborts the process ("terminate called",
+        # core dump on a clean quit). reader.close() unblocks the iterator above.
+        self._thread.join(timeout=1.5)

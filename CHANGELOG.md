@@ -6,6 +6,27 @@ The format is **lightweight** (this repo is not strictly semver-tagged). Add bul
 
 ## [Unreleased]
 
+### Gaze→robot accuracy roadmap — first pass (branch `feature/gaze-accuracy-roadmap`)
+
+Builds on the frozen REV05 planar baseline; every live-path change is gated to a
+REV05 default and independently revertible. See
+`SoftwareDocs/projects/harmony-bci/gaze-calibration/accuracy-roadmap-plan.md` §6.
+
+- **Telemetry now keeps EE orientation.** `harmony_link.parse_telemetry` returns
+  `ee_quat` `[x,y,z,w]` (defensive; absent → None, q/ee contract unchanged). The
+  sweep saves `EEQUAT`, `K`, and an optional `--save-frames` JPEG sidecar.
+- **WS-1 centroid/footprint target** in `apriltag_control_test.py`, gated by
+  `config.APRILTAG_WS1_TARGET_SOURCE` (`gaze` default = REV05 | `centroid` |
+  `bottom`). Segments the fixated object (FastSAM via `vlm_service.segment`) and
+  aims at its centroid / footprint pixel cast through the fixation's own pose;
+  any miss falls back to raw gaze (logged).
+- **Offline analysis:** `Analyze_handeye_axzb.py` (WS-2a FK-orientation hand-eye)
+  and `Analyze_eehand_offset_ls.py` (WS-2b segmentation offset LS).
+- **WS-3** optional `grasp_region` from the VLM intent reasoner (perception only).
+- **WS-5A** control-decision overlay params in `scene_overlay_renderer`.
+- **WS-4 foundation:** `GazeCalibration3D` + non-coplanar world-map registration
+  (new surface; live 3-D loop + coverage UI deferred).
+
 ### Cleanup (collaborator-onboarding prep)
 
 - **Decomposed both panel/service god classes by composition.**

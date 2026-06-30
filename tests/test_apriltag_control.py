@@ -20,7 +20,14 @@ import numpy as np  # noqa: E402
 
 from Utils.gaze.apriltag_calib import make_transform, transform_point  # noqa: E402
 from Utils.gaze.apriltag_world import plane_coords  # noqa: E402
-from tools.apriltag_control_test import gaze_point_in_plane_uv  # noqa: E402
+from tools.apriltag_control_test import (  # noqa: E402
+    _object_target_pixel,
+    gaze_point_in_plane_uv,
+)
+
+
+def _square(x0, y0, x1, y1):
+    return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
 
 
 def _rot_x(deg):
@@ -67,3 +74,75 @@ def test_gaze_point_in_plane_uv_nan_gaze_returns_none():
     T = make_transform(np.eye(3), [0.0, 0.0, 500.0])
     assert gaze_point_in_plane_uv(float("nan"), 600.0, K, T,
                                   [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]) is None
+
+
+# ── WS-1 object-target pixel selection (pure) ────────────────────────────────
+
+
+def test_object_target_pixel_centroid_of_hit_mask():
+    dets = [{"mask_polygon": _square(200, 200, 300, 300)}]
+    px = _object_target_pixel(dets, (250.0, 250.0), "centroid")
+    np.testing.assert_allclose(px, [250.0, 250.0], atol=0.5)
+
+
+def test_object_target_pixel_bottom_is_footprint():
+    # Bottom = mean x along the lowest mask row → the object↔table contact centre,
+    # invariant to where on the object gaze landed (the §1.3 overshoot fix).
+    dets = [{"mask_polygon": _square(200, 100, 300, 320)}]
+    px = _object_target_pixel(dets, (250.0, 150.0), "bottom")
+    np.testing.assert_allclose(px, [250.0, 320.0], atol=0.5)
+
+
+def test_object_target_pixel_picks_mask_gaze_is_inside():
+    # Two masks; gaze sits inside the right one → its centroid, not the left's.
+    dets = [{"mask_polygon": _square(0, 0, 100, 100)},
+            {"mask_polygon": _square(400, 400, 500, 500)}]
+    px = _object_target_pixel(dets, (450.0, 450.0), "centroid")
+    np.testing.assert_allclose(px, [450.0, 450.0], atol=0.5)
+
+
+def test_object_target_pixel_picks_smallest_containing_mask():
+    # FastSAM nests masks: a small cup inside the big table blob. Gaze at the cup
+    # centre is contained by BOTH. The fixated object is the cup -> its centroid,
+    # NOT the table's. (Regression: max-signed-distance selection returned the big
+    # blob, a confidently-wrong robot target.)
+    table = _square(0, 0, 1000, 800)
+    cup = _square(440, 360, 540, 460)        # small, fully inside the table mask
+    dets = [{"mask_polygon": table}, {"mask_polygon": cup}]
+    px = _object_target_pixel(dets, (490.0, 410.0), "centroid")
+    np.testing.assert_allclose(px, [490.0, 410.0], atol=1.0)
+
+
+def test_object_target_pixel_bottom_uses_object_not_enclosing_blob():
+    table = _square(0, 0, 1000, 800)
+    cup = _square(440, 360, 540, 460)
+    dets = [{"mask_polygon": table}, {"mask_polygon": cup}]
+    px = _object_target_pixel(dets, (490.0, 410.0), "bottom")
+    # Footprint is the cup's bottom row (~y=460), not the table's (y=800).
+    np.testing.assert_allclose(px, [490.0, 460.0], atol=1.0)
+
+
+def test_object_target_pixel_overlapping_smaller_distractor_does_not_win():
+    # b': a smaller plate mask overlaps the cup and also contains the gaze, but its
+    # centroid sits off to the side. Smallest-area would wrongly pick the plate;
+    # nearest-centroid-to-gaze correctly keeps the cup (gaze is near the cup centre).
+    cup = _square(400, 360, 540, 500)        # area 19600, centroid (470,430)
+    plate = _square(455, 425, 545, 495)      # area 6300 (smaller), centroid (500,460)
+    dets = [{"mask_polygon": cup}, {"mask_polygon": plate}]
+    px = _object_target_pixel(dets, (465.0, 435.0), "centroid")
+    np.testing.assert_allclose(px, [470.0, 430.0], atol=2.0)   # cup, not plate
+
+
+def test_object_target_pixel_rejects_far_outside_gaze():
+    dets = [{"mask_polygon": _square(200, 200, 300, 300)}]
+    assert _object_target_pixel(dets, (1000.0, 1000.0), "centroid") is None
+
+
+def test_object_target_pixel_none_when_no_masks():
+    assert _object_target_pixel([], (250.0, 250.0), "centroid") is None
+    assert _object_target_pixel([{"box_center": [1, 2]}], (1.0, 2.0), "bottom") is None
+
+
+def test_object_target_pixel_gaze_source_is_noop():
+    dets = [{"mask_polygon": _square(200, 200, 300, 300)}]
+    assert _object_target_pixel(dets, (250.0, 250.0), "gaze") is None

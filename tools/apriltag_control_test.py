@@ -38,6 +38,7 @@ so it must NOT run alongside the recorder/online driver (fails fast EADDRINUSE).
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -47,6 +48,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
 from Utils.gaze.apriltag_calib import (  # noqa: E402
@@ -71,10 +73,17 @@ from Utils.gaze.calibration_mapping import (  # noqa: E402
     GazeCalibrationMappingV3,
 )
 from Utils.gaze.harmony_link import HarmonyLink  # noqa: E402
+from Utils.perception_clients import VLMClient  # noqa: E402
 
 
 def _log(msg: str) -> None:
     print(f"[apriltag_control] {msg}", flush=True)
+
+
+# WS-1 object-target tolerances (pixels, scene-cam full-res).
+_HIT_OUTSIDE_TOL_PX = 40.0   # max gaze-outside-mask slack before the hit is rejected
+_BOTTOM_BAND_PX = 3.0        # rows above the lowest mask point averaged for the footprint x
+_GAZE_DIVERGENCE_TOL_PX = 80.0  # service-frame vs our gaze gap above which we distrust the masks
 
 
 # ── pure helpers (hardware-free, unit-tested) ────────────────────────────────
@@ -103,6 +112,141 @@ def gaze_point_in_plane_uv(gaze_x: float, gaze_y: float, K: np.ndarray,
     return plane_coords(p_world, plane_point_world, plane_normal_world)
 
 
+def _object_target_pixel(detections: List[dict], gaze_xy: Tuple[float, float],
+                         source: str) -> Optional[Tuple[float, float]]:
+    """WS-1: pick the scene-frame pixel to aim at from the fixated object's mask,
+    so the target is invariant to *where on the object* gaze landed (killing the
+    tall-object top/bottom overshoot). ``detections`` are vlm_service ``segment``
+    dicts; only those with a ``mask_polygon`` are candidates.
+
+    The fixated object is the **containing mask whose centroid is nearest the
+    gaze**. FastSAM returns nested/overlapping masks (a cup sits inside the table
+    blob; a plate may overlap the cup) and ``segment`` is unfiltered, so several
+    masks contain the gaze. Picking by *largest signed point-in-polygon distance*
+    returns the enclosing blob (a point is "more inside" the bigger region → the
+    table centroid); picking by *smallest area* mis-fires when a smaller distractor
+    overlaps the target. Nearest-centroid-to-gaze handles both: the cup's centroid
+    is near the gaze, the table's and an off-to-the-side plate's are not. If no mask
+    contains the gaze, fall back to the nearest mask within ``_HIT_OUTSIDE_TOL_PX``
+    (jitter slack); beyond that the hit is rejected (None → caller falls back to raw
+    gaze). From the chosen mask:
+      - ``centroid``: the mask area centroid (cv2 moments) — the §1a controlled
+        point, consistent with WS-2b's calibration target.
+      - ``bottom``: the footprint pixel — mean x along the lowest mask row — i.e.
+        the object↔table contact line, the depth-free overshoot fix (§1.3).
+    Returns ``(px, py)`` or None. Pure (no I/O); unit-tested."""
+    if source not in ("centroid", "bottom"):
+        return None
+    gx, gy = float(gaze_xy[0]), float(gaze_xy[1])
+
+    def _centroid(cnt):
+        m = cv2.moments(cnt)
+        if abs(m["m00"]) > 1e-6:
+            return (m["m10"] / m["m00"], m["m01"] / m["m00"])
+        p = cnt.reshape(-1, 2).astype(float)
+        return (float(p[:, 0].mean()), float(p[:, 1].mean()))
+
+    contained = []          # (centroid_dist, area, cnt) for masks containing gaze
+    nearest_cnt = None      # fallback: closest mask when gaze is outside all
+    nearest_dist = -1e18
+    for det in detections:
+        poly = det.get("mask_polygon")
+        if poly is None or len(poly) < 3:
+            continue
+        cnt = np.asarray(poly, dtype=np.int32).reshape(-1, 1, 2)
+        dist = cv2.pointPolygonTest(cnt, (gx, gy), True)  # +inside, -outside (px)
+        if dist >= 0.0:
+            cxm, cym = _centroid(cnt)
+            contained.append((float(np.hypot(cxm - gx, cym - gy)),
+                              float(cv2.contourArea(cnt)), cnt))
+        elif dist > nearest_dist:
+            nearest_dist, nearest_cnt = dist, cnt
+    if contained:
+        # The fixated object is the containing mask whose CENTROID is nearest the
+        # gaze (area as a deterministic tie-break). Nearest-centroid beats
+        # smallest-area: it returns the cup both when the cup nests inside the table
+        # blob (the table centroid is far from the gaze) AND when a smaller
+        # distractor (e.g. a plate) overlaps the cup with its centroid off to the
+        # side (smallest-area would wrongly pick the distractor). It is still a
+        # heuristic, not the server's full probabilistic hit-test — clutter where
+        # gaze lands nearer a distractor's centre than the target's can mis-pick;
+        # the far-NN gate + manual GO are the backstops.
+        best_poly = min(contained, key=lambda c: (c[0], c[1]))[2]
+    elif nearest_cnt is not None and nearest_dist >= -_HIT_OUTSIDE_TOL_PX:
+        best_poly = nearest_cnt                              # gaze just outside
+    else:
+        return None
+    pts = best_poly.reshape(-1, 2).astype(float)
+    if source == "centroid":
+        m = cv2.moments(best_poly)
+        if abs(m["m00"]) > 1e-6:
+            return (m["m10"] / m["m00"], m["m01"] / m["m00"])
+        return (float(pts[:, 0].mean()), float(pts[:, 1].mean()))
+    # bottom: mean x along the lowest few rows of the mask (footprint centre)
+    y_max = float(pts[:, 1].max())
+    on_bottom = pts[:, 1] >= y_max - _BOTTOM_BAND_PX
+    return (float(pts[on_bottom, 0].mean()), y_max)
+
+
+def _object_target_uv(vlm: "VLMClient", source: str, gaze_uv: np.ndarray, diag: dict,
+                      K: np.ndarray, world_map: dict) -> Tuple[np.ndarray, str]:
+    """WS-1: try to replace the raw-gaze table ``(u,v)`` with the fixated object's
+    centroid/footprint ``(u,v)``. Asks vlm_service for masks, picks the target pixel
+    (``_object_target_pixel``), and casts it through this fixation's pose
+    (``diag['T_cam_world']``) onto the table plane. Returns ``(uv, source_label)``;
+    on ANY miss — service down, no mask hit, ray misses the plane — returns the
+    untouched ``gaze_uv`` with label ``'gaze'`` (and logs why), so the degraded path
+    is exactly the frozen REV05 behaviour. The try/except is a documented degradation
+    path (CLAUDE.md), not blanket suppression — the reason is always surfaced.
+
+    Cross-frame caveat: the masks are FastSAM run on the **service's** latest frame
+    (a different process/instant), while the pose and gaze come from **this tool's**
+    sampling window. Under a static fixation the 2-D pixel drift is small and the
+    plane absorbs depth error, but a moving head would reproject a stale pixel. We
+    guard it by comparing the service's gaze (returned in the reply) to our median
+    gaze and falling back to raw gaze when they diverge beyond
+    ``_GAZE_DIVERGENCE_TOL_PX`` — i.e. the two frames disagree on where the eye is."""
+    tcw = diag.get("T_cam_world")
+    gpx = diag.get("gaze_px")
+    if tcw is None or gpx is None:
+        _log("WS-1: no pose/gaze for this fixation; using raw gaze")
+        return gaze_uv, "gaze"
+    try:
+        seg = vlm.segment(include_masks=True)
+    except (OSError, json.JSONDecodeError) as exc:
+        _log(f"WS-1: segment request failed ({exc!r}); using raw gaze")
+        return gaze_uv, "gaze"
+    if not (isinstance(seg, dict) and seg.get("ok")):
+        _log(f"WS-1: segmentation unavailable ({(seg or {}).get('error')}); using raw gaze")
+        return gaze_uv, "gaze"
+    svc_gaze = seg.get("gaze_px")
+    if svc_gaze is None:
+        # Older vlm_service (perception is versioned independently on the GPU host)
+        # doesn't return gaze_px, so the divergence guard can't run. Proceed but
+        # warn — the guarantee is degraded, not the motion safety (far-NN + GO gate).
+        _log("WS-1: service did not return gaze_px (older vlm_service?); "
+             "cross-frame divergence guard unavailable this resolve")
+    elif (not np.all(np.isfinite(svc_gaze))
+          or np.hypot(svc_gaze[0] - gpx[0], svc_gaze[1] - gpx[1])
+          > _GAZE_DIVERGENCE_TOL_PX):
+        # Non-finite service gaze (a blink / lost track on the service's frame) or a
+        # gaze that disagrees with ours = the masks are from the wrong instant. NaN
+        # must FALL BACK, not slip through (nan > tol is False).
+        _log(f"WS-1: service gaze {np.round(svc_gaze,0)} unusable/diverges from ours "
+             f"{np.round(gpx,0)} (stale/moving/blink frame); using raw gaze")
+        return gaze_uv, "gaze"
+    tpx = _object_target_pixel(seg.get("detections", []), (gpx[0], gpx[1]), source)
+    if tpx is None:
+        _log("WS-1: no mask hit at the fixation; using raw gaze")
+        return gaze_uv, "gaze"
+    uv_obj = gaze_point_in_plane_uv(tpx[0], tpx[1], K, tcw,
+                                    world_map["plane_point"], world_map["plane_normal"])
+    if uv_obj is None:
+        _log("WS-1: object pixel ray missed the plane; using raw gaze")
+        return gaze_uv, "gaze"
+    return uv_obj, source
+
+
 # ── gaze sampling (median over a short window) ───────────────────────────────
 
 
@@ -113,8 +257,14 @@ def _sample_uv(consumer: RelayConsumer, detector, K, world_map: dict,
     from whichever mapped tags are visible (occlusion-robust). Returns
     ``(uv_or_None, diag)`` where ``diag`` reports world-tag visibility — how many of
     the mapped world tags were detected per frame and which — so the operator can see
-    the head-invariant anchor is solid (more tags → a more stable, flip-proof pose)."""
+    the head-invariant anchor is solid (more tags → a more stable, flip-proof pose).
+
+    ``diag`` also carries ``T_cam_world`` (the last frame's recovered pose) and
+    ``gaze_px`` (the median gaze pixel) so WS-1 can recast an object-derived target
+    pixel through THIS fixation's pose without a second capture window."""
     pts: List[np.ndarray] = []
+    gaze_pts: List[np.ndarray] = []
+    last_tcw: Optional[np.ndarray] = None
     last_idx = None
     gaze_frames = 0
     per_frame_counts: List[int] = []
@@ -149,12 +299,16 @@ def _sample_uv(consumer: RelayConsumer, detector, K, world_map: dict,
                                     world_map["plane_point"], world_map["plane_normal"])
         if uv is not None:
             pts.append(uv)
+            gaze_pts.append(np.array([b.gaze.x, b.gaze.y], dtype=float))
+            last_tcw = T_cam_world
     diag = {
         "frames": len(pts),
         "gaze_frames": gaze_frames,
         "median_world_tags": float(np.median(per_frame_counts)) if per_frame_counts else 0.0,
         "tags_seen": sorted(ids_seen),
         "mapped_tags": sorted(int(i) for i in world_map["ids"]),
+        "T_cam_world": last_tcw,
+        "gaze_px": (np.median(np.vstack(gaze_pts), axis=0) if gaze_pts else None),
     }
     if not pts:
         return None, diag
@@ -227,6 +381,17 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
          "'g' to GO ('g' again to confirm a far fixation), 'r' to re-resolve, "
          "'h' to home, 'q' to quit. NO autonomous motion.")
 
+    # WS-1: optionally aim at the fixated object's centroid / footprint instead of
+    # the raw gaze∩plane point. 'gaze' (default) is the frozen REV05 path and never
+    # touches the service. Other modes ask vlm_service.segment for masks and fall
+    # back to raw gaze on any miss (logged) — so the worst case is REV05 behaviour.
+    vlm: Optional[VLMClient] = None
+    if args.target_source != "gaze":
+        import config as cfg
+        vlm = VLMClient(cfg)
+        _log(f"WS-1 target source = {args.target_source!r} (FastSAM via vlm_service); "
+             "falls back to raw gaze on any miss")
+
     pending: Optional[Tuple[np.ndarray, int, float, bool]] = None  # (q_cmd, idx, dist, clamped)
     far_armed = False  # a far fixation needs a SECOND 'g' to commit (review safety)
     while True:
@@ -262,6 +427,10 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
                  "keep ≥1 world tag in view and fixate")
             pending, far_armed = None, False
             continue
+        uv_src = "gaze"
+        if vlm is not None:
+            uv, uv_src = _object_target_uv(vlm, args.target_source, uv, diag, K, world_map)
+        _log(f"WS-1 target source: {uv_src}")
         result = mapping.query_uv(uv)
         idx, dist = result.idx, result.dist
         q_cmd, clamped = result.q_target, result.clamped
@@ -291,6 +460,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--sample-s", type=float, default=0.6, help="gaze-fixation sampling window (s)")
     p.add_argument("--max-nn-dist-mm", type=float, default=80.0,
                    help="warn/guard if the nearest calibrated pose is farther than this")
+    p.add_argument("--target-source", choices=["gaze", "centroid", "bottom"], default=None,
+                   help="WS-1: what to aim at. 'gaze' (REV05 default) = raw gaze∩plane; "
+                        "'centroid'/'bottom' = the fixated object's mask centroid / "
+                        "footprint (FastSAM via vlm_service), falling back to gaze on a "
+                        "miss. Default: config.APRILTAG_WS1_TARGET_SOURCE.")
     p.add_argument("--side", default=None, help="robot active side R/L")
     p.add_argument("--relay-host", default=None)
     p.add_argument("--relay-port", type=int, default=None)
@@ -312,6 +486,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     args.bind_ip = args.bind_ip or bind["IP"]
     args.bind_port = args.bind_port or int(bind["PORT"])
     args.side = (args.side or os.environ.get("HARMONY_ACTIVE_SIDE", "R")).upper()
+    args.target_source = (args.target_source
+                          or getattr(cfg, "APRILTAG_WS1_TARGET_SOURCE", "gaze"))
     return args
 
 
