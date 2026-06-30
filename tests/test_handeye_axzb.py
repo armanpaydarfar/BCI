@@ -188,3 +188,32 @@ def test_load_sweep_converts_saved_mm_transforms_to_metres(tmp_path):
     data = load_sweep(str(npz))
     np.testing.assert_allclose(data["T_cam_world"][0, :3, 3], [0.3, -0.4, 1.2], atol=1e-9)
     np.testing.assert_allclose(data["T_cam_world"][0, :3, :3], R, atol=1e-12)
+
+
+def test_umeyama_similarity_recovers_known_scale():
+    """The similarity fit must recover a planted scale/rotation/translation with ~0
+    residual — the core of the telemetry-anchored metric check."""
+    from Analyze_handeye_axzb import umeyama_similarity
+    rng = np.random.default_rng(0)
+    src = rng.normal(0, 100, (40, 3))
+    R = Rotation.from_euler("xyz", [20, -35, 50], degrees=True).as_matrix()
+    s_true, t_true = 1.037, np.array([12.0, -8.0, 5.0])
+    dst = (s_true * (R @ src.T).T) + t_true
+    s, R_hat, t, rms = umeyama_similarity(src, dst)
+    assert abs(s - s_true) < 1e-6
+    np.testing.assert_allclose(R_hat, R, atol=1e-6)
+    assert rms < 1e-6
+
+
+def test_telemetry_metric_check_flags_mis_scaled_map():
+    """A vision map shrunk 8% vs telemetry must surface as scale~0.92 (the single-tag
+    depth/flip corruption the vision-only gates can't see); a metric map gives ~1.0."""
+    from Analyze_handeye_axzb import telemetry_metric_check, make_transform
+    rng = np.random.default_rng(1)
+    pts_mm = rng.normal(0, 150, (30, 3))                       # telemetry EE (mm, base)
+    # vision eetag origins (metres) that match telemetry exactly -> scale 1.0
+    T_ok = np.stack([make_transform(np.eye(3), p / 1000.0) for p in pts_mm])
+    assert abs(telemetry_metric_check(T_ok, pts_mm)["scale"] - 1.0) < 1e-6
+    # vision map shrunk to 0.92x (depth ambiguity) -> recovered scale ~ 1/0.92
+    T_small = np.stack([make_transform(np.eye(3), 0.92 * p / 1000.0) for p in pts_mm])
+    assert abs(telemetry_metric_check(T_small, pts_mm)["scale"] - 1.0 / 0.92) < 1e-3

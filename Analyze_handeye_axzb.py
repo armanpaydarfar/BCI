@@ -207,6 +207,48 @@ def handeye_residuals(T_base_ee: np.ndarray, T_world_eetag: np.ndarray,
     }
 
 
+def umeyama_similarity(src: np.ndarray, dst: np.ndarray):
+    """Least-squares similarity (scale s, rotation R, translation t) mapping
+    src->dst (Umeyama 1991). Returns (s, R, t, rms_residual); src/dst are (N,3) in
+    the same units. Unlike a rigid Umeyama this estimates SCALE, which is what a
+    telemetry-vs-vision check needs (a corrupted-depth map mis-scales)."""
+    src = np.asarray(src, float); dst = np.asarray(dst, float)
+    mu_s, mu_d = src.mean(0), dst.mean(0)
+    Sc, Dc = src - mu_s, dst - mu_d
+    Sigma = (Dc.T @ Sc) / len(src)
+    U, Dsv, Vt = np.linalg.svd(Sigma)
+    W = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        W[2, 2] = -1.0
+    R = U @ W @ Vt
+    var_s = float((Sc ** 2).sum() / len(src))
+    s = float(np.trace(np.diag(Dsv) @ W) / var_s) if var_s > 0 else 1.0
+    t = mu_d - s * R @ mu_s
+    pred = (s * (R @ src.T).T) + t
+    rms = float(np.sqrt(((pred - dst) ** 2).sum(1).mean()))
+    return s, R, t, rms
+
+
+def telemetry_metric_check(T_world_eetag: np.ndarray, X_mm: np.ndarray) -> dict:
+    """Telemetry-anchored ABSOLUTE metric accuracy of the vision map.
+
+    Fits a similarity from the vision EE-tag origins (world frame, metres) to the
+    robot's telemetry EE positions (base frame, mm) — robot telemetry is the
+    consistent metric ground truth (REV05 §5.5; KineDepth, arXiv 2409.19490, uses
+    robot kinematics the same way to anchor monocular depth). The recovered SCALE
+    far from 1.0 means the vision map's metric scale is corrupted by the single-tag
+    depth/flip ambiguity — a failure the vision-only gates (reproducibility,
+    flatness) are BLIND to, since they only test self-consistency, not absolute
+    scale. The residual is an absolute mm accuracy against telemetry (an UPPER
+    bound: it also absorbs the small fixed EE->tag mount offset, which is roughly
+    constant in the EE frame).
+
+    Returns {scale, rms_mm, n}."""
+    o_v_mm = np.asarray([T[:3, 3] for T in T_world_eetag], float) * 1000.0   # m -> mm
+    s, _, _, rms = umeyama_similarity(o_v_mm, np.asarray(X_mm, float))
+    return {"scale": s, "rms_mm": rms, "n": int(len(o_v_mm))}
+
+
 def fk_vs_vision_orientation(T_base_ee: np.ndarray, T_world_eetag: np.ndarray,
                              R_world_base: np.ndarray) -> np.ndarray:
     """Per-sample angular difference (deg) between the FK-derived EE orientation in
@@ -285,10 +327,11 @@ def run(npz_path: str) -> int:
 
     # Prefer green/sufficient samples for the solve when the mask is present.
     T_base_ee, T_world_eetag = build_pose_pairs(data)
+    X_used = data["X"]
     if data["green"] is not None and data["green"].sum() >= 4:
         mask = data["green"]
         print(f"[load] using {int(mask.sum())} green/sufficient samples for solve")
-        T_base_ee, T_world_eetag = T_base_ee[mask], T_world_eetag[mask]
+        T_base_ee, T_world_eetag, X_used = T_base_ee[mask], T_world_eetag[mask], X_used[mask]
     else:
         print(f"[load] using all {len(T_base_ee)} samples (green mask absent/sparse)")
 
@@ -344,6 +387,20 @@ def run(npz_path: str) -> int:
     if not results:
         print("\n[error] no hand-eye method succeeded.")
         return 3
+
+    # --- telemetry-anchored ABSOLUTE metric accuracy (research: telemetry is the
+    # consistent ground truth; the vision-only gates can't see a mis-scaled map) ---
+    metric = telemetry_metric_check(T_world_eetag, X_used)
+    print("\n=== Telemetry-anchored metric accuracy of the vision map ===")
+    print("  similarity fit: vision EE-tag origins (world) -> telemetry EE (base)")
+    print(f"   scale    = {metric['scale']:.4f}   (1.0000 = vision metrically matches telemetry)")
+    print(f"   residual = {metric['rms_mm']:.1f} mm rms   (absolute vs telemetry; upper bound)")
+    if abs(metric["scale"] - 1.0) > 0.05:
+        print("   *** scale off >5%: the vision map's metric scale is likely corrupted by the")
+        print("   *** single-tag depth/flip ambiguity — reproducibility/flatness do NOT catch")
+        print("   *** this. Re-register with the structural constraints + BA, or rescale.   ***")
+    else:
+        print("   OK: vision map metric scale within 5% of telemetry ground truth.")
 
     # --- FK vs vision orientation cross-check (the WS-2a motivation) ---
     best = next(iter(results.values()))
