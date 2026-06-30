@@ -338,7 +338,7 @@ def _resolve_object_plane(vlm, args, K, T_cam_world, diag,
                                             max_area_frac=args.max_object_area_frac)
         if fpx is None:
             _log(f"segment: {sel['n_dets']} masks, none under gaze "
-                 f"(n_contained={sel['n_contained']}, {sel.get('rejected_large',0)} table-sized dropped); no object to target. NOT moving.")
+                 f"(n_contained={sel['n_contained']}, {sel.get('rejected_large',0)} table-sized, {sel.get('rejected_noise',0)} noise dropped); no object to target. NOT moving.")
             return None, None
         # Undistort the VLM pixels (raw-frame coords) before casting through the
         # rectified tag pose — otherwise the lens distortion (tens of px at the edges)
@@ -364,7 +364,7 @@ def _resolve_object_plane(vlm, args, K, T_cam_world, diag,
                                           max_area_frac=args.max_object_area_frac)
         if px is None:
             _log(f"segment: {sel['n_dets']} masks, none under gaze "
-                 f"(n_contained={sel['n_contained']}, {sel.get('rejected_large',0)} table-sized dropped); no object to target. NOT moving.")
+                 f"(n_contained={sel['n_contained']}, {sel.get('rejected_large',0)} table-sized, {sel.get('rejected_noise',0)} noise dropped); no object to target. NOT moving.")
             return None, None
         up = _undistort_px((px, py), K, dist_coeffs)   # raw VLM pixel → rectified before cast
         p_world = pixel_on_plane_world(up[0], up[1], K, T_cam_world, table_point, table_normal)
@@ -426,8 +426,8 @@ def _read_command(ui) -> str:
             return "g"
         if k == ord("r"):
             return "r"
-        if k in (13, 10, 32):                # Enter / space → resolve (default)
-            return ""
+        if k in (13, 10):                    # ENTER only → resolve (space removed: it
+            return ""                        # was firing accidental resolves after GO)
 
 
 def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:

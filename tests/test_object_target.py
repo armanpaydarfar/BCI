@@ -224,3 +224,31 @@ def test_height_on_vertical_needs_up_normal():
     h_dn = height_on_vertical(gpx, base, -n_up, K, T_cam_world)
     assert abs(float((h_up - base) @ n_up) - 150.0) < 5.0        # up-normal recovers height
     assert abs(float((h_dn - base) @ n_up)) < 1e-6               # down-normal clamps to 0
+
+
+def _rect(x0, y0, x1, y1):
+    return {"mask_polygon": [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]}
+
+
+def test_column_merge_reaches_bottle_base_from_cap():
+    """Fixating a bottle CAP (small, high) should take the footprint at the BOTTLE's
+    base (the contiguous body mask below), not the cap's mid-air bottom."""
+    from Utils.gaze.object_target import select_object_pixel
+    cap = _rect(100, 100, 150, 150)          # gaze lands here
+    body = _rect(90, 145, 160, 300)          # below, x-overlapping, contiguous
+    px, py, info = select_object_pixel([cap, body], (125, 125), "footprint")
+    assert info["pick"] == "contained"
+    assert py > 250          # bottle base (~300), NOT the cap base (~150)
+    # with column_merge off, it falls back to the cap's own bottom
+    _, py0, _ = select_object_pixel([cap, body], (125, 125), "footprint", column_merge=False)
+    assert py0 < 170
+
+
+def test_noise_line_mask_rejected():
+    """A thin line-like FastSAM artefact is dropped, not selected as the object."""
+    from Utils.gaze.object_target import select_object_pixel
+    line = _rect(100, 100, 500, 108)         # aspect ~50:1 → noise
+    obj = _rect(200, 200, 260, 280)          # the real object (gaze inside)
+    px, py, info = select_object_pixel([line, obj], (230, 240), "centroid")
+    assert info["rejected_noise"] == 1
+    assert info["pick"] == "contained" and 200 <= px <= 260

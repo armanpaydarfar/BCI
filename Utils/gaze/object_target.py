@@ -43,6 +43,14 @@ from Utils.gaze.apriltag_world import table_normal_from_rel
 HIT_OUTSIDE_TOL_PX = 40.0       # gaze-outside-every-mask slack before a hit is rejected
 BOTTOM_BAND_PX = 3.0            # rows above the lowest mask point averaged for the footprint x
 GAZE_DIVERGENCE_TOL_PX = 80.0   # service-frame vs our-frame gaze gap above which masks are distrusted
+# Segmentation-noise rejection (FastSAM artefacts that aren't graspable objects).
+LINE_ASPECT_MAX = 8.0           # bbox long/short ratio above which a mask is a line
+LINE_FILL_MIN = 0.06            # mask-area / bbox-area below which it's scattered noise
+# Column merge (footprint): union masks vertically aligned with the gazed one so a
+# sub-part (e.g. a bottle CAP) reaches the FULL object's table contact, not its own
+# base (the cap rests on the bottle; the bottle rests on the table).
+COLUMN_X_OVERLAP_FRAC = 0.3     # min horizontal overlap to count as the same column
+COLUMN_Y_GAP_PX = 40.0          # max vertical gap before a lower mask is a separate object
 
 
 def table_plane_from_map(world_map: Dict,
@@ -80,12 +88,56 @@ def table_plane_from_map(world_map: Dict,
     return point, normal, info
 
 
+def _bbox(cnt: np.ndarray) -> Tuple[float, float, float, float]:
+    p = cnt.reshape(-1, 2).astype(float)
+    return float(p[:, 0].min()), float(p[:, 1].min()), float(p[:, 0].max()), float(p[:, 1].max())
+
+
+def _column_base_pixel(gazed: np.ndarray, all_cnts: List[np.ndarray],
+                       bottom_band_px: float) -> Tuple[float, float]:
+    """Table-contact footprint of the vertical COLUMN the gazed mask belongs to.
+
+    Greedily union masks that horizontally overlap the column and are vertically
+    contiguous downward (gap < ``COLUMN_Y_GAP_PX``), then take the bottom band of the
+    LOWEST mask. So fixating a bottle CAP reaches the bottle's base on the table, not
+    the cap's own (mid-air) bottom. A standalone object has no mask below it → the
+    column is just itself → identical to the plain footprint."""
+    x0, y0, x1, y1 = _bbox(gazed)
+    col = [gazed]
+    used = {id(gazed)}
+    cur_x0, cur_x1, cur_ymax = x0, x1, y1
+    changed = True
+    while changed:
+        changed = False
+        for c in all_cnts:
+            if id(c) in used:
+                continue
+            bx0, by0, bx1, by1 = _bbox(c)
+            ox = min(cur_x1, bx1) - max(cur_x0, bx0)          # horizontal overlap
+            if ox <= COLUMN_X_OVERLAP_FRAC * max(min(cur_x1 - cur_x0, bx1 - bx0), 1.0):
+                continue
+            if by0 > cur_ymax + COLUMN_Y_GAP_PX:              # gap → a separate object below
+                continue
+            if by1 <= cur_ymax:                              # doesn't extend the column down
+                continue
+            col.append(c); used.add(id(c))
+            cur_x0, cur_x1 = min(cur_x0, bx0), max(cur_x1, bx1)
+            cur_ymax = max(cur_ymax, by1)
+            changed = True
+    lowest = max(col, key=lambda c: c.reshape(-1, 2)[:, 1].max())
+    pts = lowest.reshape(-1, 2).astype(float)
+    ymax = float(pts[:, 1].max())
+    on_bottom = pts[:, 1] >= ymax - bottom_band_px
+    return float(pts[on_bottom, 0].mean()), ymax
+
+
 def select_object_pixel(detections: List[Dict], gaze_xy: Tuple[float, float],
                         source: str, *,
                         outside_tol_px: float = HIT_OUTSIDE_TOL_PX,
                         bottom_band_px: float = BOTTOM_BAND_PX,
                         frame_area_px: Optional[float] = None,
-                        max_area_frac: float = 0.5
+                        max_area_frac: float = 0.5,
+                        column_merge: bool = True
                         ) -> Tuple[Optional[float], Optional[float], Dict]:
     """Pick the fixated WHOLE object's mask and return its target pixel.
 
@@ -105,9 +157,17 @@ def select_object_pixel(detections: List[Dict], gaze_xy: Tuple[float, float],
     ``max_area_frac`` of the frame is dropped as the table / whole-scene blob, so
     the table can't be picked as the target even when the gaze sits in its mask.
 
+    **Noise rejection:** line-like / scattered masks (high bbox aspect ratio or low
+    fill) are dropped as FastSAM artefacts, not graspable objects.
+
+    **Column merge** (``column_merge``, footprint only): the footprint is taken at
+    the base of the full vertical COLUMN under the gaze (masks above are unioned with
+    contiguous masks below), so fixating a bottle CAP reaches the bottle's TABLE
+    contact, not the cap's mid-air bottom. A standalone object is unaffected.
+
     Returns ``(px, py, info)``. ``info`` has ``n_dets``/``n_contained``/
-    ``rejected_large``/``pick`` and, on a hit, ``mask_area_px`` — log it to see WHY
-    a target was chosen.
+    ``rejected_large``/``rejected_noise``/``pick`` and, on a hit, ``mask_area_px`` —
+    log it to see WHY a target was chosen.
     """
     import cv2  # lazy: only the perception path needs it
 
@@ -119,7 +179,9 @@ def select_object_pixel(detections: List[Dict], gaze_xy: Tuple[float, float],
     area_cap = (max_area_frac * float(frame_area_px)) if frame_area_px else None
     contained: List[Tuple[float, float, np.ndarray]] = []   # (centroid_dist, area, contour)
     nearest_outside: Optional[Tuple[float, np.ndarray]] = None  # (outside_dist, contour)
+    all_cnts: List[np.ndarray] = []        # every accepted (non-table, non-line) contour
     n_rejected_large = 0
+    n_rejected_noise = 0
     for det in detections:
         poly = det.get("mask_polygon")
         if poly is None or len(poly) < 3:
@@ -130,6 +192,15 @@ def select_object_pixel(detections: List[Dict], gaze_xy: Tuple[float, float],
         if area_cap is not None and area > area_cap:
             n_rejected_large += 1          # table / whole-scene blob — not an object
             continue
+        # Drop line-like / scattered FastSAM artefacts: a high bbox aspect ratio is a
+        # line, a low fill (area/bbox) is scattered noise — neither is a graspable thing.
+        bx0, by0, bx1, by1 = _bbox(cnt)
+        bw, bh = bx1 - bx0 + 1.0, by1 - by0 + 1.0
+        if (max(bw, bh) / max(min(bw, bh), 1.0) > LINE_ASPECT_MAX
+                or area / max(bw * bh, 1.0) < LINE_FILL_MIN):
+            n_rejected_noise += 1
+            continue
+        all_cnts.append(cnt)
         signed = cv2.pointPolygonTest(cnt, (gx, gy), True)  # ≥0 inside, signed mm-of-pixels
         if area > 0:
             cxy = (M["m10"] / area, M["m01"] / area)
@@ -144,7 +215,7 @@ def select_object_pixel(detections: List[Dict], gaze_xy: Tuple[float, float],
                 nearest_outside = (od, cnt)
 
     info: Dict = {"n_dets": len(detections), "n_contained": len(contained),
-                  "rejected_large": n_rejected_large}
+                  "rejected_large": n_rejected_large, "rejected_noise": n_rejected_noise}
     if contained:
         cnt = min(contained, key=lambda c: (c[0], c[1]))[2]
         info["pick"] = "contained"
@@ -157,9 +228,13 @@ def select_object_pixel(detections: List[Dict], gaze_xy: Tuple[float, float],
 
     pts = cnt.reshape(-1, 2).astype(float)
     if source in ("footprint", "bottom"):
-        y_max = float(pts[:, 1].max())
-        on_bottom = pts[:, 1] >= y_max - bottom_band_px
-        px, py = float(pts[on_bottom, 0].mean()), y_max
+        if column_merge:
+            # Base of the full vertical column under the gaze (cap → bottle base).
+            px, py = _column_base_pixel(cnt, all_cnts, bottom_band_px)
+        else:
+            y_max = float(pts[:, 1].max())
+            on_bottom = pts[:, 1] >= y_max - bottom_band_px
+            px, py = float(pts[on_bottom, 0].mean()), y_max
     else:  # centroid
         M = cv2.moments(cnt)
         if M["m00"] > 0:
