@@ -205,3 +205,22 @@ def test_gaze_divergence_guard():
     assert gaze_divergence_ok([320.0, 240.0], [330.0, 245.0]) is True
     assert gaze_divergence_ok([320.0, 240.0], [500.0, 240.0]) is False   # >80 px
     assert gaze_divergence_ok([np.nan, 240.0], [320.0, 240.0]) is False
+
+
+def test_height_on_vertical_needs_up_normal():
+    """gaze_height accumulates above the table only when the table normal points UP
+    (toward the camera). A down-pointing normal (the tags' +Z can face either way)
+    sends the height the wrong way and clamps every resolve to 0 — the 2026-06-30 rig
+    bug. The control loop orients the normal toward the calibrated library to fix it."""
+    from Utils.gaze.object_target import height_on_vertical, world_to_pixel
+    from Utils.gaze.apriltag_calib import make_transform
+    K = np.array([[885., 0, 828.], [0, 885., 598.], [0, 0, 1.]])
+    R = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1.]])      # world->cam, cam looks down +Zworld
+    T_cam_world = make_transform(R, -R @ np.array([0., -300, 800]))
+    base = np.zeros(3)
+    n_up = np.array([0, 0, 1.])
+    gpx = world_to_pixel(np.array([0, 0, 150.]), K, T_cam_world)   # gaze at 150 mm up
+    h_up = height_on_vertical(gpx, base, n_up, K, T_cam_world)
+    h_dn = height_on_vertical(gpx, base, -n_up, K, T_cam_world)
+    assert abs(float((h_up - base) @ n_up) - 150.0) < 5.0        # up-normal recovers height
+    assert abs(float((h_dn - base) @ n_up)) < 1e-6               # down-normal clamps to 0

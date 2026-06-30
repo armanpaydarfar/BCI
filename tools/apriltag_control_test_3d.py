@@ -466,13 +466,22 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
         _log(f"table plane from tags {tinfo['table_ids']}: out-of-plane residual "
              f"max={tinfo['max_resid_mm']:.1f} mm, rms={tinfo['rms_resid_mm']:.1f} mm "
              "(large ⇒ wrong table-tag set or a bumped tag)")
+        # Orient the table normal to point UP. The normal comes from the tags' +Z
+        # faces and can point either way; a down-pointing normal silently sends
+        # gaze_height the wrong way and clamps EVERY height to 0 (observed at the rig
+        # 2026-06-30 — the library z came out negative). "Up" = toward the calibrated
+        # library, which was swept ABOVE the table; flip the normal to that side.
+        lib_xyz = np.asarray(z["P_WORLD3D"], dtype=float)
+        if float((lib_xyz.mean(axis=0) - np.asarray(table_point, float)) @ table_normal) < 0:
+            table_normal = -np.asarray(table_normal, float)
+            _log("  table normal flipped to point UP (toward the calibrated library) "
+                 "— gaze_height now accumulates above the table")
 
     # Visual interface (object_plane only): project the library to table (u,v) once
     # for the top-down coverage backdrop, so each resolve shows the target landing
     # inside or outside the calibrated region.
     ui: Optional[ControlView] = None
     if args.target_source == "object_plane" and not args.no_ui:
-        lib_xyz = np.asarray(z["P_WORLD3D"], dtype=float)
         lib_uv = plane_coords(lib_xyz, table_point, table_normal)
         n_hat = np.asarray(table_normal, float) / max(np.linalg.norm(table_normal), 1e-9)
         lib_z = (lib_xyz - np.asarray(table_point, float)) @ n_hat   # height above table
