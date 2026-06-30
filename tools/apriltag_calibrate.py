@@ -1007,18 +1007,16 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                                           plane_point, plane_normal, offset_mm)
                 if p_world is not None:
                     cur_uv = plane_coords(p_world, plane_point, plane_normal)
-                    # Coverage frame: the 2-D (REV05 EE-tag) sweep bins the robot's OWN
-                    # telemetry EE (x,y) — the most consistent metric, in robot axes.
-                    # BUT --coverage-3d (the object-tag/depth-free workflow) bins the
-                    # CONTROLLED POINT in the WORLD frame (``p_world`` = the tag's
-                    # position, the actual (x,y,z)→Q library coordinate), NOT the
-                    # telemetry EE — otherwise the voxel coverage shows where the arm
-                    # went (robot frame) while the library it builds lives in the world
-                    # frame, and the operator fills the wrong volume (the offline check
-                    # found table-level + corner gaps the telemetry view would hide).
-                    # No-robot dry run → vision (u,v) fallback for the 2-D path.
+                    # Telemetry-anchored coverage + display (REV05 §2C, operator
+                    # 2026-06-25): bin and draw the robot's OWN end-effector — the
+                    # single most consistent metric (no AprilTag depth ambiguity/flips/
+                    # head-dependence) — so the screen shows exactly where the arm is.
+                    # The command library still stores the vision controlled point
+                    # (gaze is the only runtime signal); telemetry anchors coverage/
+                    # display/quality, NOT the command. --coverage-3d voxel-bins the
+                    # full telemetry EE (x,y,z). No-robot dry run → vision (u,v).
                     if args.coverage_3d:
-                        disp_xy = np.asarray(p_world, dtype=float)[:3]
+                        disp_xy = x_ee[:3]
                     else:
                         disp_xy = x_ee[:2] if np.all(np.isfinite(x_ee[:2])) else cur_uv
                     grid.add(disp_xy)
