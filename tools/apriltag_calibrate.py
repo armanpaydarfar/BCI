@@ -80,6 +80,7 @@ from Utils.gaze.apriltag_calib import (  # noqa: E402
     eetag_to_world_point,
     gaze_ray_cam,
     geodesic_angle_deg,
+    invert_transform,
     per_point_errors,
     umeyama_rigid,
     umeyama_similarity_2d,
@@ -1218,22 +1219,30 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     # offset IS the grip/hand-wobble error. Small ⇒ the controlled tag alone is
     # rigid enough; large ⇒ rebuild the library from stabilizer + the solved offset.
     if stab_id is not None and tstab_rows:
-        offs = []
-        for tce, tstab in zip(tce_rows, tstab_rows):
-            if np.all(np.isfinite(tce)) and np.all(np.isfinite(tstab)):
-                offs.append((invert_transform(np.asarray(tstab, float))
-                             @ np.asarray(tce, float))[:3, 3])
-        if len(offs) >= 2:
-            O = np.array(offs)
-            sd = O.std(axis=0)
-            _log(f"  stabilizer tag {stab_id}: both tags seen in {len(offs)}/{len(tce_rows)} "
-                 f"samples; controlled↔stabilizer offset mean={np.round(O.mean(axis=0),1).tolist()} "
-                 f"mm, wobble std=[{sd[0]:.1f},{sd[1]:.1f},{sd[2]:.1f}] mm "
-                 f"(|sd|={float(np.linalg.norm(sd)):.1f}); small ⇒ rigid, large ⇒ use "
-                 "stabilizer+offset for the library)")
-        else:
-            _log(f"  stabilizer tag {stab_id}: <2 samples with both tags visible "
-                 "— couldn't measure wobble (keep it in view alongside the controlled tag)")
+        # Wrapped: this is an OPTIONAL post-capture diagnostic and runs BEFORE the
+        # npz save — a failure here must never discard the (expensive) sweep. Log and
+        # continue to the save. (A missing invert_transform import once lost a full
+        # sweep this way, 2026-06-30.)
+        try:
+            offs = []
+            for tce, tstab in zip(tce_rows, tstab_rows):
+                if np.all(np.isfinite(tce)) and np.all(np.isfinite(tstab)):
+                    offs.append((invert_transform(np.asarray(tstab, float))
+                                 @ np.asarray(tce, float))[:3, 3])
+            if len(offs) >= 2:
+                O = np.array(offs)
+                sd = O.std(axis=0)
+                _log(f"  stabilizer tag {stab_id}: both tags seen in {len(offs)}/{len(tce_rows)} "
+                     f"samples; controlled↔stabilizer offset mean={np.round(O.mean(axis=0),1).tolist()} "
+                     f"mm, wobble std=[{sd[0]:.1f},{sd[1]:.1f},{sd[2]:.1f}] mm "
+                     f"(|sd|={float(np.linalg.norm(sd)):.1f}); small ⇒ rigid, large ⇒ use "
+                     "stabilizer+offset for the library)")
+            else:
+                _log(f"  stabilizer tag {stab_id}: <2 samples with both tags visible "
+                     "— couldn't measure wobble (keep it in view alongside the controlled tag)")
+        except Exception as exc:
+            _log(f"  stabilizer wobble diagnostic failed ({exc!r}) — skipping it, "
+                 "the sweep is still being saved")
 
     if len(uv_rows) < 3:
         _log(f"only {len(uv_rows)} accepted samples (<3) — not saving a solvable npz")
