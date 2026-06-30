@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from Utils.gaze.apriltag_calib import invert_transform, make_transform, transform_point  # noqa: E402
 from Utils.gaze.object_target import (  # noqa: E402
+    elevation_coords,
     gaze_divergence_ok,
     height_on_vertical,
     pixel_on_plane_world,
@@ -159,6 +160,21 @@ def test_height_on_vertical_clamps_and_xy_locked():
     got = height_on_vertical((u, v), base, n, _K, Tcw, max_height_mm=400.0)
     assert abs(got[2] - 400.0) < 1e-6
     np.testing.assert_allclose(got[:2], base[:2], atol=1e-6)
+
+
+def test_elevation_coords_section_axes():
+    base = np.array([0.0, 0.0, 0.0])
+    n = np.array([0.0, 0.0, 1.0])
+    cam = np.array([0.0, -700.0, 500.0])   # horiz toward camera is -y
+    # straight up the object → h=0, v=height
+    np.testing.assert_allclose(elevation_coords([0.0, 0.0, 200.0], base, cam, n),
+                               [0.0, 200.0], atol=1e-9)
+    # on the table toward the camera → v=0, h>0
+    np.testing.assert_allclose(elevation_coords([0.0, -100.0, 0.0], base, cam, n),
+                               [100.0, 0.0], atol=1e-9)
+    # batch form
+    got = elevation_coords(np.array([[0, 0, 200.0], [0, -100, 0.0]]), base, cam, n)
+    assert got.shape == (2, 2)
 
 
 def test_world_to_pixel_roundtrips_with_project():

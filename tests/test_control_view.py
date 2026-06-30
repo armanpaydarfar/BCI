@@ -16,7 +16,13 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from Utils.gaze.control_view import table_uv_bounds  # noqa: E402
+from Utils.gaze.control_view import height_color, table_uv_bounds  # noqa: E402
+
+
+def test_height_color_endpoints_and_degenerate():
+    assert height_color(0.0, 0.0, 100.0) != height_color(100.0, 0.0, 100.0)
+    assert height_color(5.0, 10.0, 10.0) == (150, 150, 150)   # zero range → grey
+    assert height_color(float("nan"), 0.0, 100.0) == (150, 150, 150)
 
 
 def test_bounds_enclose_library_with_margin():

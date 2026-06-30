@@ -140,7 +140,8 @@ def object_point_world_mm(position_cam_m, T_cam_world: np.ndarray) -> np.ndarray
 
 
 def _recover_world_pose(consumer: RelayConsumer, detector, K, world_map: dict,
-                        tag_size: float, dur_s: float
+                        tag_size: float, dur_s: float, *,
+                        ee_tag_id: Optional[int] = None, ee_tag_size: Optional[float] = None
                         ) -> Tuple[Optional[np.ndarray], dict]:
     """Recover ``T_cam_world`` over a short window, keeping the LAST frame whose
     pose solved, using the SAME view-robust board PnP the sweep/2-D tool use
@@ -154,10 +155,15 @@ def _recover_world_pose(consumer: RelayConsumer, detector, K, world_map: dict,
     move (more tags → a more stable, flip-proof pose)."""
     last_tcw: Optional[np.ndarray] = None
     last_gaze: Optional[Tuple[float, float]] = None  # our-frame gaze at the solved frame
+    last_ee_world: Optional[np.ndarray] = None       # EE tag position in world (robot-state viz)
     last_idx = None
     frames_with_pose = 0
     per_frame_counts: List[int] = []
     ids_seen: dict = {}
+    # Size the EE tag correctly if we're also locating it (it's usually smaller than
+    # the world tags), else its pose comes out mis-scaled.
+    tag_sizes = ({int(ee_tag_id): float(ee_tag_size)}
+                 if ee_tag_id is not None and ee_tag_size else None)
     deadline = time.time() + dur_s
     while time.time() < deadline:
         b = consumer.latest()
@@ -167,7 +173,7 @@ def _recover_world_pose(consumer: RelayConsumer, detector, K, world_map: dict,
         last_idx = b.video.frame_idx
         if not getattr(b, "worn", True):
             continue
-        tags = detect_tags(detector, b.video.bgr, K, tag_size)
+        tags = detect_tags(detector, b.video.bgr, K, tag_size, tag_sizes=tag_sizes)
         world_view = {i: tags[i] for i in world_map["ids"] if i in tags}
         per_frame_counts.append(len(world_view))
         for i in world_view:
@@ -185,12 +191,17 @@ def _recover_world_pose(consumer: RelayConsumer, detector, K, world_map: dict,
         g = getattr(b, "gaze", None)
         if g is not None and np.isfinite(getattr(g, "x", np.nan)) and np.isfinite(getattr(g, "y", np.nan)):
             last_gaze = (float(g.x), float(g.y))
+        # Current EE position in world (from the EE tag, if visible) for the viz.
+        if ee_tag_id is not None and int(ee_tag_id) in tags:
+            ee_cam = np.asarray(tags[int(ee_tag_id)]["T"], dtype=float)
+            last_ee_world = transform_point(invert_transform(T_cam_world), ee_cam[:3, 3])
     diag = {
         "frames": frames_with_pose,
         "median_world_tags": float(np.median(per_frame_counts)) if per_frame_counts else 0.0,
         "tags_seen": sorted(ids_seen),
         "mapped_tags": sorted(int(i) for i in world_map["ids"]),
         "gaze_px": last_gaze,
+        "ee_tag_world": last_ee_world,
     }
     return last_tcw, diag
 
@@ -297,8 +308,11 @@ def _resolve_object_plane(vlm, args, K, T_cam_world, diag,
     # Reproject the chosen 3-D target onto the scene so the viz marker shows where it
     # lands (rides up the object in gaze_height mode); fall back to the gaze pixel.
     tgt_px = world_to_pixel(p_world, K, T_cam_world) or svc_gaze
+    # The footprint (table-level base under the target) anchors the side view's
+    # vertical line — it's the gaze_height base, else the on-table target itself.
+    base_world = base if args.target_point == "gaze_height" else p_world
     viz = {"gaze_px": svc_gaze, "mask_polygon": sel.get("mask_polygon"),
-           "target_px": tgt_px}
+           "target_px": tgt_px, "base_world": base_world}
     return p_world, viz
 
 
@@ -385,9 +399,11 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
     # inside or outside the calibrated region.
     ui: Optional[ControlView] = None
     if args.target_source == "object_plane" and not args.no_ui:
-        lib_uv = plane_coords(np.asarray(z["P_WORLD3D"], dtype=float),
-                              table_point, table_normal)
-        ui = ControlView(lib_uv)
+        lib_xyz = np.asarray(z["P_WORLD3D"], dtype=float)
+        lib_uv = plane_coords(lib_xyz, table_point, table_normal)
+        n_hat = np.asarray(table_normal, float) / max(np.linalg.norm(table_normal), 1e-9)
+        lib_z = (lib_xyz - np.asarray(table_point, float)) @ n_hat   # height above table
+        ui = ControlView(lib_uv, lib_z)
 
     _log(f"calibration: {mapping.num_valid_samples} world (x,y,z)→Q poses. Workspace "
          f"clamp from Q±{WORKSPACE_BOUNDS_MARGIN:.0%}. Robot dur={args.dur:.1f}s.")
@@ -430,8 +446,10 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
         # default (Enter / 'r'): resolve a fixation
         _log(f"── resolve ── fixate the object; anchoring world frame for "
              f"{args.sample_s:.1f}s …")
-        T_cam_world, diag = _recover_world_pose(consumer, detector, K, world_map,
-                                                tag_size, args.sample_s)
+        T_cam_world, diag = _recover_world_pose(
+            consumer, detector, K, world_map, tag_size, args.sample_s,
+            ee_tag_id=(args.ee_tag_id if ui is not None else None),
+            ee_tag_size=args.ee_tag_size)
         if T_cam_world is None:
             _log(f"no world pose (world tags seen={diag['tags_seen']} of "
                  f"{diag['mapped_tags']}) — keep ≥1 world tag in view")
@@ -472,14 +490,22 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
             scene = b.video.bgr if (b is not None and b.video is not None) else None
             tgt_uv = plane_coords(np.asarray(p_world, float), table_point, table_normal)
             near_uv = plane_coords(np.asarray(result.x_target, float), table_point, table_normal)
+            ee_world = diag.get("ee_tag_world")
+            ee_uv = (plane_coords(np.asarray(ee_world, float), table_point, table_normal)
+                     if ee_world is not None else None)
+            cam_center = invert_transform(T_cam_world)[:3, 3]
             ui.update(
                 scene, gaze_px=viz["gaze_px"], mask_polygon=viz["mask_polygon"],
                 target_px=viz["target_px"], target_uv=tgt_uv, nearest_uv=near_uv,
+                current_ee_uv=ee_uv, base_world=viz.get("base_world"),
+                target_world=np.asarray(p_world, float), cam_center_world=cam_center,
+                table_normal=table_normal,
                 lines=[
                     f"target world {np.round(p_world,0).tolist()} mm   "
                     f"nearest #{idx} dist={dist:.0f} mm   clamped={clamped}",
                     f"anchor {diag['frames']}f median {diag['median_world_tags']:.0f}"
-                    f"/{len(diag['mapped_tags'])} tags   "
+                    f"/{len(diag['mapped_tags'])} tags   EE tag "
+                    + ("seen" if ee_world is not None else "not seen") + "   "
                     + ("OUTSIDE calibrated region" if dist > args.max_nn_dist_mm
                        else "in calibrated region"),
                 ])
@@ -521,7 +547,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "plane (default: config.APRILTAG_WORLD_TAG_IDS). Exclude "
                         "wall/elevated tags here.")
     p.add_argument("--no-ui", action="store_true",
-                   help="disable the visual interface (scene + top-down table view)")
+                   help="disable the visual interface (scene + top-down + side views)")
+    p.add_argument("--ee-tag-id", type=int, default=5,
+                   help="EE tag id to locate for the robot-state overlay (current EE on "
+                        "the views). Default 5; detection is best-effort (skipped if unseen).")
+    p.add_argument("--ee-tag-size", type=float, default=0.04,
+                   help="EE tag edge length in METRES (default 0.04) so its pose is scaled "
+                        "right when located for the overlay")
     p.add_argument("--side", default=None, help="robot active side R/L")
     p.add_argument("--relay-host", default=None)
     p.add_argument("--relay-port", type=int, default=None)

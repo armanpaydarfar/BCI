@@ -234,6 +234,37 @@ def world_to_pixel(p_world: np.ndarray, K: np.ndarray,
             float(K[1, 1] * p_cam[1] / p_cam[2] + K[1, 2]))
 
 
+def elevation_coords(points: np.ndarray, base_world: np.ndarray,
+                     cam_center_world: np.ndarray,
+                     table_normal: np.ndarray) -> np.ndarray:
+    """Project world points into the vertical cross-section through the object's
+    base and the camera, for the side/elevation view that makes the gaze-height
+    geometry visible.
+
+    The section's 2-D axes (origin at ``base_world``): ``h`` = horizontal distance
+    along the in-plane direction from the base toward the camera; ``v`` = height
+    along the table normal. So the table reads as the line v=0, the object's
+    vertical line as h=0, and the gaze ray / camera / target plot in true
+    edge-on geometry. ``points`` is ``(3,)`` or ``(N,3)``; returns ``(2,)`` or
+    ``(N,2)``."""
+    n = np.asarray(table_normal, dtype=float)
+    n = n / max(float(np.linalg.norm(n)), 1e-9)
+    base = np.asarray(base_world, dtype=float)
+    toward = np.asarray(cam_center_world, dtype=float) - base
+    horiz = toward - (toward @ n) * n
+    if float(np.linalg.norm(horiz)) < 1e-6:        # camera ~straight overhead
+        # degenerate: any in-plane axis ⟂ n (camera directly above the base)
+        ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        horiz = ref - (ref @ n) * n
+    h_hat = horiz / float(np.linalg.norm(horiz))
+    P = np.asarray(points, dtype=float)
+    single = (P.ndim == 1)
+    P = np.atleast_2d(P)
+    d = P - base
+    out = np.column_stack([d @ h_hat, d @ n])
+    return out[0] if single else out
+
+
 def gaze_divergence_ok(service_gaze_px, our_gaze_px,
                        tol_px: float = GAZE_DIVERGENCE_TOL_PX) -> bool:
     """True if the service-frame gaze and our-frame gaze agree within ``tol_px``.
