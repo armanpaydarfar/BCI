@@ -101,11 +101,17 @@ def test_select_picks_nearest_containing_centroid_not_smallest():
     np.testing.assert_allclose([px, py], [103.0, 103.0], atol=1.0)  # big mask centroid (nearer)
 
 
-def test_select_bottom_is_footprint_row():
+def test_select_footprint_row():
+    # Both the control tool's "footprint" and the alias "bottom" hit the lowest
+    # mask row (regression: "footprint" used to fall through to centroid).
     det = {"mask_polygon": _square(100, 100, 50)}  # spans y∈[50,150]
-    px, py, _ = select_object_pixel([det], (100.0, 100.0), "bottom")
-    assert abs(py - 150.0) < 1e-6        # lowest mask row
-    assert abs(px - 100.0) < 1.0         # centered footprint x
+    for source in ("footprint", "bottom"):
+        px, py, _ = select_object_pixel([det], (100.0, 100.0), source)
+        assert abs(py - 150.0) < 1e-6, source     # lowest mask row
+        assert abs(px - 100.0) < 1.0, source      # centered footprint x
+    # centroid is the middle, distinct from the footprint
+    _, cy, _ = select_object_pixel([det], (100.0, 100.0), "centroid")
+    assert abs(cy - 100.0) < 1.0
 
 
 def test_select_miss_when_gaze_far_outside():

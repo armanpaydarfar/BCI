@@ -89,8 +89,8 @@ def select_object_pixel(detections: List[Dict], gaze_xy: Tuple[float, float],
 
     ``detections``: ``vlm.segment(include_masks=True)`` output — dicts with a
     ``mask_polygon`` ``[[x,y],...]``. ``source``: ``'centroid'`` (mask centroid) or
-    ``'bottom'`` (footprint = mean x of the lowest ``bottom_band_px`` rows, at the
-    max y — the object↔table contact line).
+    ``'footprint'`` (alias ``'bottom'``: mean x of the lowest ``bottom_band_px``
+    rows, at the max y — the object↔table contact line).
 
     Selection (the validated WS-1 rule, ``apriltag_control_test.py:149-178``):
     among masks whose polygon CONTAINS the gaze, choose the one whose centroid is
@@ -139,7 +139,7 @@ def select_object_pixel(detections: List[Dict], gaze_xy: Tuple[float, float],
         return None, None, info
 
     pts = cnt.reshape(-1, 2).astype(float)
-    if source == "bottom":
+    if source in ("footprint", "bottom"):
         y_max = float(pts[:, 1].max())
         on_bottom = pts[:, 1] >= y_max - bottom_band_px
         px, py = float(pts[on_bottom, 0].mean()), y_max
