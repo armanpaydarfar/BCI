@@ -189,7 +189,7 @@ class ControlView:
         # Library heights at this spot (uv near the target) → the covered z band here.
         near_z = self._heights_near(target_uv)
         v_hi = max(self.z_hi, float(tgt_hv[1]), (near_z.max() if near_z.size else 0.0)) + 30.0
-        h_hi = max(80.0, float(abs(tgt_hv[0])) + 40.0, (near_z.size and 40.0) or 40.0)
+        h_hi = max(80.0, float(abs(tgt_hv[0])) + 40.0)   # horizontal extent (near_z is heights → v_hi)
         layout = fit_box(-40.0, h_hi, -30.0, v_hi, w, h, 24)
 
         def to_px(hv):

@@ -267,9 +267,17 @@ def _resolve_object_plane(vlm, args, K, T_cam_world, diag,
     dets = seg.get("detections", [])
     svc_gaze, our_gaze = seg.get("gaze_px"), diag.get("gaze_px")
     if not gaze_divergence_ok(svc_gaze, our_gaze):
-        _log(f"segment: {len(dets)} masks, service gaze={_fmt_px(svc_gaze)} vs ours "
-             f"{_fmt_px(our_gaze)} diverged >{GAZE_DIVERGENCE_TOL_PX:.0f}px (head moved "
-             "during resolve). NOT moving — hold still and re-resolve.")
+        if svc_gaze is None or our_gaze is None:
+            # A missing gaze (not a divergence) — almost always the Neon gaze stream
+            # isn't flowing through the relay, NOT head motion. Say so, or the operator
+            # chases a phantom head-movement problem.
+            _log(f"segment: {len(dets)} masks, but NO live gaze captured "
+                 f"(service={_fmt_px(svc_gaze)}, ours={_fmt_px(our_gaze)}) — is the Neon "
+                 "gaze stream flowing through the relay? NOT moving.")
+        else:
+            _log(f"segment: {len(dets)} masks, service gaze={_fmt_px(svc_gaze)} vs ours "
+                 f"{_fmt_px(our_gaze)} diverged >{GAZE_DIVERGENCE_TOL_PX:.0f}px (head moved "
+                 "during resolve). NOT moving — hold still and re-resolve.")
         return None, None
     # Frame area (≈ from the principal point) for the table-rejection guard: masks
     # bigger than a fraction of the frame are the table/background, not an object.

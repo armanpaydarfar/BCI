@@ -599,6 +599,16 @@ def stage_register_world_3d(args, consumer: RelayConsumer, ui=None) -> int:
             groups["table"] = [int(i) for i in args.table_plane_tag_ids]
         if args.wall_plane_tag_ids:
             groups["wall"] = [int(i) for i in args.wall_plane_tag_ids]
+        # Loudly flag plane tags that never made it into the map — apply_plane_structure
+        # silently skips a group with <3 mapped tags, so a typo or an uncaptured tag
+        # would DISABLE structural hardening with no other sign (audit 2026-06-30).
+        mapped = {int(i) for i in world_map.get("rel", {})}
+        for name, ids in groups.items():
+            missing = [i for i in ids if i not in mapped]
+            if missing:
+                _log(f"structure: WARNING {name}-plane tags {missing} are NOT in the map "
+                     f"(not in --world-tag-ids or never captured) — that group keeps only "
+                     f"{[i for i in ids if i in mapped]}; <3 ⇒ its hardening is DISABLED.")
         perp = [("table", "wall")] if {"table", "wall"} <= set(groups) else []
         world_map, struct = apply_plane_structure(world_map, groups, perpendicular_pairs=perp)
         for name, g in struct["groups"].items():
