@@ -298,92 +298,129 @@ def _px_dist(a, b) -> float:
         return float("nan")
 
 
-def _resolve_object_plane(vlm, args, K, T_cam_world, diag,
-                          table_point, table_normal, dist_coeffs=None):
-    """Depth-free target: the fixated object's footprint/centroid pixel cast onto
-    the table plane → world ``(x,y,z)`` mm. Logs each stage; returns
-    ``(p_world, viz)`` or ``(None, None)`` on a logged miss. ``viz`` carries
-    ``gaze_px``/``mask_polygon``/``target_px`` for the visual interface."""
+def _resolve_object_once(vlm, args, K, T_cam_world, diag, table_point, table_normal,
+                         dist_coeffs=None, *, quiet=False):
+    """ONE segmentation → depth-free target. Returns ``(p_world, viz, reason)``:
+    ``reason`` is None on success, else a short tag for the windowed caller's summary.
+    ``quiet`` suppresses per-frame logs (the window logs a summary instead)."""
+    def log(m):
+        if not quiet:
+            _log(m)
     try:
         seg = vlm.segment(include_masks=True)
     except OSError as exc:
-        _log(f"segment request failed ({exc!r}); is vlm_service up? NOT moving.")
-        return None, None
+        log(f"segment request failed ({exc!r}); is vlm_service up? NOT moving.")
+        return None, None, "segment_failed"
     if not (isinstance(seg, dict) and seg.get("ok")):
-        _log(f"segment unavailable ({(seg or {}).get('error')}); NOT moving.")
-        return None, None
+        log(f"segment unavailable ({(seg or {}).get('error')}); NOT moving.")
+        return None, None, "segment_unavailable"
     dets = seg.get("detections", [])
     svc_gaze, our_gaze = seg.get("gaze_px"), diag.get("gaze_px")
     if not gaze_divergence_ok(svc_gaze, our_gaze):
         if svc_gaze is None or our_gaze is None:
-            # A missing gaze (not a divergence) — almost always the Neon gaze stream
-            # isn't flowing through the relay, NOT head motion. Say so, or the operator
-            # chases a phantom head-movement problem.
-            _log(f"segment: {len(dets)} masks, but NO live gaze captured "
-                 f"(service={_fmt_px(svc_gaze)}, ours={_fmt_px(our_gaze)}) — is the Neon "
-                 "gaze stream flowing through the relay? NOT moving.")
-        else:
-            _log(f"segment: {len(dets)} masks, service gaze={_fmt_px(svc_gaze)} vs ours "
-                 f"{_fmt_px(our_gaze)} diverged >{GAZE_DIVERGENCE_TOL_PX:.0f}px (head moved "
-                 "during resolve). NOT moving — hold still and re-resolve.")
-        return None, None
-    # Frame area (≈ from the principal point) for the table-rejection guard: masks
-    # bigger than a fraction of the frame are the table/background, not an object.
+            log(f"segment: {len(dets)} masks, but NO live gaze captured "
+                f"(service={_fmt_px(svc_gaze)}, ours={_fmt_px(our_gaze)}) — is the Neon "
+                "gaze stream flowing through the relay? NOT moving.")
+            return None, None, "no_gaze"
+        log(f"segment: {len(dets)} masks, service gaze={_fmt_px(svc_gaze)} vs ours "
+            f"{_fmt_px(our_gaze)} diverged >{GAZE_DIVERGENCE_TOL_PX:.0f}px (head moved "
+            "during resolve). NOT moving — hold still and re-resolve.")
+        return None, None, "gaze_diverged"
     frame_area = 4.0 * float(K[0, 2]) * float(K[1, 2])
+    base = None
     if args.target_point == "gaze_height":
-        # XY from the footprint (overshoot-free, stable); height from the gaze ray ∩
-        # the object's vertical line through that footprint.
         fpx, fpy, sel = select_object_pixel(dets, svc_gaze, "footprint",
                                             frame_area_px=frame_area,
                                             max_area_frac=args.max_object_area_frac)
         if fpx is None:
-            _log(f"segment: {sel['n_dets']} masks, none under gaze "
-                 f"(n_contained={sel['n_contained']}, {sel.get('rejected_large',0)} table-sized, {sel.get('rejected_noise',0)} noise dropped); no object to target. NOT moving.")
-            return None, None
+            log(f"segment: {sel['n_dets']} masks, none under gaze (n_contained="
+                f"{sel['n_contained']}, {sel.get('rejected_large',0)} table-sized, "
+                f"{sel.get('rejected_noise',0)} noise dropped); no object. NOT moving.")
+            return None, None, "no_object"
         # Undistort the VLM pixels (raw-frame coords) before casting through the
-        # rectified tag pose — otherwise the lens distortion (tens of px at the edges)
-        # corrupts the ray, the same root cause that broke the map.
+        # rectified tag pose — else lens distortion (tens of px at the edges) corrupts
+        # the ray, the same root cause that broke the map.
         ufp = _undistort_px((fpx, fpy), K, dist_coeffs)
         base = pixel_on_plane_world(ufp[0], ufp[1], K, T_cam_world, table_point, table_normal)
         if base is None:
-            _log("footprint ray missed the table plane (parallel/behind). NOT moving.")
-            return None, None
+            log("footprint ray missed the table plane (parallel/behind). NOT moving.")
+            return None, None, "ray_missed"
         p_world = height_on_vertical(_undistort_px(svc_gaze, K, dist_coeffs), base,
                                      table_normal, K, T_cam_world)
         if p_world is None:
-            _log("gaze-height ray unusable; NOT moving.")
-            return None, None
+            log("gaze-height ray unusable; NOT moving.")
+            return None, None, "height_unusable"
         n = np.asarray(table_normal, float) / max(np.linalg.norm(table_normal), 1e-9)
         h_mm = float((np.asarray(p_world) - base) @ n)
-        _log(f"object: {sel['pick']} mask, area={sel.get('mask_area_px', 0):.0f}px → "
-             f"footprint=({fpx:.0f},{fpy:.0f}), gaze height={h_mm:.0f} mm above table  "
-             f"[{len(dets)} masks, gaze div={_px_dist(svc_gaze, our_gaze):.0f}px]")
+        log(f"object: {sel['pick']} mask, area={sel.get('mask_area_px', 0):.0f}px → "
+            f"footprint=({fpx:.0f},{fpy:.0f}), gaze height={h_mm:.0f} mm above table  "
+            f"[{len(dets)} masks, gaze div={_px_dist(svc_gaze, our_gaze):.0f}px]")
     else:
         px, py, sel = select_object_pixel(dets, svc_gaze, args.target_point,
                                           frame_area_px=frame_area,
                                           max_area_frac=args.max_object_area_frac)
         if px is None:
-            _log(f"segment: {sel['n_dets']} masks, none under gaze "
-                 f"(n_contained={sel['n_contained']}, {sel.get('rejected_large',0)} table-sized, {sel.get('rejected_noise',0)} noise dropped); no object to target. NOT moving.")
-            return None, None
-        up = _undistort_px((px, py), K, dist_coeffs)   # raw VLM pixel → rectified before cast
+            log(f"segment: {sel['n_dets']} masks, none under gaze (n_contained="
+                f"{sel['n_contained']}, {sel.get('rejected_large',0)} table-sized, "
+                f"{sel.get('rejected_noise',0)} noise dropped); no object. NOT moving.")
+            return None, None, "no_object"
+        up = _undistort_px((px, py), K, dist_coeffs)
         p_world = pixel_on_plane_world(up[0], up[1], K, T_cam_world, table_point, table_normal)
         if p_world is None:
-            _log("object pixel ray missed the table plane (parallel/behind). NOT moving.")
-            return None, None
-        _log(f"object: {sel['pick']} mask, area={sel.get('mask_area_px', 0):.0f}px → "
-             f"{args.target_point} pixel=({px:.0f},{py:.0f})  "
-             f"[{len(dets)} masks, gaze div={_px_dist(svc_gaze, our_gaze):.0f}px]")
-    # Reproject the chosen 3-D target onto the RAW scene (with distortion) so the viz
-    # marker lands correctly on the raw display frame (rides up the object in
-    # gaze_height mode).
+            log("object pixel ray missed the table plane (parallel/behind). NOT moving.")
+            return None, None, "ray_missed"
+        log(f"object: {sel['pick']} mask, area={sel.get('mask_area_px', 0):.0f}px → "
+            f"{args.target_point} pixel=({px:.0f},{py:.0f})  "
+            f"[{len(dets)} masks, gaze div={_px_dist(svc_gaze, our_gaze):.0f}px]")
     tgt_px = _project_world_px(p_world, K, T_cam_world, dist_coeffs)
-    # The footprint (table-level base under the target) anchors the side view's
-    # vertical line — it's the gaze_height base, else the on-table target itself.
     base_world = base if args.target_point == "gaze_height" else p_world
     viz = {"gaze_px": svc_gaze, "mask_polygon": sel.get("mask_polygon"),
            "target_px": tgt_px, "base_world": base_world}
-    return p_world, viz
+    return np.asarray(p_world, float), viz, None
+
+
+def _resolve_object_plane(vlm, args, K, T_cam_world, diag,
+                          table_point, table_normal, dist_coeffs=None):
+    """Depth-free target, robust to a single bad segmentation frame. Calls segment
+    ``--resolve-samples`` times over a short window and returns the per-component
+    MEDIAN target — so a transient line/partial/cap-only mask is an outlier the median
+    discards, not the whole answer (operator idea, 2026-06-30). N=1 keeps the original
+    single-shot behaviour + per-frame logs. Returns ``(p_world, viz)`` or
+    ``(None, None)`` on a logged miss."""
+    n = max(1, int(args.resolve_samples))
+    pts: List[np.ndarray] = []
+    vizs: List[dict] = []
+    reasons: List[str] = []
+    for i in range(n):
+        p, viz, reason = _resolve_object_once(
+            vlm, args, K, T_cam_world, diag, table_point, table_normal,
+            dist_coeffs, quiet=(n > 1))
+        if p is not None:
+            pts.append(p); vizs.append(viz)
+        elif reason is not None:
+            reasons.append(reason)
+        if n > 1 and i < n - 1:
+            time.sleep(0.03)
+    if n == 1:
+        return (pts[0], vizs[0]) if pts else (None, None)
+    if len(pts) < (n + 1) // 2:                          # need a majority to agree
+        from collections import Counter
+        why = Counter(reasons).most_common(1)
+        _log(f"object: only {len(pts)}/{n} segmentation samples found the object"
+             + (f" (mostly: {why[0][0]})" if why else "")
+             + " — unstable, NOT moving. Re-resolve.")
+        return None, None
+    arr = np.asarray(pts, float)
+    med = np.median(arr, axis=0)
+    spread = float(np.median(np.linalg.norm(arr - med, axis=1)))   # robust spread (MAD)
+    if spread > args.resolve_spread_mm:
+        _log(f"object: {len(pts)}/{n} samples disagree by {spread:.0f} mm "
+             f"(> {args.resolve_spread_mm:.0f}) — segmentation unstable. NOT moving.")
+        return None, None
+    best = int(np.argmin(np.linalg.norm(arr - med, axis=1)))       # viz nearest the median
+    _log(f"object: median of {len(pts)}/{n} samples, spread {spread:.0f} mm "
+         "(transient bad frames discarded)")
+    return med, vizs[best]
 
 
 def _resolve_depth(vlm, T_cam_world):
@@ -646,6 +683,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="HARD refuse a target this far from any calibrated pose — a "
                         "mis-fixation (e.g. gaze drifting to the computer screen lands "
                         "~1m away); refused outright, no double-g override")
+    p.add_argument("--resolve-samples", type=int, default=5,
+                   help="segment this many times per resolve and take the MEDIAN target, "
+                        "so a transient bad frame (a line, a partial/cap-only mask) is an "
+                        "outlier the median discards. 1 = single-shot (original behaviour)")
+    p.add_argument("--resolve-spread-mm", type=float, default=40.0,
+                   help="refuse the resolve if the windowed samples disagree (median "
+                        "deviation) by more than this — segmentation too unstable to trust")
     p.add_argument("--target-source", choices=["object_plane", "depth"],
                    default="object_plane",
                    help="how to get the 3-D target. 'object_plane' (default, robust): "

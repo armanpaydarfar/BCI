@@ -252,3 +252,16 @@ def test_noise_line_mask_rejected():
     px, py, info = select_object_pixel([line, obj], (230, 240), "centroid")
     assert info["rejected_noise"] == 1
     assert info["pick"] == "contained" and 200 <= px <= 260
+
+
+def test_column_merge_does_not_overreach_into_table():
+    """The column must stop at the object — a wide table mask below (even contiguous)
+    is NOT merged, so the footprint can't balloon to the image bottom (the 2026-06-30
+    over-reach: footprints at y=1197)."""
+    from Utils.gaze.object_target import select_object_pixel
+    cap = _rect(100, 100, 150, 150)          # gaze here (w=50)
+    body = _rect(90, 145, 160, 300)          # bottle body (w=70, ≤1.7×50) → merges
+    table = _rect(0, 295, 1600, 1197)        # wide table below (w=1600) → must NOT merge
+    px, py, info = select_object_pixel([cap, body, table], (125, 125), "footprint",
+                                       frame_area_px=1656 * 1196, max_area_frac=0.5)
+    assert py < 350          # reaches the body base (~300), NOT the table (~1197)

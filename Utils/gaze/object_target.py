@@ -49,8 +49,10 @@ LINE_FILL_MIN = 0.06            # mask-area / bbox-area below which it's scatter
 # Column merge (footprint): union masks vertically aligned with the gazed one so a
 # sub-part (e.g. a bottle CAP) reaches the FULL object's table contact, not its own
 # base (the cap rests on the bottle; the bottle rests on the table).
-COLUMN_X_OVERLAP_FRAC = 0.3     # min horizontal overlap to count as the same column
+COLUMN_X_OVERLAP_FRAC = 0.3     # min horizontal overlap (vs the gazed mask) to be the same column
 COLUMN_Y_GAP_PX = 40.0          # max vertical gap before a lower mask is a separate object
+COLUMN_WIDTH_RATIO = 1.7        # a merged mask wider than this × the gazed mask is the
+                                # table/background, not the object's body — do NOT merge
 
 
 def table_plane_from_map(world_map: Dict,
@@ -103,9 +105,12 @@ def _column_base_pixel(gazed: np.ndarray, all_cnts: List[np.ndarray],
     the cap's own (mid-air) bottom. A standalone object has no mask below it → the
     column is just itself → identical to the plain footprint."""
     x0, y0, x1, y1 = _bbox(gazed)
+    gw = max(x1 - x0, 1.0)        # the object's width — tests stay vs the GAZED mask so the
+                                 # column can't balloon into the wide table (the bug that sent
+                                 # footprints to the image bottom, 2026-06-30).
     col = [gazed]
     used = {id(gazed)}
-    cur_x0, cur_x1, cur_ymax = x0, x1, y1
+    cur_ymax = y1
     changed = True
     while changed:
         changed = False
@@ -113,15 +118,15 @@ def _column_base_pixel(gazed: np.ndarray, all_cnts: List[np.ndarray],
             if id(c) in used:
                 continue
             bx0, by0, bx1, by1 = _bbox(c)
-            ox = min(cur_x1, bx1) - max(cur_x0, bx0)          # horizontal overlap
-            if ox <= COLUMN_X_OVERLAP_FRAC * max(min(cur_x1 - cur_x0, bx1 - bx0), 1.0):
+            if min(x1, bx1) - max(x0, bx0) <= COLUMN_X_OVERLAP_FRAC * gw:  # not under the object
+                continue
+            if (bx1 - bx0) > COLUMN_WIDTH_RATIO * gw:        # much wider → table/background
                 continue
             if by0 > cur_ymax + COLUMN_Y_GAP_PX:              # gap → a separate object below
                 continue
             if by1 <= cur_ymax:                              # doesn't extend the column down
                 continue
             col.append(c); used.add(id(c))
-            cur_x0, cur_x1 = min(cur_x0, bx0), max(cur_x1, bx1)
             cur_ymax = max(cur_ymax, by1)
             changed = True
     lowest = max(col, key=lambda c: c.reshape(-1, 2)[:, 1].max())
