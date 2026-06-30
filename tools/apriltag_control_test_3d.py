@@ -75,6 +75,7 @@ if str(ROOT) not in sys.path:
 import numpy as np  # noqa: E402
 
 from Utils.gaze.apriltag_calib import (  # noqa: E402
+    gaze_ray_cam,
     invert_transform,
     transform_point,
 )
@@ -99,7 +100,9 @@ from Utils.gaze.object_target import (  # noqa: E402
     height_on_vertical,
     pixel_on_plane_world,
     select_object_pixel,
+    select_vertical_line,
     table_plane_from_map,
+    triangulate_vertical_line,
 )
 from Utils.perception_clients import VLMClient  # noqa: E402
 
@@ -467,6 +470,128 @@ def _read_command(ui) -> str:
             return ""                        # was firing accidental resolves after GO)
 
 
+# ── registration-based target (gaze_lines): no segmentation ───────────────────
+
+_FOOTPRINT_RESID_MAX_MM = 60.0     # triangulation residual above which a capture is too unstable
+_MIN_REG_RAYS = 12                 # gaze rays (head motion) needed for a footprint
+
+
+def _read_register_key(ui, msg: str) -> str:
+    """Prompt + read ENTER / d / q (window keys with a ui, else terminal)."""
+    _log(msg)
+    if ui is None:
+        c = input("> ").strip().lower()
+        return c if c in ("d", "q") else ""
+    while True:
+        k = ui.poll_key(60)
+        if k in (ord("q"), 27):
+            return "q"
+        if k == ord("d"):
+            return "d"
+        if k in (13, 10):
+            return ""
+
+
+def _register_footprints(consumer, detector, K, world_map, tag_size, table_point,
+                         table_normal, dist_coeffs, ui):
+    """Register each graspable object's vertical-line FOOTPRINT by triangulation: the
+    operator looks at the object and MOVES THEIR HEAD; gaze rays from different views
+    converge on its table XY (never aiming at the occluded base). Returns the list of
+    footprint world points, or None if aborted."""
+    undist = _make_frame_undistorter(K, dist_coeffs)
+    foots: List[np.ndarray] = []
+    while True:
+        cmd = _read_register_key(
+            ui, f"REGISTER object #{len(foots) + 1}: look at it and MOVE YOUR HEAD "
+                "around it; ENTER = capture (~4s), d = done, q = abort.")
+        if cmd == "q":
+            return None
+        if cmd == "d":
+            return foots
+        _log("  capturing ~4s — keep looking at the object and moving your head …")
+        origins, dirs = [], []
+        last_idx = None
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            b = consumer.latest()
+            if (b is None or b.video is None or b.video.bgr is None
+                    or b.video.frame_idx == last_idx):
+                time.sleep(0.005)
+                continue
+            last_idx = b.video.frame_idx
+            bgr = undist(b.video.bgr) if undist is not None else b.video.bgr
+            tags = detect_tags(detector, bgr, K, tag_size)
+            wv = {i: tags[i] for i in world_map["ids"] if i in tags}
+            Tcw = recover_world_pose_pnp(wv, world_map, K)
+            if Tcw is None:
+                Tcw = recover_world_pose({i: wv[i]["T"] for i in wv}, world_map)
+            if Tcw is None:
+                continue
+            g = getattr(b, "gaze", None)
+            if g is None or not (np.isfinite(getattr(g, "x", np.nan))
+                                 and np.isfinite(getattr(g, "y", np.nan))):
+                continue
+            ug = _undistort_px((float(g.x), float(g.y)), K, dist_coeffs)
+            rc = gaze_ray_cam(ug[0], ug[1], K)
+            if rc is None:
+                continue
+            Twc = invert_transform(Tcw)
+            origins.append(Twc[:3, 3]); dirs.append(Twc[:3, :3] @ rc)
+        f, resid = triangulate_vertical_line(origins, dirs, table_point, table_normal)
+        if f is None or len(origins) < _MIN_REG_RAYS or resid > _FOOTPRINT_RESID_MAX_MM:
+            _log(f"  poor capture ({len(origins)} rays, resid {resid:.0f} mm > "
+                 f"{_FOOTPRINT_RESID_MAX_MM:.0f}) — MOVE YOUR HEAD MORE while looking "
+                 "steadily. Not stored; retry.")
+            continue
+        foots.append(np.asarray(f, dtype=float))
+        _log(f"  OK object #{len(foots)} footprint = {np.round(f, 0).tolist()} mm "
+             f"(resid {resid:.0f} mm, {len(origins)} rays)")
+
+
+def _load_or_register_footprints(args, consumer, detector, K, world_map, tag_size,
+                                 table_point, table_normal, dist_coeffs, ui):
+    path = args.footprints_file
+    if path and Path(path).is_file():
+        foots = [np.asarray(f, float)
+                 for f in np.atleast_2d(np.load(path)["footprints"])]
+        _log(f"loaded {len(foots)} object footprints from {path}")
+        return foots
+    foots = _register_footprints(consumer, detector, K, world_map, tag_size,
+                                 table_point, table_normal, dist_coeffs, ui)
+    if foots and path:
+        np.savez(path, footprints=np.asarray(foots, float))
+        _log(f"saved {len(foots)} footprints -> {path} (reuse with --footprints-file)")
+    return foots
+
+
+def _resolve_gaze_lines(diag, footprints, table_point, table_normal, K, T_cam_world,
+                        args, dist_coeffs=None):
+    """Registration-based target: the gaze ray's closest registered vertical line ->
+    the target at the gaze height on it. No segmentation. Returns (p_world, viz)."""
+    gaze = diag.get("gaze_px")
+    if gaze is None:
+        _log("no live gaze captured — is the Neon gaze stream flowing? NOT moving.")
+        return None, None
+    ug = _undistort_px(gaze, K, dist_coeffs)
+    target, info = select_vertical_line(ug, footprints, table_normal, K, T_cam_world,
+                                        max_dist_mm=args.line_max_dist_mm)
+    if target is None:
+        if info.get("reason") == "too_far":
+            _log(f"gaze not on a registered object (nearest line {info['nearest_dist']:.0f} "
+                 f"mm > {args.line_max_dist_mm:.0f} mm). NOT moving.")
+        else:
+            _log("gaze ray unusable for line selection. NOT moving.")
+        return None, None
+    foot = np.asarray(footprints[info["idx"]], float)
+    n = np.asarray(table_normal, float) / max(np.linalg.norm(table_normal), 1e-9)
+    h_mm = float((np.asarray(target) - foot) @ n)
+    _log(f"gaze_lines: object #{info['idx']} (gaze {info['dist']:.0f} mm from its line), "
+         f"height {h_mm:.0f} mm above table")
+    tgt_px = _project_world_px(target, K, T_cam_world, dist_coeffs)
+    viz = {"gaze_px": gaze, "mask_polygon": None, "target_px": tgt_px, "base_world": foot}
+    return np.asarray(target, float), viz
+
+
 def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
     z = np.load(args.calib, allow_pickle=True)
     meta = z["meta"].item() if "meta" in z.files else {}
@@ -544,9 +669,25 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
         lib_z = (lib_xyz - np.asarray(table_point, float)) @ n_hat   # height above table
         ui = ControlView(lib_uv, lib_z)
 
+    # gaze_lines: register each graspable object's vertical line up front (or load a
+    # saved set) — no segmentation at runtime.
+    footprints = None
+    if args.target_point == "gaze_lines":
+        footprints = _load_or_register_footprints(
+            args, consumer, detector, K, world_map, tag_size, table_point,
+            table_normal, dist_coeffs, ui)
+        if not footprints:
+            _log("gaze_lines: no registered objects — nothing to target. Exiting.")
+            if ui is not None:
+                ui.close()
+            return 1
+
     _log(f"calibration: {mapping.num_valid_samples} world (x,y,z)→Q poses. Workspace "
          f"clamp from Q±{WORKSPACE_BOUNDS_MARGIN:.0%}. Robot dur={args.dur:.1f}s.")
-    if args.target_source == "object_plane":
+    if args.target_point == "gaze_lines":
+        _log(f"3-D target: {len(footprints)} REGISTERED object lines — the gaze ray "
+             "picks the nearest; no segmentation, no VLM.")
+    elif args.target_source == "object_plane":
         _log(f"3-D target: DEPTH-FREE — fixated object's {args.target_point} pixel ∩ "
              f"table plane (segment masks from {vlm.host}:{vlm.port}; no Depth Pro).")
     else:
@@ -600,7 +741,10 @@ def run(args, consumer: RelayConsumer, link: HarmonyLink) -> int:
              f"saw {diag['tags_seen']}, our gaze={_fmt_px(diag.get('gaze_px'))}")
 
         # Target (Tier-1 fail-safe: any uncertainty → return None → NOT moving).
-        if args.target_source == "object_plane":
+        if args.target_point == "gaze_lines":
+            p_world, viz = _resolve_gaze_lines(diag, footprints, table_point,
+                                               table_normal, K, T_cam_world, args, dist_coeffs)
+        elif args.target_source == "object_plane":
             p_world, viz = _resolve_object_plane(vlm, args, K, T_cam_world, diag,
                                                  table_point, table_normal, dist_coeffs)
         else:
@@ -696,13 +840,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "fixated object's footprint/centroid pixel cast onto the TABLE "
                         "plane (depth-free). 'depth': legacy Depth Pro position_cam "
                         "(vlm_service.waypoints).")
-    p.add_argument("--target-point", choices=["footprint", "centroid", "gaze_height"],
+    p.add_argument("--target-point",
+                   choices=["footprint", "centroid", "gaze_height", "gaze_lines"],
                    default="footprint",
                    help="object_plane target. 'footprint' (default): lowest mask row ∩ "
                         "table (overshoot-free, table height). 'centroid': mask centroid "
                         "∩ table. 'gaze_height': footprint XY but height from the gaze ray "
                         "∩ the object's vertical line — look at a part, move to its height "
-                        "(for tall/stacked objects).")
+                        "(for tall/stacked objects). 'gaze_lines': NO segmentation — "
+                        "register each object's vertical line once (look + move head), "
+                        "then the gaze ray's nearest registered line gives XY + height "
+                        "(robust object-on-object: cup-on-block, cap-on-bottle).")
+    p.add_argument("--footprints-file", default=None,
+                   help="gaze_lines: load registered object footprints from this .npz "
+                        "(skip registration); written here after a fresh registration")
+    p.add_argument("--line-max-dist-mm", type=float, default=60.0,
+                   help="gaze_lines: refuse if the gaze ray is farther than this from "
+                        "every registered object's vertical line (gaze not on an object)")
     p.add_argument("--max-object-area-frac", type=float, default=0.5,
                    help="object_plane: drop any segment larger than this fraction of "
                         "the frame as the TABLE / background (so the table is never "
