@@ -61,7 +61,12 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from Utils.gaze.apriltag_calib import invert_transform, make_transform, umeyama_rigid
-from Utils.gaze.apriltag_world import _CONSENSUS_TOL_MM, average_pose, fit_plane
+from Utils.gaze.apriltag_world import (
+    _CONSENSUS_TOL_MM,
+    average_pose,
+    fit_plane,
+    table_normal_from_rel,
+)
 
 
 def _pairwise_edges(frames: List[Dict[int, np.ndarray]], outlier_tol_mm: float):
@@ -355,3 +360,111 @@ def world_map_3d_reproducibility(frames: List[Dict[int, np.ndarray]], *,
     A_aligned = (T[:3, :3] @ A.T).T + T[:3, 3]
     return {int(common[k]): float(np.linalg.norm(A_aligned[k] - B[k]))
             for k in range(len(common))}
+
+
+# ── structural constraints (Tier-1 hardening: known coplanar/perpendicular rig) ──
+
+
+def _orthogonalize_normals(n1: np.ndarray, n2: np.ndarray):
+    """Closest perpendicular unit pair to ``(n1, n2)``, staying in their span — used
+    to enforce that two physically-perpendicular planes (table ⊥ wall) read 90°
+    despite registration noise. Equal split (both move the same amount). Returns
+    ``(n1', n2')``; if the inputs are ~parallel (degenerate) returns them unchanged."""
+    n1 = n1 / np.linalg.norm(n1)
+    n2 = n2 / np.linalg.norm(n2)
+    w = n2 - (n2 @ n1) * n1
+    wn = float(np.linalg.norm(w))
+    if wn < 1e-9:
+        return n1, n2
+    e1, e2 = n1, w / wn
+    th = np.arctan2(float(n2 @ e2), float(n2 @ e1))   # angle of n2 from n1 (n1 at 0)
+    a1, a2 = th / 2 - np.pi / 4, th / 2 + np.pi / 4
+    return (np.cos(a1) * e1 + np.sin(a1) * e2), (np.cos(a2) * e1 + np.sin(a2) * e2)
+
+
+def _align_z(R: np.ndarray, n: np.ndarray) -> np.ndarray:
+    """Minimal rotation of ``R`` so its +Z column becomes ``n`` (keeps the in-plane
+    spin). Used to make a group's tags share the group plane normal."""
+    z = R[:, 2] / np.linalg.norm(R[:, 2])
+    n = np.asarray(n, dtype=float)
+    n = n / np.linalg.norm(n)
+    c = float(np.clip(z @ n, -1.0, 1.0))
+    if c > 1.0 - 1e-12:
+        return R.copy()
+    if c < -1.0 + 1e-9:                          # opposite: 180° about any axis ⟂ z
+        a = np.array([1.0, 0.0, 0.0]) if abs(z[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        axis = np.cross(z, a); axis /= np.linalg.norm(axis); angle = np.pi
+    else:
+        axis = np.cross(z, n); s = float(np.linalg.norm(axis)); axis /= s
+        angle = np.arctan2(s, c)
+    K = np.array([[0.0, -axis[2], axis[1]],
+                  [axis[2], 0.0, -axis[0]],
+                  [-axis[1], axis[0], 0.0]])
+    Rrot = np.eye(3) + np.sin(angle) * K + (1.0 - np.cos(angle)) * (K @ K)
+    return Rrot @ R
+
+
+def apply_plane_structure(world_map: Dict, groups: Dict[str, List[int]],
+                          perpendicular_pairs=()) -> tuple:
+    """Impose the rig's known structure on a fused 3-D world map (Tier-1 hardening):
+    each named ``groups`` set is made coplanar, and each ``perpendicular_pairs``
+    group pair is made 90°.
+
+    The single-tag depth ambiguity leaves a fused map non-flat (table tags scatter
+    in depth) and non-square (table↔wall ≠ 90°) even though the rig is physically
+    flat + perpendicular. Using those facts: per group, take the (reliable)
+    orientation-average normal (``table_normal_from_rel``) and origin centroid;
+    orthogonalize the perpendicular pair's normals; then **snap** each tag's origin
+    onto its group plane and **re-align** its rotation so +Z = the group normal. The
+    result is structurally correct — board-PnP recovery (which uses the tag origins)
+    and the table-plane target both ride on a flat, square map.
+
+    ``groups``: e.g. ``{"table": [0,1,2,3,4,12], "wall": [6,7,8,9,10,11]}``.
+    ``perpendicular_pairs``: e.g. ``[("table", "wall")]``. Groups with <3 mapped
+    tags are skipped. Returns ``(structured_map, report)`` — ``report`` has per-group
+    pre-snap flatness (how far the registration was from coplanar) and per-pair
+    pre-orthogonalization angle + how far each normal moved (the squareness gate)."""
+    rel = {int(i): np.asarray(world_map["rel"][i], dtype=float).copy()
+           for i in world_map["rel"]}
+    planes: Dict[str, Dict] = {}
+    for name, ids in groups.items():
+        present = [int(i) for i in ids if int(i) in rel]
+        if len(present) < 3:
+            continue
+        planes[name] = {"ids": present,
+                        "normal": table_normal_from_rel(rel, present),
+                        "point": np.mean([rel[i][:3, 3] for i in present], axis=0)}
+
+    report: Dict = {"groups": {}, "perpendicular": {}}
+    for a, b in perpendicular_pairs:
+        if a in planes and b in planes:
+            na, nb = planes[a]["normal"], planes[b]["normal"]
+            ang = float(np.degrees(np.arccos(abs(np.clip(na @ nb, -1.0, 1.0)))))
+            na2, nb2 = _orthogonalize_normals(na, nb)
+            planes[a]["normal"], planes[b]["normal"] = na2, nb2
+            report["perpendicular"][f"{a}-{b}"] = {
+                "angle_before_deg": ang,
+                "normal_moved_deg": float(np.degrees(np.arccos(abs(np.clip(na @ na2, -1.0, 1.0))))),
+            }
+
+    for name, pl in planes.items():
+        n, c, resid = pl["normal"], pl["point"], []
+        for i in pl["ids"]:
+            d = float((rel[i][:3, 3] - c) @ n)
+            resid.append(abs(d))
+            rel[i][:3, 3] = rel[i][:3, 3] - d * n          # snap onto the plane
+            rel[i][:3, :3] = _align_z(rel[i][:3, :3], n)   # +Z = group normal
+        resid = np.asarray(resid)
+        report["groups"][name] = {
+            "ids": pl["ids"],
+            "flatness_max_mm": float(resid.max()),
+            "flatness_rms_mm": float(np.sqrt(np.mean(resid ** 2))),
+        }
+
+    out = dict(world_map)
+    out["rel"] = rel
+    ids = sorted(rel)
+    if len(ids) >= 3:                                       # refresh informational plane
+        origins = np.array([rel[i][:3, 3] for i in ids])
+        out["plane_point"], out["plane_normal"] = fit_plane(origins)
+    return out, report

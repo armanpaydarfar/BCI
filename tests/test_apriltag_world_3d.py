@@ -22,10 +22,12 @@ from Utils.gaze.apriltag_calib import make_transform  # noqa: E402
 from Utils.gaze.apriltag_world import (  # noqa: E402
     recover_world_pose,
     register_world_map_multiview,
+    table_normal_from_rel,
     world_map_from_arrays,
     world_map_to_arrays,
 )
 from Utils.gaze.apriltag_world_3d import (  # noqa: E402
+    apply_plane_structure,
     register_world_map_3d,
     world_map_3d_geometry_report,
     world_map_3d_reproducibility,
@@ -134,6 +136,39 @@ def test_pose_graph_survives_reference_tag_flips():
     err = np.mean([np.linalg.norm(wm["rel"][i][:3, 3] - world_T[i][:3, 3])
                    for i in world_T])
     assert err < 25.0, f"pose-graph should reject ref flips; residual {err:.1f} mm"
+
+
+def test_apply_plane_structure_flattens_and_squares():
+    rng = np.random.default_rng(0)
+    rel = {}
+    # table tags: coplanar at z=0, +Z up, with depth (z) noise + small orientation noise
+    for i, (x, y) in enumerate([(0, 0), (400, 0), (0, 300), (400, 300), (200, 150), (200, 0)]):
+        R = _rot_x(rng.normal(0, 3)) @ _rot_y(rng.normal(0, 3))
+        rel[i] = make_transform(R, [x, y, rng.normal(0, 60)])           # 60 mm depth noise
+    # wall tags 6-11: coplanar on x=600, +Z = +X (⟂ table), with x-noise + orient noise
+    base_w = _rot_y(90.0)                                                # maps +Z → +X
+    for j, (y, z) in enumerate([(0, 100), (300, 100), (0, 300), (300, 300), (150, 200), (150, 400)]):
+        R = base_w @ _rot_x(rng.normal(0, 3)) @ _rot_y(rng.normal(0, 3))
+        rel[6 + j] = make_transform(R, [600 + rng.normal(0, 60), y, z])
+    wm = {"ref_id": 0, "ids": sorted(rel), "rel": rel,
+          "plane_point": np.zeros(3), "plane_normal": np.array([0.0, 0.0, 1.0])}
+
+    groups = {"table": [0, 1, 2, 3, 4, 5], "wall": [6, 7, 8, 9, 10, 11]}
+    sm, rep = apply_plane_structure(wm, groups, perpendicular_pairs=[("table", "wall")])
+
+    def flat(mp, ids):
+        O = np.array([mp["rel"][i][:3, 3] for i in ids])
+        n = table_normal_from_rel(mp["rel"], ids)
+        return float(np.abs((O - O.mean(0)) @ n).max())
+    # after structure: each group is coplanar, and the two planes are perpendicular
+    assert flat(sm, groups["table"]) < 1e-6
+    assert flat(sm, groups["wall"]) < 1e-6
+    nt = table_normal_from_rel(sm["rel"], groups["table"])
+    nw = table_normal_from_rel(sm["rel"], groups["wall"])
+    assert abs(abs(float(nt @ nw))) < 1e-6                    # 90° exactly
+    # the report records the pre-snap flatness it corrected (was ~tens of mm)
+    assert rep["groups"]["table"]["flatness_rms_mm"] > 10.0
+    assert "table-wall" in rep["perpendicular"]
 
 
 def test_reproducibility_tracks_accuracy_not_scatter():
