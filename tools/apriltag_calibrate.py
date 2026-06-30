@@ -883,6 +883,31 @@ def stage_collect(args, consumer: RelayConsumer) -> int:
 _SWEEP_AUTO_HOME_DUR_S = 5.0
 
 
+def _make_undistorter(K, dist_coeffs):
+    """Return a callable ``bgr -> rectified_bgr`` (cv2 remap, SAME K), or None when
+    there's no usable distortion. The Neon ships RAW wide-FOV frames while AprilTag
+    pose/PnP/BA assume a pinhole, so frames MUST be undistorted before detection or
+    the corners are biased tens of px at the edges (2026-06-30 root cause). The remap
+    is built lazily on the first frame (K + size are constant)."""
+    if dist_coeffs is None:
+        return None
+    dist = np.asarray(dist_coeffs, dtype=float).ravel()
+    if not np.any(np.abs(dist) > 1e-9):
+        return None
+    import cv2
+    Kf = np.asarray(K, dtype=float)
+    maps: List = [None, None]
+
+    def _u(bgr):
+        if maps[0] is None:
+            h, w = bgr.shape[:2]
+            maps[0], maps[1] = cv2.initUndistortRectifyMap(
+                Kf, dist, None, Kf, (w, h), cv2.CV_32FC1)
+        return cv2.remap(bgr, maps[0], maps[1], cv2.INTER_LINEAR)
+
+    return _u
+
+
 def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     """REV04 continuous swept capture (rev04 §2). The operator frees the arm and
     hand-guides the EE **across the table surface** while a ~20 Hz loop pairs each
@@ -908,6 +933,9 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
     world_ids = [int(i) for i in args.world_tag_ids]
     detector = load_detector(args.families)
     K = consumer.camera_matrix
+    undistort = _make_undistorter(K, consumer.distortion_coeffs)
+    if undistort is not None:
+        _log("  undistorting frames before detection (Neon lens) — matches the map")
     offset_mm = np.asarray(args.t_eetag_ee, dtype=float)
     ee_size = args.ee_tag_size or args.tag_size
     tag_sizes = {int(i): ee_size for i in ee_ids}
@@ -1038,6 +1066,7 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                 _sleep_until(next_tick)
                 continue
             last_idx = b.video.frame_idx
+            bgr = undistort(b.video.bgr) if undistort is not None else b.video.bgr
 
             if link is not None:
                 rstate = link.query_state()
@@ -1050,7 +1079,7 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                 q_joints, x_ee, t_robot = np.full(7, np.nan), np.full(3, np.nan), time.time()
                 ee_quat = None
 
-            tags = detect_tags(detector, b.video.bgr, K, args.tag_size, tag_sizes=tag_sizes)
+            tags = detect_tags(detector, bgr, K, args.tag_size, tag_sizes=tag_sizes)
             world_view = {i: tags[i] for i in world_ids if i in tags}
             ee_view = {i: tags[i]["T"] for i in ee_ids if i in tags}
             # View-robust world pose: one multi-tag board PnP over the visible tag
@@ -1106,7 +1135,7 @@ def stage_sweep(args, consumer: RelayConsumer, ui=None) -> int:
                         tstab_rows.append(tags[stab_id]["T"] if stab_id in tags
                                           else np.full((4, 4), np.nan))
                     if args.save_frames:
-                        frame_rows.append(b.video.bgr.copy())
+                        frame_rows.append(bgr.copy())   # rectified, matches the map
                     accepted += 1
 
             target = grid.next_target()
