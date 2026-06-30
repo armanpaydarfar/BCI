@@ -197,3 +197,7 @@ class RelayConsumer:
             # the daemon thread's iterator exit; a failure here is benign on a
             # bench tool already shutting down.
             pass
+        # Join the drain thread so it isn't mid-decode (an av/cv2 C call) when the
+        # interpreter tears down — that aborts the process ("terminate called",
+        # core dump on a clean quit). reader.close() unblocks the iterator above.
+        self._thread.join(timeout=1.5)
